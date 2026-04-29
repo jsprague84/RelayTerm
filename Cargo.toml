@@ -53,6 +53,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # Misc
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+base64 = "0.22"
+
+# Crypto (vault)
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", features = ["derive"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+sha2 = { version = "0.10", default-features = false }
 
 # Internal crates
 relayterm-core = { path = "crates/relayterm-core" }

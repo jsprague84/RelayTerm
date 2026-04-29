@@ -1,28 +1,66 @@
 //! SSH identity routes.
 //!
-//! `POST` is intentionally absent: keypair generation requires the vault
-//! crate (encryption + key derivation) which is not yet implemented. This
-//! slice exposes only the safe metadata surface — list and read.
+//! `POST` generates a fresh keypair inside the vault, encrypts the
+//! private material, persists the row, and returns *only* the public
+//! metadata. The plaintext private key never leaves the vault call;
+//! the encrypted blob never leaves the persistence layer.
 
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::get,
+    http::StatusCode,
+    routing::{get, post},
 };
 use relayterm_core::ids::SshIdentityId;
-use relayterm_core::repository::SshIdentityRepository;
+use relayterm_core::repository::{CreateSshIdentity, SshIdentityRepository};
 
 use crate::AppState;
 use crate::dev_user::DevUser;
-use crate::dto::ssh_identity::SshIdentityResponse;
+use crate::dto::ssh_identity::{CreateSshIdentityRequest, SshIdentityResponse};
 use crate::error::ApiError;
 
 const ENTITY: &str = "ssh_identity";
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list))
+        .route("/", post(create).get(list))
         .route("/{id}", get(get_by_id))
+}
+
+async fn create(
+    State(state): State<AppState>,
+    user: DevUser,
+    Json(req): Json<CreateSshIdentityRequest>,
+) -> Result<(StatusCode, Json<SshIdentityResponse>), ApiError> {
+    let validated = req.validate()?;
+
+    // The vault is the single point that owns the master key and the
+    // generated private bytes. If it isn't configured we 503 — refusing
+    // to silently degrade to an unencrypted or no-op path.
+    let vault = state.vault.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "vault is disabled; backend-generated SSH identities require a master key".to_owned(),
+        )
+    })?;
+
+    // Generate inside the vault. The plaintext PEM exists only inside this
+    // call and is wiped before `encrypted_private_key` is handed back.
+    let generated = vault.generate_ssh_identity(validated.key_type, &validated.name)?;
+
+    let identity = state
+        .db
+        .ssh_identities()
+        .create(CreateSshIdentity {
+            owner_id: user.0,
+            name: validated.name,
+            key_type: generated.key_type,
+            public_key: generated.public_key_openssh,
+            encrypted_private_key: generated.encrypted_private_key.into_bytes(),
+            fingerprint_sha256: generated.fingerprint_sha256,
+        })
+        .await?;
+
+    Ok((StatusCode::CREATED, Json(identity.into())))
 }
 
 async fn list(

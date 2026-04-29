@@ -8,6 +8,7 @@
 use axum::{Router, extract::FromRef};
 use relayterm_core::ids::UserId;
 use relayterm_db::Db;
+use relayterm_vault::VaultService;
 use tower_http::trace::TraceLayer;
 
 mod dev_user;
@@ -22,6 +23,10 @@ pub use error::ApiError;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
+    /// Vault service used to generate and decrypt SSH identities. `None`
+    /// means vault-backed identity creation is disabled — the
+    /// `POST /api/v1/ssh-identities` route returns `503` in that mode.
+    pub vault: Option<VaultService>,
     /// Dev-only owner id stamped onto every created row until auth lands.
     /// `None` when `dev_auth.enabled = false` (the shim is off but real
     /// auth has not yet been wired up); in that mode `DevUser` extractors

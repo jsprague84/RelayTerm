@@ -11,8 +11,99 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use relayterm_core::ids::SshIdentityId;
 use relayterm_core::ssh_identity::{SshIdentity, SshKeyType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::error::ApiError;
+
+/// Maximum length for the user-supplied identity name.
+const MAX_NAME_LEN: usize = 64;
+
+/// Request body for `POST /api/v1/ssh-identities`.
+///
+/// Deliberately minimal: the user picks a label and (optionally) a key
+/// type. Everything else — the keypair itself, fingerprint, encrypted
+/// blob — is generated server-side by the vault. There is no field for
+/// supplying private-key material; private-key import is a separate,
+/// not-yet-implemented surface.
+///
+/// `key_type` is taken as a free-form string and parsed in
+/// [`Self::validate`] so an unknown algorithm tag yields a clean 400
+/// `invalid_input` rather than a serde 422 rejection.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateSshIdentityRequest {
+    pub name: String,
+    /// Optional; defaults to `ed25519` when omitted.
+    pub key_type: Option<String>,
+}
+
+/// Validated, normalized form of [`CreateSshIdentityRequest`].
+///
+/// `Debug` is fine here — the struct only carries public, user-supplied
+/// metadata. The vault, not this struct, owns the secret material.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedCreateSshIdentity {
+    pub name: String,
+    pub key_type: SshKeyType,
+}
+
+impl CreateSshIdentityRequest {
+    /// Validate the request body. Failures map to `400 invalid_input`
+    /// without echoing the offending value beyond what the validator
+    /// already names.
+    pub(crate) fn validate(self) -> Result<ValidatedCreateSshIdentity, ApiError> {
+        let trimmed = self.name.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::Validation("name must not be empty".to_owned()));
+        }
+        if trimmed != self.name {
+            return Err(ApiError::Validation(
+                "name must not start or end with whitespace".to_owned(),
+            ));
+        }
+        if trimmed.chars().count() > MAX_NAME_LEN {
+            return Err(ApiError::Validation(format!(
+                "name must be at most {MAX_NAME_LEN} characters",
+            )));
+        }
+        if trimmed.chars().any(char::is_control) {
+            return Err(ApiError::Validation(
+                "name must not contain control characters".to_owned(),
+            ));
+        }
+        let key_type = match self.key_type.as_deref() {
+            None => SshKeyType::Ed25519,
+            Some(tag) => parse_supported_key_type(tag)?,
+        };
+        Ok(ValidatedCreateSshIdentity {
+            name: trimmed.to_owned(),
+            key_type,
+        })
+    }
+}
+
+/// Parse and gate a `key_type` tag against the algorithms the vault can
+/// currently generate.
+///
+/// Funnels both "unknown algorithm" and "known but not yet supported by
+/// the vault generator" through one error shape: 400 `invalid_input` with
+/// the message `unsupported key_type "<tag>"`. Without this gate, an
+/// unknown tag would 400 from the DTO and a known-unsupported tag (e.g.
+/// `"rsa"`) would 400 from the vault's `UnsupportedKeyType` mapping with
+/// a slightly different phrasing — surprising clients that match on
+/// message text.
+fn parse_supported_key_type(tag: &str) -> Result<SshKeyType, ApiError> {
+    let parsed = SshKeyType::from_str_tag(tag)
+        .ok_or_else(|| ApiError::Validation(format!("unsupported key_type {tag:?}")))?;
+    match parsed {
+        SshKeyType::Ed25519 => Ok(parsed),
+        SshKeyType::Rsa | SshKeyType::EcdsaP256 | SshKeyType::EcdsaP384 | SshKeyType::EcdsaP521 => {
+            Err(ApiError::Validation(format!(
+                "unsupported key_type {tag:?}"
+            )))
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SshIdentityResponse {
@@ -120,5 +211,115 @@ mod tests {
         // Replacement char appears, no panic.
         assert!(resp.public_key.starts_with("ssh-"));
         assert!(resp.public_key.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn create_request_defaults_to_ed25519() {
+        let req = CreateSshIdentityRequest {
+            name: "primary".to_owned(),
+            key_type: None,
+        };
+        let v = req.validate().unwrap();
+        assert_eq!(v.name, "primary");
+        assert_eq!(v.key_type, SshKeyType::Ed25519);
+    }
+
+    #[test]
+    fn create_request_accepts_explicit_key_type() {
+        let req = CreateSshIdentityRequest {
+            name: "primary".to_owned(),
+            key_type: Some("ed25519".to_owned()),
+        };
+        let v = req.validate().unwrap();
+        assert_eq!(v.key_type, SshKeyType::Ed25519);
+    }
+
+    #[test]
+    fn create_request_rejects_unknown_key_type() {
+        let req = CreateSshIdentityRequest {
+            name: "primary".to_owned(),
+            key_type: Some("invalid-algo".to_owned()),
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert_eq!(msg, "unsupported key_type \"invalid-algo\"");
+    }
+
+    #[test]
+    fn create_request_rejects_known_but_unsupported_key_type() {
+        // RSA parses to a known SshKeyType variant but the vault has no
+        // generator for it — the DTO must produce the same error shape as
+        // a totally-unknown tag so clients see one canonical 400.
+        let req = CreateSshIdentityRequest {
+            name: "primary".to_owned(),
+            key_type: Some("rsa".to_owned()),
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert_eq!(msg, "unsupported key_type \"rsa\"");
+    }
+
+    #[test]
+    fn create_request_unknown_and_unsupported_share_message_shape() {
+        // Same prefix, just a different tag value — what the test above
+        // proves implicitly, restated as a one-line invariant.
+        let unknown = CreateSshIdentityRequest {
+            name: "p".to_owned(),
+            key_type: Some("foo".to_owned()),
+        };
+        let unsupported = CreateSshIdentityRequest {
+            name: "p".to_owned(),
+            key_type: Some("ecdsa_p256".to_owned()),
+        };
+        let m1 = match unknown.validate() {
+            Err(ApiError::Validation(m)) => m,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let m2 = match unsupported.validate() {
+            Err(ApiError::Validation(m)) => m,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(m1.starts_with("unsupported key_type "));
+        assert!(m2.starts_with("unsupported key_type "));
+    }
+
+    #[test]
+    fn create_request_rejects_empty_name() {
+        let req = CreateSshIdentityRequest {
+            name: "   ".to_owned(),
+            key_type: None,
+        };
+        assert!(matches!(req.validate(), Err(ApiError::Validation(_))));
+    }
+
+    #[test]
+    fn create_request_rejects_surrounding_whitespace() {
+        let req = CreateSshIdentityRequest {
+            name: " primary".to_owned(),
+            key_type: None,
+        };
+        assert!(matches!(req.validate(), Err(ApiError::Validation(_))));
+    }
+
+    #[test]
+    fn create_request_rejects_control_chars() {
+        let req = CreateSshIdentityRequest {
+            name: "bad\nname".to_owned(),
+            key_type: None,
+        };
+        assert!(matches!(req.validate(), Err(ApiError::Validation(_))));
+    }
+
+    #[test]
+    fn create_request_rejects_too_long() {
+        let req = CreateSshIdentityRequest {
+            name: "a".repeat(65),
+            key_type: None,
+        };
+        assert!(matches!(req.validate(), Err(ApiError::Validation(_))));
     }
 }
