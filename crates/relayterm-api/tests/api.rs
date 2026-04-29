@@ -15,6 +15,7 @@
 
 #![cfg(feature = "postgres-tests")]
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -23,6 +24,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt as _;
 use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
@@ -3129,4 +3131,667 @@ async fn create_terminal_session_message_does_not_overclaim_pty_or_ssh(pool: PgP
             "create message must not imply `{forbidden}`: {message}",
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// Terminal WebSocket attach/detach lifecycle
+// ----------------------------------------------------------------------
+
+/// Spawn the supplied router on an OS-assigned local port and return the
+/// bound address. The handle is detached; the server lives until the
+/// test process exits or every client connection has dropped.
+async fn spawn_app(app: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
+/// Open a WebSocket against `/api/v1/terminal-sessions/:id/ws` for the
+/// given session. Panics on any handshake failure — the tests assert
+/// pre-upgrade rejections via the plain HTTP client below.
+async fn open_ws(
+    addr: SocketAddr,
+    session_id: relayterm_core::ids::TerminalSessionId,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let url = format!("ws://{addr}/api/v1/terminal-sessions/{session_id}/ws");
+    let (stream, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WebSocket handshake should succeed for an owned, open session");
+    stream
+}
+
+/// Receive the next text frame and decode it as a [`ServerMsg`]. Panics
+/// on transport error / non-text frame so the test surfaces them loudly.
+async fn recv_server_msg(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> relayterm_protocol::ServerMsg {
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                return serde_json::from_str(&text).expect("server message must be valid JSON");
+            }
+            Some(Ok(Message::Close(_))) => panic!("socket closed before any text frame"),
+            Some(Ok(_)) => continue, // skip ping/pong frames
+            Some(Err(err)) => panic!("transport error: {err:?}"),
+            None => panic!("socket ended before any text frame"),
+        }
+    }
+}
+
+async fn send_client_msg(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    msg: &relayterm_protocol::ClientMsg,
+) {
+    use tokio_tungstenite::tungstenite::Message;
+    let payload = serde_json::to_string(msg).unwrap();
+    socket.send(Message::Text(payload.into())).await.unwrap();
+}
+
+/// Drive the create route and return the new session's id.
+async fn create_session_via_api(
+    app: &Router,
+    profile_id: relayterm_core::ids::ServerProfileId,
+) -> relayterm_core::ids::TerminalSessionId {
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    body["id"]
+        .as_str()
+        .unwrap()
+        .parse::<uuid::Uuid>()
+        .map(relayterm_core::ids::TerminalSessionId::from_uuid)
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_emits_session_attached_stub(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-attach.example.com",
+        "SHA256:ws-attach",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+
+    let msg = recv_server_msg(&mut socket).await;
+    match msg {
+        relayterm_protocol::ServerMsg::SessionAttached {
+            session_id: got_id,
+            attachment_id: _,
+            status,
+            message,
+        } => {
+            assert_eq!(got_id, session_id);
+            assert_eq!(
+                status,
+                relayterm_protocol::SessionAttachStatus::AttachedStub
+            );
+            // Wire wording must explicitly disclaim PTY scope.
+            let lower = message.to_lowercase();
+            assert!(
+                lower.contains("pty") && lower.contains("not implemented"),
+                "session_attached message must signal PTY-not-implemented: {message}",
+            );
+            for forbidden in ["session opened", "shell ready", "logged in"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "session_attached must not imply `{forbidden}`: {message}",
+                );
+            }
+        }
+        other => panic!("expected SessionAttached, got {other:?}"),
+    }
+
+    // The attachment row exists.
+    let session = relayterm_core::ids::TerminalSessionId::from(session_id.into_uuid());
+    let attachments = PgTerminalSessionRepository::new(pool)
+        .list_attachments(session)
+        .await
+        .unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert!(attachments[0].detached_at.is_none());
+}
+
+/// `tokio-tungstenite` returns the rejected handshake response inside the
+/// `Http` error variant — pull the status code out so tests can assert on
+/// the same numbers the HTTP routes use. Any other error variant is a
+/// test-rig bug, not a route behavior.
+async fn ws_handshake_status(
+    addr: SocketAddr,
+    session_id_uri: &str,
+) -> (axum::http::StatusCode, Option<Vec<u8>>) {
+    use tokio_tungstenite::tungstenite::Error;
+    let url = format!("ws://{addr}/api/v1/terminal-sessions/{session_id_uri}/ws");
+    let err = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect_err("expected handshake failure");
+    match err {
+        Error::Http(resp) => {
+            let (parts, body) = resp.into_parts();
+            (parts.status, body)
+        }
+        other => panic!("expected Http error, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_unknown_session_returns_404_before_upgrade(pool: PgPool) {
+    let (app, _user) = setup(pool).await;
+    let addr = spawn_app(app).await;
+    let bogus = uuid::Uuid::new_v4();
+    let (status, body) = ws_handshake_status(addr, &bogus.to_string()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let body = body.expect("404 must carry an error envelope body");
+    let parsed: Value = serde_json::from_slice(&body).expect("body is valid JSON");
+    assert_eq!(parsed["error"]["code"], "not_found");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_foreign_session_returns_indistinguishable_404(pool: PgPool) {
+    let other_user = create_user(&pool, "other").await;
+    let foreign_profile = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-ws",
+        "foreign-ws.example.com",
+    )
+    .await;
+    let foreign_session = PgTerminalSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: other_user,
+            server_profile_id: foreign_profile,
+            status: TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let (app, _dev_user) = setup(pool).await;
+    let addr = spawn_app(app).await;
+
+    let bogus = uuid::Uuid::new_v4();
+    let (bogus_status, bogus_body) = ws_handshake_status(addr, &bogus.to_string()).await;
+    let (foreign_status, foreign_body) =
+        ws_handshake_status(addr, &foreign_session.id.to_string()).await;
+
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign_status, bogus_status);
+    assert_eq!(
+        foreign_body, bogus_body,
+        "foreign-owned WS attach must produce a byte-identical 404 body",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_closed_session_returns_409(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-closed.example.com",
+        "SHA256:ws-closed",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    // Close it before attempting to attach.
+    let close = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{session_id}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+
+    let addr = spawn_app(app).await;
+    let (status, body) = ws_handshake_status(addr, &session_id.to_string()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let body = body.expect("409 must carry an error envelope body");
+    let parsed: Value = serde_json::from_slice(&body).expect("body is valid JSON");
+    assert_eq!(parsed["error"]["code"], "conflict");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_returns_401_when_dev_auth_disabled(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
+        dev_user_id: None,
+    };
+    let app = router(state);
+    let addr = spawn_app(app).await;
+    let (status, _body) = ws_handshake_status(addr, &uuid::Uuid::new_v4().to_string()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_ping_returns_pong(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-ping.example.com",
+        "SHA256:ws-ping",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    // Drain the SessionAttached frame.
+    let _ = recv_server_msg(&mut socket).await;
+
+    send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Ping).await;
+    let pong = recv_server_msg(&mut socket).await;
+    assert!(matches!(pong, relayterm_protocol::ServerMsg::Pong));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_resize_acks_and_writes_event(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-resize.example.com",
+        "SHA256:ws-resize",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Resize {
+            cols: 132,
+            rows: 50,
+        },
+    )
+    .await;
+    let ack = recv_server_msg(&mut socket).await;
+    match ack {
+        relayterm_protocol::ServerMsg::Ack { kind } => {
+            assert_eq!(kind, relayterm_protocol::AckKind::Resize);
+        }
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    // Resized event was persisted with the new dims.
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap();
+    let resized: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Resized)
+        .collect();
+    assert_eq!(resized.len(), 1);
+    assert_eq!(resized[0].payload["cols"], 132);
+    assert_eq!(resized[0].payload["rows"], 50);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_resize_invalid_dims_returns_typed_error(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-bad-resize.example.com",
+        "SHA256:ws-bad-resize",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Resize { cols: 0, rows: 24 },
+    )
+    .await;
+    let err = recv_server_msg(&mut socket).await;
+    match err {
+        relayterm_protocol::ServerMsg::Error { code, message } => {
+            assert_eq!(code, relayterm_protocol::ErrorCode::InvalidInput);
+            assert!(
+                message.to_lowercase().contains("dimension")
+                    || message.to_lowercase().contains("invalid"),
+                "error message should signal invalid dims: {message}",
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // No Resized event was written.
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap();
+    let resized = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Resized)
+        .count();
+    assert_eq!(resized, 0, "invalid resize must not append a Resized event");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_input_returns_pty_not_implemented_and_does_not_echo_payload(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-input.example.com",
+        "SHA256:ws-input",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    // Sentinel string the test then asserts is NOT present in any
+    // response — pinned so a future "helpful" handler change that
+    // reflects input back fails loudly.
+    let sentinel = "REDACT-MARKER-WS-INPUT-3D8F";
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Input {
+            data: sentinel.to_owned(),
+        },
+    )
+    .await;
+    let resp = recv_server_msg(&mut socket).await;
+    let raw = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !raw.contains(sentinel),
+        "input handler must NOT reflect payload bytes: {raw}",
+    );
+    match resp {
+        relayterm_protocol::ServerMsg::Error { code, message } => {
+            assert_eq!(code, relayterm_protocol::ErrorCode::PtyNotImplemented);
+            let lower = message.to_lowercase();
+            assert!(
+                lower.contains("pty") && lower.contains("not implemented"),
+                "input rejection must name PTY-not-implemented: {message}",
+            );
+        }
+        other => panic!("expected Error frame, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_binary_frame_is_rejected_without_echo(pool: PgPool) {
+    use tokio_tungstenite::tungstenite::Message;
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-binary.example.com",
+        "SHA256:ws-binary",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    // Sentinel bytes the test asserts the server never reflects. JSON
+    // protocol rejects binary frames wholesale — payload must not appear
+    // in the error response or in any subsequent frame.
+    let sentinel = b"REDACT-MARKER-BINARY-FRAME-22EE";
+    socket
+        .send(Message::Binary(sentinel.to_vec().into()))
+        .await
+        .unwrap();
+    let resp = recv_server_msg(&mut socket).await;
+    let raw = serde_json::to_string(&resp).unwrap();
+    let sentinel_str = std::str::from_utf8(sentinel).unwrap();
+    assert!(
+        !raw.contains(sentinel_str),
+        "binary frame rejection must NOT echo payload bytes: {raw}",
+    );
+    match resp {
+        relayterm_protocol::ServerMsg::Error { code, .. } => {
+            assert_eq!(code, relayterm_protocol::ErrorCode::InvalidMessage);
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_invalid_message_returns_typed_error_without_echo(pool: PgPool) {
+    use tokio_tungstenite::tungstenite::Message;
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-bad-msg.example.com",
+        "SHA256:ws-bad-msg",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    let sentinel = "REDACT-MARKER-BAD-FRAME-A11C";
+    socket
+        .send(Message::Text(
+            format!("{{\"type\":\"totally-bogus\",\"data\":\"{sentinel}\"}}").into(),
+        ))
+        .await
+        .unwrap();
+    let resp = recv_server_msg(&mut socket).await;
+    let raw = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !raw.contains(sentinel),
+        "invalid_message handler must NOT reflect frame bytes: {raw}",
+    );
+    match resp {
+        relayterm_protocol::ServerMsg::Error { code, .. } => {
+            assert_eq!(code, relayterm_protocol::ErrorCode::InvalidMessage);
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-detach.example.com",
+        "SHA256:ws-detach",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let attached = recv_server_msg(&mut socket).await;
+    let attachment_id = match attached {
+        relayterm_protocol::ServerMsg::SessionAttached { attachment_id, .. } => attachment_id,
+        other => panic!("expected SessionAttached, got {other:?}"),
+    };
+
+    send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
+    let resp = recv_server_msg(&mut socket).await;
+    match resp {
+        relayterm_protocol::ServerMsg::SessionDetached {
+            session_id: got_session,
+            attachment_id: got_attachment,
+        } => {
+            assert_eq!(got_session, session_id);
+            assert_eq!(got_attachment, attachment_id);
+        }
+        other => panic!("expected SessionDetached, got {other:?}"),
+    }
+
+    // The attachment row's detached_at is stamped.
+    let attachments = PgTerminalSessionRepository::new(pool.clone())
+        .list_attachments(session_id)
+        .await
+        .unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert!(attachments[0].detached_at.is_some());
+
+    // Detached event was written.
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap();
+    let detached = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Detached)
+        .count();
+    assert_eq!(detached, 1);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_close_transitions_session_and_emits_session_closed(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-close.example.com",
+        "SHA256:ws-close",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Close).await;
+    let resp = recv_server_msg(&mut socket).await;
+    match resp {
+        relayterm_protocol::ServerMsg::SessionClosed {
+            session_id: got_session,
+        } => {
+            assert_eq!(got_session, session_id);
+        }
+        other => panic!("expected SessionClosed, got {other:?}"),
+    }
+
+    // The session row is now closed.
+    let row = PgTerminalSessionRepository::new(pool.clone())
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
+    assert!(row.closed_at.is_some());
+
+    // The closed event was written.
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap();
+    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&SessionEventKind::Closed));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-drop.example.com",
+        "SHA256:ws-drop",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    // Drop the socket without sending Detach. The handler's cleanup
+    // tail must still write the detach bookkeeping so the audit row
+    // reflects the disconnect.
+    socket.close(None).await.unwrap();
+    drop(socket);
+
+    // Poll briefly for the detached_at write — the handler runs on a
+    // separate task, so this is the natural "wait for cleanup" point.
+    let attachment = PgTerminalSessionRepository::new(pool.clone());
+    let mut detached_at = None;
+    for _ in 0..50 {
+        let rows = attachment.list_attachments(session_id).await.unwrap();
+        if let Some(row) = rows.into_iter().next() {
+            if row.detached_at.is_some() {
+                detached_at = row.detached_at;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        detached_at.is_some(),
+        "socket drop must surface as detached_at on the attachment row",
+    );
+
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap();
+    let detached = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Detached)
+        .count();
+    assert_eq!(
+        detached, 1,
+        "socket drop must append a single Detached event"
+    );
 }

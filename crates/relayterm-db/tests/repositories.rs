@@ -691,6 +691,77 @@ async fn terminal_session_attachment_round_trip(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn mark_attachment_detached_idempotent_and_round_trips(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let attachment = repo
+        .create_attachment(CreateTerminalSessionAttachment {
+            session_id: session.id,
+            client_info: None,
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+
+    let first_at = chrono::Utc::now();
+    repo.mark_attachment_detached(attachment.id, first_at, Some(42))
+        .await
+        .unwrap();
+    let after = repo.get_attachment(attachment.id).await.unwrap().unwrap();
+    assert!(after.detached_at.is_some());
+    assert_eq!(after.last_seen_seq, Some(42));
+
+    // Second call with different timestamp + seq must be a no-op:
+    // COALESCE on detached_at preserves the original.
+    let later = first_at + chrono::Duration::seconds(60);
+    repo.mark_attachment_detached(attachment.id, later, Some(99))
+        .await
+        .unwrap();
+    let after_second = repo.get_attachment(attachment.id).await.unwrap().unwrap();
+    assert_eq!(
+        after_second.detached_at, after.detached_at,
+        "second detach must not overwrite the original detached_at",
+    );
+    assert_eq!(
+        after_second.last_seen_seq,
+        Some(42),
+        "second detach must not overwrite the original last_seen_seq",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn mark_attachment_detached_unknown_id_returns_not_found(pool: PgPool) {
+    let repo = PgTerminalSessionRepository::new(pool);
+    let err = repo
+        .mark_attachment_detached(
+            relayterm_core::ids::TerminalSessionAttachmentId::new(),
+            chrono::Utc::now(),
+            None,
+        )
+        .await
+        .expect_err("unknown attachment id must not silently succeed");
+    match err {
+        relayterm_core::repository::RepositoryError::NotFound { entity } => {
+            assert_eq!(entity, "terminal_session_attachment");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
 // ----------------------------------------------------------------------
 // Unique constraint conflict
 // ----------------------------------------------------------------------

@@ -245,6 +245,11 @@ impl From<TerminalSessionManagerError> for ApiError {
             TerminalSessionManagerError::NotFound => Self::NotFound {
                 entity: "terminal_session",
             },
+            // Closed-session attach/resize → 409. Distinct from 404 so the
+            // operator UI can tell "no such session" from "session is gone."
+            TerminalSessionManagerError::SessionClosed => Self::Conflict {
+                entity: "terminal_session",
+            },
             TerminalSessionManagerError::Repository(e) => e.into(),
         }
     }

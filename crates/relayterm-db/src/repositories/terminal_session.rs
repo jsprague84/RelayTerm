@@ -196,4 +196,38 @@ impl TerminalSessionRepository for PgTerminalSessionRepository {
 
         Ok(row.map(TerminalSessionAttachmentRow::into_domain))
     }
+
+    async fn mark_attachment_detached(
+        &self,
+        id: TerminalSessionAttachmentId,
+        detached_at: DateTime<Utc>,
+        last_seen_seq: Option<i64>,
+    ) -> Result<(), RepositoryError> {
+        // Idempotent first-write: only stamp `detached_at` if it's still
+        // NULL. A redundant detach call (client drop + WS close path racing,
+        // for example) leaves the original timestamp + seq intact rather
+        // than overwriting them. The "missing row" case below is the only
+        // hard error.
+        let result = sqlx::query(
+            r#"
+            UPDATE terminal_session_attachments
+            SET detached_at = COALESCE(detached_at, $2),
+                last_seen_seq = COALESCE(last_seen_seq, $3)
+            WHERE id = $1
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(detached_at)
+        .bind(last_seen_seq)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ATTACHMENT_ENTITY, e))?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound {
+                entity: ATTACHMENT_ENTITY,
+            });
+        }
+        Ok(())
+    }
 }

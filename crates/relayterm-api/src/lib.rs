@@ -78,7 +78,6 @@ impl FromRef<AppState> for Option<UserId> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
-        .merge(routes::ws::router())
         .nest("/api/v1", routes::v1::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

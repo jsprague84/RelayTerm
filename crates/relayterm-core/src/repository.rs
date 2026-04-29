@@ -266,6 +266,23 @@ pub trait TerminalSessionRepository: Send + Sync {
         &self,
         id: TerminalSessionAttachmentId,
     ) -> Result<Option<TerminalSessionAttachment>, RepositoryError>;
+    /// Stamp `detached_at` and `last_seen_seq` on an attachment row.
+    ///
+    /// Idempotent: a second call against an already-detached row is a
+    /// no-op and returns `Ok(())`. Distinguishing "first detach" from
+    /// "redundant detach" is the manager's responsibility (the runtime
+    /// registry tracks live attachments) — repositories don't fight the
+    /// caller about this.
+    ///
+    /// Returns [`RepositoryError::NotFound`] if the attachment id does
+    /// not exist; the manager treats that as an internal bug since it
+    /// only calls this for attachments it just registered.
+    async fn mark_attachment_detached(
+        &self,
+        id: TerminalSessionAttachmentId,
+        detached_at: DateTime<Utc>,
+        last_seen_seq: Option<i64>,
+    ) -> Result<(), RepositoryError>;
 }
 
 #[async_trait]

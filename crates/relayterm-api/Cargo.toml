@@ -33,15 +33,22 @@ postgres-tests = []
 
 [dev-dependencies]
 relayterm-db = { workspace = true }
+relayterm-protocol = { workspace = true }
 relayterm-ssh = { workspace = true }
 relayterm-terminal = { workspace = true }
 relayterm-vault = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 http-body-util = "0.1"
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+# WebSocket client for end-to-end lifecycle tests against an in-process
+# axum::serve. Pinned to the same minor as the `tungstenite` axum 0.8
+# already pulls in transitively (^0.29) so the lockfile keeps a single
+# copy of the protocol crate.
+tokio-tungstenite = "0.29"
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
 

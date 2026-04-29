@@ -100,7 +100,75 @@ A `terminal_session` is a backend-owned runtime object. The metadata row in `ter
 - **Lifecycle events** (`session_events`): `created` is appended on a successful create with payload `{ "cols", "rows", "stub": true }`; `closed` is appended on a successful (non-idempotent) close. `attached`, `detached`, `reattached`, `resized`, `replay_started`, and `replay_completed` are reserved for future slices and MUST NOT be written until the corresponding behavior exists.
 - **Failure modes**: `400 invalid_input` for cols/rows out of `1..=4096`; `401 unauthorized` when dev-auth is disabled; `404 not_found` for a missing or foreign-owned profile (create) or session (get/close); `409 conflict { entity: "host_key" }` when no trusted pin exists for the profile's host on create; `500 internal_error` for repository/database failures (static body, never echoes SQL). Responses NEVER contain encrypted private-key bytes, plaintext PEM, fingerprints, peer banners, or terminal I/O.
 - **Backend restart behavior**: the in-memory runtime registry is NOT durable. On restart, any pre-restart `starting` row is operator-visible as a stale metadata record until it's explicitly closed via `POST /:id/close`. A future recovery policy may sweep these — for now the close route is the single hand-back surface. (The DB row itself survives normally; only the placeholder runtime entry is lost.)
-- **What this slice does NOT do**: open an SSH transport, allocate a PTY, request a shell, run a command, attach a client, stream terminal output, write any session_event other than `created`/`closed`, persist replay-ring or VT-state data, accept user-uploaded private keys, or recover stale `starting` rows on restart. Each of those is a separate, deliberate slice.
+- **What this slice does NOT do**: open an SSH transport, allocate a PTY, request a shell, run a command, stream terminal output, write any session_event other than `created`/`closed`, persist replay-ring or VT-state data, accept user-uploaded private keys, or recover stale `starting` rows on restart. (The WebSocket attach/detach surface, including `attached`/`detached`/`resized` lifecycle events, is described in the next section.) Each remaining capability is a separate, deliberate slice.
+
+### Terminal WebSocket attach/detach contract
+
+After a terminal session row exists (see preceding section), clients open a WebSocket to attach their renderer to that session. This slice implements the **lifecycle skeleton only**: the typed protocol envelope, attachment audit rows, and the events that go with them. There is **no PTY, no SSH channel, no terminal byte streaming**. The contract below is what the client gets to rely on; the byte-streaming slice will extend it without breaking these shapes.
+
+**Scope (load-bearing — this slice).** A successful WebSocket attach attests ONLY to:
+
+1. Dev-auth resolved a [`UserId`] for the request.
+2. The addressed `terminal_session` row exists, is owned by the caller, and is not `closed`.
+3. A new `terminal_session_attachments` row was written and an in-memory attachment runtime entry is registered with the orchestrator.
+4. The session's lifecycle log gained an `attached` event.
+
+It does **NOT** mean a PTY was allocated, an SSH channel was opened, a shell was spawned, or that any terminal bytes will flow. The first server frame on every successful attach is a [`session_attached`](#wire-messages) message whose `message` field carries the static string `"attached to RelayTerm session placeholder; PTY streaming is not implemented yet"` so the client cannot mistake "socket open" for "shell ready."
+
+- **Endpoint**: `GET /api/v1/terminal-sessions/:id/ws`. The route resolves the session scoped to the caller's user; missing or foreign-owned ids collapse to a byte-identical `404 not_found` BEFORE the WebSocket handshake completes (no upgrade is performed). A session in `closed` state is rejected with `409 conflict { entity: "terminal_session" }`. With dev-auth disabled the request short-circuits to `401 unauthorized` at the extractor — the upgrade never runs. `User-Agent` is captured (length-capped to 256 chars) and persisted on the attachment row as `client_info`; `remote_addr` is recorded as `NULL` until `ConnectInfo` is plumbed through the listener.
+
+#### Wire messages
+
+The protocol is JSON-over-WebSocket; binary frames are rejected with `invalid_message`. Message tags (`type`) and `code` strings are wire-stable; new variants/codes append, never renumber.
+
+**Client → server** ([`relayterm_protocol::ClientMsg`]):
+
+| `type`     | Fields                                       | Server reply                                                                                                                                                                                                |
+|------------|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `ping`     | none                                         | `pong`.                                                                                                                                                                                                     |
+| `attach`   | `session_id?`, `last_seen_seq?`, `client_id?` | Rejected with `error { code: "invalid_message" }` — the route already attaches on upgrade, so a redundant attach frame would orphan the first row. `last_seen_seq` is reserved for the future replay slice. |
+| `input`    | `data: string`                               | Rejected with `error { code: "pty_not_implemented" }`. The payload is NEVER reflected back, logged, or forwarded. The handler's only side effect is the static error frame.                                 |
+| `resize`   | `cols: u16`, `rows: u16`                     | `ack { kind: "resize" }` on success; `error { code: "invalid_input" }` for cols/rows outside `1..=4096`. Updates the runtime hint and appends a `resized` `session_event`.                                  |
+| `detach`   | none                                         | `session_detached { session_id, attachment_id }`, then the server initiates a clean WebSocket close. Stamps `detached_at` on the attachment row and appends a `detached` event. Idempotent.                 |
+| `close`    | none                                         | `session_closed { session_id }`, then the server initiates a clean WebSocket close. Transitions the session to `closed`, appends a `closed` event, drops live attachments. Idempotent.                      |
+
+**Server → client** ([`relayterm_protocol::ServerMsg`]):
+
+| `type`              | Fields                                                                                                  | Notes                                                                                                                                                          |
+|---------------------|---------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `session_attached`  | `session_id`, `attachment_id`, `status: "attached_stub"`, `message: string`                             | First frame on every successful attach. `message` explicitly disclaims PTY readiness — the wire string is pinned in a test.                                    |
+| `pong`              | none                                                                                                    | Reply to `ping`.                                                                                                                                               |
+| `ack`               | `kind: "resize"`                                                                                        | Acknowledges a state-changing non-data client message. New `kind` variants append.                                                                             |
+| `session_detached`  | `session_id`, `attachment_id`                                                                           | Server confirms detach bookkeeping landed.                                                                                                                     |
+| `session_closed`    | `session_id`                                                                                            | Server confirms session-close transition landed.                                                                                                               |
+| `output`            | `seq: u64`, `data: string`                                                                              | Reserved for the future PTY-bearing slice. Never emitted by this implementation.                                                                               |
+| `replay_window_lost`| none                                                                                                    | Reserved for the future replay slice. Never emitted by this implementation.                                                                                    |
+| `error`             | `code: ErrorCode`, `message: string`                                                                    | `code` is one of `invalid_message`, `invalid_input`, `pty_not_implemented`, `internal`. `message` is short and static — never echoes input or operator detail. |
+
+#### Lifecycle events written by the WebSocket handler
+
+`session_events` rows are appended at these points:
+
+- `attached` — on successful attach. Payload: `{ "attachment_id", "client_info", "remote_addr", "stub": true }`.
+- `detached` — on successful first detach (idempotent on subsequent calls). Payload: `{ "attachment_id", "last_seen_seq" }`. `last_seen_seq` is `null` until the PTY-bearing slice populates it.
+- `resized` — on successful resize. Payload: `{ "cols", "rows" }`.
+- `closed` — on successful first close (delegated to the existing close path; idempotent on subsequent calls). Payload: `{ "reason": "client_requested" }`.
+
+`reattached`, `replay_started`, and `replay_completed` are still reserved for future slices and MUST NOT be written until the corresponding behavior exists.
+
+#### Handler behavior on socket exit
+
+If the underlying transport drops (client disconnect, network failure, abrupt close) without an explicit `Detach` or `Close` frame, the handler MUST still write the detach bookkeeping (`detached_at` stamp + `detached` lifecycle event) so the audit row reflects reality. The first detach wins — `mark_attachment_detached` is COALESCE-on-`detached_at` so a race between the explicit `Detach` frame and the cleanup tail can't corrupt the original timestamp.
+
+#### Logging and reflection prohibitions
+
+- The raw `Input.data` payload MUST NEVER appear in tracing logs, panic messages, error responses, or any frame the server emits. The protocol's `Debug` impl masks the payload at the type level as a last line of defense.
+- An invalid (unparseable) frame MUST NEVER be reflected back in the `error` response or logged at any level above trace. The handler emits a static `"invalid message"` body with no payload echo.
+- `error` frames carry a wire-stable `code` plus a short, static, public `message`. SQL fragments, repository errors, ssh peer banners, encrypted-key bytes, and PEM markers are NEVER permitted in any WebSocket frame.
+
+#### Future work (explicit out-of-scope for this slice)
+
+PTY allocation and `russh::Channel` ownership; forwarding `Input` bytes to the SSH peer; emitting `output` frames with monotonic sequence numbers; the replay ring buffer and the `replay_window_lost` recovery path; multi-client (collaborative) attach behavior; backend-restart recovery for `starting` rows; binary frame format; and `ConnectInfo`-based `remote_addr` capture all belong to later, deliberate slices.
 
 ### Authenticated SSH credential check contract
 
@@ -135,7 +203,7 @@ It does **NOT** mean a PTY can be allocated, a shell can be spawned, a command c
 
 ## Behavior contracts
 
-- **Reconnect replay**: when a client reconnects with `(session_id, last_seen_seq)`, the backend MUST send all events with `seq > last_seen_seq` from the ring buffer in order, then resume live streaming. If `last_seen_seq` is older than the ring buffer's tail, the backend returns a `replay_window_lost` error and the client must request a full re-render or close the session.
+- **Reconnect replay**: when a client reconnects with `(session_id, last_seen_seq)`, the backend MUST send all events with `seq > last_seen_seq` from the ring buffer in order, then resume live streaming. If `last_seen_seq` is older than the ring buffer's tail, the backend returns a `replay_window_lost` error and the client must request a full re-render or close the session. **Status (this slice):** the WebSocket protocol carries `last_seen_seq` on `attach` already, but the backend does not yet persist a ring buffer to replay from — the `output` and `replay_window_lost` frames are reserved for a later slice and MUST NOT be emitted until that work lands.
 - **Renderer swap**: the user MAY change the active renderer for a session at any time. The new renderer subscribes from the current sequence number; no replay is required.
 - **Session lifecycle**: a session enters `detached` immediately on client drop, NOT after a timeout. A `detached` session continues to receive PTY output and append to the ring buffer until `inactivity_timeout` or explicit close. Audit log records every state transition.
 - **Host-key change**: on `check_server_key` mismatch, the backend rejects the connection, logs an `audit_event`, and surfaces the mismatch to the user; it does NOT silently update the known_hosts entry. The preflight + trust-host-key endpoints (see "SSH preflight + known-host trust contract") implement this for the pre-session probe; the same rule applies to live sessions once they land.

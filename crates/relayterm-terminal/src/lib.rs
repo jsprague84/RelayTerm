@@ -28,7 +28,9 @@
 pub mod manager;
 
 pub use manager::{
-    CloseTerminalSessionOutcome, CreateTerminalSessionOutcome, CreateTerminalSessionRequest,
-    RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager,
-    TerminalSessionManagerError, TerminalSessionRuntime,
+    AttachSessionOutcome, AttachSessionRequest, AttachmentRuntime, CloseTerminalSessionOutcome,
+    CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DetachSessionOutcome,
+    ResizeSessionOutcome, RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
+    STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager, TerminalSessionManagerError,
+    TerminalSessionRuntime,
 };
