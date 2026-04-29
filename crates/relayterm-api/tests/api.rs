@@ -53,9 +53,17 @@ async fn setup(pool: PgPool) -> (Router, UserId) {
     let user_id = create_user(&pool, "dev").await;
     let state = AppState {
         db: Db::from_pool(pool),
+        vault: Some(test_vault()),
         dev_user_id: Some(user_id),
     };
     (router(state), user_id)
+}
+
+/// Vault service backed by a deterministic test master key. Tests that
+/// don't exercise the vault still need *some* vault instance because the
+/// API state requires it for the `POST /ssh-identities` route.
+fn test_vault() -> relayterm_vault::VaultService {
+    relayterm_vault::VaultService::new(relayterm_vault::VaultMasterKey::from_bytes([0x77u8; 32]))
 }
 
 async fn read_body(resp: axum::response::Response) -> Value {
@@ -264,6 +272,7 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
 async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let state = AppState {
         db: Db::from_pool(pool),
+        vault: Some(test_vault()),
         dev_user_id: None,
     };
     let app = router(state);
@@ -301,6 +310,238 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
 // ----------------------------------------------------------------------
 // SSH identities
 // ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_returns_public_metadata_only(pool: PgPool) {
+    let (app, _) = setup(pool).await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({
+                "name": "homelab-admin",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // No secret material on the wire — neither the field name nor any
+    // bytes that could only have come from the plaintext PEM.
+    assert!(
+        !raw.contains("encrypted_private_key"),
+        "POST response must not expose encrypted_private_key: {raw}"
+    );
+    assert!(
+        !raw.contains("BEGIN OPENSSH PRIVATE KEY"),
+        "POST response must not contain a plaintext PEM: {raw}"
+    );
+    assert!(
+        !raw.contains("private_key"),
+        "POST response must not contain any private_key field: {raw}"
+    );
+
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    assert!(
+        body["id"].is_string(),
+        "id should be present as UUID string"
+    );
+    assert_eq!(body["name"], "homelab-admin");
+    assert_eq!(body["key_type"], "ed25519");
+    let public_key = body["public_key"].as_str().expect("public_key string");
+    assert!(
+        public_key.starts_with("ssh-ed25519 "),
+        "public_key should be an OpenSSH ed25519 line: {public_key}"
+    );
+    assert!(
+        public_key.ends_with(" homelab-admin"),
+        "public_key should bake the user-supplied name as the OpenSSH comment: {public_key}"
+    );
+    let fp = body["fingerprint_sha256"].as_str().expect("fingerprint");
+    assert!(
+        fp.starts_with("SHA256:"),
+        "fingerprint should be SHA256:<base64>: {fp}"
+    );
+    assert!(
+        body.get("owner_id").is_none(),
+        "ssh identity response should not expose owner_id"
+    );
+
+    // Subsequent GET also omits the encrypted blob.
+    let id = body["id"].as_str().unwrap();
+    let get_resp = app
+        .oneshot(get(&format!("/api/v1/ssh-identities/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let bytes = get_resp.into_body().collect().await.unwrap().to_bytes();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!raw.contains("encrypted_private_key"));
+    assert!(!raw.contains("BEGIN OPENSSH PRIVATE KEY"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_invalid_key_type_returns_400(pool: PgPool) {
+    let (app, _) = setup(pool).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({
+                "name": "primary",
+                "key_type": "invalid-algo",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(
+        body["error"]["message"],
+        "unsupported key_type \"invalid-algo\""
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_rsa_returns_400_unsupported(pool: PgPool) {
+    // Ed25519 is the only generator wired up today; RSA and friends are a
+    // future slice. Unknown tags and known-but-unsupported tags share one
+    // canonical 400 shape so clients can match on it without caring which
+    // gate caught them.
+    let (app, _) = setup(pool).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({
+                "name": "primary",
+                "key_type": "rsa",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(body["error"]["message"], "unsupported key_type \"rsa\"");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_empty_name_returns_400(pool: PgPool) {
+    let (app, _) = setup(pool).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({
+                "name": "",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
+    // dev-auth off → DevUser extractor short-circuits with 401 BEFORE any
+    // vault work happens. The request body never reaches the vault.
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        dev_user_id: None,
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({"name": "should-never-be-created"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "unauthorized");
+
+    // And nothing was persisted.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0, "401 must not create rows");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
+    let user_id = create_user(&pool, "dev").await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: None,
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({"name": "primary"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+    // Static wire body — no operator-facing detail leaked.
+    assert_eq!(body["error"]["message"], "service unavailable");
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn post_ssh_identity_persists_encrypted_blob(pool: PgPool) {
+    // After a successful POST the row exists, the public key matches the
+    // API response, and the stored ciphertext does NOT contain the
+    // OpenSSH PEM header — proving the blob is actually encrypted.
+    let (app, _) = setup(pool.clone()).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({"name": "store-check"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let id_str = body["id"].as_str().unwrap();
+    let id_uuid: uuid::Uuid = id_str.parse().unwrap();
+
+    let row: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT public_key, encrypted_private_key FROM ssh_identities WHERE id = $1",
+    )
+    .bind(id_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let public_key_text = std::str::from_utf8(&row.0).unwrap();
+    assert!(public_key_text.starts_with("ssh-ed25519 "));
+    let needle = b"BEGIN OPENSSH PRIVATE KEY";
+    assert!(
+        !row.1.windows(needle.len()).any(|w| w == needle),
+        "stored encrypted_private_key must not contain plaintext PEM marker"
+    );
+    // The envelope magic should be present at the front.
+    assert_eq!(&row.1[..4], b"RTV1");
+}
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn list_ssh_identities_omits_encrypted_private_key(pool: PgPool) {

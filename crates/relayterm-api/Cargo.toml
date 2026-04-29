@@ -10,6 +10,7 @@ publish.workspace = true
 relayterm-core = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-protocol = { workspace = true }
+relayterm-vault = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
@@ -29,6 +30,7 @@ postgres-tests = []
 
 [dev-dependencies]
 relayterm-db = { workspace = true }
+relayterm-vault = { workspace = true }
 http-body-util = "0.1"
 serde_json = { workspace = true }
 sqlx = { workspace = true }

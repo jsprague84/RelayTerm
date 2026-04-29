@@ -15,12 +15,17 @@ relayterm-api = { workspace = true }
 relayterm-core = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-observability = { workspace = true }
+relayterm-vault = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
 
 [lints]
 workspace = true

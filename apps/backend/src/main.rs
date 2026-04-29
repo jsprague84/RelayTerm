@@ -3,6 +3,7 @@ use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{CreateUser, UserRepository};
 use relayterm_db::Db;
+use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
 
@@ -18,7 +19,7 @@ const DEV_USER_DISPLAY_NAME: &str = "RelayTerm Dev User";
 async fn main() -> anyhow::Result<()> {
     relayterm_observability::init();
 
-    let cfg = config::Config::load().context("load config")?;
+    let mut cfg = config::Config::load().context("load config")?;
     info!(addr = %cfg.server.bind, "relayterm-backend starting");
 
     let db = Db::connect(&cfg.database.url, cfg.database.max_connections)
@@ -55,7 +56,29 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let state = AppState { db, dev_user_id };
+    // Resolve the vault master key. Failure here is fatal — we will not
+    // boot a backend that silently disables encrypted-private-key storage.
+    // The error message names the source ("file" / "b64") but never echoes
+    // the configured value or any prefix of it.
+    let vault = match cfg.vault_master_key().context("resolve vault master key")? {
+        Some(master_key) => {
+            info!("vault master key loaded; backend-generated SSH identities enabled");
+            Some(VaultService::new(master_key))
+        }
+        None => {
+            warn!(
+                "vault.enabled = false — POST /api/v1/ssh-identities returns 503 until a \
+                 master key is configured",
+            );
+            None
+        }
+    };
+
+    let state = AppState {
+        db,
+        vault,
+        dev_user_id,
+    };
     let app = router(state);
 
     let listener = TcpListener::bind(cfg.server.bind)

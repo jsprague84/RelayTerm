@@ -50,6 +50,10 @@ Do not change without asking.
 | tailwindcss | `^4` | CSS-first config (`@theme`); auto content detection. |
 | xterm.js | `^5` (`@xterm/xterm`) | Scoped package; legacy `xterm` is unmaintained. |
 | tauri | `^2` | Adds Android/iOS; v1 conf schema is incompatible. |
+| ssh-key | `^0.6` | OpenSSH keypair gen + `authorized_keys` text + SHA-256 fingerprint. RustCrypto; pulls `ed25519` feature only — no RSA/ECDSA generators yet. |
+| chacha20poly1305 | `^0.10` | XChaCha20-Poly1305 AEAD for the vault envelope. 24-byte nonce → safe random nonces. `alloc` feature; no `std`. |
+| zeroize | `^1` | Wipes vault secrets (master key, plaintext PEM, b64 source string) on drop. `derive` feature for `ZeroizeOnDrop`. |
+| rand | `^0.8` | `OsRng` for nonce + keypair generation. `0.8` line is what `ssh-key 0.6` and `chacha20poly1305 0.10` interop with via `rand_core 0.6`. |
 
 ## Critical gotchas
 
@@ -124,7 +128,9 @@ If you're tempted to invent a new directory, propose it here first.
 | Session lifecycle, replay, sequence numbers | `apps/backend/src/session/` |
 | HTTP / WebSocket route, axum extractor | `apps/backend/src/http/` |
 | DB query or schema change | `apps/backend/src/db/` + new migration |
-| Key vault, known_hosts, audit log | `apps/backend/src/auth/` |
+| Vault primitives (keypair gen, AEAD envelope, master key) | `crates/relayterm-vault/` |
+| Auth wiring (session/passkey middleware, dev-auth shim) | `crates/relayterm-auth/` and `apps/backend/src/auth/` |
+| Known-hosts policy, audit-log surface | `crates/relayterm-auth/` (vault is for credentials only) |
 | Renderer behavior (drawing, fit, perf) | `packages/terminal-<name>/` |
 | Reconnect, sequence-replay, transport | `apps/web/src/lib/ws/` |
 | UI state (Svelte runes) | `apps/web/src/lib/stores/` |

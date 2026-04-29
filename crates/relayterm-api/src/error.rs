@@ -13,6 +13,7 @@ use axum::{
 };
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::validation::ValidationError;
+use relayterm_vault::VaultError;
 use serde::Serialize;
 use tracing::{error, warn};
 
@@ -25,6 +26,7 @@ pub enum ErrorCode {
     Unauthorized,
     NotFound,
     Conflict,
+    ServiceUnavailable,
     InternalError,
 }
 
@@ -35,6 +37,7 @@ impl ErrorCode {
             Self::Unauthorized => "unauthorized",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
+            Self::ServiceUnavailable => "service_unavailable",
             Self::InternalError => "internal_error",
         }
     }
@@ -66,6 +69,13 @@ pub enum ApiError {
     #[error("{entity} conflict")]
     Conflict { entity: &'static str },
 
+    /// 503 — a backend dependency required for the request is intentionally
+    /// not configured (e.g. vault disabled). The wrapped detail is logged
+    /// at warn but the wire body is the static `service unavailable`
+    /// message.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     /// 500 — anything unexpected. The wrapped string is logged but never echoed.
     #[error("internal error: {0}")]
     Internal(String),
@@ -93,6 +103,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 ErrorCode::Conflict,
                 format!("{entity} conflict"),
+            ),
+            Self::ServiceUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ServiceUnavailable,
+                "service unavailable".to_owned(),
             ),
             Self::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -122,6 +137,9 @@ impl IntoResponse for ApiError {
         match &self {
             Self::Internal(detail) => error!(detail = %detail, "internal API error"),
             Self::Unauthorized(detail) => warn!(detail = %detail, "unauthorized request"),
+            Self::ServiceUnavailable(detail) => {
+                warn!(detail = %detail, "service unavailable");
+            }
             _ => {}
         }
         let (status, code, message) = self.parts();
@@ -153,5 +171,48 @@ impl From<RepositoryError> for ApiError {
             }
             RepositoryError::Database(msg) => Self::Internal(msg),
         }
+    }
+}
+
+impl From<VaultError> for ApiError {
+    fn from(err: VaultError) -> Self {
+        match err {
+            // Defense-in-depth: the DTO's `parse_supported_key_type` already
+            // 400s every non-Ed25519 tag before the vault is called, so this
+            // arm is unreachable in normal flow. Kept so a future
+            // `SshKeyType` variant added to the DTO allowlist before the
+            // vault grows a generator falls through as a clean 400 instead
+            // of a 500. Format mirrors the DTO (`{tag:?}`) so the wire
+            // message stays identical regardless of which gate fires.
+            VaultError::UnsupportedKeyType(tag) => {
+                Self::Validation(format!("unsupported key_type {tag:?}"))
+            }
+            // Master key issues are an operator/deploy problem, not a
+            // client problem. Crash with 503 rather than leaking why.
+            VaultError::MasterKey(_) => {
+                Self::ServiceUnavailable("vault master key invalid".to_owned())
+            }
+            // Anything else inside the vault is an internal bug — encrypt
+            // failures, serialization failures, etc.
+            other => Self::Internal(format!("vault: {other}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_unsupported_key_type_message_matches_dto_format() {
+        // The DTO's `parse_supported_key_type` emits
+        // `unsupported key_type "<tag>"`. The vault fallback must produce
+        // the same shape so a future change that exposes this arm doesn't
+        // break clients matching on the wire message.
+        let err: ApiError = VaultError::UnsupportedKeyType("rsa").into();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got: {err:?}");
+        };
+        assert_eq!(msg, "unsupported key_type \"rsa\"");
     }
 }
