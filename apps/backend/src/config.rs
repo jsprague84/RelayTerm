@@ -16,6 +16,7 @@ use serde::Deserialize;
 pub(crate) struct Config {
     pub(crate) server: ServerConfig,
     pub(crate) database: DatabaseConfig,
+    pub(crate) dev_auth: DevAuthConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,19 @@ pub(crate) struct ServerConfig {
 pub(crate) struct DatabaseConfig {
     pub(crate) url: String,
     pub(crate) max_connections: u32,
+}
+
+/// Stopgap toggle for the unimplemented-auth shim.
+///
+/// While `enabled = true` the backend bootstraps a single hardcoded dev user
+/// at startup and stamps every request with their id (see
+/// `relayterm_api::DevUser`). When real auth lands the operator MUST flip
+/// this to `false`; the backend will then refuse to start until the
+/// bootstrap call site is removed and replaced by the session/passkey
+/// middleware. The whole struct is expected to disappear at that point.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DevAuthConfig {
+    pub(crate) enabled: bool,
 }
 
 impl Config {
@@ -54,6 +68,7 @@ impl Config {
                 url: "postgres://relayterm:relayterm@127.0.0.1:5432/relayterm".to_owned(),
                 max_connections: 10,
             },
+            dev_auth: DevAuthConfig { enabled: true },
         }
     }
 
@@ -84,6 +99,11 @@ impl Config {
         if let Ok(v) = std::env::var("DATABASE_URL") {
             cfg.database.url = v;
         }
+        if let Ok(v) = std::env::var("RELAYTERM_DEV_AUTH__ENABLED")
+            && let Ok(parsed) = v.parse()
+        {
+            cfg.dev_auth.enabled = parsed;
+        }
     }
 }
 
@@ -91,6 +111,7 @@ impl Config {
 struct FileConfig {
     server: Option<FileServerConfig>,
     database: Option<FileDatabaseConfig>,
+    dev_auth: Option<FileDevAuthConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +123,11 @@ struct FileServerConfig {
 struct FileDatabaseConfig {
     url: Option<String>,
     max_connections: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileDevAuthConfig {
+    enabled: Option<bool>,
 }
 
 impl FileConfig {
@@ -118,6 +144,11 @@ impl FileConfig {
             if let Some(mx) = d.max_connections {
                 cfg.database.max_connections = mx;
             }
+        }
+        if let Some(a) = self.dev_auth
+            && let Some(enabled) = a.enabled
+        {
+            cfg.dev_auth.enabled = enabled;
         }
     }
 }

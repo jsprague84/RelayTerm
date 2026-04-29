@@ -2,18 +2,35 @@
 //!
 //! Handlers are kept thin — they extract from axum, validate, and hand off
 //! to a service in another crate. Auth and session orchestration are NOT
-//! implemented at this layer.
+//! implemented at this layer; `dev_user` injects a stopgap [`UserId`] until
+//! they are.
 
-use axum::Router;
+use axum::{Router, extract::FromRef};
+use relayterm_core::ids::UserId;
 use relayterm_db::Db;
 use tower_http::trace::TraceLayer;
 
+mod dev_user;
+mod dto;
+mod error;
 mod routes;
+
+pub use dev_user::DevUser;
+pub use error::ApiError;
 
 /// Shared state injected into every handler via `axum::extract::State`.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
+    /// Dev-only owner id stamped onto every created row until auth lands.
+    /// See [`dev_user`](crate::dev_user) for the rationale.
+    pub dev_user_id: UserId,
+}
+
+impl FromRef<AppState> for UserId {
+    fn from_ref(state: &AppState) -> Self {
+        state.dev_user_id
+    }
 }
 
 /// Build the top-level router.
@@ -21,6 +38,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
         .merge(routes::ws::router())
+        .nest("/api/v1", routes::v1::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

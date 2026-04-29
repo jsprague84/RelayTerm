@@ -1244,16 +1244,22 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 name = "relayterm-api"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "chrono",
+ "http-body-util",
  "relayterm-core",
  "relayterm-db",
  "relayterm-protocol",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
