@@ -250,6 +250,20 @@ impl From<TerminalSessionManagerError> for ApiError {
             TerminalSessionManagerError::SessionClosed => Self::Conflict {
                 entity: "terminal_session",
             },
+            // The session row exists but its live PTY runtime is gone
+            // (start failed, shell exited, or never bound). Surface as
+            // 409 conflict so the operator UI can tell "row missing"
+            // (404) from "row present, runtime gone" (409).
+            TerminalSessionManagerError::PtyNotLive => Self::Conflict {
+                entity: "pty_runtime",
+            },
+            // PTY-startup errors only reach the API layer if a route
+            // forwards one without prior translation. The terminal-
+            // sessions create route handles them via `map_pty_start_error`
+            // for precise typed mapping; this fallback is the safe net.
+            TerminalSessionManagerError::PtyStart(inner) => {
+                Self::Internal(format!("ssh pty: {inner}"))
+            }
             TerminalSessionManagerError::Repository(e) => e.into(),
         }
     }

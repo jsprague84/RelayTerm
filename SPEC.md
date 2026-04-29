@@ -281,6 +281,98 @@ ghostty-web / restty / wterm renderer adapters; real PTY byte streaming through 
 
 Real PTY byte streaming through `output` frames; ghostty-web / restty / wterm renderer adapters; renderer benchmarking harness; persistent per-renderer preferences; production terminal UI; renderer-swap UX; mobile/Tauri shell integration. Each is a separate, deliberate slice.
 
+### Live SSH PTY bridge contract
+
+After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.
+
+**Scope (load-bearing — this slice).** A successful create + attach attests ONLY to:
+
+1. The (server_profile, host, ssh_identity) trio resolves and is owned by the caller.
+2. The host has at least one active, trusted, non-revoked `known_host_entries` row.
+3. The vault decrypted the identity's `encrypted_private_key` to a valid OpenSSH PEM.
+4. The SSH transport reached the target, the captured host key matched an accept-pin in `check_server_key`, public-key authentication succeeded, an interactive PTY was allocated, and the user's default login shell started.
+5. WebSocket attachments stream raw PTY bytes (base64-encoded inside the JSON `output` frame) from the remote shell, and forward `input`/`resize` to the SSH PTY.
+
+It does **NOT** yet provide:
+
+- Replay or resume across reconnects. A client that drops MUST treat its byte stream as truncated; the server's monotonic `seq` exists for the future replay slice but no ring buffer is persisted yet.
+- Multi-client collaborative attach. Today the manager registers fan-out via a `tokio::sync::broadcast` channel, but only one WS attachment per session is exercised by the API tests.
+- Backend-restart recovery for live sessions. A restart drops the in-memory runtime registry; metadata rows survive but their PTYs are gone — the operator must explicitly close orphaned rows.
+- A binary frame format. Output is base64 inside JSON; a binary slice is future work.
+
+#### Endpoints
+
+- **Endpoint**: `POST /api/v1/terminal-sessions`. Request body unchanged from the metadata-only slice (`{ "server_profile_id", "cols"?, "rows"? }`, dims clamped to `1..=4096`). The route resolves the trio scoped to the caller, refuses with `409 conflict { entity: "host_key" }` if no trusted pin exists, decrypts the identity inside the vault (`503 service_unavailable` if the vault is disabled), writes the `terminal_sessions` row in `starting`, then hands the decrypted PEM and the active accept-pin set to the SSH PTY bridge. On success the row is transitioned to `active` and a live runtime entry is bound to the manager. On failure the row is transitioned to `closed` and the typed error is returned.
+- **Create response (201)**: `{ id, server_profile_id, status, cols, rows, created_at, last_seen_at, closed_at, message, pty_live }`. `status` is `active` on a live response. `message` is the static string `"ssh pty started; replay across reconnects is not yet implemented"`. `pty_live` is `true`. The response carries NO host-key fingerprint, NO key material, NO peer banner, NO `owner_id`.
+- **Endpoint**: `GET /api/v1/terminal-sessions/:id/ws`. Behavior unchanged at the lifecycle layer (same pre-upgrade ownership / closed-session gating). When a live PTY is bound:
+  - The first server frame is `session_attached` with `status: "active"` and a static `message: "attached to live RelayTerm session; replay across reconnects is not yet implemented"`.
+  - Server emits `output { seq, data }` frames where `data` is base64-encoded raw PTY bytes (renderer-neutral; the renderer decodes via `output_data_decode` / `decodeOutputData`).
+  - Client `input { data }` frames forward the UTF-8 string bytes to the remote PTY's stdin. The payload is NEVER reflected back, logged, or echoed.
+  - Client `resize { cols, rows }` frames apply both the metadata-only resize event and a `window_change` on the SSH channel.
+- The legacy stub status (`attached_stub`) is still emitted for sessions that have no live PTY (e.g. a row whose runtime was lost across a restart).
+
+#### Wire-stable error codes added
+
+- `pty_not_live` — input/resize attempted on a session whose live runtime is not present (startup failed, PTY exited, or row was created without a bridge).
+- `ssh_start_failed` — surfaced over the WebSocket if a live PTY tears down mid-session and the manager surfaces an SSH bridge error.
+- `pty_not_implemented` — retained as a legacy code so existing clients keep decoding; new deployments emit `pty_not_live` instead.
+
+#### Lifecycle event behaviour
+
+The bridge slice does **not** introduce any new `SessionEventKind` and does **not** write `replay_started` on PTY start (the existing skeleton SPEC forbids that until the replay buffer lands). The audit trail for a live session is:
+
+- `created` on row insert (existing).
+- `attached` on each successful WS attach (existing).
+- `resized` on each successful resize (existing).
+- `detached` on each clean detach or socket-drop cleanup (existing).
+- `closed` on row close, with `reason` distinguishing `client_requested` (user/operator close), `pty_teardown` + `category` (remote shell exit, transport error, local close), and `ssh_start_failed` + `category` (create-time bridge failure).
+
+A precise `live_pty_started` event variant (and matching migration to the `session_events_kind_chk` CHECK constraint) is future work.
+
+#### HTTP error mapping for create-time failures
+
+| Bridge outcome | API status | Closed event `category` |
+|---|---|---|
+| `InvalidIdentity` | 500 (static body) | `invalid_identity` |
+| `Transport(_)` | 502 `bad_gateway` | `transport` |
+| `HostKeyNotTrusted` | 409 `host_key` | `host_key_not_trusted` |
+| `AuthenticationFailed` | 409 `ssh_auth` | `authentication_failed` |
+| `PtyStartFailed` (channel/pty/shell) | 502 `bad_gateway` | `pty_alloc` |
+| Vault disabled | 503 (static body) | n/a — refused before bridge call |
+
+The wire body for 4xx/5xx is always the static `code/message` envelope; peer banners, russh error text, SQL fragments, encrypted blobs, and PEM markers NEVER leak. Decrypted private-key bytes live only inside `SshPtyTarget` and the russh internal parse — both wipe on drop.
+
+#### Detach / close semantics for this slice (load-bearing)
+
+The current live-PTY persistence policy is **conservative**: until a replay buffer + TTL/reaper for detached live sessions exists, RelayTerm MUST NOT leave a live SSH PTY running with zero attached clients. This rule is what keeps the slice safe to ship without a background sweep job — every PTY has a deterministic teardown owner.
+
+The orchestrator's [`TerminalSessionManager::detach_attachment`] is the single lifecycle entry point for any detach (explicit `Detach` frame or socket-drop cleanup tail). Its policy:
+
+1. Detach the attachment first — `detach_session` is COALESCE-on-`detached_at` so the first call wins on the row, the `detached` event fires exactly once, and the runtime entry is removed.
+2. **If this was the last attachment of a live PTY, also close the session.** The manager calls `close_session`, which transitions the row to `closed`, writes the `closed` event, and via `LiveRuntime`'s `Drop` aborts both the orchestrator's forwarder task and the SSH bridge's driver task.
+3. If the session has no live PTY (stub session, or PTY already torn down by the forwarder when the remote shell exited) the manager does NOT auto-close.
+4. If other attachments remain (multi-client read attach is future work, but the registry is shaped for it) the manager does NOT auto-close.
+5. If the detach observed `already_detached == true`, the manager does NOT auto-close — that's the path that runs when an explicit `Detach` frame and the WebSocket cleanup tail both fire. `close_session` is itself idempotent, but the early skip guarantees a single `Closed` event under the race.
+
+Wire-side behaviour:
+
+- Client `Detach` on the last attachment of a live session: server emits `SessionDetached`, then `SessionClosed`, then closes the WebSocket. The client's state machine MUST treat this sequence as terminal — neither `Detach` nor `Close` will produce any further frames.
+- Client `Close`: server emits `SessionClosed`, closes the WebSocket. Idempotent at the route layer (`POST /:id/close` returns `already_closed = true` on a second call) and at the manager.
+- Socket drop without an explicit `Detach`/`Close`: the cleanup tail fires `detach_attachment`, which writes the `detached` event AND auto-closes if this was the last live attachment. A reattach to the auto-closed session id returns `409 conflict { entity: "terminal_session" }` from the upgrade gate.
+- Race coverage: explicit `Detach` followed by socket-drop cleanup tail writes exactly one `Detached` and exactly one `Closed` event. Duplicate calls to `close_session` from any source still write exactly one `Closed` event.
+
+Future work (still explicit out-of-scope): a replay ring buffer + sequence-number-based resume, plus a TTL/reaper that lets a detached live PTY linger for a bounded window, will replace this conservative policy with the SPEC's original "detached PTY survives until inactivity timeout" contract. The ring buffer is the load-bearing precondition — without it, a reconnecting client cannot pick up where it left off.
+
+#### Logging and reflection prohibitions (re-affirmed)
+
+- Raw `input` payloads MUST NEVER appear in logs, panic messages, error responses, or any server-emitted frame. Both the protocol's `Debug` impl and the SSH bridge's `Debug` impl mask these bytes at the type level.
+- Raw `output` PTY bytes MUST NEVER appear in logs at any level. The bridge → orchestrator → fanout path forwards `Vec<u8>` end-to-end with no `Debug`/`Display` rendering of the payload.
+- `error` frames carry only the typed wire-stable `code` plus a short, static, public `message`.
+
+#### Future work (explicit out-of-scope for this slice)
+
+Replay buffer + sequence-number-based resume across reconnects; multi-client collaborative attach UX; binary frame format for `Output`; backend-restart recovery for `active` rows; per-session inactivity-timeout reaping for detached PTYs; password-bootstrap / `ssh-copy-id` flow; user-uploaded private keys; SFTP / file-browser surface; session recording. Each is a separate, deliberate slice.
+
 ### Authenticated SSH credential check contract
 
 After the host key is pinned and trusted (see preceding section), an operator may run an authenticated check to confirm the configured `ssh_identity` actually authenticates against the target. The check is deliberately scoped to "did the credentials work?" — it never opens a PTY, runs a shell, or executes a command, so it cannot be abused to drive arbitrary SSH activity through the API.

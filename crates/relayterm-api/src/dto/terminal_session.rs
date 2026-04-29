@@ -54,13 +54,16 @@ impl From<TerminalSession> for TerminalSessionResponse {
 }
 
 /// Wrapper around [`TerminalSessionResponse`] for routes that need to
-/// surface the stub-PTY message inline. `flatten` keeps the wire shape
+/// surface the PTY/stub message inline. `flatten` keeps the wire shape
 /// flat so clients see one object, not a wrapper.
 #[derive(Debug, Serialize)]
 pub(crate) struct CreateTerminalSessionResponse {
     #[serde(flatten)]
     pub session: TerminalSessionResponse,
     pub message: &'static str,
+    /// `true` once a live PTY is bound to the session. The renderer
+    /// uses this to decide whether to expect `output` frames.
+    pub pty_live: bool,
 }
 
 #[derive(Debug, Serialize)]

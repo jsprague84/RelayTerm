@@ -20,10 +20,11 @@ use relayterm_core::session_event::{SessionEvent, SessionEventKind};
 use relayterm_core::terminal_session::{
     TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
+use relayterm_ssh::{ClosedReason, SshPtyError, SshPtyEvent, SshPtyHandle, SshPtyStart};
 use relayterm_terminal::{
-    AttachSessionRequest, CreateTerminalSessionRequest, RuntimeSessionStatus,
-    STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE, STUB_PTY_NOT_IMPLEMENTED_MESSAGE,
-    TerminalSessionManager, TerminalSessionManagerError,
+    AttachSessionRequest, CreateTerminalSessionRequest, LIVE_PTY_ATTACH_MESSAGE,
+    RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
+    STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager, TerminalSessionManagerError,
 };
 
 #[derive(Default)]
@@ -726,5 +727,561 @@ async fn stub_attach_message_is_pinned() {
     assert_eq!(
         STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
         "attached to RelayTerm session placeholder; PTY streaming is not implemented yet",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Live PTY runtime
+// ----------------------------------------------------------------------
+
+/// Test-only fake handle that records inputs and resizes. Owns the
+/// single sender into the bridge's output channel via a shared
+/// `Arc<Mutex<Option<...>>>` so [`FakeFixture`] can simulate transport
+/// teardown by `take()`ing the sender out.
+struct FakeHandle {
+    inputs: Arc<Mutex<Vec<Vec<u8>>>>,
+    resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+    output_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<SshPtyEvent>>>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl SshPtyHandle for FakeHandle {
+    async fn write_input(&self, bytes: Vec<u8>) -> Result<(), SshPtyError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SshPtyError::BridgeClosed);
+        }
+        self.inputs.lock().unwrap().push(bytes);
+        Ok(())
+    }
+    async fn resize(&self, cols: u16, rows: u16) -> Result<(), SshPtyError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SshPtyError::BridgeClosed);
+        }
+        self.resizes.lock().unwrap().push((cols, rows));
+        Ok(())
+    }
+    async fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Mirror the russh impl: dropping the sender causes the
+        // bridge's output_rx to see end-of-stream, which in turn
+        // exits the orchestrator's forwarder task.
+        let _ = self.output_tx.lock().unwrap().take();
+    }
+}
+
+struct FakeFixture {
+    inputs: Arc<Mutex<Vec<Vec<u8>>>>,
+    resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+    /// Shared with the [`FakeHandle`] so the test can inject output AND
+    /// simulate teardown by taking the single sender out.
+    output_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<SshPtyEvent>>>>,
+}
+
+impl FakeFixture {
+    async fn inject_output(&self, bytes: Vec<u8>) {
+        let tx = self.output_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(SshPtyEvent::Output(bytes)).await;
+        }
+    }
+
+    /// Drop the bridge's sole output sender, simulating an SSH transport
+    /// teardown. The orchestrator's forwarder will see `None` on its
+    /// next `recv()` and run its closed-session bookkeeping.
+    fn simulate_teardown(&self) {
+        let _ = self.output_tx.lock().unwrap().take();
+    }
+}
+
+fn fake_start() -> (SshPtyStart, FakeFixture) {
+    let (output_tx, output_rx) = tokio::sync::mpsc::channel(16);
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let resizes = Arc::new(Mutex::new(Vec::new()));
+    let shared_tx = Arc::new(Mutex::new(Some(output_tx)));
+    let handle = FakeHandle {
+        inputs: inputs.clone(),
+        resizes: resizes.clone(),
+        output_tx: shared_tx.clone(),
+        closed: std::sync::atomic::AtomicBool::new(false),
+    };
+    let start = SshPtyStart {
+        handle: Box::new(handle),
+        output_rx,
+        // Fakes don't spawn a separate driver task; the FakeHandle
+        // multiplexes input/output through shared mutexes.
+        driver: None,
+    };
+    let fixture = FakeFixture {
+        inputs,
+        resizes,
+        output_tx: shared_tx,
+    };
+    (start, fixture)
+}
+
+#[tokio::test]
+async fn start_live_pty_promotes_runtime_and_returns_active_session() {
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+
+    let (start, _fixture) = fake_start();
+    let updated = mgr
+        .start_live_pty(owner, session.id, start)
+        .await
+        .expect("start_live_pty");
+    assert_eq!(updated.status, TerminalSessionStatus::Active);
+    let runtime = mgr.runtime(session.id).expect("runtime");
+    assert_eq!(runtime.status, RuntimeSessionStatus::Live);
+    assert!(mgr.live(session.id).is_some());
+
+    // No new `SessionEventKind` is written on PTY-start in this slice —
+    // SPEC explicitly forbids `replay_started` until the replay buffer
+    // exists, and a precise `live_started` kind is future work that
+    // requires a migration. The `Created` event from `create_session`
+    // is the only audit row at this point.
+    let kinds: Vec<_> = repo.snapshot_events().into_iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, vec![SessionEventKind::Created]);
+    let _ = repo;
+}
+
+#[tokio::test]
+async fn write_pty_input_routes_to_handle_when_live() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    let inputs = fixture.inputs.clone();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    mgr.write_pty_input(owner, session.id, b"hello".to_vec())
+        .await
+        .unwrap();
+    let recorded = inputs.lock().unwrap().clone();
+    assert_eq!(recorded, vec![b"hello".to_vec()]);
+}
+
+#[tokio::test]
+async fn write_pty_input_returns_pty_not_live_for_stub_session() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+
+    let err = mgr
+        .write_pty_input(owner, session.id, b"x".to_vec())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TerminalSessionManagerError::PtyNotLive));
+}
+
+#[tokio::test]
+async fn write_pty_input_foreign_owner_returns_not_found() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let stranger = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    let err = mgr
+        .write_pty_input(stranger, session.id, b"x".to_vec())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TerminalSessionManagerError::NotFound));
+}
+
+#[tokio::test]
+async fn apply_pty_resize_calls_handle_and_returns_true_when_live() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    let resizes = fixture.resizes.clone();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    let live = mgr
+        .apply_pty_resize(owner, session.id, 132, 50)
+        .await
+        .unwrap();
+    assert!(live);
+    assert_eq!(resizes.lock().unwrap().clone(), vec![(132, 50)]);
+}
+
+#[tokio::test]
+async fn apply_pty_resize_returns_false_for_stub_session() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let live = mgr
+        .apply_pty_resize(owner, session.id, 80, 24)
+        .await
+        .unwrap();
+    assert!(!live);
+}
+
+#[tokio::test]
+async fn close_session_drops_live_runtime() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    assert!(mgr.live(session.id).is_some());
+
+    mgr.close_session(session.id, owner).await.unwrap();
+    assert!(mgr.live(session.id).is_none());
+    assert!(mgr.runtime(session.id).is_none());
+}
+
+#[tokio::test]
+async fn attach_session_returns_active_message_when_live() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    let outcome = mgr
+        .attach_session(AttachSessionRequest {
+            owner_id: owner,
+            session_id: session.id,
+            client_info: None,
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.message, LIVE_PTY_ATTACH_MESSAGE);
+    assert!(
+        outcome.live.is_some(),
+        "live runtime view should be present"
+    );
+}
+
+#[tokio::test]
+async fn record_pty_start_failed_marks_session_closed() {
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+
+    mgr.record_pty_start_failed(owner, session.id, "host_key_not_trusted")
+        .await
+        .unwrap();
+
+    let row = repo.snapshot_session(session.id).unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
+    assert!(row.closed_at.is_some());
+
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .collect::<Vec<_>>();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].payload["reason"], "ssh_start_failed");
+    assert_eq!(closed[0].payload["category"], "host_key_not_trusted");
+}
+
+#[tokio::test]
+async fn pty_teardown_marks_session_closed_via_forwarder() {
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    // Simulate the bridge's transport tearing down. The forwarder must
+    // observe Closed, persist a closed event, and transition the row.
+    fixture.inject_output(b"final-banner".to_vec()).await; // pre-teardown bytes
+    let tx_clone = fixture.output_tx.lock().unwrap().clone();
+    if let Some(tx) = tx_clone {
+        tx.send(SshPtyEvent::Closed {
+            reason: ClosedReason::TransportError,
+        })
+        .await
+        .unwrap();
+    }
+    fixture.simulate_teardown(); // drop the sender so recv() returns None
+
+    // Give the forwarder a moment to run. We use a short sleep loop —
+    // yield_now() alone is not enough because the forwarder's exit path
+    // chains several .await calls (sessions.get, set_status, events.create)
+    // which need real scheduler progress, not just a single yield.
+    for _ in 0..40 {
+        let row = repo.snapshot_session(session.id).unwrap();
+        if row.status == TerminalSessionStatus::Closed {
+            assert!(
+                row.closed_at.is_some(),
+                "closed_at must be stamped on transport teardown"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "session row did not transition to Closed after pty teardown within budget; got {:?}",
+        repo.snapshot_session(session.id).map(|s| s.status),
+    );
+}
+
+// ----------------------------------------------------------------------
+// detach_attachment: final-detach auto-close for live PTY sessions
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn detach_attachment_closes_live_session_on_final_detach() {
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    // Detach the only attachment — should auto-close the live session.
+    let outcome = mgr
+        .detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    assert!(!outcome.detach.already_detached);
+    let close = outcome
+        .also_closed
+        .expect("final detach of a live session must auto-close");
+    assert!(!close.already_closed);
+    assert_eq!(close.session.status, TerminalSessionStatus::Closed);
+    assert!(close.session.closed_at.is_some());
+
+    // Live runtime + attachment registry both empty.
+    assert!(mgr.runtime(session.id).is_none());
+    assert!(mgr.live(session.id).is_none());
+    assert_eq!(mgr.attachment_count(), 0);
+
+    // Exactly one Detached event and one Closed event were written.
+    let events = repo.snapshot_events();
+    let detached = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Detached)
+        .count();
+    let closed = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(detached, 1, "exactly one Detached event must be written");
+    assert_eq!(closed, 1, "exactly one Closed event must be written");
+}
+
+#[tokio::test]
+async fn detach_attachment_does_not_close_when_other_attachments_remain() {
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let a1 = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+    let _a2 = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    let outcome = mgr
+        .detach_attachment(owner, session.id, a1.id, None)
+        .await
+        .unwrap();
+    assert!(
+        outcome.also_closed.is_none(),
+        "another attachment is still live"
+    );
+    // Session remains Active, runtime stays bound.
+    let row = repo.snapshot_session(session.id).unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Active);
+    assert!(mgr.live(session.id).is_some());
+    assert_eq!(mgr.attachment_count(), 1);
+}
+
+#[tokio::test]
+async fn detach_attachment_does_not_close_stub_session() {
+    // No live PTY → no auto-close even if the only attachment detaches.
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    let outcome = mgr
+        .detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    assert!(
+        outcome.also_closed.is_none(),
+        "stub session must not auto-close"
+    );
+    let row = repo.snapshot_session(session.id).unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Starting);
+}
+
+#[tokio::test]
+async fn detach_attachment_idempotent_on_already_detached_row() {
+    // Mirrors the WS race: explicit Detach frame fires, the cleanup tail
+    // also fires `detach_attachment` — must NOT write a second Closed
+    // event.
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    let first = mgr
+        .detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    assert!(first.also_closed.is_some());
+    let second = mgr
+        .detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    assert!(
+        second.detach.already_detached,
+        "second detach must observe the row as already_detached",
+    );
+    assert!(
+        second.also_closed.is_none(),
+        "second detach must NOT auto-close again",
+    );
+
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "race between Detach and cleanup-tail must write exactly one Closed event",
+    );
+}
+
+#[tokio::test]
+async fn explicit_close_remains_idempotent() {
+    // Explicit Close, then second Close: must surface `already_closed`
+    // and write no second Closed event.
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    mgr.attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap();
+
+    let first = mgr.close_session(session.id, owner).await.unwrap();
+    assert!(!first.already_closed);
+    let second = mgr.close_session(session.id, owner).await.unwrap();
+    assert!(second.already_closed);
+
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "double explicit close must write exactly one Closed event",
+    );
+    // Live runtime is gone after the first close.
+    assert!(mgr.live(session.id).is_none());
+    assert!(mgr.runtime(session.id).is_none());
+}
+
+#[tokio::test]
+async fn detach_after_explicit_close_does_not_auto_close_again() {
+    // Race scenario: explicit Close ran (registry attachment removed,
+    // session row Closed); a subsequent detach call (e.g. from a
+    // misbehaving external caller) must NOT trigger another auto-close
+    // — there's no live PTY to close.
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    mgr.close_session(session.id, owner).await.unwrap();
+
+    let detach = mgr
+        .detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    // The runtime entry was dropped by close_session, so the helper's
+    // "session has live pty" check is false → no auto-close.
+    assert!(
+        detach.also_closed.is_none(),
+        "detach after close must NOT auto-close again",
+    );
+
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "explicit close + later detach must write exactly one Closed event",
+    );
+}
+
+#[tokio::test]
+async fn write_pty_input_after_final_detach_returns_pty_not_live() {
+    // After final detach auto-closed the session, the PTY runtime is
+    // gone — input must surface PtyNotLive (or NotFound), and never
+    // reach the (now-aborted) bridge.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    let inputs = fixture.inputs.clone();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    mgr.detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+
+    let err = mgr
+        .write_pty_input(owner, session.id, b"after-detach".to_vec())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TerminalSessionManagerError::PtyNotLive | TerminalSessionManagerError::NotFound
+        ),
+        "input after auto-close must surface PtyNotLive or NotFound, got {err:?}",
+    );
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "no input bytes should reach the fake bridge after auto-close",
     );
 }

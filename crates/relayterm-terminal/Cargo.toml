@@ -21,6 +21,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
+relayterm-ssh = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }

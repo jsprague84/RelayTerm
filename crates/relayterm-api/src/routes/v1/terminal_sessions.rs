@@ -25,6 +25,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use relayterm_core::SeqNo;
 use relayterm_core::ids::{TerminalSessionAttachmentId, TerminalSessionId, UserId};
 use relayterm_core::repository::{
     HostRepository, KnownHostEntryRepository, ServerProfileRepository, SshIdentityRepository,
@@ -33,13 +34,16 @@ use relayterm_core::repository::{
 use relayterm_core::terminal_session::TerminalSessionStatus;
 use relayterm_protocol::{
     AckKind, ClientMsg, ErrorCode as ProtoErrorCode, ServerMsg, SessionAttachStatus,
+    output_data_encode,
 };
+use relayterm_ssh::{SshPtyConfig, SshPtyError, SshPtyTarget};
 use relayterm_terminal::{
     AttachSessionRequest as ManagerAttachRequest,
-    CreateTerminalSessionRequest as ManagerCreateRequest, TerminalSessionManager,
-    TerminalSessionManagerError,
+    CreateTerminalSessionRequest as ManagerCreateRequest, LIVE_PTY_CREATE_MESSAGE, OutputFrame,
+    TerminalSessionManager, TerminalSessionManagerError,
 };
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::AppState;
@@ -68,11 +72,25 @@ pub(super) fn router() -> Router<AppState> {
 
 /// `POST /api/v1/terminal-sessions`.
 ///
-/// Creates terminal-session metadata and an in-memory runtime placeholder.
-/// PTY startup and SSH channel allocation are NOT implemented in this
-/// slice — the response carries a static `message` that names the stub
-/// scope explicitly so the client cannot mistake "row created" for
-/// "shell ready."
+/// Creates terminal-session metadata AND starts a live SSH PTY backed
+/// by the configured `(profile, host, identity)` trio. The flow:
+/// 1. Resolve the trio scoped to the caller (foreign-owned ids collapse
+///    to 404).
+/// 2. Verify the host has at least one active, trusted, non-revoked
+///    `known_host_entries` row (else 409 `host_key`).
+/// 3. Decrypt the SSH identity inside the vault (5xx on data-integrity
+///    failure; 503 if the vault is disabled).
+/// 4. Write the metadata row in `Starting` status.
+/// 5. Hand the decrypted PEM + accept-pin set to the SSH PTY bridge.
+/// 6. On bridge success, transition the row to `Active` and bind the
+///    live runtime to the manager.
+/// 7. On bridge failure, transition the row to `Closed` with a
+///    `closed { reason: ssh_start_failed, category }` event and
+///    return the appropriate typed error.
+///
+/// Decrypted private-key bytes live ONLY in the `SshPtyTarget` for the
+/// duration of the start call; the `Zeroizing` buffer wipes them on
+/// drop.
 async fn create(
     State(state): State<AppState>,
     user: DevUser,
@@ -95,7 +113,7 @@ async fn create(
         .await?
         .filter(|h| h.owner_id == user.0)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
-    let _identity = state
+    let identity = state
         .db
         .ssh_identities()
         .get(profile.ssh_identity_id)
@@ -105,18 +123,31 @@ async fn create(
 
     // Precondition: host key MUST already be pinned and trusted (and not
     // revoked). We do NOT perform a live preflight here — that's the
-    // caller's responsibility via `POST /trust-host-key`. Refusing to
-    // create a session without a trusted pin keeps the future PTY-bearing
-    // implementation from accidentally connecting to an unverified peer.
+    // caller's responsibility via `POST /trust-host-key`. The accept-pin
+    // set is passed straight to the bridge so the host-key check happens
+    // BEFORE any client signature reaches the wire.
     let known = state.db.known_host_entries().list_for_host(host.id).await?;
-    let any_trusted = known
+    let accept_pins: Vec<_> = known
         .iter()
-        .any(|e| e.trusted_at.is_some() && e.revoked_at.is_none());
-    if !any_trusted {
+        .filter(|e| e.trusted_at.is_some() && e.revoked_at.is_none())
+        .map(|e| (e.key_type, e.fingerprint_sha256.clone()))
+        .collect();
+    if accept_pins.is_empty() {
         return Err(ApiError::Conflict { entity: "host_key" });
     }
 
-    let outcome = state
+    // Decrypt the identity. Vault disabled → 503 (matches the rest of
+    // the SSH-side routes). The decrypted PEM is held in a Zeroizing
+    // buffer for the rest of this function.
+    let vault = state.vault.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("vault disabled — pty start not available".to_owned())
+    })?;
+    let private_key_pem = vault.decrypt_private_key(&identity.encrypted_private_key)?;
+
+    // Write the metadata row + Created event + register the runtime
+    // placeholder. After this the manager owns the row's runtime; we
+    // call `start_live_pty` to promote it once the bridge succeeds.
+    let create_outcome = state
         .terminal_sessions
         .create_session(ManagerCreateRequest {
             owner_id: user.0,
@@ -125,12 +156,90 @@ async fn create(
             rows: req.rows,
         })
         .await?;
+    let session_id = create_outcome.session.id;
+
+    // Build the bridge target. `username_override` (if any) supersedes
+    // the host's `default_username`; that's the existing precedence the
+    // auth-check route uses.
+    let username = profile
+        .username_override
+        .as_ref()
+        .map(|u| u.as_str().to_owned())
+        .unwrap_or_else(|| host.default_username.as_str().to_owned());
+    let pty_config = SshPtyConfig::new(
+        host.hostname.as_str().to_owned(),
+        host.port.get(),
+        username,
+        accept_pins,
+        create_outcome.session.cols,
+        create_outcome.session.rows,
+    );
+    let target = SshPtyTarget {
+        config: pty_config,
+        private_key_pem,
+    };
+
+    let started = match state.pty_bridge.start(target).await {
+        Ok(s) => s,
+        Err(err) => {
+            // Map the bridge error to a typed API status BEFORE we touch
+            // the DB so the operator-facing detail is logged once with
+            // a precise classifier.
+            let (api_err, category) = map_pty_start_error(&err);
+            let _ = state
+                .terminal_sessions
+                .record_pty_start_failed(user.0, session_id, category)
+                .await;
+            return Err(api_err);
+        }
+    };
+
+    // Bridge succeeded — promote the session to live.
+    let session = state
+        .terminal_sessions
+        .start_live_pty(user.0, session_id, started)
+        .await?;
 
     let body = CreateTerminalSessionResponse {
-        session: outcome.session.into(),
-        message: outcome.message,
+        session: session.into(),
+        message: LIVE_PTY_CREATE_MESSAGE,
+        pty_live: true,
     };
+    let _ = create_outcome; // create_outcome.message ("...not implemented yet") is intentionally not surfaced once the PTY succeeded
     Ok((StatusCode::CREATED, Json(body)))
+}
+
+/// Map a bridge error to a wire-stable (ApiError, category) pair. The
+/// category is recorded on the `closed` lifecycle event the manager
+/// writes when startup fails; the ApiError carries operator detail
+/// for tracing only.
+fn map_pty_start_error(err: &SshPtyError) -> (ApiError, &'static str) {
+    match err {
+        SshPtyError::InvalidIdentity => (
+            ApiError::Internal("ssh identity material is malformed".to_owned()),
+            "invalid_identity",
+        ),
+        SshPtyError::Transport(_) => (
+            ApiError::BadGateway("ssh transport failure during pty start".to_owned()),
+            "transport",
+        ),
+        SshPtyError::HostKeyNotTrusted => (
+            ApiError::Conflict { entity: "host_key" },
+            "host_key_not_trusted",
+        ),
+        SshPtyError::AuthenticationFailed => (
+            ApiError::Conflict { entity: "ssh_auth" },
+            "authentication_failed",
+        ),
+        SshPtyError::PtyStartFailed => (
+            ApiError::BadGateway("ssh pty/shell start failed".to_owned()),
+            "pty_alloc",
+        ),
+        SshPtyError::BridgeClosed => (
+            ApiError::Internal("bridge closed before start completed".to_owned()),
+            "bridge_closed",
+        ),
+    }
 }
 
 async fn list(
@@ -244,16 +353,28 @@ struct SocketState {
     attachment_id: TerminalSessionAttachmentId,
     detached: bool,
     closed: bool,
+    /// `Some` once the attach handshake bound a live PTY to this socket;
+    /// the broadcast subscription is owned here for the duration.
+    live: Option<LiveSubscription>,
+}
+
+struct LiveSubscription {
+    /// Subscribe handle for the per-session output broadcast. Takes a
+    /// lagging-on-overflow stance via `broadcast::Receiver`.
+    rx: broadcast::Receiver<OutputFrame>,
 }
 
 /// Run the attach / per-message loop for one WebSocket connection.
 ///
 /// Lifecycle:
 /// 1. Call [`TerminalSessionManager::attach_session`] to write the
-///    attachment row and register the in-memory runtime entry. Failure
-///    here is rare (race with `close`) — emit an `Error` frame and exit.
-/// 2. Send [`ServerMsg::SessionAttached`] with the static stub message.
-/// 3. Read frames until the socket drops or the client sends `Close`.
+///    attachment row, register the in-memory runtime entry, and (when
+///    a live PTY is bound) hand back the [`LiveRuntimeView`].
+/// 2. Send [`ServerMsg::SessionAttached`] with `Active` (live PTY) or
+///    `AttachedStub` (placeholder).
+/// 3. Multiplex client frames AND broadcast `Output` frames until the
+///    socket drops, the client sends `Close`/`Detach`, or the live PTY
+///    tears down.
 /// 4. On exit, ensure the attachment is detached (idempotent) so the
 ///    audit row reflects reality even on abrupt drops.
 async fn run_attached_socket(
@@ -287,10 +408,19 @@ async fn run_attached_socket(
         }
     };
 
+    let live_subscription = outcome.live.as_ref().map(|view| LiveSubscription {
+        rx: view.output_tx.subscribe(),
+    });
+    let attach_status = if outcome.live.is_some() {
+        SessionAttachStatus::Active
+    } else {
+        SessionAttachStatus::AttachedStub
+    };
+
     let attached = ServerMsg::SessionAttached {
         session_id: outcome.session.id,
         attachment_id: outcome.attachment.id,
-        status: SessionAttachStatus::AttachedStub,
+        status: attach_status,
         message: outcome.message.to_owned(),
     };
     if !send_msg(&mut socket, &attached).await {
@@ -306,60 +436,134 @@ async fn run_attached_socket(
         attachment_id: outcome.attachment.id,
         detached: false,
         closed: false,
+        live: live_subscription,
     };
 
     loop {
-        match socket.recv().await {
-            Some(Ok(Message::Text(text))) => {
-                if !handle_text_frame(
-                    &mut socket,
-                    &manager,
-                    user_id,
-                    session_id,
-                    &mut state,
-                    &text,
-                )
-                .await
-                {
-                    break;
+        // Multiplex: socket recv vs broadcast recv. If the live PTY is
+        // not bound, the broadcast branch is replaced with a never-
+        // resolving future so the loop only fires on socket frames.
+        let recv_socket = socket.recv();
+        if let Some(sub) = state.live.as_mut() {
+            tokio::select! {
+                biased;
+                client_frame = recv_socket => {
+                    if !handle_recv_outcome(
+                        &mut socket,
+                        &manager,
+                        user_id,
+                        session_id,
+                        &mut state,
+                        client_frame,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                pty_frame = sub.rx.recv() => {
+                    match pty_frame {
+                        Ok(frame) => {
+                            // Output bytes from the remote PTY. NEVER log
+                            // the raw payload at any level.
+                            let msg = ServerMsg::Output {
+                                seq: SeqNo(frame.seq),
+                                data: output_data_encode(&frame.data),
+                            };
+                            if !send_msg(&mut socket, &msg).await {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Slow consumer: missed frames. The future
+                            // replay slice fills this gap; for now the
+                            // renderer just sees the next frames in line.
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // The PTY tore down. The manager's forwarder
+                            // marks the row closed; we just exit.
+                            break;
+                        }
+                    }
                 }
             }
-            Some(Ok(Message::Binary(_))) => {
-                // Binary frames have no defined meaning in the JSON-only
-                // protocol skeleton. Reject without echoing so a probing
-                // client can't confuse the audit log with arbitrary bytes.
-                let _ = send_msg(
-                    &mut socket,
-                    &ServerMsg::Error {
-                        code: ProtoErrorCode::InvalidMessage,
-                        message: "binary frames are not accepted".to_owned(),
-                    },
-                )
-                .await;
-            }
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
-                // axum handles WebSocket-protocol pings transparently;
-                // application-level liveness uses ClientMsg::Ping.
-            }
-            Some(Ok(Message::Close(_))) | None => break,
-            Some(Err(err)) => {
-                debug!(?err, "websocket transport error; closing");
+        } else {
+            let client_frame = recv_socket.await;
+            if !handle_recv_outcome(
+                &mut socket,
+                &manager,
+                user_id,
+                session_id,
+                &mut state,
+                client_frame,
+            )
+            .await
+            {
                 break;
             }
         }
     }
 
     // Cleanup: if the user closed the session through this socket the
-    // attachment is already gone from the registry and the row's
-    // `detached_at` will stay NULL forever (the close path subsumes
-    // detach for audit purposes). Otherwise mark the attachment detached
-    // — idempotent on already-detached rows.
+    // attachment is already gone from the registry. Otherwise mark the
+    // attachment detached. The manager's `detach_attachment` helper
+    // is the single lifecycle entry point — it auto-closes the session
+    // when this is the last attachment of a live PTY (see SPEC.md
+    // "detach / close semantics for this slice"). Idempotent in two
+    // ways: (a) `detach_session` is COALESCE-on-detached_at so a race
+    // with the explicit Detach frame can't write a second `Detached`
+    // event; (b) `close_session` is itself idempotent and the helper
+    // skips the auto-close when the detach observed the row as already
+    // detached, so a second cleanup-tail pass cannot write a duplicate
+    // `Closed` event.
     if !state.detached && !state.closed {
         if let Err(err) = manager
-            .detach_session(user_id, session_id, state.attachment_id, None)
+            .detach_attachment(user_id, session_id, state.attachment_id, None)
             .await
         {
             warn!(?err, "failed to mark attachment detached on socket exit");
+        }
+    }
+}
+
+/// Handle one outcome of `socket.recv()`. Returns `false` to break the
+/// outer loop (e.g. transport closed, client said `Close`/`Detach`).
+async fn handle_recv_outcome(
+    socket: &mut WebSocket,
+    manager: &Arc<TerminalSessionManager>,
+    user_id: UserId,
+    session_id: TerminalSessionId,
+    state: &mut SocketState,
+    frame: Option<Result<Message, axum::Error>>,
+) -> bool {
+    match frame {
+        Some(Ok(Message::Text(text))) => {
+            handle_text_frame(socket, manager, user_id, session_id, state, &text).await
+        }
+        Some(Ok(Message::Binary(_))) => {
+            // Binary frames have no defined meaning in the JSON-only
+            // protocol skeleton. Reject without echoing so a probing
+            // client can't confuse the audit log with arbitrary bytes.
+            let _ = send_msg(
+                socket,
+                &ServerMsg::Error {
+                    code: ProtoErrorCode::InvalidMessage,
+                    message: "binary frames are not accepted".to_owned(),
+                },
+            )
+            .await;
+            true
+        }
+        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+            // axum handles WebSocket-protocol pings transparently;
+            // application-level liveness uses ClientMsg::Ping.
+            true
+        }
+        Some(Ok(Message::Close(_))) | None => false,
+        Some(Err(err)) => {
+            debug!(?err, "websocket transport error; closing");
+            false
         }
     }
 }
@@ -410,19 +614,32 @@ async fn handle_text_frame(
             )
             .await;
         }
-        ClientMsg::Input { data: _ } => {
-            // No PTY exists; the bytes have nowhere to go. We must NOT
-            // reflect the payload back, log it, or forward it anywhere —
-            // the only side effect of this match arm is the static stub
-            // error frame.
-            send_msg(
-                socket,
-                &ServerMsg::Error {
-                    code: ProtoErrorCode::PtyNotImplemented,
-                    message: "PTY streaming is not implemented yet".to_owned(),
-                },
-            )
-            .await;
+        ClientMsg::Input { data } => {
+            // Forward to the live PTY if bound. The payload is NEVER
+            // logged or echoed — the manager's `write_pty_input`
+            // takes ownership and hands raw bytes to the SSH layer,
+            // which streams them straight to the remote shell.
+            if state.live.is_none() {
+                send_msg(
+                    socket,
+                    &ServerMsg::Error {
+                        code: ProtoErrorCode::PtyNotLive,
+                        message: "no live pty for this session".to_owned(),
+                    },
+                )
+                .await;
+            } else {
+                // UTF-8 string → bytes is the right shape for keystrokes
+                // from xterm.js: control sequences, paste, Unicode all
+                // round-trip. A binary frame format is future work.
+                let bytes = data.into_bytes();
+                if let Err(err) = manager.write_pty_input(user_id, session_id, bytes).await {
+                    send_error(socket, &err).await;
+                }
+                // Success path: NO ack — input is fire-and-forget;
+                // the renderer sees the echo as Output bytes. An ack
+                // here would inflate per-keystroke wire traffic.
+            }
         }
         ClientMsg::Resize { cols, rows } => {
             match manager
@@ -430,13 +647,41 @@ async fn handle_text_frame(
                 .await
             {
                 Ok(_) => {
-                    send_msg(
-                        socket,
-                        &ServerMsg::Ack {
-                            kind: AckKind::Resize,
-                        },
-                    )
-                    .await;
+                    // The metadata-only resize landed; now tell the live
+                    // PTY. When the PTY is NOT live (post-restart stub
+                    // row, or a session whose runtime tore down without
+                    // being closed yet), surface `pty_not_live` so the
+                    // renderer doesn't believe the SSH side tracked the
+                    // resize. Per SPEC: "input/resize attempted on a
+                    // session whose live runtime is not present" → the
+                    // typed `pty_not_live` error.
+                    match manager
+                        .apply_pty_resize(user_id, session_id, cols, rows)
+                        .await
+                    {
+                        Ok(true) => {
+                            send_msg(
+                                socket,
+                                &ServerMsg::Ack {
+                                    kind: AckKind::Resize,
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(false) => {
+                            send_msg(
+                                socket,
+                                &ServerMsg::Error {
+                                    code: ProtoErrorCode::PtyNotLive,
+                                    message: "no live pty for this session".to_owned(),
+                                },
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            send_error(socket, &err).await;
+                        }
+                    }
                 }
                 Err(err) => {
                     send_error(socket, &err).await;
@@ -444,8 +689,16 @@ async fn handle_text_frame(
             }
         }
         ClientMsg::Detach => {
+            // The manager's `detach_attachment` helper detaches AND, if
+            // this is the last attachment of a live PTY, also closes
+            // the session (until a TTL/reaper for detached live sessions
+            // exists, leaving a PTY running with zero clients is unsafe
+            // — see SPEC.md). The handler emits both `SessionDetached`
+            // and `SessionClosed` when both transitions fired so the
+            // client's state machine sees the same lifecycle the
+            // backend persisted.
             match manager
-                .detach_session(user_id, session_id, state.attachment_id, None)
+                .detach_attachment(user_id, session_id, state.attachment_id, None)
                 .await
             {
                 Ok(out) => {
@@ -453,11 +706,21 @@ async fn handle_text_frame(
                     send_msg(
                         socket,
                         &ServerMsg::SessionDetached {
-                            session_id: out.session.id,
-                            attachment_id: out.attachment.id,
+                            session_id: out.detach.session.id,
+                            attachment_id: out.detach.attachment.id,
                         },
                     )
                     .await;
+                    if let Some(close) = out.also_closed {
+                        state.closed = true;
+                        send_msg(
+                            socket,
+                            &ServerMsg::SessionClosed {
+                                session_id: close.session.id,
+                            },
+                        )
+                        .await;
+                    }
                     let _ = socket.send(Message::Close(None)).await;
                     return false;
                 }
@@ -516,6 +779,13 @@ async fn send_error(socket: &mut WebSocket, err: &TerminalSessionManagerError) {
         TerminalSessionManagerError::SessionClosed => {
             warn!(?err, "post-upgrade SessionClosed race in WebSocket handler");
             (ProtoErrorCode::Internal, "internal error")
+        }
+        TerminalSessionManagerError::PtyNotLive => {
+            (ProtoErrorCode::PtyNotLive, "no live pty for this session")
+        }
+        TerminalSessionManagerError::PtyStart(inner) => {
+            warn!(?inner, "pty bridge error during in-flight session");
+            (ProtoErrorCode::SshStartFailed, "ssh pty error")
         }
         TerminalSessionManagerError::Repository(_) => {
             // Operator detail goes to the log via the Debug impl; the

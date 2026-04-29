@@ -55,6 +55,7 @@ Do not change without asking.
 | zeroize | `^1` | Wipes vault secrets (master key, plaintext PEM, b64 source string) on drop. `derive` feature for `ZeroizeOnDrop`. |
 | rand | `^0.8` | `OsRng` for nonce + keypair generation. `0.8` line is what `ssh-key 0.6` and `chacha20poly1305 0.10` interop with via `rand_core 0.6`. |
 | tokio-tungstenite | `^0.29` (dev-dep) | WebSocket client used only by `relayterm-api` integration tests to drive the `/api/v1/terminal-sessions/:id/ws` route against an in-process `axum::serve`. Pinned to match the `tungstenite` axum 0.8 pulls in transitively so the lockfile keeps a single copy. Not a runtime dep. |
+| base64 | `^0.22` | Standard-alphabet RFC 4648 codec. The protocol encodes raw PTY output bytes as base64 inside `ServerMsg::Output { data }` (JSON strings can't carry arbitrary binary). Centralised in `relayterm-protocol::output_data_encode/decode`; the TS mirror uses `atob`/`btoa` against the same alphabet. A binary frame format is future work. |
 
 ## Critical gotchas
 

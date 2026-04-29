@@ -349,14 +349,15 @@ export class TerminalSessionClient {
         this.#setState("closed");
         return;
       case "error":
-        if (msg.code === "pty_not_implemented") {
-          // The backend stubs every `input` frame with this code today.
-          // Surface the dedicated rejection event so consumers don't have
-          // to special-case server vs client rejection. We deliberately
-          // do NOT also emit the generic `error` event here — a consumer
-          // listening to both would otherwise handle the same stubbed
-          // rejection twice. Genuine server-side failures still flow
-          // through the `error` event below.
+        if (msg.code === "pty_not_implemented" || msg.code === "pty_not_live") {
+          // Either: (a) the legacy stub slice rejecting input; or (b) a
+          // live session whose PTY tore down. The input was not
+          // delivered. Surface the dedicated rejection event so the UI
+          // doesn't have to special-case server vs client rejection.
+          // We deliberately do NOT also emit the generic `error` event
+          // here — a consumer listening to both would otherwise handle
+          // the same stubbed rejection twice. Genuine server-side
+          // failures still flow through the `error` event below.
           this.#emitter.emit("input_rejected_or_stubbed", {
             reason: "pty_not_implemented",
             attempted: "input",

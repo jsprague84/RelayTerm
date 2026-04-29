@@ -46,7 +46,8 @@ use relayterm_db::{
 };
 use relayterm_ssh::{
     AuthAttemptKind, AuthCheckOutcome, AuthCheckTarget, CapturedHostKey, HostKeyPreflightService,
-    ProbeError, ProbeTarget, SshAuthCheckService, SshAuthChecker, SshHostKeyProbe,
+    ProbeError, ProbeTarget, SshAuthCheckService, SshAuthChecker, SshHostKeyProbe, SshPtyBridge,
+    SshPtyError, SshPtyEvent, SshPtyHandle, SshPtyStart, SshPtyTarget,
 };
 use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
@@ -93,6 +94,18 @@ async fn setup_with_auth_check_service(
     probe: Arc<dyn SshHostKeyProbe>,
     auth_check: Arc<SshAuthCheckService>,
 ) -> (Router, UserId) {
+    setup_with_full_state(pool, probe, auth_check, default_pty_bridge()).await
+}
+
+/// Most general setup: every dependency is injectable. Used by tests
+/// that drive the live PTY surface and need the bridge to either
+/// succeed (default) or fail with a specific [`SshPtyError`].
+async fn setup_with_full_state(
+    pool: PgPool,
+    probe: Arc<dyn SshHostKeyProbe>,
+    auth_check: Arc<SshAuthCheckService>,
+    pty_bridge: Arc<dyn SshPtyBridge>,
+) -> (Router, UserId) {
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
@@ -101,6 +114,7 @@ async fn setup_with_auth_check_service(
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(probe)),
         auth_check,
+        pty_bridge,
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -267,6 +281,216 @@ impl SshAuthChecker for BlockingAuthChecker {
             kind: self.kind,
         })
     }
+}
+
+/// Outcome a [`FakePtyBridge`] returns from `start`. `SshPtyError` is
+/// not `Clone` (transport variants wrap non-cloneable upstream errors),
+/// so the failure variant carries a small sentinel the bridge maps back
+/// to a fresh error on each call.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum FakePtyOutcome {
+    /// Start succeeds; hand back a [`FakePtyHandleRecord`] the test can
+    /// drive through `inject_output` and assert against for input/resize.
+    Success,
+    /// Start fails with the configured error category. Used to exercise
+    /// the API's typed error mapping (host_key_not_trusted, auth_failed,
+    /// transport, etc.).
+    Failure(FakePtyFailure),
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum FakePtyFailure {
+    InvalidIdentity,
+    Transport,
+    HostKeyNotTrusted,
+    AuthenticationFailed,
+    PtyStartFailed,
+}
+
+impl FakePtyFailure {
+    fn into_error(self) -> SshPtyError {
+        match self {
+            Self::InvalidIdentity => SshPtyError::InvalidIdentity,
+            Self::Transport => SshPtyError::Transport(ProbeError::Transport),
+            Self::HostKeyNotTrusted => SshPtyError::HostKeyNotTrusted,
+            Self::AuthenticationFailed => SshPtyError::AuthenticationFailed,
+            Self::PtyStartFailed => SshPtyError::PtyStartFailed,
+        }
+    }
+}
+
+/// Recorded interactions with one fake PTY handle. Held behind `Arc` so
+/// the test side and the SSH-side `SshPtyHandle` impl can share it.
+#[allow(dead_code)]
+struct FakePtyHandleRecord {
+    inputs: Mutex<Vec<Vec<u8>>>,
+    resizes: Mutex<Vec<(u16, u16)>>,
+    closed: std::sync::atomic::AtomicBool,
+    /// Sender into the bridge's `output_rx`, owned by the record so the
+    /// test can `inject_output` after the start call returns. Wrapped
+    /// in `Mutex<Option<...>>` so tests can also explicitly drop the
+    /// sender to simulate transport teardown.
+    output_tx: Mutex<Option<tokio::sync::mpsc::Sender<SshPtyEvent>>>,
+}
+
+#[allow(dead_code)]
+impl FakePtyHandleRecord {
+    /// Push raw PTY bytes into the bridge's `output_rx` so the manager's
+    /// forwarder fans them out to attached WebSockets.
+    async fn inject_output(&self, bytes: Vec<u8>) {
+        let tx = {
+            let guard = self.output_tx.lock().unwrap();
+            guard.as_ref().cloned()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(SshPtyEvent::Output(bytes)).await;
+        }
+    }
+
+    fn input_log(&self) -> Vec<Vec<u8>> {
+        self.inputs.lock().unwrap().clone()
+    }
+
+    fn resize_log(&self) -> Vec<(u16, u16)> {
+        self.resizes.lock().unwrap().clone()
+    }
+}
+
+/// Adapter exposing a [`FakePtyHandleRecord`] as an [`SshPtyHandle`] for
+/// the SSH bridge contract. Held behind `Box` inside `SshPtyStart`.
+struct FakePtyHandleAdapter(Arc<FakePtyHandleRecord>);
+
+#[async_trait]
+impl SshPtyHandle for FakePtyHandleAdapter {
+    async fn write_input(&self, bytes: Vec<u8>) -> Result<(), SshPtyError> {
+        if self.0.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SshPtyError::BridgeClosed);
+        }
+        self.0.inputs.lock().unwrap().push(bytes);
+        Ok(())
+    }
+    async fn resize(&self, cols: u16, rows: u16) -> Result<(), SshPtyError> {
+        if self.0.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SshPtyError::BridgeClosed);
+        }
+        self.0.resizes.lock().unwrap().push((cols, rows));
+        Ok(())
+    }
+    async fn close(&self) {
+        self.0
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Drop the sender so the manager's forwarder sees the channel
+        // close and tears down. Mirrors what the russh impl does on
+        // shutdown.
+        let _ = self.0.output_tx.lock().unwrap().take();
+    }
+}
+
+/// Recorded inputs to one `start` call.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct RecordedPtyTarget {
+    hostname: String,
+    port: u16,
+    username: String,
+    accept_pin_count: usize,
+    cols: u16,
+    rows: u16,
+    /// Length of the decrypted PEM the bridge received. The actual bytes
+    /// are NEVER cloned out of the Zeroizing buffer the test side keeps
+    /// — this length is operator-facing and lets a test assert that the
+    /// vault-decrypted PEM did reach the bridge.
+    pem_len: usize,
+}
+
+/// Fake bridge that records every `start` call and hands back a fake
+/// handle the test can drive. The configured `outcome` decides whether
+/// `start` succeeds or returns a typed error.
+struct FakePtyBridge {
+    outcome: Mutex<FakePtyOutcome>,
+    records: Mutex<Vec<RecordedPtyTarget>>,
+    handles: Mutex<Vec<Arc<FakePtyHandleRecord>>>,
+}
+
+#[allow(dead_code)]
+impl FakePtyBridge {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(FakePtyOutcome::Success),
+            records: Mutex::new(Vec::new()),
+            handles: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn with_outcome(outcome: FakePtyOutcome) -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(outcome),
+            records: Mutex::new(Vec::new()),
+            handles: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn last_handle(&self) -> Option<Arc<FakePtyHandleRecord>> {
+        self.handles.lock().unwrap().last().cloned()
+    }
+
+    fn records(&self) -> Vec<RecordedPtyTarget> {
+        self.records.lock().unwrap().clone()
+    }
+
+    fn call_count(&self) -> usize {
+        self.records.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl SshPtyBridge for FakePtyBridge {
+    async fn start(&self, target: SshPtyTarget) -> Result<SshPtyStart, SshPtyError> {
+        let SshPtyTarget {
+            config,
+            private_key_pem,
+        } = target;
+        self.records.lock().unwrap().push(RecordedPtyTarget {
+            hostname: config.hostname.clone(),
+            port: config.port,
+            username: config.username.clone(),
+            accept_pin_count: config.accept_pins.len(),
+            cols: config.cols,
+            rows: config.rows,
+            pem_len: private_key_pem.len(),
+        });
+        // Drop the PEM right after we've recorded its length. Any
+        // assertion about the bytes happens against `record.pem_len` —
+        // the plaintext never leaves this scope.
+        drop(private_key_pem);
+
+        let outcome = *self.outcome.lock().unwrap();
+        match outcome {
+            FakePtyOutcome::Success => {
+                let (output_tx, output_rx) = tokio::sync::mpsc::channel(64);
+                let record = Arc::new(FakePtyHandleRecord {
+                    inputs: Mutex::new(Vec::new()),
+                    resizes: Mutex::new(Vec::new()),
+                    closed: std::sync::atomic::AtomicBool::new(false),
+                    output_tx: Mutex::new(Some(output_tx)),
+                });
+                self.handles.lock().unwrap().push(record.clone());
+                Ok(SshPtyStart {
+                    handle: Box::new(FakePtyHandleAdapter(record)),
+                    output_rx,
+                    driver: None,
+                })
+            }
+            FakePtyOutcome::Failure(failure) => Err(failure.into_error()),
+        }
+    }
+}
+
+fn default_pty_bridge() -> Arc<dyn SshPtyBridge> {
+    FakePtyBridge::new() as Arc<dyn SshPtyBridge>
 }
 
 /// Probe that returns a configured fingerprint and records every call.
@@ -528,6 +752,7 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
     };
@@ -712,6 +937,7 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
     };
@@ -747,6 +973,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -1480,6 +1707,7 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(Arc::new(probe))),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -2052,6 +2280,7 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
         auth_check: Arc::new(SshAuthCheckService::new(Arc::new(ErroringAuthChecker(
             ProbeError::Unreachable,
         )))),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -2095,6 +2324,7 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -2157,6 +2387,7 @@ async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
     };
@@ -2244,6 +2475,7 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: svc,
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -2307,6 +2539,7 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: svc,
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
     };
@@ -2411,7 +2644,7 @@ async fn make_trusted_profile(
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn create_terminal_session_returns_starting_placeholder(pool: PgPool) {
+async fn create_terminal_session_returns_active_with_live_pty(pool: PgPool) {
     let (app, user_id) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
@@ -2437,7 +2670,10 @@ async fn create_terminal_session_returns_starting_placeholder(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = read_body(resp).await;
 
-    assert_eq!(body["status"], "starting");
+    // Default `setup` uses a successful FakePtyBridge — the create
+    // route binds a live PTY and transitions the row to `active`.
+    assert_eq!(body["status"], "active");
+    assert_eq!(body["pty_live"], true);
     assert_eq!(body["cols"], 120);
     assert_eq!(body["rows"], 30);
     assert_eq!(
@@ -2448,11 +2684,11 @@ async fn create_terminal_session_returns_starting_placeholder(pool: PgPool) {
     assert!(body["created_at"].is_string());
     assert!(body["closed_at"].is_null());
 
-    // Stub message must explicitly disclaim PTY readiness.
+    // Live message must announce PTY started AND caveat replay.
     let message = body["message"].as_str().unwrap().to_lowercase();
     assert!(
-        message.contains("pty") && message.contains("not implemented"),
-        "create response message must signal stub scope, got: {message}",
+        message.contains("ssh pty started") && message.contains("replay"),
+        "create response message must announce live pty + caveat replay, got: {message}",
     );
 
     // Body must NOT contain any key material, terminal I/O, or
@@ -2470,7 +2706,9 @@ async fn create_terminal_session_returns_starting_placeholder(pool: PgPool) {
         );
     }
 
-    // A `created` lifecycle event was persisted.
+    // The `Created` lifecycle event is the only audit row at this
+    // point. SPEC forbids writing `replay_started` until the replay
+    // buffer exists, and a precise `live_started` kind is future work.
     let session_id = body["id"].as_str().unwrap();
     let session_uuid: uuid::Uuid = session_id.parse().unwrap();
     let events = PgSessionEventRepository::new(pool.clone())
@@ -2479,8 +2717,8 @@ async fn create_terminal_session_returns_starting_placeholder(pool: PgPool) {
         ))
         .await
         .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, SessionEventKind::Created);
+    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, vec![SessionEventKind::Created]);
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -3060,6 +3298,7 @@ async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool)
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
     };
@@ -3088,10 +3327,12 @@ async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool)
     }
 }
 
-/// The create response's `message` must explicitly disclaim PTY/SSH
-/// readiness so a future "helpful" rewording is forced through review.
+/// The create response's `message` must announce the live PTY AND
+/// caveat the no-replay scope, never overpromise reconnect/resume. The
+/// pinned wording is enforced so a future "helpful" rewording is forced
+/// through review.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn create_terminal_session_message_does_not_overclaim_pty_or_ssh(pool: PgPool) {
+async fn create_terminal_session_message_announces_pty_and_caveats_replay(pool: PgPool) {
     let (app, user_id) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
@@ -3115,16 +3356,18 @@ async fn create_terminal_session_message_does_not_overclaim_pty_or_ssh(pool: PgP
     let message = body["message"].as_str().unwrap().to_lowercase();
 
     assert!(
-        message.contains("pty") && message.contains("not implemented"),
-        "create message must signal PTY-not-implemented scope, got: {message}",
+        message.contains("ssh pty started") && message.contains("replay"),
+        "create message must announce live pty + caveat replay, got: {message}",
     );
     for forbidden in [
-        "session opened",
+        // Words that would imply more than what the slice attests.
+        "logged in",
         "shell ready",
         "shell spawned",
         "connected to",
-        "authenticated",
-        "logged in",
+        "session opened",
+        "replay implemented",
+        "replay across reconnects is implemented",
     ] {
         assert!(
             !message.contains(forbidden),
@@ -3219,7 +3462,11 @@ async fn create_session_via_api(
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn ws_attach_emits_session_attached_stub(pool: PgPool) {
+async fn ws_attach_emits_session_attached_with_session_id_and_writes_attachment_row(pool: PgPool) {
+    // Default `setup` uses a successful FakePtyBridge, so the create
+    // route binds a live PTY. The status MUST be `Active` and the
+    // attachment row must land in the DB. Wire wording is asserted
+    // separately by `ws_attach_emits_session_attached_active_when_pty_live`.
     let (app, user_id) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
@@ -3244,16 +3491,8 @@ async fn ws_attach_emits_session_attached_stub(pool: PgPool) {
             message,
         } => {
             assert_eq!(got_id, session_id);
-            assert_eq!(
-                status,
-                relayterm_protocol::SessionAttachStatus::AttachedStub
-            );
-            // Wire wording must explicitly disclaim PTY scope.
+            assert_eq!(status, relayterm_protocol::SessionAttachStatus::Active);
             let lower = message.to_lowercase();
-            assert!(
-                lower.contains("pty") && lower.contains("not implemented"),
-                "session_attached message must signal PTY-not-implemented: {message}",
-            );
             for forbidden in ["session opened", "shell ready", "logged in"] {
                 assert!(
                     !lower.contains(forbidden),
@@ -3387,6 +3626,7 @@ async fn ws_attach_returns_401_when_dev_auth_disabled(pool: PgPool) {
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
     };
@@ -3514,25 +3754,53 @@ async fn ws_resize_invalid_dims_returns_typed_error(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn ws_input_returns_pty_not_implemented_and_does_not_echo_payload(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: PgPool) {
+    // Build a session that has NO live PTY (the manager's stub path).
+    // We do this by inserting a `terminal_sessions` row directly via the
+    // repo, bypassing the create route — exercises the WS handler's
+    // `state.live.is_none()` branch which surfaces `pty_not_live` and
+    // never reflects the input payload.
+    let user_id = create_user(&pool, "dev").await;
+    let db = relayterm_db::Db::from_pool(pool.clone());
+    let bridge = FakePtyBridge::new();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db: db.clone(),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: bridge as Arc<dyn SshPtyBridge>,
+        terminal_sessions: terminal_sessions.clone(),
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    // Insert a row directly — no live PTY runtime is registered.
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
         &test_vault(),
         "primary",
-        "ws-input.example.com",
-        "SHA256:ws-input",
+        "ws-no-pty.example.com",
+        "SHA256:ws-no-pty",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session = PgTerminalSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: user_id,
+            server_profile_id: profile_id,
+            status: relayterm_core::terminal_session::TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let session_id = session.id;
+
     let addr = spawn_app(app).await;
     let mut socket = open_ws(addr, session_id).await;
-    let _ = recv_server_msg(&mut socket).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached(AttachedStub)
 
-    // Sentinel string the test then asserts is NOT present in any
-    // response — pinned so a future "helpful" handler change that
-    // reflects input back fails loudly.
     let sentinel = "REDACT-MARKER-WS-INPUT-3D8F";
     send_client_msg(
         &mut socket,
@@ -3549,11 +3817,11 @@ async fn ws_input_returns_pty_not_implemented_and_does_not_echo_payload(pool: Pg
     );
     match resp {
         relayterm_protocol::ServerMsg::Error { code, message } => {
-            assert_eq!(code, relayterm_protocol::ErrorCode::PtyNotImplemented);
+            assert_eq!(code, relayterm_protocol::ErrorCode::PtyNotLive);
             let lower = message.to_lowercase();
             assert!(
-                lower.contains("pty") && lower.contains("not implemented"),
-                "input rejection must name PTY-not-implemented: {message}",
+                lower.contains("pty") || lower.contains("live"),
+                "input rejection must signal pty-not-live: {message}",
             );
         }
         other => panic!("expected Error frame, got {other:?}"),
@@ -3674,6 +3942,21 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
         other => panic!("expected SessionDetached, got {other:?}"),
     }
 
+    // The detach was the last attachment of a live PTY → the manager
+    // auto-closes the session and the handler emits a `SessionClosed`
+    // frame after the `SessionDetached`. See SPEC.md "detach / close
+    // semantics for this slice" — until a TTL/reaper exists, leaving
+    // a PTY running with zero attached clients is unsafe.
+    let resp = recv_server_msg(&mut socket).await;
+    match resp {
+        relayterm_protocol::ServerMsg::SessionClosed {
+            session_id: got_session,
+        } => {
+            assert_eq!(got_session, session_id);
+        }
+        other => panic!("expected SessionClosed after final detach, got {other:?}"),
+    }
+
     // The attachment row's detached_at is stamped.
     let attachments = PgTerminalSessionRepository::new(pool.clone())
         .list_attachments(session_id)
@@ -3682,8 +3965,8 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
     assert_eq!(attachments.len(), 1);
     assert!(attachments[0].detached_at.is_some());
 
-    // Detached event was written.
-    let events = PgSessionEventRepository::new(pool)
+    // Exactly one Detached event AND one Closed event were written.
+    let events = PgSessionEventRepository::new(pool.clone())
         .list_for_session(session_id)
         .await
         .unwrap();
@@ -3691,7 +3974,23 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
         .iter()
         .filter(|e| e.kind == SessionEventKind::Detached)
         .count();
-    assert_eq!(detached, 1);
+    let closed = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(detached, 1, "exactly one Detached event must be written");
+    assert_eq!(
+        closed, 1,
+        "explicit Detach of last live attachment must write exactly one Closed event",
+    );
+    // The session row itself is now Closed.
+    let row = PgTerminalSessionRepository::new(pool)
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
+    assert!(row.closed_at.is_some());
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -3782,7 +4081,7 @@ async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
         "socket drop must surface as detached_at on the attachment row",
     );
 
-    let events = PgSessionEventRepository::new(pool)
+    let events = PgSessionEventRepository::new(pool.clone())
         .list_for_session(session_id)
         .await
         .unwrap();
@@ -3793,5 +4092,689 @@ async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
     assert_eq!(
         detached, 1,
         "socket drop must append a single Detached event"
+    );
+    // Socket-drop on the last live-PTY attachment also auto-closes the
+    // session — cleanup tail's `detach_attachment` fires the close.
+    let closed = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "socket drop on the last live attachment must auto-close the session",
+    );
+    let row = PgTerminalSessionRepository::new(pool)
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
+    assert!(row.closed_at.is_some());
+}
+
+// ----------------------------------------------------------------------
+// Live SSH PTY bridge — integration with the FakePtyBridge
+// ----------------------------------------------------------------------
+
+/// Build the standard router with a [`FakePtyBridge`] of the caller's
+/// choosing wired into AppState.
+async fn setup_with_pty_bridge(pool: PgPool, bridge: Arc<FakePtyBridge>) -> (Router, UserId) {
+    setup_with_full_state(
+        pool,
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge as Arc<dyn SshPtyBridge>,
+    )
+    .await
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_starts_live_pty_when_trusted_and_auth_ready(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "live.example.com",
+        "SHA256:live-create",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id, "cols": 132, "rows": 50}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+
+    // Live response shape: status=active, pty_live=true, conservative wording.
+    assert_eq!(body["status"], "active");
+    assert_eq!(body["pty_live"], true);
+    let message = body["message"].as_str().unwrap().to_lowercase();
+    assert!(
+        message.contains("ssh pty started") && message.contains("replay"),
+        "live create message must announce pty + caveat replay, got: {message}",
+    );
+    for forbidden in ["pty startup is not implemented", "logged in", "shell ready"] {
+        assert!(
+            !message.contains(forbidden),
+            "create message must not contain `{forbidden}`: {message}",
+        );
+    }
+
+    // Body must NOT contain key material or PEM markers.
+    let raw = body.to_string();
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "owner_id",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "create body must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // Bridge was called once with the trusted pin and a non-empty PEM.
+    let records = bridge.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].cols, 132);
+    assert_eq!(records[0].rows, 50);
+    assert_eq!(records[0].accept_pin_count, 1);
+    assert!(
+        records[0].pem_len > 0,
+        "bridge must receive a non-empty PEM"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_with_unknown_host_key_blocks_before_bridge(pool: PgPool) {
+    // No trusted entry → API returns 409 BEFORE the bridge is called.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "untrusted2.example.com",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        bridge.call_count(),
+        0,
+        "bridge must not be called before host-key trust",
+    );
+    // No row was inserted.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_with_bridge_host_key_failure_returns_409(pool: PgPool) {
+    let bridge =
+        FakePtyBridge::with_outcome(FakePtyOutcome::Failure(FakePtyFailure::HostKeyNotTrusted));
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "race.example.com",
+        "SHA256:race",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("host_key"),
+        "host-key conflict must surface, got: {}",
+        body["error"]["message"]
+    );
+
+    // Row was created and then closed-with-reason for audit.
+    let row: (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT status, closed_at FROM terminal_sessions LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "closed");
+    assert!(row.1.is_some());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_with_bridge_auth_failure_returns_conflict(pool: PgPool) {
+    let bridge = FakePtyBridge::with_outcome(FakePtyOutcome::Failure(
+        FakePtyFailure::AuthenticationFailed,
+    ));
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "auth-fail.example.com",
+        "SHA256:auth-fail",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    let raw = body.to_string();
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "auth-fail body must not contain `{forbidden}`: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_with_bridge_transport_failure_returns_502(pool: PgPool) {
+    let bridge = FakePtyBridge::with_outcome(FakePtyOutcome::Failure(FakePtyFailure::Transport));
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "transport-fail.example.com",
+        "SHA256:transport-fail",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
+    // Vault disabled → 503 BEFORE the bridge is called.
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let bridge = FakePtyBridge::new();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: bridge.clone() as Arc<dyn SshPtyBridge>,
+        terminal_sessions,
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "vault-off.example.com",
+        "SHA256:vault-off",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        bridge.call_count(),
+        0,
+        "vault-disabled path must not reach the bridge",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_emits_session_attached_active_when_pty_live(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-active.example.com",
+        "SHA256:ws-active",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let msg = recv_server_msg(&mut socket).await;
+    match msg {
+        relayterm_protocol::ServerMsg::SessionAttached {
+            status, message, ..
+        } => {
+            assert_eq!(status, relayterm_protocol::SessionAttachStatus::Active);
+            let lower = message.to_lowercase();
+            assert!(
+                lower.contains("live") || lower.contains("ssh"),
+                "active attach message must indicate liveness, got: {message}",
+            );
+            assert!(
+                lower.contains("replay"),
+                "active attach must caveat replay, got: {message}",
+            );
+        }
+        other => panic!("expected SessionAttached, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_input_forwards_to_live_pty_without_echoing_payload(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-input.example.com",
+        "SHA256:ws-input",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
+
+    let sentinel = "REDACT-MARKER-INPUT-LIVE-7C";
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Input {
+            data: sentinel.to_owned(),
+        },
+    )
+    .await;
+
+    // Poll for the fake handle to record the input. There's no echo
+    // frame to wait on — the contract is "no reply on success".
+    let handle = {
+        let mut out = None;
+        for _ in 0..50 {
+            if let Some(h) = bridge.last_handle() {
+                if !h.input_log().is_empty() {
+                    out = Some(h);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        out.expect("input must reach the fake handle within budget")
+    };
+    let recorded = handle.input_log();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0], sentinel.as_bytes());
+
+    // Confirm no reflection of the input in any subsequent server frame.
+    // We don't expect any frame at all — assert the socket is quiet.
+    let timeout = tokio::time::timeout(std::time::Duration::from_millis(100), socket.next());
+    if let Ok(Some(Ok(frame))) = timeout.await {
+        let raw = format!("{frame:?}");
+        assert!(
+            !raw.contains(sentinel),
+            "no server frame may echo the input payload: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_output_from_pty_reaches_attached_client(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-output.example.com",
+        "SHA256:ws-output",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge
+        .last_handle()
+        .expect("create flow must produce a handle");
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
+
+    // Inject raw PTY bytes from the fake bridge — the orchestrator's
+    // forwarder fans them out to the broadcast, which the WS handler
+    // subscribes to.
+    let payload = b"\xfeNON-UTF8\x80hello".to_vec();
+    handle.inject_output(payload.clone()).await;
+
+    // The next server frame on the socket must be an Output frame whose
+    // base64 data round-trips to our injected bytes.
+    let msg = recv_server_msg(&mut socket).await;
+    match msg {
+        relayterm_protocol::ServerMsg::Output { seq, data } => {
+            let decoded = relayterm_protocol::output_data_decode(&data)
+                .expect("output data must be valid base64");
+            assert_eq!(decoded, payload);
+            assert!(seq.0 >= 1, "seq must be monotonic from 1");
+        }
+        other => panic!("expected Output, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_resize_forwards_to_live_pty(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-resize.example.com",
+        "SHA256:ws-resize",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
+
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Resize {
+            cols: 200,
+            rows: 60,
+        },
+    )
+    .await;
+
+    // Wait for the Ack frame, which proves the manager processed the
+    // resize. The fake handle records the call.
+    let msg = recv_server_msg(&mut socket).await;
+    match msg {
+        relayterm_protocol::ServerMsg::Ack {
+            kind: relayterm_protocol::AckKind::Resize,
+        } => {}
+        other => panic!("expected Ack(resize), got {other:?}"),
+    }
+    let resizes = handle.resize_log();
+    assert!(
+        resizes.contains(&(200, 60)),
+        "fake handle must record the (cols, rows) pair, got {resizes:?}",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Live SSH PTY bridge — final-detach auto-close lifecycle
+// ----------------------------------------------------------------------
+
+/// Drive a fresh WS attach against the supplied router and return the
+/// open socket. The first server frame (SessionAttached) is consumed.
+async fn open_ws_attached(
+    addr: SocketAddr,
+    session_id: relayterm_core::ids::TerminalSessionId,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
+    socket
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_explicit_close_remains_idempotent(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-close-idempotent.example.com",
+        "SHA256:ws-close-idempotent",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    // First WS: explicit Close.
+    let addr = spawn_app(app.clone()).await;
+    let mut s1 = open_ws_attached(addr, session_id).await;
+    send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Close).await;
+    let resp = recv_server_msg(&mut s1).await;
+    match resp {
+        relayterm_protocol::ServerMsg::SessionClosed { .. } => {}
+        other => panic!("expected SessionClosed, got {other:?}"),
+    }
+
+    // Second close via the HTTP route is idempotent: same shape, no new event.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{session_id}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["already_closed"], true);
+
+    let closed = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "double close must write exactly one Closed event"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_socket_drop_after_explicit_detach_does_not_duplicate_events(pool: PgPool) {
+    // Race: client sends `Detach`, the server emits SessionDetached +
+    // SessionClosed and closes the WS. The cleanup tail still runs (no
+    // explicit Close from the client). It MUST observe state.detached
+    // and skip — exactly one Detached event and one Closed event must
+    // be written even though `detach_attachment` could have fired twice.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-detach-race.example.com",
+        "SHA256:ws-detach-race",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws_attached(addr, session_id).await;
+    send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
+
+    // Drain the server frames and let the WS task finish its cleanup.
+    while (socket.next().await).is_some() {}
+
+    // Settle: the cleanup tail runs after the loop exits.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let events = PgSessionEventRepository::new(pool.clone())
+        .list_for_session(session_id)
+        .await
+        .unwrap();
+    let detached = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Detached)
+        .count();
+    let closed = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        detached, 1,
+        "Detach + cleanup-tail race must write exactly one Detached event",
+    );
+    assert_eq!(
+        closed, 1,
+        "Detach + cleanup-tail race must write exactly one Closed event",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_reattach_after_auto_close_returns_409(pool: PgPool) {
+    // After socket-drop auto-closes the live session, opening a new WS
+    // to the same id must fail with 409 (closed) — the row is gone for
+    // attach purposes. Demonstrates that the PTY didn't survive past
+    // the final detach.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-reattach.example.com",
+        "SHA256:ws-reattach",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws_attached(addr, session_id).await;
+    socket.close(None).await.unwrap();
+    drop(socket);
+
+    // Wait for the cleanup tail to run + auto-close to land in the DB.
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    for _ in 0..50 {
+        let row = repo.get(session_id).await.unwrap().unwrap();
+        if row.status == TerminalSessionStatus::Closed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let row = repo.get(session_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        TerminalSessionStatus::Closed,
+        "auto-close must land before the reattach probe",
+    );
+
+    // A reattach must surface 409 — the WS upgrade gate sees the closed row.
+    let (status, _body) = ws_handshake_status(addr, &session_id.to_string()).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "reattach to an auto-closed session must return 409",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_input_after_auto_close_does_not_reach_bridge(pool: PgPool) {
+    // After auto-close, the PTY runtime is gone. A fresh WS upgrade is
+    // refused (asserted in the previous test), so the only surface that
+    // could reach the bridge is the in-flight WebSocket — but the
+    // server initiates a clean close after sending SessionClosed, so
+    // there's no second channel to send input through. We assert that
+    // the FakePtyBridge's last handle has no input recorded after the
+    // auto-close has settled.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-input-after.example.com",
+        "SHA256:ws-input-after",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().expect("create produced a handle");
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws_attached(addr, session_id).await;
+    send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
+    while (socket.next().await).is_some() {}
+
+    // Confirm the row auto-closed.
+    for _ in 0..50 {
+        let row = PgTerminalSessionRepository::new(pool.clone())
+            .get(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.status == TerminalSessionStatus::Closed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        handle.input_log().is_empty(),
+        "no input bytes should reach the bridge after final detach + auto-close",
     );
 }

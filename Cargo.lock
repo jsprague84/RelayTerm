@@ -1919,6 +1919,7 @@ dependencies = [
 name = "relayterm-protocol"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "relayterm-core",
  "serde",
  "serde_json",

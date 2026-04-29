@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  decodeOutputData,
   decodeServerMsg,
   encodeClientMsg,
+  encodeOutputData,
   type ClientMsg,
   type ServerMsg,
 } from "../src/index.js";
@@ -56,8 +58,17 @@ describe("decodeServerMsg", () => {
       status: "attached_stub",
       message: "attached to placeholder",
     },
+    {
+      type: "session_attached",
+      session_id: "00000000-0000-0000-0000-000000000001",
+      attachment_id: "00000000-0000-0000-0000-000000000002",
+      status: "active",
+      message: "attached live",
+    },
     { type: "ack", kind: "resize" },
     { type: "output", seq: 17, data: "hello" },
+    { type: "error", code: "pty_not_live", message: "no live pty" },
+    { type: "error", code: "ssh_start_failed", message: "ssh pty error" },
     { type: "replay_window_lost" },
     {
       type: "session_detached",
@@ -141,5 +152,25 @@ describe("decodeServerMsg", () => {
     if (!result.ok) {
       expect(JSON.stringify(result.failure)).not.toContain(sentinel);
     }
+  });
+});
+
+describe("output data codec", () => {
+  it("round-trips arbitrary bytes including high-bit values", () => {
+    // Mirror of the Rust-side test: every byte from 0x00..=0xFF must
+    // survive the base64 encode/decode pair losslessly. A naive utf-8
+    // wrap would mangle high-bit bytes.
+    const raw = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) raw[i] = i;
+    const decoded = decodeOutputData(encodeOutputData(raw));
+    expect(decoded).toEqual(raw);
+  });
+
+  it("decodes a known fixture matching the Rust encoder", () => {
+    // 'hello world' base64 → 'aGVsbG8gd29ybGQ='. The fixture is the
+    // contract: any deviation is a protocol-level break.
+    const decoded = decodeOutputData("aGVsbG8gd29ybGQ=");
+    const expected = new TextEncoder().encode("hello world");
+    expect(decoded).toEqual(expected);
   });
 });

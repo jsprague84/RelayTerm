@@ -34,8 +34,10 @@ export {
   type SessionClosedMsg,
   type SessionDetachedMsg,
   type SessionId,
+  decodeOutputData,
   decodeServerMsg,
   encodeClientMsg,
+  encodeOutputData,
 } from "./protocol.js";
 
 export { type Listener, type Unsubscribe } from "./events.js";

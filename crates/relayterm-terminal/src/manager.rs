@@ -1,7 +1,10 @@
 //! `TerminalSessionManager` and supporting types.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use chrono::{DateTime, Utc};
 use relayterm_core::ids::{
@@ -15,6 +18,9 @@ use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::terminal_session::{
     TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
+use relayterm_ssh::{ClosedReason, SshPtyError, SshPtyEvent, SshPtyHandle, SshPtyStart};
+use tokio::sync::broadcast;
+use tracing::warn;
 
 /// Bounds for `cols`/`rows` requested at session creation. Mirrored by the
 /// `terminal_sessions_cols_chk` / `_rows_chk` migration so the API rejects
@@ -28,39 +34,70 @@ const MAX_DIM: u16 = 4096;
 /// Pinned in tests so a future helpful rewording is forced through review.
 /// MUST disclaim PTY readiness explicitly: a green response from
 /// `POST /terminal-sessions` does NOT mean an SSH channel was opened or a
-/// shell can be reached.
+/// shell can be reached. This is the legacy "metadata-only" path used by
+/// callers that don't want a live PTY immediately; today the API routes
+/// always start a PTY on create and use [`LIVE_PTY_CREATE_MESSAGE`].
 pub const STUB_PTY_NOT_IMPLEMENTED_MESSAGE: &str =
     "session metadata created; PTY startup is not implemented yet";
 
 /// Wire-stable message returned alongside a freshly opened WebSocket
-/// attachment.
+/// attachment WHEN the session is metadata-only (no live PTY).
 ///
 /// Pinned in tests so a future helpful rewording is forced through review.
-/// MUST disclaim PTY/streaming readiness explicitly: a `session_attached`
-/// frame does NOT mean an SSH shell exists or that terminal bytes will
-/// flow yet. Mirrors the "stub" message returned by the create route.
+/// MUST disclaim PTY/streaming readiness explicitly.
 pub const STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE: &str =
     "attached to RelayTerm session placeholder; PTY streaming is not implemented yet";
+
+/// Wire-stable message returned alongside a freshly created session that
+/// has a LIVE PTY backing it.
+///
+/// Pinned in tests so a future helpful rewording is forced through review.
+/// MUST be conservative: a green create response means SSH transport,
+/// host-key trust, public-key auth, and PTY allocation succeeded — it
+/// does NOT promise replay/resume across reconnects.
+pub const LIVE_PTY_CREATE_MESSAGE: &str =
+    "ssh pty started; replay across reconnects is not yet implemented";
+
+/// Wire-stable message returned alongside a freshly opened WebSocket
+/// attachment WHEN a live PTY is streaming.
+///
+/// Pinned in tests so a future helpful rewording is forced through review.
+/// MUST be conservative: byte streaming is live, but replay across
+/// reconnects is future work.
+pub const LIVE_PTY_ATTACH_MESSAGE: &str =
+    "attached to live RelayTerm session; replay across reconnects is not yet implemented";
+
+/// Capacity of the per-session broadcast that fans PTY output to all
+/// active attachments. Bounded — a slow attachment that lags by more
+/// than this many `Output` frames is silently dropped (`broadcast::Lagged`)
+/// rather than blocking the SSH driver. The renderer that lagged sees
+/// missing bytes; the future replay slice will close the gap.
+const ATTACHMENT_FANOUT_CAPACITY: usize = 256;
 
 /// In-memory status for a runtime registry entry.
 ///
 /// Distinct from [`TerminalSessionStatus`] (the persisted enum) so the
-/// runtime can carry states that are meaningless at rest — e.g. a future
-/// `Spawning` while `russh::Channel::request_pty` is in flight. For the
-/// PTY-less placeholder slice the registry only ever holds `Starting`;
-/// `close_session` removes the entry rather than transitioning to a
-/// `Closed` runtime state.
+/// runtime can carry states that are meaningless at rest. `close_session`
+/// removes the entry rather than transitioning to a `Closed` runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeSessionStatus {
     /// Placeholder created at metadata-write time. No PTY yet.
     Starting,
+    /// Live PTY is allocated and bytes are streaming. Input writes,
+    /// resize requests, and `Output` events all flow through the
+    /// underlying [`SshPtyHandle`].
+    Live,
+    /// PTY tore down (remote shell exited, transport error, or local
+    /// close). The runtime entry is kept transiently so attached
+    /// WebSocket tasks can observe the final state before the manager
+    /// drops it during `close_session`.
+    Ended,
 }
 
 /// In-memory runtime entry for a terminal session.
 ///
-/// Holds NO `russh::Channel`, NO PTY descriptor, NO replay ring buffer.
-/// Those land in later slices. Today it's a marker that lets us exercise
-/// the lifecycle surface end-to-end without SSH.
+/// Public fields surface the metadata-shaped view; the live PTY handle
+/// and broadcast fanout are kept opaque (see [`LiveRuntimeView`]).
 #[derive(Debug, Clone)]
 pub struct TerminalSessionRuntime {
     pub id: TerminalSessionId,
@@ -70,6 +107,97 @@ pub struct TerminalSessionRuntime {
     pub created_at: DateTime<Utc>,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// Internal entry held in the runtime registry. Carries the public
+/// snapshot plus, when live, the SSH PTY handle and the broadcast
+/// channel attachments subscribe to. Internal: never crosses the API
+/// boundary directly.
+struct RuntimeEntry {
+    snapshot: TerminalSessionRuntime,
+    live: Option<LiveRuntime>,
+    /// Monotonic per-session output sequence counter. Carried in the
+    /// runtime so it survives PTY teardown; closed/recreated sessions
+    /// get a fresh counter via the new entry.
+    next_seq: Arc<AtomicU64>,
+}
+
+/// Live PTY surface for one terminal session. Held by the manager and
+/// shared with attachments so they can subscribe to the broadcast
+/// without touching the SSH layer directly.
+struct LiveRuntime {
+    /// Handle to the running PTY bridge. Cheap to share across handlers
+    /// (`Arc`); [`SshPtyHandle`] methods are `&self`.
+    handle: Arc<dyn SshPtyHandle>,
+    /// Broadcast surface attachments subscribe to. New subscribers see
+    /// only NEW frames — there is no replay buffer yet.
+    output_tx: broadcast::Sender<OutputFrame>,
+    /// Forwarder task handle. Tied to the lifetime of the runtime entry
+    /// so the manager can detach it cleanly on close. Never awaited
+    /// from a request handler — the task will exit when the bridge's
+    /// `output_rx` returns `None` (transport tore down) or when the
+    /// handle's `close()` is called.
+    forwarder: tokio::task::JoinHandle<()>,
+    /// Bridge's own driver task (russh impl: the channel multiplexer;
+    /// fakes: `None`). Stored so the manager can `abort()` it on close
+    /// rather than relying solely on the channel-closure teardown path.
+    /// AGENTS.md prohibits `tokio::spawn`-and-forget for long-lived
+    /// tasks; this field is the orchestrator-side tracker.
+    driver: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for LiveRuntime {
+    fn drop(&mut self) {
+        // Best-effort: abort the spawned tasks so a lingering registry
+        // drop doesn't leave them running. The driver task in russh_pty
+        // would also tear down on its own when the handle's senders
+        // drop, but `abort()` is the explicit "stop now" signal.
+        self.forwarder.abort();
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+        }
+    }
+}
+
+/// Per-output broadcast frame: the raw PTY bytes plus the monotonic
+/// sequence number stamped at fanout time. Subscribers project this
+/// into a [`relayterm_protocol::ServerMsg::Output`].
+///
+/// The `Debug` impl is manual and redacts `data` to a length-only
+/// summary so a stray `?frame` in a `tracing` macro can never leak raw
+/// terminal output. AGENTS.md / SPEC.md: PTY output bytes MUST NEVER
+/// appear in logs at any level.
+#[derive(Clone)]
+pub struct OutputFrame {
+    pub seq: u64,
+    pub data: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for OutputFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputFrame")
+            .field("seq", &self.seq)
+            .field("len", &self.data.len())
+            .field("data", &"<redacted pty output>")
+            .finish()
+    }
+}
+
+/// Read-only handle handed to attachment tasks so they can subscribe
+/// to the live output broadcast without holding the manager's lock.
+#[derive(Clone)]
+pub struct LiveRuntimeView {
+    pub handle: Arc<dyn SshPtyHandle>,
+    pub output_tx: broadcast::Sender<OutputFrame>,
+}
+
+impl std::fmt::Debug for LiveRuntimeView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveRuntimeView")
+            .field("handle", &"<dyn SshPtyHandle>")
+            .field("output_tx", &"<broadcast::Sender<OutputFrame>>")
+            .finish()
+    }
 }
 
 /// In-memory runtime entry for a single live WebSocket attachment.
@@ -104,6 +232,11 @@ pub struct CreateTerminalSessionRequest {
 pub struct CreateTerminalSessionOutcome {
     pub session: TerminalSession,
     pub message: &'static str,
+    /// `true` once the manager has bound a live PTY runtime to the
+    /// session (i.e. SSH transport, host-key trust, public-key auth,
+    /// PTY/shell allocation all succeeded). When `false`, the row was
+    /// written but no PTY exists — typically only the legacy stub path.
+    pub pty_live: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +265,10 @@ pub struct AttachSessionOutcome {
     pub session: TerminalSession,
     pub attachment: TerminalSessionAttachment,
     pub message: &'static str,
+    /// `Some` if a live PTY is bound to this session — the WebSocket
+    /// task subscribes to `output_tx` for fanout and routes input
+    /// through `handle`. `None` for stub/closed sessions.
+    pub live: Option<LiveRuntimeView>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +279,26 @@ pub struct DetachSessionOutcome {
     /// Lets the WS handler avoid double-emitting `SessionDetached` frames
     /// when both the client `Detach` message and the socket close path race.
     pub already_detached: bool,
+}
+
+/// Combined outcome for the [`TerminalSessionManager::detach_attachment`]
+/// helper. Carries the regular detach result plus, when the manager
+/// auto-closed the session because this was the last attachment of a
+/// live PTY, the close outcome.
+///
+/// Auto-close policy (this slice): until a TTL/reaper exists, leaving a
+/// live SSH PTY running with zero attachments is unsafe — see SPEC.md.
+/// The manager closes the session in that case so PTY/forwarder/driver
+/// teardown happens deterministically.
+#[derive(Debug, Clone)]
+pub struct DetachOutcome {
+    pub detach: DetachSessionOutcome,
+    /// `Some(close_outcome)` if the manager closed the session because
+    /// this detach left a live PTY with zero attachments. `None` when
+    /// the session had no live PTY, when other attachments remain, or
+    /// when this detach was already-idempotent (the close had already
+    /// happened or there was nothing live to close).
+    pub also_closed: Option<CloseTerminalSessionOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +334,20 @@ pub enum TerminalSessionManagerError {
     #[error("terminal session is closed")]
     SessionClosed,
 
+    /// Caller wrote input or asked for a resize on a session whose live
+    /// PTY runtime is not present (startup failed, PTY tore down, or
+    /// the session never had a PTY). Distinct from `SessionClosed` —
+    /// the row may still be `starting` while the PTY is gone.
+    #[error("terminal session has no live pty")]
+    PtyNotLive,
+
+    /// Live PTY startup failed (SSH transport / auth / pty alloc /
+    /// shell start). Carries the bridge's typed error so the API can
+    /// map it to a stable wire status. The bridge layer handles
+    /// secret redaction; this variant is the boundary.
+    #[error("ssh pty start failed: {0}")]
+    PtyStart(#[from] SshPtyError),
+
     /// Underlying repository failure. Map at the API boundary —
     /// `RepositoryError::Database` collapses to a 500 with the static
     /// `internal error` message.
@@ -189,7 +360,7 @@ pub enum TerminalSessionManagerError {
 pub struct TerminalSessionManager {
     sessions: Arc<dyn TerminalSessionRepository>,
     events: Arc<dyn SessionEventRepository>,
-    runtimes: RwLock<HashMap<TerminalSessionId, TerminalSessionRuntime>>,
+    runtimes: RwLock<HashMap<TerminalSessionId, RuntimeEntry>>,
     /// Live attachments keyed by attachment id. A single session may have
     /// multiple entries here (the future "two clients viewing one shell"
     /// shape) — today the WS handler enforces one at a time, but the
@@ -214,10 +385,11 @@ impl TerminalSessionManager {
     /// Create a metadata row in `Starting` status, append the `created`
     /// session event, and register an in-memory runtime placeholder.
     ///
-    /// This call does NOT open an SSH channel, allocate a PTY, or stream
-    /// any terminal data. The returned [`CreateTerminalSessionOutcome`]
-    /// carries the static `STUB_PTY_NOT_IMPLEMENTED_MESSAGE` to make the
-    /// stub nature explicit on the wire.
+    /// This call does NOT open an SSH channel — the PTY is bound in a
+    /// follow-up [`Self::start_live_pty`] call. The two-step shape lets
+    /// the API route apply preconditions (host-key trust, vault decrypt,
+    /// dim validation) between the row write and the PTY start without
+    /// the manager owning that orchestration.
     pub async fn create_session(
         &self,
         req: CreateTerminalSessionRequest,
@@ -252,24 +424,206 @@ impl TerminalSessionManager {
             })
             .await?;
 
-        let runtime = TerminalSessionRuntime {
-            id: session.id,
-            owner_id: session.owner_id,
-            server_profile_id: session.server_profile_id,
-            status: RuntimeSessionStatus::Starting,
-            created_at: session.created_at,
-            cols: session.cols,
-            rows: session.rows,
+        let entry = RuntimeEntry {
+            snapshot: TerminalSessionRuntime {
+                id: session.id,
+                owner_id: session.owner_id,
+                server_profile_id: session.server_profile_id,
+                status: RuntimeSessionStatus::Starting,
+                created_at: session.created_at,
+                cols: session.cols,
+                rows: session.rows,
+            },
+            live: None,
+            next_seq: Arc::new(AtomicU64::new(1)),
         };
         self.runtimes
             .write()
             .expect("runtime registry lock poisoned")
-            .insert(session.id, runtime);
+            .insert(session.id, entry);
 
         Ok(CreateTerminalSessionOutcome {
             session,
             message: STUB_PTY_NOT_IMPLEMENTED_MESSAGE,
+            pty_live: false,
         })
+    }
+
+    /// Bind a live SSH PTY runtime to an existing session.
+    ///
+    /// On success the session row transitions to `Active`, the runtime
+    /// entry stores the [`SshPtyHandle`] + broadcast surface, and a
+    /// forwarder task drains the bridge's `output_rx` into the broadcast
+    /// (stamping a monotonic `seq`). On PTY exit the forwarder appends
+    /// a `Closed` lifecycle event and transitions the session row to
+    /// `Closed`.
+    ///
+    /// On failure the session row is transitioned to `Closed` with a
+    /// `closed` event payload that names the failure category — the
+    /// orphan-row pattern from the metadata-only slice still applies.
+    pub async fn start_live_pty(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+        start: SshPtyStart,
+    ) -> Result<TerminalSession, TerminalSessionManagerError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .await?
+            .filter(|s| s.owner_id == owner_id)
+            .ok_or(TerminalSessionManagerError::NotFound)?;
+        if session.status == TerminalSessionStatus::Closed {
+            return Err(TerminalSessionManagerError::SessionClosed);
+        }
+
+        // Promote the runtime entry to Live and spawn the forwarder.
+        let SshPtyStart {
+            handle,
+            output_rx,
+            driver,
+        } = start;
+        let handle: Arc<dyn SshPtyHandle> = Arc::from(handle);
+        let (output_tx, _) = broadcast::channel::<OutputFrame>(ATTACHMENT_FANOUT_CAPACITY);
+
+        let next_seq = {
+            let runtimes = self
+                .runtimes
+                .read()
+                .expect("runtime registry lock poisoned");
+            runtimes
+                .get(&session_id)
+                .map(|e| e.next_seq.clone())
+                .ok_or(TerminalSessionManagerError::NotFound)?
+        };
+
+        let sessions_repo = self.sessions.clone();
+        let events_repo = self.events.clone();
+        let output_tx_for_task = output_tx.clone();
+        let next_seq_for_task = next_seq.clone();
+        let forwarder_session_id = session_id;
+        let forwarder_owner_id = owner_id;
+        let forwarder = tokio::spawn(forward_pty_output(
+            output_rx,
+            output_tx_for_task,
+            next_seq_for_task,
+            sessions_repo,
+            events_repo,
+            forwarder_session_id,
+            forwarder_owner_id,
+        ));
+
+        // Mark the persisted row Active. `closed_at` stays NULL on the
+        // row; only the close path stamps it.
+        self.sessions
+            .set_status(session_id, TerminalSessionStatus::Active, None)
+            .await?;
+        // Re-fetch so the response carries the row the database stamped.
+        // Re-filter on owner_id for defense-in-depth.
+        let updated = self
+            .sessions
+            .get(session_id)
+            .await?
+            .filter(|s| s.owner_id == owner_id)
+            .ok_or(TerminalSessionManagerError::NotFound)?;
+
+        // Promote the registry entry. If the entry vanished between the
+        // initial check and now (concurrent close), tear the bridge
+        // down so we don't leak an orphan task. The guard is released
+        // BEFORE any await so the compiler can prove the future is
+        // `Send`.
+        //
+        // The pattern: build the LiveRuntime up-front, hand it to the
+        // registry under a write lock, and only on the failure path
+        // does the local own it again. Dropping the un-installed
+        // LiveRuntime fires its `Drop` impl, which aborts the forwarder
+        // and the bridge driver — no orphan tasks even on the race.
+        let candidate = LiveRuntime {
+            handle: handle.clone(),
+            output_tx,
+            forwarder,
+            driver,
+        };
+        let leftover = {
+            let mut runtimes = self
+                .runtimes
+                .write()
+                .expect("runtime registry lock poisoned");
+            if let Some(entry) = runtimes.get_mut(&session_id) {
+                entry.snapshot.status = RuntimeSessionStatus::Live;
+                entry.live = Some(candidate);
+                None
+            } else {
+                Some(candidate)
+            }
+        };
+        if let Some(leftover) = leftover {
+            // Drop the un-installed runtime first so the abort fires
+            // before we await on `close()`. This avoids leaving the
+            // tasks running while the SSH transport tears down.
+            drop(leftover);
+            handle.close().await;
+            return Err(TerminalSessionManagerError::NotFound);
+        }
+        Ok(updated)
+    }
+
+    /// Mark the live PTY runtime as torn down without removing the
+    /// metadata row. Idempotent. Used by the API layer when SSH startup
+    /// fails partway through `start_live_pty`'s side-effects so the
+    /// session row can still be returned to the operator.
+    pub async fn record_pty_start_failed(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+        category: &'static str,
+    ) -> Result<(), TerminalSessionManagerError> {
+        // Drop any partial live-runtime entry; the bridge is gone.
+        if let Some(entry) = self
+            .runtimes
+            .write()
+            .expect("runtime registry lock poisoned")
+            .get_mut(&session_id)
+        {
+            entry.live = None;
+            entry.snapshot.status = RuntimeSessionStatus::Ended;
+        }
+
+        let session = self
+            .sessions
+            .get(session_id)
+            .await?
+            .filter(|s| s.owner_id == owner_id)
+            .ok_or(TerminalSessionManagerError::NotFound)?;
+        if session.status == TerminalSessionStatus::Closed {
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        self.sessions
+            .set_status(session_id, TerminalSessionStatus::Closed, Some(now))
+            .await?;
+        let _ = self
+            .events
+            .create(CreateSessionEvent {
+                session_id,
+                kind: SessionEventKind::Closed,
+                payload: serde_json::json!({
+                    "reason": "ssh_start_failed",
+                    "category": category,
+                }),
+            })
+            .await;
+        // Drop attachments, runtime entry — same shape as close.
+        self.attachments
+            .write()
+            .expect("attachment registry lock poisoned")
+            .retain(|_, a| a.session_id != session_id);
+        self.runtimes
+            .write()
+            .expect("runtime registry lock poisoned")
+            .remove(&session_id);
+        Ok(())
     }
 
     /// Mark a session closed.
@@ -296,10 +650,16 @@ impl TerminalSessionManager {
 
         if session.status == TerminalSessionStatus::Closed {
             // Drop any stale runtime entry that survived a partial close.
-            self.runtimes
+            // Use take() so the live runtime's drop runs OUTSIDE the
+            // lock — the forwarder abort might otherwise contend.
+            let stale = self
+                .runtimes
                 .write()
                 .expect("runtime registry lock poisoned")
                 .remove(&id);
+            if let Some(stale) = stale {
+                self.shutdown_runtime(stale).await;
+            }
             return Ok(CloseTerminalSessionOutcome {
                 session,
                 already_closed: true,
@@ -332,10 +692,14 @@ impl TerminalSessionManager {
             .filter(|s| s.owner_id == owner_id)
             .ok_or(TerminalSessionManagerError::NotFound)?;
 
-        self.runtimes
+        let removed = self
+            .runtimes
             .write()
             .expect("runtime registry lock poisoned")
             .remove(&id);
+        if let Some(entry) = removed {
+            self.shutdown_runtime(entry).await;
+        }
         // Drop any live attachments belonging to this session. The DB
         // rows still exist; they just won't be addressable through the
         // registry. The WS handler's own task will observe its socket
@@ -351,6 +715,21 @@ impl TerminalSessionManager {
         })
     }
 
+    /// Tear down a runtime entry's live PTY (if any) without holding
+    /// any registry lock. Best-effort.
+    async fn shutdown_runtime(&self, entry: RuntimeEntry) {
+        if let Some(live) = entry.live {
+            // Notify the bridge handle so the SSH session is torn down
+            // promptly; the forwarder task observes the resulting
+            // `Closed` event and exits.
+            live.handle.close().await;
+            // The forwarder will exit when the bridge's output_rx
+            // drains. We DO NOT await it here — that would tie the
+            // close response to remote SSH teardown latency.
+            let _ = live;
+        }
+    }
+
     /// Attach a client to an existing terminal session.
     ///
     /// Writes a `terminal_session_attachments` row, registers the in-memory
@@ -362,10 +741,10 @@ impl TerminalSessionManager {
     /// [`TerminalSessionManagerError::SessionClosed`] so the API can map
     /// it to a stable 409 — the row exists but is unusable.
     ///
-    /// PTY allocation, byte streaming, and replay-buffer fast-forward are
-    /// all NOT implemented in this slice. The caller is responsible for
-    /// surfacing the stub-attach scope to the WS client (see
-    /// [`STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE`]).
+    /// Returns whichever attach surface (live or stub) matches the
+    /// session's current runtime state. The caller is the WebSocket
+    /// route, which uses the returned `live` view (if any) to subscribe
+    /// to the broadcast and route input through the SSH handle.
     pub async fn attach_session(
         &self,
         req: AttachSessionRequest,
@@ -394,6 +773,8 @@ impl TerminalSessionManager {
         // the API returns 5xx instead of leaving an attachment row that
         // never made it into the audit log. The orphan row is sweep-able
         // via close (same shape as the create-time partial-success case).
+        let live_view = self.runtime_view(session.id);
+        let live_for_event = live_view.is_some();
         self.events
             .create(CreateSessionEvent {
                 session_id: session.id,
@@ -402,7 +783,8 @@ impl TerminalSessionManager {
                     "attachment_id": attachment.id,
                     "client_info": req.client_info,
                     "remote_addr": req.remote_addr,
-                    "stub": true,
+                    "stub": !live_for_event,
+                    "live": live_for_event,
                 }),
             })
             .await?;
@@ -420,11 +802,108 @@ impl TerminalSessionManager {
             .expect("attachment registry lock poisoned")
             .insert(attachment.id, runtime);
 
+        let message = if live_view.is_some() {
+            LIVE_PTY_ATTACH_MESSAGE
+        } else {
+            STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE
+        };
+
         Ok(AttachSessionOutcome {
             session,
             attachment,
-            message: STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
+            message,
+            live: live_view,
         })
+    }
+
+    /// Forward an input byte buffer to the live PTY. Returns
+    /// [`TerminalSessionManagerError::PtyNotLive`] if no live runtime is
+    /// bound (startup failed, PTY exited, session closed, etc.).
+    /// Ownership-gated: foreign-owner ids collapse to `NotFound`.
+    pub async fn write_pty_input(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    ) -> Result<(), TerminalSessionManagerError> {
+        let handle = self.live_handle_for(owner_id, session_id)?;
+        match handle.write_input(bytes).await {
+            Ok(()) => Ok(()),
+            Err(SshPtyError::BridgeClosed) => Err(TerminalSessionManagerError::PtyNotLive),
+            Err(e) => Err(TerminalSessionManagerError::PtyStart(e)),
+        }
+    }
+
+    /// Apply a window-size change to the live PTY in addition to the
+    /// metadata-only [`Self::resize_session`] path. Use this from the
+    /// WS resize handler so both the runtime hint AND the remote PTY
+    /// stay in sync. Returns `Ok(false)` if no live runtime is bound
+    /// (the metadata-only resize still happened).
+    pub async fn apply_pty_resize(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<bool, TerminalSessionManagerError> {
+        let Some(handle) = self.maybe_live_handle_for(owner_id, session_id)? else {
+            return Ok(false);
+        };
+        match handle.resize(cols, rows).await {
+            Ok(()) => Ok(true),
+            Err(SshPtyError::BridgeClosed) => Ok(false),
+            Err(e) => Err(TerminalSessionManagerError::PtyStart(e)),
+        }
+    }
+
+    fn live_handle_for(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+    ) -> Result<Arc<dyn SshPtyHandle>, TerminalSessionManagerError> {
+        let runtimes = self
+            .runtimes
+            .read()
+            .expect("runtime registry lock poisoned");
+        let entry = runtimes
+            .get(&session_id)
+            .filter(|e| e.snapshot.owner_id == owner_id)
+            .ok_or(TerminalSessionManagerError::NotFound)?;
+        let live = entry
+            .live
+            .as_ref()
+            .ok_or(TerminalSessionManagerError::PtyNotLive)?;
+        Ok(live.handle.clone())
+    }
+
+    fn maybe_live_handle_for(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+    ) -> Result<Option<Arc<dyn SshPtyHandle>>, TerminalSessionManagerError> {
+        let runtimes = self
+            .runtimes
+            .read()
+            .expect("runtime registry lock poisoned");
+        let entry = runtimes
+            .get(&session_id)
+            .filter(|e| e.snapshot.owner_id == owner_id)
+            .ok_or(TerminalSessionManagerError::NotFound)?;
+        Ok(entry.live.as_ref().map(|l| l.handle.clone()))
+    }
+
+    fn runtime_view(&self, session_id: TerminalSessionId) -> Option<LiveRuntimeView> {
+        let runtimes = self
+            .runtimes
+            .read()
+            .expect("runtime registry lock poisoned");
+        runtimes
+            .get(&session_id)
+            .and_then(|e| e.live.as_ref())
+            .map(|l| LiveRuntimeView {
+                handle: l.handle.clone(),
+                output_tx: l.output_tx.clone(),
+            })
     }
 
     /// Mark an attachment detached.
@@ -506,6 +985,89 @@ impl TerminalSessionManager {
         })
     }
 
+    /// Detach a single attachment AND, if this leaves a live PTY with
+    /// zero attached clients, close the session.
+    ///
+    /// This is the lifecycle helper the WebSocket route uses on every
+    /// detach path (explicit `Detach` frame, socket-drop cleanup tail).
+    /// Until a TTL/reaper for detached live sessions exists, leaving a
+    /// PTY running with no clients is unsafe — see SPEC.md "detach /
+    /// close semantics for this slice."
+    ///
+    /// Behaviour:
+    /// * `detach_session` runs first and is idempotent against the
+    ///   attachment row.
+    /// * If the call observed `already_detached == true`, the manager
+    ///   does NOT auto-close — that path runs every time the WS
+    ///   handler's cleanup tail fires after an explicit detach, and
+    ///   re-closing the session is what causes duplicate `Closed`
+    ///   events.
+    /// * If the session does not have a live PTY (stub session, or PTY
+    ///   already torn down by the forwarder), the manager does NOT
+    ///   auto-close.
+    /// * If other attachments are still live for this session, the
+    ///   manager does NOT auto-close.
+    /// * Otherwise: close the session (which writes the `Closed` event
+    ///   and aborts the forwarder + bridge driver via `LiveRuntime`'s
+    ///   Drop). `close_session` is itself idempotent, so a race that
+    ///   double-fires this helper still results in exactly one `Closed`
+    ///   event.
+    pub async fn detach_attachment(
+        &self,
+        owner_id: UserId,
+        session_id: TerminalSessionId,
+        attachment_id: TerminalSessionAttachmentId,
+        last_seen_seq: Option<i64>,
+    ) -> Result<DetachOutcome, TerminalSessionManagerError> {
+        let detach = self
+            .detach_session(owner_id, session_id, attachment_id, last_seen_seq)
+            .await?;
+
+        // Decide whether the auto-close should fire. The decision is
+        // made under read locks then released BEFORE the close await so
+        // the future stays Send.
+        let should_auto_close = if detach.already_detached {
+            false
+        } else {
+            let any_remaining_attachment = self
+                .attachments
+                .read()
+                .expect("attachment registry lock poisoned")
+                .values()
+                .any(|a| a.session_id == session_id);
+            let session_has_live_pty = self
+                .runtimes
+                .read()
+                .expect("runtime registry lock poisoned")
+                .get(&session_id)
+                .and_then(|e| e.live.as_ref())
+                .is_some();
+            !any_remaining_attachment && session_has_live_pty
+        };
+
+        let also_closed = if should_auto_close {
+            match self.close_session(session_id, owner_id).await {
+                Ok(out) if !out.already_closed => Some(out),
+                Ok(_) => None,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        %session_id,
+                        "failed to auto-close live session on final detach"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(DetachOutcome {
+            detach,
+            also_closed,
+        })
+    }
+
     /// Update the runtime PTY dimensions for a session and append a
     /// `resized` event. Validates dims against the same `1..=4096`
     /// envelope the create route enforces. Does NOT update the
@@ -542,9 +1104,9 @@ impl TerminalSessionManager {
                 .runtimes
                 .write()
                 .expect("runtime registry lock poisoned");
-            if let Some(runtime) = guard.get_mut(&session.id) {
-                runtime.cols = cols;
-                runtime.rows = rows;
+            if let Some(entry) = guard.get_mut(&session.id) {
+                entry.snapshot.cols = cols;
+                entry.snapshot.rows = rows;
             }
         }
 
@@ -587,7 +1149,7 @@ impl TerminalSessionManager {
             .len()
     }
 
-    /// Read the current runtime entry, if any. Returns a snapshot — the
+    /// Read the current runtime snapshot, if any. Returns a clone — the
     /// caller is free to drop the result without holding the lock.
     ///
     /// Absence does NOT mean the session is gone: a metadata row can
@@ -599,7 +1161,15 @@ impl TerminalSessionManager {
             .read()
             .expect("runtime registry lock poisoned")
             .get(&id)
-            .cloned()
+            .map(|e| e.snapshot.clone())
+    }
+
+    /// Live PTY runtime view for an active session, if a PTY is bound.
+    /// Returns `None` for sessions without a live PTY (stub or after
+    /// teardown).
+    #[must_use]
+    pub fn live(&self, id: TerminalSessionId) -> Option<LiveRuntimeView> {
+        self.runtime_view(id)
     }
 
     /// Number of live runtime entries. Test-only convenience; production
@@ -610,6 +1180,94 @@ impl TerminalSessionManager {
             .read()
             .expect("runtime registry lock poisoned")
             .len()
+    }
+}
+
+/// Drain a bridge's `output_rx`, stamp monotonic sequence numbers, and
+/// fan out to attachments via the per-session broadcast. Exits when
+/// `output_rx.recv()` returns `None` (bridge tore down) or when the
+/// broadcast `output_tx` has no remaining subscribers AND the bridge
+/// has emitted `Closed` — the latter signals end of stream.
+///
+/// On exit, transitions the session row to `Closed` (idempotent) and
+/// appends a `closed` lifecycle event with the bridge's reason. The
+/// runtime entry is NOT removed here — close_session handles that to
+/// keep registry mutation centralised.
+async fn forward_pty_output(
+    mut output_rx: tokio::sync::mpsc::Receiver<SshPtyEvent>,
+    output_tx: broadcast::Sender<OutputFrame>,
+    next_seq: Arc<AtomicU64>,
+    sessions: Arc<dyn TerminalSessionRepository>,
+    events: Arc<dyn SessionEventRepository>,
+    session_id: TerminalSessionId,
+    owner_id: UserId,
+) {
+    let mut closed_reason: Option<ClosedReason> = None;
+
+    while let Some(evt) = output_rx.recv().await {
+        match evt {
+            SshPtyEvent::Output(bytes) => {
+                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                // `send` returns the number of subscribers reached; we
+                // ignore — broadcast::Sender has no failure mode short
+                // of "no subscribers", which is fine.
+                let _ = output_tx.send(OutputFrame {
+                    seq,
+                    data: Arc::from(bytes.into_boxed_slice()),
+                });
+            }
+            SshPtyEvent::Exit { status: _ } => {
+                // Recorded operator-side via tracing only. The wire signal
+                // for the renderer is the upcoming Closed event.
+                // ExitStatus is informational; do NOT log raw output.
+            }
+            SshPtyEvent::Closed { reason } => {
+                closed_reason = Some(reason);
+                // Don't break — drain any final Output bytes that may
+                // arrive after Closed (russh may emit them before
+                // `wait()` returns None).
+            }
+        }
+    }
+
+    // Bridge is gone. Mark the session closed in the DB so a stale
+    // Active row doesn't survive a remote shell exit.
+    let reason_str = match closed_reason {
+        Some(ClosedReason::RemoteEof) => "remote_eof",
+        Some(ClosedReason::TransportError) => "transport_error",
+        Some(ClosedReason::LocalClose) | None => "local_close",
+    };
+
+    // Fetch the session to confirm it's still owned by the user (defense-
+    // in-depth) and not already closed. Treat any error as best-effort —
+    // we don't have a request to fail.
+    match sessions.get(session_id).await {
+        Ok(Some(session))
+            if session.owner_id == owner_id && session.status != TerminalSessionStatus::Closed =>
+        {
+            let now = Utc::now();
+            if let Err(err) = sessions
+                .set_status(session_id, TerminalSessionStatus::Closed, Some(now))
+                .await
+            {
+                warn!(?err, %session_id, "failed to mark session closed after pty teardown");
+            }
+            if let Err(err) = events
+                .create(CreateSessionEvent {
+                    session_id,
+                    kind: SessionEventKind::Closed,
+                    payload: serde_json::json!({
+                        "reason": "pty_teardown",
+                        "category": reason_str,
+                    }),
+                })
+                .await
+            {
+                warn!(?err, %session_id, "failed to append closed event after pty teardown");
+            }
+        }
+        Ok(_) => { /* already closed or vanished — nothing to do */ }
+        Err(err) => warn!(?err, %session_id, "failed to read session row during pty teardown"),
     }
 }
 

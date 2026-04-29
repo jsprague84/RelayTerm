@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::{Router, extract::FromRef};
 use relayterm_core::ids::UserId;
 use relayterm_db::Db;
-use relayterm_ssh::{HostKeyPreflightService, SshAuthCheckService};
+use relayterm_ssh::{HostKeyPreflightService, SshAuthCheckService, SshPtyBridge};
 use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
 use tower_http::trace::TraceLayer;
@@ -52,6 +52,16 @@ pub struct AppState {
     /// [`SshAuthCheckService`](relayterm_ssh::SshAuthCheckService) docs
     /// for the full "proves vs does not prove" contract.
     pub auth_check: Arc<SshAuthCheckService>,
+    /// Live SSH PTY bridge. Production: the russh-backed implementation.
+    /// Tests inject a fake bridge directly into `AppState` so the
+    /// terminal-session create + WebSocket attach paths can be exercised
+    /// without an SSH peer.
+    ///
+    /// **Scope**: this attests to the minimal interactive PTY path —
+    /// connect, host-key trust, public-key auth, PTY/shell allocation,
+    /// and `Input`/`Resize`/`Output` plumbing. It does NOT yet provide
+    /// replay-buffer recovery across reconnects.
+    pub pty_bridge: Arc<dyn SshPtyBridge>,
     /// Backend-owned terminal-session orchestrator. Owns the in-memory
     /// runtime registry and writes session metadata + lifecycle events
     /// to Postgres. Held behind `Arc` so `AppState` stays `Clone`.

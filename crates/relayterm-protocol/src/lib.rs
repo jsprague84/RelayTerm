@@ -16,9 +16,29 @@
 
 use std::fmt;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use relayterm_core::ids::TerminalSessionAttachmentId;
 use relayterm_core::{SeqNo, SessionId};
 use serde::{Deserialize, Serialize};
+
+/// Encode raw PTY bytes for transport in [`ServerMsg::Output::data`].
+///
+/// Centralised so the wire encoding is single-sourced — the backend
+/// orchestrator and the TS mirror MUST agree byte-for-byte. Standard
+/// alphabet + padding is the canonical RFC 4648 form `atob` accepts.
+#[must_use]
+pub fn output_data_encode(bytes: &[u8]) -> String {
+    BASE64.encode(bytes)
+}
+
+/// Decode the inverse of [`output_data_encode`]. Returns `Err` for any
+/// invalid base64 (control bytes, non-alphabet characters, broken
+/// padding) so the caller can surface a stable
+/// [`ErrorCode::InvalidMessage`] without echoing the offending value.
+pub fn output_data_decode(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    BASE64.decode(encoded)
+}
 
 /// Wire-stable error codes the server emits inside [`ServerMsg::Error`].
 ///
@@ -34,10 +54,21 @@ pub enum ErrorCode {
     /// A field in a parsed message failed validation (e.g. `cols`/`rows`
     /// out of range). The handler does not echo the offending value.
     InvalidInput,
-    /// Client sent an [`ClientMsg::Input`] frame, but the backend has not
-    /// allocated a PTY for this session yet. Stub-only response — the
-    /// payload bytes are NEVER reflected back or logged.
+    /// Reserved legacy code — emitted by earlier slices when the
+    /// backend had no PTY surface at all. New deployments emit
+    /// [`Self::PtyNotLive`] instead. Kept on the wire so old clients
+    /// don't fail to decode the code; new clients SHOULD treat it
+    /// identically to `PtyNotLive`.
     PtyNotImplemented,
+    /// Client sent [`ClientMsg::Input`] (or resize) but the backend has
+    /// no live PTY for this session — startup failed, the shell exited,
+    /// or the session has already been closed. The payload bytes are
+    /// NEVER reflected back or logged.
+    PtyNotLive,
+    /// SSH transport / auth / PTY allocation failed during attach. The
+    /// session row is transitioned to `closed` server-side; the client
+    /// must not retry on this socket.
+    SshStartFailed,
     /// Catch-all for backend-side failures the client cannot recover from.
     Internal,
 }
@@ -49,6 +80,8 @@ impl ErrorCode {
             Self::InvalidMessage => "invalid_message",
             Self::InvalidInput => "invalid_input",
             Self::PtyNotImplemented => "pty_not_implemented",
+            Self::PtyNotLive => "pty_not_live",
+            Self::SshStartFailed => "ssh_start_failed",
             Self::Internal => "internal",
         }
     }
@@ -154,8 +187,18 @@ pub enum ServerMsg {
     /// non-data messages where a pong-shaped reply isn't enough (e.g.
     /// resize succeeded and the new dims are recorded).
     Ack { kind: AckKind },
-    /// PTY output bytes. Reserved for the future PTY-bearing slice — the
-    /// current handler never emits this variant.
+    /// PTY output bytes from the remote shell.
+    ///
+    /// `data` is the **base64-encoded** raw PTY byte stream (standard
+    /// alphabet, with padding). Base64 is used because the underlying
+    /// JSON-over-WebSocket protocol cannot carry arbitrary binary bytes
+    /// inside a string field — `\xff` is not valid UTF-8. A binary frame
+    /// format is future work; clients SHOULD route every `Output` through
+    /// [`output_data_decode`] / [`output_data_encode`] (or an equivalent)
+    /// and write the raw bytes to the renderer. `seq` is a monotonic
+    /// per-session counter the orchestrator stamps so the future replay
+    /// slice can reason about ordering — it is NOT a guarantee that any
+    /// gap in `seq` is recoverable in this slice.
     Output { seq: SeqNo, data: String },
     /// Replay window has expired; the client must reset.
     ReplayWindowLost,
@@ -175,17 +218,24 @@ pub enum ServerMsg {
 
 /// Lifecycle status of a freshly attached client.
 ///
-/// Today the only variant is [`SessionAttachStatus::AttachedStub`] — the
-/// session is registered in the manager but no PTY has been allocated.
-/// Future slices will add `Active` (PTY live, streaming) and `Resumed`
-/// (replay buffer fast-forwarded) variants without renaming this enum.
+/// Wire-stable; new variants append. Existing clients SHOULD treat any
+/// unknown variant defensively (no PTY assumed) rather than failing to
+/// decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionAttachStatus {
-    /// Attachment exists; PTY does not. Client should treat the session as
-    /// "wired up but not yet streaming". Sending an [`ClientMsg::Input`]
-    /// will be rejected with [`ErrorCode::PtyNotImplemented`].
+    /// Reserved for the placeholder slice. Emitted only when no live PTY
+    /// is wired (e.g. the session reached `attached` before SSH startup).
+    /// Sending an [`ClientMsg::Input`] returns [`ErrorCode::PtyNotLive`]
+    /// or [`ErrorCode::PtyNotImplemented`] (legacy code) depending on
+    /// the build.
     AttachedStub,
+    /// Attachment exists AND the backend has a live PTY: input flows to
+    /// the remote shell, [`ServerMsg::Output`] frames stream back,
+    /// resize is honoured. Replay/resume across reconnects is NOT yet
+    /// guaranteed by this variant — it carries no `last_seen_seq` —
+    /// that is a future, deliberate slice.
+    Active,
 }
 
 #[cfg(test)]
@@ -279,11 +329,35 @@ mod tests {
             (ErrorCode::InvalidMessage, "invalid_message"),
             (ErrorCode::InvalidInput, "invalid_input"),
             (ErrorCode::PtyNotImplemented, "pty_not_implemented"),
+            (ErrorCode::PtyNotLive, "pty_not_live"),
+            (ErrorCode::SshStartFailed, "ssh_start_failed"),
             (ErrorCode::Internal, "internal"),
         ] {
             assert_eq!(code.as_str(), expected);
             assert_eq!(serde_json::to_value(code).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn output_data_codec_round_trips_arbitrary_bytes() {
+        // Includes high-bit / control bytes that would never survive
+        // a naive utf-8 wrap. Base64 carries them losslessly.
+        let raw: Vec<u8> = (0..=255u8).collect();
+        let encoded = output_data_encode(&raw);
+        let decoded = output_data_decode(&encoded).expect("round-trip decode");
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn output_data_decode_rejects_invalid_base64() {
+        let res = output_data_decode("!!!not-base64!!!");
+        assert!(res.is_err(), "invalid base64 must surface an error");
+    }
+
+    #[test]
+    fn session_attach_status_active_serializes_to_active() {
+        let v = serde_json::to_value(SessionAttachStatus::Active).unwrap();
+        assert_eq!(v, "active");
     }
 
     #[test]

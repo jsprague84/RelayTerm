@@ -15,13 +15,22 @@ export type ServerErrorCode =
   | "invalid_message"
   | "invalid_input"
   | "pty_not_implemented"
+  | "pty_not_live"
+  | "ssh_start_failed"
   | "internal";
 
 /** Acknowledgement-kind tag for `ack` frames. */
 export type AckKind = "resize";
 
-/** Lifecycle status of a freshly attached client. */
-export type SessionAttachStatus = "attached_stub";
+/** Lifecycle status of a freshly attached client.
+ *
+ * - `attached_stub` — placeholder slice; no live PTY. Sending `input`
+ *   yields a stubbed-rejection event.
+ * - `active` — backend has a live SSH PTY; `input` flows to the remote
+ *   shell, `output` frames stream back. Replay across reconnects is NOT
+ *   yet guaranteed by this status; the session client treats a transport
+ *   close in `attached` as a clean detach. */
+export type SessionAttachStatus = "attached_stub" | "active";
 
 /** Branded string aliases for ids that travel over the wire. */
 export type SessionId = string;
@@ -246,7 +255,7 @@ function matchesShape(tag: ServerMsgType, value: Record<string, unknown>): boole
       return (
         typeof value["session_id"] === "string" &&
         typeof value["attachment_id"] === "string" &&
-        value["status"] === "attached_stub" &&
+        (value["status"] === "attached_stub" || value["status"] === "active") &&
         typeof value["message"] === "string"
       );
     case "ack":
@@ -273,8 +282,39 @@ const SERVER_ERROR_CODES: readonly ServerErrorCode[] = [
   "invalid_message",
   "invalid_input",
   "pty_not_implemented",
+  "pty_not_live",
+  "ssh_start_failed",
   "internal",
 ];
+
+/**
+ * Decode a base64 PTY-output payload (`ServerMsg::Output.data`) into raw
+ * bytes the renderer can write. Throws on malformed input — callers MUST
+ * route into a typed protocol-error event rather than echoing the
+ * offending payload.
+ */
+export function decodeOutputData(data: string): Uint8Array {
+  // Browser `atob` returns a binary string; turn it into a Uint8Array.
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Inverse of {@link decodeOutputData}. Used by tests to round-trip the
+ * codec; the production frontend does not encode `output` (only the
+ * backend does). Lives here to keep the wire-format single-sourced.
+ */
+export function encodeOutputData(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary);
+}
 
 function isKnownErrorCode(value: unknown): value is ServerErrorCode {
   return (

@@ -8,7 +8,8 @@ use relayterm_core::repository::{
 };
 use relayterm_db::Db;
 use relayterm_ssh::{
-    HostKeyPreflightService, RusshAuthChecker, RusshHostKeyProbe, SshAuthCheckService,
+    HostKeyPreflightService, RusshAuthChecker, RusshHostKeyProbe, RusshPtyBridge,
+    SshAuthCheckService, SshPtyBridge,
 };
 use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
@@ -101,6 +102,11 @@ async fn main() -> anyhow::Result<()> {
     // directly. SCOPE: no interactive session, no command execution.
     let auth_check = Arc::new(SshAuthCheckService::new(Arc::new(RusshAuthChecker::new())));
 
+    // Live SSH PTY bridge. Production: russh-backed; tests inject a
+    // fake via AppState directly. SCOPE: minimal interactive PTY path
+    // — no replay-buffer recovery yet.
+    let pty_bridge: Arc<dyn SshPtyBridge> = Arc::new(RusshPtyBridge::new());
+
     // Terminal session orchestrator. Owns the in-memory runtime registry
     // and writes session metadata + lifecycle events to Postgres. The
     // registry is NOT durable — a backend restart leaves any pre-restart
@@ -120,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         vault,
         preflight,
         auth_check,
+        pty_bridge,
         terminal_sessions,
         dev_user_id,
     };
