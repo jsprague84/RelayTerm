@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/backend",
+    "crates/relayterm-core",
+    "crates/relayterm-api",
+    "crates/relayterm-db",
+    "crates/relayterm-auth",
+    "crates/relayterm-vault",
+    "crates/relayterm-ssh",
+    "crates/relayterm-terminal",
+    "crates/relayterm-terminal-vt",
+    "crates/relayterm-protocol",
+    "crates/relayterm-observability",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+futures = "0.3"
+
+# HTTP / WebSocket
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# SSH (no implementation yet — declared for downstream crates)
+russh = "0.52"
+
+# DB
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+async-trait = "0.1"
+
+# Serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Misc
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Internal crates
+relayterm-core = { path = "crates/relayterm-core" }
+relayterm-api = { path = "crates/relayterm-api" }
+relayterm-db = { path = "crates/relayterm-db" }
+relayterm-auth = { path = "crates/relayterm-auth" }
+relayterm-vault = { path = "crates/relayterm-vault" }
+relayterm-ssh = { path = "crates/relayterm-ssh" }
+relayterm-terminal = { path = "crates/relayterm-terminal" }
+relayterm-terminal-vt = { path = "crates/relayterm-terminal-vt" }
+relayterm-protocol = { path = "crates/relayterm-protocol" }
+relayterm-observability = { path = "crates/relayterm-observability" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

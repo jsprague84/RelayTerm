@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: relayterm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: relayterm
+      POSTGRES_PASSWORD: relayterm
+      POSTGRES_DB: relayterm
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - relayterm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relayterm -d relayterm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  relayterm-pgdata:

@@ -1,0 +1,84 @@
+{
+  "queried_at": "2026-04-28T00:00:00Z",
+  "ttl_days": 14,
+  "mode": "greenfield",
+  "overlays": ["solo-dev-workflow", "web-app-defaults"],
+  "shape": "monorepo-multilang",
+  "components": {
+    "axum": {
+      "library_id": "/tokio-rs/axum",
+      "version": "0.8.x",
+      "version_rationale": "0.9 is in-progress on main; 0.8 is the published stable line.",
+      "skill_path": ".claude/skills/axum-tasks/SKILL.md",
+      "paths_glob": "apps/backend/**/*.rs"
+    },
+    "tokio": {
+      "library_id": "/tokio-rs/tokio",
+      "version": "^1",
+      "version_rationale": "API-stable since 1.0; pin to current 1.x.",
+      "skill_path": ".claude/skills/tokio-tasks/SKILL.md",
+      "paths_glob": "apps/backend/**/*.rs"
+    },
+    "russh": {
+      "library_id": "/eugeny/russh",
+      "version": "0.5x",
+      "version_rationale": "Current channel API (channel.into_stream, request_pty, window_change, ChannelMsg::ExtendedData).",
+      "skill_path": ".claude/skills/russh-tasks/SKILL.md",
+      "paths_glob": "apps/backend/src/ssh/**/*.rs"
+    },
+    "sqlx": {
+      "library_id": "/launchbadge/sqlx",
+      "version": "0.8.x",
+      "version_rationale": "0.8 introduced the .sqlx/ folder offline cache and changed default features; runtime-tokio-rustls is canonical.",
+      "skill_path": ".claude/skills/sqlx-tasks/SKILL.md",
+      "paths_glob": "apps/backend/src/db/**/*.rs,apps/backend/migrations/**"
+    },
+    "svelte": {
+      "library_id": "/sveltejs/svelte",
+      "version": "^5",
+      "version_rationale": "Svelte 5 stable; runes API ($state/$derived/$effect/$props) replaces Svelte 4 reactive let / $: / export let.",
+      "skill_path": ".claude/skills/svelte-tasks/SKILL.md",
+      "paths_glob": "apps/web/**/*.svelte,apps/web/**/*.svelte.ts,apps/web/**/*.svelte.js"
+    },
+    "vite": {
+      "library_id": "/vitejs/vite",
+      "version": "^7",
+      "version_rationale": "v7 stabilizes the Environment API and switches default minifier to oxc.",
+      "skill_path": ".claude/skills/vite-tasks/SKILL.md",
+      "paths_glob": "apps/web/vite.config.*,apps/web/src/main.*,apps/web/index.html"
+    },
+    "tailwindcss": {
+      "library_id": "/tailwindlabs/tailwindcss.com",
+      "version": "^4",
+      "version_rationale": "v4 is CSS-first: @import \"tailwindcss\", @theme block in CSS, @tailwindcss/vite plugin replaces postcss.",
+      "skill_path": ".claude/skills/tailwindcss-tasks/SKILL.md",
+      "paths_glob": "apps/web/**/*.css,apps/web/**/*.svelte,packages/terminal-*/**/*.css,packages/terminal-*/**/*.svelte"
+    },
+    "xterm.js": {
+      "library_id": "/xtermjs/xterm.js",
+      "version": "^5 (@xterm/xterm)",
+      "version_rationale": "Package rescoped to @xterm/xterm and @xterm/addon-*; legacy xterm package is unmaintained.",
+      "skill_path": ".claude/skills/xterm-tasks/SKILL.md",
+      "paths_glob": "packages/terminal-*/**,apps/web/src/terminals/**"
+    },
+    "tauri": {
+      "library_id": "/tauri-apps/tauri-docs",
+      "version": "^2",
+      "version_rationale": "v2 added Android/iOS, capabilities replace v1 allowlist, conf schema split into app/build/bundle/plugins.",
+      "skill_path": ".claude/skills/tauri-tasks/SKILL.md",
+      "paths_glob": "apps/web/src-tauri/**,apps/web/src/lib/tauri/**"
+    }
+  },
+  "experimental_components_no_context7": [
+    "wterm",
+    "ghostty-web",
+    "restty",
+    "libghostty-vt"
+  ],
+  "infra_markers_detected_in_user_spec": [
+    "docker-compose",
+    "traefik",
+    "wireguard",
+    "postgresql"
+  ]
+}

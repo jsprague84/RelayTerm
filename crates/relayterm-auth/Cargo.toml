@@ -1,0 +1,15 @@
+[package]
+name = "relayterm-auth"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+relayterm-core = { workspace = true }
+relayterm-db = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

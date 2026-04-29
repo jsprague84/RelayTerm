@@ -1,0 +1,30 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+dist/
+.svelte-kit/
+*.tsbuildinfo
+
+# Env / local config
+.env
+.env.local
+.env.*.local
+config/relayterm.local.toml
+
+# Tauri (when we wire it up)
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json

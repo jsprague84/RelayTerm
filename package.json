@@ -1,0 +1,12 @@
+{
+  "name": "relayterm",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "check": "pnpm -r check",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test"
+  },
+  "packageManager": "pnpm@10.33.0"
+}
