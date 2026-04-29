@@ -1,10 +1,18 @@
 <script lang="ts">
   import TerminalProtocolLab from "./lib/dev/TerminalProtocolLab.svelte";
+  import XtermRendererLab from "./lib/dev/XtermRendererLab.svelte";
 
   // `import.meta.env.DEV` is statically `true` under `vite dev` / vitest
   // and statically `false` for `vite build` (see vite.config.ts). Vite
   // inlines this constant at build time, so the production bundle's
   // dead-code elimination drops the lab branch entirely.
+  //
+  // Caveat: the lab components are imported unconditionally above. JS
+  // tree-shaking handles that — terminal-xterm's `sideEffects` field
+  // lets Rollup drop xterm entirely from the prod JS — but the CSS
+  // side-effect import (`@relayterm/terminal-xterm/styles`) is still
+  // included in the prod CSS bundle (≈3KB of xterm.css). That is the
+  // documented compromise; revisit if it ever stops being trivial.
   const isDev = import.meta.env.DEV;
 
   let backendStatus = $state<"unknown" | "ok" | "down">("unknown");
@@ -43,6 +51,7 @@
 
   {#if isDev}
     <TerminalProtocolLab />
+    <XtermRendererLab />
   {:else}
     <section class="rounded-md border border-zinc-800 p-4 text-sm">
       <h2 class="text-base font-semibold">Terminal</h2>

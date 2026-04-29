@@ -174,7 +174,7 @@ PTY allocation and `russh::Channel` ownership; forwarding `Input` bytes to the S
 
 The browser/Tauri client never talks to the WebSocket directly — it goes through the `@relayterm/terminal-core` package. That package owns the wire protocol, the transport, and the per-attachment state machine. **Renderers (xterm.js, libghostty-vt, restty, wterm) plug in through a renderer-neutral interface; none are dependencies of the core.** This load-bearing separation is what lets a renderer swap (or a future native Tauri renderer) drop in without changing protocol or state-machine code.
 
-**Scope (load-bearing — this slice).** A successful `terminal-core` integration attests ONLY to the typed protocol envelope, transport lifecycle, and a renderer-neutral plug interface. It does **NOT** include xterm.js or any other renderer adapter, replay-buffer behavior, real PTY byte streaming on the wire, or any reconnect policy beyond the explicit `attach`/`detach` lifecycle. Each remaining capability is a separate, deliberate slice.
+**Scope (load-bearing — this slice).** A successful `terminal-core` integration attests ONLY to the typed protocol envelope, transport lifecycle, and a renderer-neutral plug interface. It does **NOT** include replay-buffer behavior, real PTY byte streaming on the wire, or any reconnect policy beyond the explicit `attach`/`detach` lifecycle. (The xterm.js baseline renderer adapter — `@relayterm/terminal-xterm` — landed as a separate slice; see "xterm.js baseline renderer adapter" below.) Each remaining capability is a separate, deliberate slice.
 
 #### Package layout
 
@@ -243,7 +243,43 @@ A renderer adapter (xterm, ghostty-web, restty, wterm) is a separate package und
 
 #### Future work (explicit out-of-scope for this slice)
 
-xterm.js / ghostty-web / restty / wterm renderer adapters; real PTY byte streaming through `output` frames; replay-buffer integration on reconnect; auth handshake on the WebSocket beyond dev-auth; per-renderer preference persistence; mobile/Tauri shell integration of the lab UI. Each is a separate, deliberate slice.
+ghostty-web / restty / wterm renderer adapters; real PTY byte streaming through `output` frames; replay-buffer integration on reconnect; auth handshake on the WebSocket beyond dev-auth; per-renderer preference persistence; mobile/Tauri shell integration of the lab UI. Each is a separate, deliberate slice.
+
+### xterm.js baseline renderer adapter
+
+`@relayterm/terminal-xterm` is the first concrete `TerminalRenderer` implementation. xterm.js is the **compatibility baseline**, not the architecture: the protocol stays RelayTerm-shaped, the session client never sees xterm types, and the adapter is one of N planned renderers (ghostty-web, restty, wterm, future native/Tauri).
+
+**Scope (load-bearing — this slice).** A successful integration attests ONLY to the renderer interface bridging xterm.js bidirectionally — `mount`/`write`/`focus`/`resize`/`dispose`/`onInput`/`onResize` all flow through xterm cleanly. It does **NOT** mean PTY bytes stream end-to-end (the backend still rejects `input` with `pty_not_implemented`), it does **NOT** include the replay buffer, and the production terminal UI is still not implemented — only a dev-only renderer lab consumes the adapter today.
+
+#### Package layout
+
+`packages/terminal-xterm/` is a workspace package alongside `terminal-core`. Its only neighbors today are the protocol/client core; future renderers live as siblings. Keys:
+
+- `src/XtermRenderer.ts` — the only file in the repo that imports `@xterm/xterm`. Implements `TerminalRenderer` from `terminal-core` and exposes a `fit()` helper for callers that own the container.
+- `src/options.ts` — renderer-neutral `XtermRendererOptions` (`fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`, `theme`) and the `RendererTheme` shape (background/foreground/cursor/selectionBackground + 16 named ANSI slots). A `xtermOnly` escape hatch passes raw `ITerminalOptions` through and is documented as **non-portable**.
+- `src/styles.ts` — side-effect entry that imports `@xterm/xterm/css/xterm.css`. Split out of `index.ts` so Node consumers (vitest) can import the renderer without bundler help. Browser consumers do `import "@relayterm/terminal-xterm/styles"` once at app boot.
+- `package.json` declares `"sideEffects": ["./src/styles.ts", "**/*.css"]` so Rollup tree-shakes unused JS in non-dev builds while preserving the styles side-effect import for callers that explicitly want it.
+
+#### Adapter contract
+
+- `XtermRenderer` is the **only** xterm.js consumer in the repo. `terminal-core` does not depend on `@xterm/xterm`. `apps/web` depends on `@relayterm/terminal-xterm` (workspace) — never directly on `@xterm/xterm`.
+- Constructor takes `XtermRendererOptions` only; the underlying `Terminal` instance is private.
+- `mount` is allowed exactly once per renderer instance. Re-mount throws — silent re-attach would mask a misuse. Calls to `write` before `mount` are queued and flushed on mount; calls to `write` after `dispose` are silent no-ops.
+- `dispose` is idempotent and tears down the Terminal, addons (FitAddon, WebLinksAddon), the `onData`/`onResize` subscriptions, and the listener sets in one shot.
+- A throwing user listener inside `onInput` is caught and dropped — it MUST NOT interrupt sibling listeners or surface the input bytes through the error envelope (the redaction rule is enforced inside the adapter and re-asserted by tests in `tests/xtermRenderer.test.ts`).
+
+#### Renderer-neutral rule (re-affirmed)
+
+- `terminal-core` still imports nothing from `@xterm/*` and the protocol stays RelayTerm-shaped, never xterm-shaped.
+- `XtermRendererOptions` is the **first** concrete shape future renderer adapters are expected to honor 1:1 for the portable knobs. Renderer-only escape-hatch fields (the `xtermOnly` block) are explicitly NOT promised to behave the same on a future adapter.
+
+#### Diagnostic UI
+
+`apps/web/src/lib/dev/XtermRendererLab.svelte` is a developer-only lab that mounts `XtermRenderer` against a real backend WebSocket. It (a) shows a static local banner explaining PTY streaming is not implemented, (b) routes renderer keystrokes through `TerminalSessionClient.sendInput` so the existing `pty_not_implemented` rejection surfaces in the event log as the expected response, and (c) follows the same redaction rule as the protocol lab — the log shows byte length only, never the input payload. Both labs gate on `import.meta.env.DEV`; the production bundle drops the JS via Rollup tree-shaking (verified empirically — JS bundle is ~28KB without the lab vs. ~322KB with it eagerly included before the `sideEffects` marker landed).
+
+#### Future work (explicit out-of-scope for this slice)
+
+Real PTY byte streaming through `output` frames; ghostty-web / restty / wterm renderer adapters; renderer benchmarking harness; persistent per-renderer preferences; production terminal UI; renderer-swap UX; mobile/Tauri shell integration. Each is a separate, deliberate slice.
 
 ### Authenticated SSH credential check contract
 
@@ -301,7 +337,7 @@ TODO — explicit list of features deferred so the agent doesn't "helpfully" imp
 - Multi-user shared sessions / "screen-share."
 - Public-cloud-hosted multi-tenant deployment (v1 is single-tenant Docker Compose).
 - iOS Tauri build (Android first; iOS later).
-- libghostty-vt state engine swap (planned; xterm.js drives the baseline until then).
+- libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) has landed; ghostty-web / restty / wterm are future siblings under `packages/terminal-<name>/`.
 
 ## Open questions
 
