@@ -5,7 +5,9 @@ use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{CreateUser, UserRepository};
 use relayterm_db::Db;
-use relayterm_ssh::{HostKeyPreflightService, RusshHostKeyProbe};
+use relayterm_ssh::{
+    HostKeyPreflightService, RusshAuthChecker, RusshHostKeyProbe, SshAuthCheckService,
+};
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
@@ -89,10 +91,18 @@ async fn main() -> anyhow::Result<()> {
         RusshHostKeyProbe::new(),
     )));
 
+    // Authenticated credential-check service. Verifies a saved
+    // (profile, host, ssh-identity) trio's host-key trust state and
+    // attempts SSH public-key authentication, disconnecting before any
+    // PTY/command/shell. Tests inject a fake checker via `AppState`
+    // directly. SCOPE: no interactive session, no command execution.
+    let auth_check = Arc::new(SshAuthCheckService::new(Arc::new(RusshAuthChecker::new())));
+
     let state = AppState {
         db,
         vault,
         preflight,
+        auth_check,
         dev_user_id,
     };
     let app = router(state);

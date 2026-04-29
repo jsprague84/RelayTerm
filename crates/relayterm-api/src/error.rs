@@ -13,7 +13,7 @@ use axum::{
 };
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::validation::ValidationError;
-use relayterm_ssh::{HostKeyPreflightError, ProbeError};
+use relayterm_ssh::{HostKeyPreflightError, ProbeError, SshAuthCheckError};
 use relayterm_vault::VaultError;
 use serde::Serialize;
 use tracing::{error, warn};
@@ -211,6 +211,27 @@ impl From<HostKeyPreflightError> for ApiError {
 impl From<ProbeError> for ApiError {
     fn from(err: ProbeError) -> Self {
         Self::BadGateway(format!("ssh probe: {err}"))
+    }
+}
+
+impl From<SshAuthCheckError> for ApiError {
+    fn from(err: SshAuthCheckError) -> Self {
+        match err {
+            // The decrypted blob did not parse — vault row is corrupt.
+            // Same shape as the preflight equivalent: a generic 500 with
+            // no operator detail on the wire.
+            SshAuthCheckError::InvalidIdentity => {
+                Self::Internal("ssh identity material is malformed".to_owned())
+            }
+            // Outbound-network safety guard fired: the process is already
+            // running its configured maximum number of auth-checks. Surface
+            // as 503 (`service_unavailable`) so the operator UI knows the
+            // request is safe to retry. The wire body is the static
+            // `service unavailable` string per the ApiError contract.
+            SshAuthCheckError::Saturated => {
+                Self::ServiceUnavailable("auth-check concurrency limit reached".to_owned())
+            }
+        }
     }
 }
 

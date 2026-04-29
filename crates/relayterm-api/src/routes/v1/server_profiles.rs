@@ -12,11 +12,12 @@ use relayterm_core::repository::{
 };
 use relayterm_core::server_profile::ServerProfile;
 use relayterm_core::ssh_identity::SshIdentity;
-use relayterm_ssh::{HostKeyPreflightRequest, HostKeyStatus};
+use relayterm_ssh::{HostKeyPreflightRequest, HostKeyStatus, SshAuthCheckRequest};
 use zeroize::Zeroizing;
 
 use crate::AppState;
 use crate::dev_user::DevUser;
+use crate::dto::auth_check::{AuthCheckResponse, AuthCheckStatusWire};
 use crate::dto::preflight::{
     HostKeyPreflightResponse, HostKeyStatusWire, TrustHostKeyRequest, TrustHostKeyResponse,
 };
@@ -31,6 +32,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/{id}", get(get_by_id))
         .route("/{id}/host-key-preflight", post(host_key_preflight))
         .route("/{id}/trust-host-key", post(trust_host_key))
+        .route("/{id}/auth-check", post(auth_check))
 }
 
 async fn create(
@@ -282,5 +284,55 @@ async fn trust_host_key(
         host_key_type: entry.key_type,
         host_key_fingerprint: entry.fingerprint_sha256,
         trusted_at,
+    }))
+}
+
+/// `POST /api/v1/server-profiles/:id/auth-check`.
+///
+/// Authenticated SSH credential check for a saved server profile. Connects
+/// to the host, verifies the host key matches an active, trusted, non-
+/// revoked pin, attempts public-key authentication, and disconnects. Does
+/// NOT open a PTY, run a shell, execute a command, or persist any session.
+///
+/// Host-key trust is a precondition. If the host key isn't already pinned
+/// and trusted, the route returns a typed `host_key_unknown` /
+/// `host_key_changed` status WITHOUT attempting authentication, so no
+/// client signature is ever sent to an unverified peer.
+async fn auth_check(
+    State(state): State<AppState>,
+    user: DevUser,
+    Path(id): Path<ServerProfileId>,
+) -> Result<Json<AuthCheckResponse>, ApiError> {
+    let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    let pem = decrypt_identity(&state, &identity)?;
+
+    let username = profile
+        .username_override
+        .as_ref()
+        .map_or_else(|| host.default_username.as_str(), |u| u.as_str())
+        .to_owned();
+    let port = host.port.get();
+
+    let known = state.db.known_host_entries().list_for_host(host.id).await?;
+    let req = SshAuthCheckRequest {
+        host_id: host.id,
+        hostname: host.hostname.as_str().to_owned(),
+        port,
+        username,
+        private_key_pem: pem,
+    };
+    // `SshAuthCheckError` → `ApiError` mapping lives in `crate::error`;
+    // a stuck checker, an oversubscribed semaphore, and a corrupt vault
+    // row each get the right HTTP status without operator detail leaking.
+    let result = state.auth_check.auth_check(req, &known).await?;
+
+    let status: AuthCheckStatusWire = result.status.into();
+    Ok(Json(AuthCheckResponse {
+        profile_id: profile.id,
+        host_id: host.id,
+        ssh_identity_id: identity.id,
+        status,
+        message: AuthCheckResponse::message_for(status),
+        checked_at: chrono::Utc::now(),
     }))
 }

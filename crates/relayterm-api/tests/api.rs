@@ -40,12 +40,14 @@ use relayterm_db::{
     PgSshIdentityRepository, PgUserRepository,
 };
 use relayterm_ssh::{
-    CapturedHostKey, HostKeyPreflightService, ProbeError, ProbeTarget, SshHostKeyProbe,
+    AuthAttemptKind, AuthCheckOutcome, AuthCheckTarget, CapturedHostKey, HostKeyPreflightService,
+    ProbeError, ProbeTarget, SshAuthCheckService, SshAuthChecker, SshHostKeyProbe,
 };
 use relayterm_vault::VaultService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
+use zeroize::Zeroizing;
 
 const PRIVATE_KEY_MARKER: &[u8] = b"REDACT-MARKER-API-9F2B";
 
@@ -65,11 +67,32 @@ async fn setup(pool: PgPool) -> (Router, UserId) {
 }
 
 async fn setup_with_probe(pool: PgPool, probe: Arc<dyn SshHostKeyProbe>) -> (Router, UserId) {
+    setup_full(pool, probe, default_auth_checker()).await
+}
+
+async fn setup_full(
+    pool: PgPool,
+    probe: Arc<dyn SshHostKeyProbe>,
+    checker: Arc<dyn SshAuthChecker>,
+) -> (Router, UserId) {
+    setup_with_auth_check_service(pool, probe, Arc::new(SshAuthCheckService::new(checker))).await
+}
+
+/// Variant of `setup_full` that takes a pre-built [`SshAuthCheckService`].
+/// Tests use this to inject an `SshAuthCheckService::with_limits(...)` so
+/// the timeout and concurrency bounds are short enough to exercise the
+/// safety guards without burning real wall-clock budget.
+async fn setup_with_auth_check_service(
+    pool: PgPool,
+    probe: Arc<dyn SshHostKeyProbe>,
+    auth_check: Arc<SshAuthCheckService>,
+) -> (Router, UserId) {
     let user_id = create_user(&pool, "dev").await;
     let state = AppState {
         db: Db::from_pool(pool),
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(probe)),
+        auth_check,
         dev_user_id: Some(user_id),
     };
     (router(state), user_id)
@@ -97,6 +120,131 @@ impl SshHostKeyProbe for FailingProbe {
         // Surface as Transport so a test that hits this by mistake fails
         // with a 502 instead of a misleading 500.
         Err(ProbeError::Transport)
+    }
+}
+
+/// Auth checker used by tests that don't go through the auth-check
+/// surface. Returns ConnectionFailed so an accidental hit produces a
+/// recognisable wire status instead of a hung await.
+fn default_auth_checker() -> Arc<dyn SshAuthChecker> {
+    Arc::new(FailingAuthChecker)
+}
+
+struct FailingAuthChecker;
+
+#[async_trait]
+impl SshAuthChecker for FailingAuthChecker {
+    async fn run(&self, _target: AuthCheckTarget) -> Result<AuthCheckOutcome, ProbeError> {
+        Err(ProbeError::Transport)
+    }
+}
+
+/// Fake auth checker: returns a configured outcome and records every call.
+/// Used to exercise the auth-check route without a real SSH peer.
+#[derive(Clone)]
+struct FakeAuthChecker {
+    captured: CapturedHostKey,
+    kind: AuthAttemptKind,
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+}
+
+/// Snapshot of one auth-check call. The PEM is held in a `Zeroizing`
+/// buffer so the test-side copy of the decrypted private key is wiped
+/// when the call record drops, matching the discipline the production
+/// code path keeps. Tests that need to assert on the PEM shape do so
+/// against this buffer — they MUST NOT clone it into a plain `Vec<u8>`.
+#[derive(Clone, Debug)]
+struct RecordedCall {
+    hostname: String,
+    port: u16,
+    username: String,
+    accept_pin_count: usize,
+    private_key_pem: Zeroizing<Vec<u8>>,
+}
+
+impl FakeAuthChecker {
+    fn new(captured: CapturedHostKey, kind: AuthAttemptKind) -> Self {
+        Self {
+            captured,
+            kind,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl SshAuthChecker for FakeAuthChecker {
+    async fn run(&self, target: AuthCheckTarget) -> Result<AuthCheckOutcome, ProbeError> {
+        self.calls.lock().unwrap().push(RecordedCall {
+            hostname: target.hostname.clone(),
+            port: target.port,
+            username: target.username.clone(),
+            accept_pin_count: target.accept_pins.len(),
+            private_key_pem: Zeroizing::new(target.private_key_pem.to_vec()),
+        });
+        Ok(AuthCheckOutcome {
+            captured: self.captured.clone(),
+            kind: self.kind,
+        })
+    }
+}
+
+/// Auth checker that always errors — exercises the ConnectionFailed path.
+struct ErroringAuthChecker(ProbeError);
+
+#[async_trait]
+impl SshAuthChecker for ErroringAuthChecker {
+    async fn run(&self, _target: AuthCheckTarget) -> Result<AuthCheckOutcome, ProbeError> {
+        Err(match &self.0 {
+            ProbeError::Unreachable => ProbeError::Unreachable,
+            ProbeError::Timeout => ProbeError::Timeout,
+            ProbeError::BadHostKey => ProbeError::BadHostKey,
+            ProbeError::Transport => ProbeError::Transport,
+        })
+    }
+}
+
+/// Auth checker that sleeps for a configured duration. Lets a test
+/// exercise the outer-timeout guard the service wraps around `run`.
+struct SlowAuthChecker {
+    delay: std::time::Duration,
+    captured: CapturedHostKey,
+    kind: AuthAttemptKind,
+}
+
+#[async_trait]
+impl SshAuthChecker for SlowAuthChecker {
+    async fn run(&self, _target: AuthCheckTarget) -> Result<AuthCheckOutcome, ProbeError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(AuthCheckOutcome {
+            captured: self.captured.clone(),
+            kind: self.kind,
+        })
+    }
+}
+
+/// Auth checker that signals when entered then blocks until released.
+/// Lets a saturation test know — without a sleep — that the only
+/// available permit is now held by the in-flight call.
+struct BlockingAuthChecker {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    captured: CapturedHostKey,
+    kind: AuthAttemptKind,
+}
+
+#[async_trait]
+impl SshAuthChecker for BlockingAuthChecker {
+    async fn run(&self, _target: AuthCheckTarget) -> Result<AuthCheckOutcome, ProbeError> {
+        // The service acquires the semaphore BEFORE calling `run`, so
+        // notifying here is the canonical "permit is held" signal — no
+        // sleep, no polling.
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(AuthCheckOutcome {
+            captured: self.captured.clone(),
+            kind: self.kind,
+        })
     }
 }
 
@@ -356,6 +504,7 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
         db: Db::from_pool(pool),
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         dev_user_id: None,
     };
     let app = router(state);
@@ -536,6 +685,7 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
         db: Db::from_pool(pool.clone()),
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         dev_user_id: None,
     };
     let app = router(state);
@@ -567,6 +717,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         db: Db::from_pool(pool.clone()),
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -1296,6 +1447,7 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         db: Db::from_pool(pool.clone()),
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(Arc::new(probe))),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -1498,4 +1650,684 @@ async fn preflight_response_message_does_not_overclaim_auth_or_session_readiness
         !lower.contains("session is ready") && !lower.contains("ready to use"),
         "message must not imply session readiness: {message}"
     );
+}
+
+// ----------------------------------------------------------------------
+// Auth-check
+//
+// These tests use a fake `SshAuthChecker` so the route can be exercised
+// end-to-end without a real SSH peer. The vault path IS exercised — every
+// test goes through `vault.decrypt_private_key` against a real vault-
+// issued blob. The fake checker records every call so accept-pin shape and
+// the absence of leaked private-key bytes can be asserted.
+// ----------------------------------------------------------------------
+
+async fn setup_with_fake_auth_checker(
+    pool: PgPool,
+    captured: CapturedHostKey,
+    kind: AuthAttemptKind,
+) -> (Router, UserId, Arc<FakeAuthChecker>) {
+    let checker = Arc::new(FakeAuthChecker::new(captured, kind));
+    let (app, user_id) = setup_full(pool, default_probe(), checker.clone()).await;
+    (app, user_id, checker)
+}
+
+async fn pin_trusted_entry(pool: &PgPool, host_id: relayterm_core::ids::HostId, fp: &str) {
+    PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: fp.to_owned(),
+            public_key: b"ssh-ed25519 AAAA-host-key".to_vec(),
+        })
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_succeeds_with_trusted_host_key_and_successful_auth(pool: PgPool) {
+    let fp = "SHA256:auth-trusted";
+    let (app, user_id, checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(fp),
+        AuthAttemptKind::Authenticated,
+    )
+    .await;
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "auth.example.com").await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pin_trusted_entry(&pool, profile.host_id, fp).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "authentication_succeeded");
+    assert_eq!(body["profile_id"].as_str().unwrap(), profile_id.to_string());
+    assert_eq!(
+        body["host_id"].as_str().unwrap(),
+        profile.host_id.to_string()
+    );
+    assert!(body["ssh_identity_id"].is_string());
+    assert!(body["checked_at"].is_string());
+
+    // Response must NOT contain any host-key, fingerprint, or private-key
+    // material — the auth-check surface deliberately omits them.
+    let raw = body.to_string();
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "fingerprint",
+        "SHA256:",
+        "host_key",
+        "public_key",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "auth-check body must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // The fake saw exactly one call; the accept-pins list contained the
+    // trusted entry; the PEM passed to the checker did NOT include the
+    // ciphertext bytes — proving the vault decrypt happened upstream.
+    let calls = checker.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].hostname, "auth.example.com");
+    assert_eq!(calls[0].port, 22);
+    assert_eq!(calls[0].username, "deploy");
+    assert_eq!(calls[0].accept_pin_count, 1);
+    let pem = std::str::from_utf8(&calls[0].private_key_pem).unwrap();
+    assert!(
+        pem.contains("BEGIN OPENSSH PRIVATE KEY"),
+        "checker should receive plaintext OpenSSH PEM",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_unknown_profile_returns_404(pool: PgPool) {
+    let (app, _user_id, _checker) = setup_with_fake_auth_checker(
+        pool,
+        captured_for_test("SHA256:never"),
+        AuthAttemptKind::Authenticated,
+    )
+    .await;
+    let bogus = uuid::Uuid::new_v4();
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+/// A foreign-owned profile must produce a response byte-identical to a
+/// genuine 404 — same status, same body. AGENTS.md `API get_by_id
+/// ownership` lesson applied to auth-check.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_foreign_owned_profile_returns_indistinguishable_404(pool: PgPool) {
+    let other_user = create_user(&pool, "other").await;
+    let foreign_id = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-auth",
+        "foreign.example.com",
+    )
+    .await;
+
+    let (app, _dev_user, _checker) = setup_with_fake_auth_checker(
+        pool,
+        captured_for_test("SHA256:never"),
+        AuthAttemptKind::Authenticated,
+    )
+    .await;
+
+    let bogus = uuid::Uuid::new_v4();
+    let bogus_resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{foreign_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "cross-user auth-check 404 must match a genuine 404",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_blocks_when_host_key_unknown(pool: PgPool) {
+    let captured_fp = "SHA256:fresh";
+    let (app, user_id, checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(captured_fp),
+        AuthAttemptKind::HostKeyMismatch,
+    )
+    .await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "fresh.example.com",
+    )
+    .await;
+    // No known_host_entries pinned at all → status must be host_key_unknown.
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "host_key_unknown");
+
+    // The checker was called (so we know unknown vs changed) and accept_pins
+    // was empty.
+    let calls = checker.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].accept_pin_count, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_blocks_when_host_key_changed(pool: PgPool) {
+    let new_fp = "SHA256:NEW-auth";
+    let (app, user_id, checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(new_fp),
+        AuthAttemptKind::HostKeyMismatch,
+    )
+    .await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "rotated-auth.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Pin OLD as trusted; the server now presents NEW.
+    pin_trusted_entry(&pool, profile.host_id, "SHA256:OLD-auth").await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "host_key_changed");
+
+    // Accept-pins handed to the checker contained ONLY the OLD pin —
+    // proving the route did not auto-trust the new fingerprint.
+    let calls = checker.calls.lock().unwrap().clone();
+    assert_eq!(calls[0].accept_pin_count, 1);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_blocks_when_matching_known_host_is_revoked(pool: PgPool) {
+    let fp = "SHA256:revoked-auth";
+    let (app, user_id, checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(fp),
+        AuthAttemptKind::HostKeyMismatch,
+    )
+    .await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "revoked-auth.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let seeded = PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: fp.to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    revoke_entry(&pool, seeded.id).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "host_key_unknown");
+
+    // accept_pins MUST be empty even though the captured fingerprint
+    // matches the row — revoked entries do not enter the pin set.
+    let calls = checker.calls.lock().unwrap().clone();
+    assert_eq!(calls[0].accept_pin_count, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_returns_authentication_failed_safely(pool: PgPool) {
+    let fp = "SHA256:badcred";
+    let (app, user_id, _checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(fp),
+        AuthAttemptKind::AuthenticationFailed,
+    )
+    .await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "badcred.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pin_trusted_entry(&pool, profile.host_id, fp).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "authentication_failed");
+
+    // Body must not surface any russh-side error text or peer banner.
+    let raw = body.to_string();
+    for forbidden in [
+        "russh",
+        "peer",
+        "permission denied",
+        "publickey",
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+    ] {
+        assert!(
+            !raw.to_lowercase().contains(&forbidden.to_lowercase()),
+            "auth-check body must not contain `{forbidden}`: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) {
+    let user_id = create_user(&pool, "dev").await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(Arc::new(ErroringAuthChecker(
+            ProbeError::Unreachable,
+        )))),
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "unreachable.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pin_trusted_entry(&pool, profile.host_id, "SHA256:any").await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "connection_failed");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
+    // Without a vault, the route can't decrypt the identity → 503 with
+    // the static service-unavailable body. The auth checker is never called.
+    let user_id = create_user(&pool, "dev").await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    // Provision a profile with an opaque encrypted blob — the route must
+    // 503 before it tries to decrypt it.
+    let host = PgHostRepository::new(pool.clone())
+        .create(CreateHost {
+            owner_id: user_id,
+            display_name: validate_host_display_name("Vaultless-auth").unwrap(),
+            hostname: validate_hostname("va.example.com").unwrap(),
+            port: validate_ssh_port(22).unwrap(),
+            default_username: validate_ssh_username("deploy").unwrap(),
+        })
+        .await
+        .unwrap();
+    let identity = PgSshIdentityRepository::new(pool.clone())
+        .create(CreateSshIdentity {
+            owner_id: user_id,
+            name: "vaultless-auth".to_owned(),
+            key_type: SshKeyType::Ed25519,
+            public_key: b"ssh-ed25519 PUB".to_vec(),
+            encrypted_private_key: b"opaque".to_vec(),
+            fingerprint_sha256: format!("SHA256:vaultless-auth-{}", uuid::Uuid::new_v4()),
+        })
+        .await
+        .unwrap();
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .create(CreateServerProfile {
+            owner_id: user_id,
+            name: relayterm_core::validation::validate_profile_name("vaultless-auth").unwrap(),
+            host_id: host.id,
+            ssh_identity_id: identity.id,
+            username_override: None,
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{}/auth-check", profile.id),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+    assert_eq!(body["error"]["message"], "service unavailable");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
+    let state = AppState {
+        db: Db::from_pool(pool),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        dev_user_id: None,
+    };
+    let app = router(state);
+    let bogus = uuid::Uuid::new_v4();
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "unauthorized");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_response_does_not_overclaim_session_or_command_execution(pool: PgPool) {
+    // The success message must NOT imply that a PTY was allocated, a
+    // shell was spawned, or a command ran. Pin the wording for each
+    // non-error status so an accidental rewording trips the test.
+    let fp = "SHA256:scope";
+    let (app, user_id, _checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(fp),
+        AuthAttemptKind::Authenticated,
+    )
+    .await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "scope-auth.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pin_trusted_entry(&pool, profile.host_id, fp).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let message = body["message"].as_str().unwrap().to_lowercase();
+    assert!(
+        message.contains("no pty") && message.contains("no command"),
+        "auth-check success message must explicitly disclaim PTY/command, got: {message}",
+    );
+    assert!(
+        !message.contains("session opened") && !message.contains("shell"),
+        "auth-check success message must not imply a shell or session: {message}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool) {
+    // Outer timeout 50ms; checker sleeps 500ms. The route must return
+    // `connection_failed` and the body must NOT leak the slow checker's
+    // existence, the configured timeout, or any private-key material.
+    let user_id = create_user(&pool, "dev").await;
+    let svc = Arc::new(SshAuthCheckService::with_limits(
+        Arc::new(SlowAuthChecker {
+            delay: std::time::Duration::from_millis(500),
+            captured: captured_for_test("SHA256:should-not-reach"),
+            kind: AuthAttemptKind::Authenticated,
+        }),
+        std::time::Duration::from_millis(50),
+        4,
+    ));
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: svc,
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "slow.example.com").await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["status"], "connection_failed");
+
+    // The body must not reveal anything about the timeout, the slow
+    // checker, or the decrypted PEM.
+    let raw = body.to_string().to_lowercase();
+    for forbidden in [
+        "timeout",
+        "elapsed",
+        "deadline",
+        "encrypted_private_key",
+        "private_key",
+        "begin openssh private key",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "auth-check timeout body must not contain `{forbidden}`: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
+    // max_concurrent = 1; the first call holds the slot via a Notify
+    // gate; the second call must get a 503 with the static service-
+    // unavailable body, NOT a 200 typed status. This is the wire-level
+    // proof of the saturation guard.
+    let user_id = create_user(&pool, "dev").await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let svc = Arc::new(SshAuthCheckService::with_limits(
+        Arc::new(BlockingAuthChecker {
+            entered: entered.clone(),
+            release: release.clone(),
+            captured: captured_for_test("SHA256:any"),
+            kind: AuthAttemptKind::Authenticated,
+        }),
+        std::time::Duration::from_secs(60),
+        1,
+    ));
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: svc,
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    // Two profiles so the two requests address different rows — proves
+    // the cap is process-wide rather than per-profile.
+    let profile_first =
+        make_owned_profile(&pool, user_id, &test_vault(), "first", "first.example.com").await;
+    let profile_second = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "second",
+        "second.example.com",
+    )
+    .await;
+
+    // Fire the first request; it parks on the gate.
+    let app_first = app.clone();
+    let first = tokio::spawn(async move {
+        app_first
+            .oneshot(json_post(
+                &format!("/api/v1/server-profiles/{profile_first}/auth-check"),
+                json!({}),
+            ))
+            .await
+            .unwrap()
+    });
+
+    // Wait deterministically until the first request has reached the
+    // checker — at which point the service has already acquired the only
+    // permit. No sleep, no race: the `entered` notify fires from inside
+    // `BlockingAuthChecker::run`, after `try_acquire_owned` returned.
+    entered.notified().await;
+
+    let saturated = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_second}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body(saturated).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+    assert_eq!(body["error"]["message"], "service unavailable");
+
+    // The 503 body must not leak operator detail about the semaphore,
+    // the in-flight call, or any private-key material.
+    let raw = body.to_string().to_lowercase();
+    for forbidden in [
+        "saturated",
+        "semaphore",
+        "permit",
+        "concurrency",
+        "encrypted_private_key",
+        "private_key",
+        "begin openssh private key",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "auth-check saturation body must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // Release the first request so the test exits cleanly.
+    release.notify_one();
+    let first_resp = first.await.unwrap();
+    assert_eq!(first_resp.status(), StatusCode::OK);
 }

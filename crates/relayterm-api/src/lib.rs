@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::{Router, extract::FromRef};
 use relayterm_core::ids::UserId;
 use relayterm_db::Db;
-use relayterm_ssh::HostKeyPreflightService;
+use relayterm_ssh::{HostKeyPreflightService, SshAuthCheckService};
 use relayterm_vault::VaultService;
 use tower_http::trace::TraceLayer;
 
@@ -40,6 +40,17 @@ pub struct AppState {
     /// PTY readiness — see `HostKeyPreflightService` docs for the full
     /// "what it proves vs does not prove" list.
     pub preflight: Arc<HostKeyPreflightService>,
+    /// Authenticated SSH credential check service. Verifies the host key
+    /// is pinned and trusted, then attempts public-key auth and tears the
+    /// connection down — no PTY, no shell, no commands. Held behind `Arc`
+    /// for the same reason `preflight` is.
+    ///
+    /// **Scope**: this attests to host-key trust + public-key auth only.
+    /// It does NOT validate that a PTY can be allocated, a shell can be
+    /// spawned, or a session can be opened. See
+    /// [`SshAuthCheckService`](relayterm_ssh::SshAuthCheckService) docs
+    /// for the full "proves vs does not prove" contract.
+    pub auth_check: Arc<SshAuthCheckService>,
     /// Dev-only owner id stamped onto every created row until auth lands.
     /// `None` when `dev_auth.enabled = false` (the shim is off but real
     /// auth has not yet been wired up); in that mode `DevUser` extractors

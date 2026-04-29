@@ -82,6 +82,37 @@ Before opening a real SSH session against a `server_profile`, clients run a host
 - **Failure modes**: `400` for a malformed `expected_fingerprint`; `401` when dev-auth is disabled; `404` for a missing or foreign-owned profile (cross-user 404 is byte-identical to a genuine 404); `409` for a host-key mismatch (changed key, stale expected fingerprint, OR revoked-row-for-this-fingerprint); `502 bad_gateway` for any SSH probe failure (unreachable, timeout, transport error, unsupported host-key algorithm) — the wire body is a static `"bad gateway"` string so peer banners and topology never leak; `503 service_unavailable` when the vault is disabled.
 - **What this slice does NOT do**: open an interactive session, request a PTY, run a shell, attempt SSH authentication, validate that the configured identity works against the target, or unrevoke/restore a previously revoked known-host entry. The decrypted private key is parsed for round-trip validation only; it is never sent to the peer during the host-key probe. Auth-side verification, persistent session orchestration, reconnect-replay, and revoked-entry recovery all belong to later slices.
 
+### Authenticated SSH credential check contract
+
+After the host key is pinned and trusted (see preceding section), an operator may run an authenticated check to confirm the configured `ssh_identity` actually authenticates against the target. The check is deliberately scoped to "did the credentials work?" — it never opens a PTY, runs a shell, or executes a command, so it cannot be abused to drive arbitrary SSH activity through the API.
+
+**Scope (load-bearing).** A successful auth-check response attests ONLY to:
+
+1. The TCP+SSH transport reached the target.
+2. The captured server host key matches an active, trusted, non-revoked `known_host_entries` row for the host.
+3. The vault-stored private key decrypted and parsed as a valid OpenSSH key.
+4. SSH public-key authentication succeeded against the server for the configured username.
+
+It does **NOT** mean a PTY can be allocated, a shell can be spawned, a command can be executed, or that a long-lived terminal session can be opened. Those are separate, later concerns. The auth-check route holds the connection only long enough to read the auth result and tears it down before returning.
+
+- **Endpoint**: `POST /api/v1/server-profiles/:id/auth-check`. No request body. The route resolves the (profile, host, ssh_identity) trio scoped to the caller's user, decrypts the identity inside the vault, computes the active+trusted+non-revoked accept-pin set from `known_host_entries`, and asks the SSH auth checker to (a) connect, (b) verify the captured host key matches an accept-pin in `check_server_key`, (c) attempt public-key authentication if it does, and (d) disconnect. If the captured key is not in the accept-pin set, the checker returns `Ok(false)` from `check_server_key` and russh tears the transport down BEFORE any client signature is sent. No PTY is requested, no channel is opened, no command is executed.
+- **Response (200)**: `{ profile_id, host_id, ssh_identity_id, status, message, checked_at }`. `status` is one of `authentication_succeeded`, `authentication_failed`, `host_key_unknown`, `host_key_changed`, `connection_failed`. `message` is a short, static, human-facing string keyed off `status` that explicitly disclaims PTY/command/shell scope on success. The response carries NO host-key fingerprint, NO public/private key material, NO peer banner, and NO russh error text.
+- **Status semantics**:
+  - `authentication_succeeded` — the host key matched a trusted pin AND `authenticate_publickey` returned success.
+  - `authentication_failed` — the host key matched a trusted pin, but the server rejected the credential for the configured username. Auth was attempted; this is the operator-facing "wrong key / wrong user" diagnostic.
+  - `host_key_unknown` — no active, trusted, non-revoked row matches the captured host key. Auth was NOT attempted. Trust the host key first via `trust-host-key`.
+  - `host_key_changed` — an active, non-revoked row exists for the same key type with a DIFFERENT fingerprint. Auth was NOT attempted. The pin is NOT auto-overwritten — the operator must explicitly revoke the old pin before re-trusting.
+  - `connection_failed` — the SSH transport failed before authentication could complete (TCP refused, timeout, malformed peer). Auth was NOT attempted.
+- **Host-key trust precondition (load-bearing)**: the auth checker is given ONLY the active, trusted, non-revoked pins. Anything else triggers `Ok(false)` from `check_server_key` and the connection terminates before auth — guaranteeing no client signature is ever sent to an unverified peer. A revoked-and-reappearing key surfaces as `host_key_unknown`; the route never auto-trusts it.
+- **Failure modes** (HTTP error, distinct from typed status responses):
+  - `401 unauthorized` when dev-auth is disabled.
+  - `404 not_found` for a missing or foreign-owned profile (cross-user 404 is byte-identical to a genuine 404).
+  - `500 internal_error` if the decrypted private key fails to parse (data-integrity bug in the vault row).
+  - `503 service_unavailable` when the vault is disabled OR the auth-check concurrency cap is saturated. The wire body is the static `service unavailable` string in either case — operator detail (vault flag, semaphore state) is logged but never echoed.
+  Auth failure, host-key mismatch, and connection failure are NOT HTTP errors — they are typed `status` outcomes on a 200 response, because they are diagnostic answers the operator UI surfaces directly.
+- **Outbound-network safety bounds**: every auth-check is wrapped by two guards owned by `SshAuthCheckService`. (1) A hard outer timeout (default 25s) caps the whole `checker.run` call; if it fires, the response collapses to `connection_failed` so a stuck checker can never hold an HTTP request indefinitely. (2) A process-wide [`tokio::sync::Semaphore`] caps concurrent in-flight auth-checks (default 4); callers past the cap get a 503 with the static `service unavailable` body and may retry. Both bounds are configurable via `SshAuthCheckService::with_limits` so tests can exercise them without burning real wall-clock budget.
+- **What this slice does NOT do**: open an interactive session, request a PTY, run a shell, execute a command, persist any session state, exchange any non-auth SSH messages, log decrypted private-key bytes, surface peer banners, or accept user-uploaded private keys. The decrypted PEM lives only inside `SshAuthCheckService::auth_check` and the russh checker call, and is wiped from memory when the request struct drops.
+
 ## Behavior contracts
 
 - **Reconnect replay**: when a client reconnects with `(session_id, last_seen_seq)`, the backend MUST send all events with `seq > last_seen_seq` from the ring buffer in order, then resume live streaming. If `last_seen_seq` is older than the ring buffer's tail, the backend returns a `replay_window_lost` error and the client must request a full re-render or close the session.
