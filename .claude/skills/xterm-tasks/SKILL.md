@@ -86,4 +86,7 @@ The architectural rule says renderers don't own state — implementations MUST N
 
 ## Project-specific patterns
 
-*(no entries yet)*
+- xterm.js is isolated in `packages/terminal-xterm`. `packages/terminal-core` MUST NOT import `@xterm/*`; the protocol and session client stay renderer-neutral.
+- xterm's stylesheet is exposed via the `@relayterm/terminal-xterm/styles` subpath import, not the bare package entry. JS tree-shaking is preserved by the package's `sideEffects: ["./src/styles.ts", "**/*.css"]` declaration; xterm.css still rides into the production CSS bundle as a documented compromise.
+- The `xtermOnly` field on `XtermRendererOptions` is an adapter-local escape hatch for xterm-only knobs and MUST NOT be promoted to RelayTerm's persisted terminal-preference model — that surface stays renderer-neutral.
+- The renderer adapter MUST NOT log, echo, or include raw terminal input bytes in any error, event, or debug output. Listener errors are swallowed inside the fanout for the same reason.
