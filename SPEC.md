@@ -170,6 +170,81 @@ If the underlying transport drops (client disconnect, network failure, abrupt cl
 
 PTY allocation and `russh::Channel` ownership; forwarding `Input` bytes to the SSH peer; emitting `output` frames with monotonic sequence numbers; the replay ring buffer and the `replay_window_lost` recovery path; multi-client (collaborative) attach behavior; backend-restart recovery for `starting` rows; binary frame format; and `ConnectInfo`-based `remote_addr` capture all belong to later, deliberate slices.
 
+### Frontend terminal-core contract
+
+The browser/Tauri client never talks to the WebSocket directly — it goes through the `@relayterm/terminal-core` package. That package owns the wire protocol, the transport, and the per-attachment state machine. **Renderers (xterm.js, libghostty-vt, restty, wterm) plug in through a renderer-neutral interface; none are dependencies of the core.** This load-bearing separation is what lets a renderer swap (or a future native Tauri renderer) drop in without changing protocol or state-machine code.
+
+**Scope (load-bearing — this slice).** A successful `terminal-core` integration attests ONLY to the typed protocol envelope, transport lifecycle, and a renderer-neutral plug interface. It does **NOT** include xterm.js or any other renderer adapter, replay-buffer behavior, real PTY byte streaming on the wire, or any reconnect policy beyond the explicit `attach`/`detach` lifecycle. Each remaining capability is a separate, deliberate slice.
+
+#### Package layout
+
+`packages/terminal-core/` exports four orthogonal layers — protocol, transport, renderer interface, session client — from one barrel `index.ts`. No file in this package may import an xterm/ghostty/restty/wterm package; if a future component needs renderer-specific behavior it lives in `packages/terminal-<name>/` and consumes `@relayterm/terminal-core` as a peer.
+
+| Module       | Owns                                                                                          |
+|--------------|-----------------------------------------------------------------------------------------------|
+| `protocol`   | TS mirrors of `relayterm_protocol::{ClientMsg, ServerMsg, ErrorCode, AckKind, SessionAttachStatus}` plus a non-throwing `decodeServerMsg` that returns `{ok, message}` or `{ok:false, failure}`. |
+| `transport`  | `TerminalTransport` interface and `WebSocketTerminalTransport` impl. Encodes outbound frames, decodes inbound text frames, surfaces close/error events. |
+| `renderer`   | `TerminalRenderer` interface (mount/write/focus/resize/dispose/onInput) and the renderer-neutral `TerminalPreferences` placeholder type. |
+| `client`     | `TerminalSessionClient` — the lifecycle state machine that ties transport + protocol together and exposes typed events to UI/renderer code. |
+| `events`     | Internal `TypedEmitter` used by transport and client. Listener errors are swallowed so a misbehaving listener can't break the dispatch loop. |
+
+#### `TerminalSessionClient` state machine
+
+States and the legal transitions out of each:
+
+- `idle` — initial. Calling `attach()` moves to `connecting`.
+- `connecting` — WebSocket is opening; the wire `attach` frame will be sent the moment `connect()` resolves. The first server frame MUST be `session_attached`; anything else collapses to `error`. A transport close in this state collapses to `error`.
+- `attached` — happy path. `ping`/`resize`/`input`/`detach`/`close` are all accepted; the server's typed responses fan out to the matching events.
+- `detached` — terminal-on-this-attachment state, reached by either a server `session_detached` frame OR a transport close on an attached client (the backend always writes the detach bookkeeping on socket exit, so a transport-close-after-attach is treated as a clean detach by the client).
+- `closed` — terminal-on-this-session state, reached by a server `session_closed` frame.
+- `error` — terminal state for protocol or transport failures during attach. The client is dead; create a new instance to retry.
+
+**Send guards (load-bearing):**
+- `sendInput` / `sendResize` / `sendPing` / `detach` / `close` are all REJECTED before `attached` and after a terminal state. Resize is **not queued** — the simpler and safer policy is to reject and let the renderer re-fire on the `attached` event. Rejection emits `input_rejected_or_stubbed` with a stable `reason` (`not_attached` | `pty_not_implemented` | `after_terminal_state`) plus the `attempted` action tag (`input` | `resize` | `ping` | `detach` | `close`). The raw payload of any rejected `input` call is NEVER reflected into events, errors, or logs.
+- The backend's stub `pty_not_implemented` error frame is translated into the same `input_rejected_or_stubbed` event (`reason: "pty_not_implemented"`, `attempted: "input"`) so callers don't have to special-case server vs client rejection.
+
+**Typed events emitted by `TerminalSessionClient`:**
+
+| Event                          | Payload                          | When                                                                                  |
+|--------------------------------|----------------------------------|---------------------------------------------------------------------------------------|
+| `state_change`                 | `TerminalSessionState`            | Every state transition.                                                                |
+| `attached`                     | `SessionAttachedMsg`              | First server frame after a successful upgrade.                                         |
+| `detached`                     | `SessionDetachedMsg`              | Server confirmed detach OR transport closed after attach.                              |
+| `closed`                       | `SessionClosedMsg`                | Server confirmed session-close transition.                                             |
+| `ack`                          | `AckMsg`                          | Generic ack (`kind: "resize"` today).                                                  |
+| `resize_ack`                   | `AckMsg`                          | Convenience event fired in addition to `ack` when `kind === "resize"`.                 |
+| `pong`                         | `PongMsg`                         | Reply to `ping`.                                                                       |
+| `output`                       | `OutputMsg`                       | Reserved for the future PTY slice; never emitted today.                                |
+| `replay_window_lost`           | `ReplayWindowLostMsg`             | Reserved for the future replay slice; never emitted today.                             |
+| `error`                        | `TerminalClientError`             | Transport, decode, unexpected-first-frame, server `error`, or send-while-not-attached. |
+| `input_rejected_or_stubbed`    | `{reason, attempted}`             | See "Send guards" above; never includes payload bytes.                                 |
+
+#### `TerminalRenderer` interface
+
+A renderer is a class implementing `mount(element)`, `write(data)`, `focus()`, `resize(cols, rows)`, `dispose()`, and `onInput(cb)` — plus an optional `onResize(cb)` for renderers that own their own cell-grid measurement. The interface is deliberately minimal:
+
+- `write(data)` accepts `string | Uint8Array` so a future binary-frame slice doesn't have to widen the type.
+- The renderer never sees the protocol. The session client decides what bytes to call `write()` with; today that is nothing (no PTY).
+- `dispose()` MUST release every listener and DOM/WebGL resource. Renderers MUST NOT carry state across a `dispose`/`mount` cycle — the orchestrator owns reconnect/replay.
+- Renderer-specific config (xterm option names, ghostty-vt parser flags) does NOT belong in this interface. It lives in the adapter package's own constructor / config surface. The renderer-neutral `TerminalPreferences` type in `renderer.ts` (font, theme, cursor style, scrollback) is reserved for a future preferences slice and is intentionally lowest-common-denominator.
+
+#### Renderer-neutral rule
+
+Across `packages/terminal-core/`:
+- No file imports xterm.js, libghostty-vt, restty, wterm, or any concrete drawing library.
+- No interface uses xterm-specific option names or DOM/canvas/WebGPU-specific shapes.
+- The protocol stays RelayTerm-shaped, never xterm-shaped.
+
+A renderer adapter (xterm, ghostty-web, restty, wterm) is a separate package under `packages/terminal-<name>/` that imports `@relayterm/terminal-core`, NEVER the other way around. Adding a new renderer is an architectural surface — see AGENTS.md "When unsure" — propose before adding.
+
+#### Diagnostic UI
+
+`apps/web/src/lib/dev/TerminalProtocolLab.svelte` is a developer-only page that drives the client against a real backend WebSocket. It is NOT the production terminal UI; it has no renderer, and its log deliberately does NOT echo the bytes of any `input` frame the user sends (the diagnostic UI follows the same redaction rule as the protocol layer).
+
+#### Future work (explicit out-of-scope for this slice)
+
+xterm.js / ghostty-web / restty / wterm renderer adapters; real PTY byte streaming through `output` frames; replay-buffer integration on reconnect; auth handshake on the WebSocket beyond dev-auth; per-renderer preference persistence; mobile/Tauri shell integration of the lab UI. Each is a separate, deliberate slice.
+
 ### Authenticated SSH credential check contract
 
 After the host key is pinned and trusted (see preceding section), an operator may run an authenticated check to confirm the configured `ssh_identity` actually authenticates against the target. The check is deliberately scoped to "did the credentials work?" — it never opens a PTY, runs a shell, or executes a command, so it cannot be abused to drive arbitrary SSH activity through the API.
