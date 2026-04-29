@@ -24,29 +24,38 @@ use http_body_util::BodyExt as _;
 use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
-    CreateSshIdentity, CreateUser, SshIdentityRepository, UserRepository,
+    CreateHost, CreateSshIdentity, CreateUser, HostRepository, SshIdentityRepository,
+    UserRepository,
 };
 use relayterm_core::ssh_identity::SshKeyType;
-use relayterm_db::{Db, PgSshIdentityRepository, PgUserRepository};
+use relayterm_core::validation::{
+    validate_host_display_name, validate_hostname, validate_ssh_port, validate_ssh_username,
+};
+use relayterm_db::{Db, PgHostRepository, PgSshIdentityRepository, PgUserRepository};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
 const PRIVATE_KEY_MARKER: &[u8] = b"REDACT-MARKER-API-9F2B";
 
-async fn setup(pool: PgPool) -> (Router, UserId) {
-    let user = PgUserRepository::new(pool.clone())
+async fn create_user(pool: &PgPool, label: &str) -> UserId {
+    PgUserRepository::new(pool.clone())
         .create(CreateUser {
-            email: format!("dev+{}@relayterm.local", uuid::Uuid::new_v4()),
-            display_name: "Dev".to_owned(),
+            email: format!("{label}+{}@relayterm.local", uuid::Uuid::new_v4()),
+            display_name: label.to_owned(),
         })
         .await
-        .expect("create dev user");
+        .expect("create user")
+        .id
+}
+
+async fn setup(pool: PgPool) -> (Router, UserId) {
+    let user_id = create_user(&pool, "dev").await;
     let state = AppState {
         db: Db::from_pool(pool),
-        dev_user_id: user.id,
+        dev_user_id: Some(user_id),
     };
-    (router(state), user.id)
+    (router(state), user_id)
 }
 
 async fn read_body(resp: axum::response::Response) -> Value {
@@ -199,6 +208,94 @@ async fn get_host_unknown_id_returns_404(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = read_body(resp).await;
     assert_eq!(body["error"]["code"], "not_found");
+}
+
+/// A `GET /api/v1/hosts/:id` for a host owned by a different user must be
+/// indistinguishable from a genuine 404 — same status, same body. Otherwise
+/// an attacker can probe for the existence of other users' resources by id.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool) {
+    // Provision a foreign user and a host they own, directly via the
+    // repository (the API is bound to a different dev user).
+    let other_user = create_user(&pool, "other").await;
+    let foreign_host = PgHostRepository::new(pool.clone())
+        .create(CreateHost {
+            owner_id: other_user,
+            display_name: validate_host_display_name("Other-user host").unwrap(),
+            hostname: validate_hostname("other.example.com").unwrap(),
+            port: validate_ssh_port(22).unwrap(),
+            default_username: validate_ssh_username("ops").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let (app, _dev_user) = setup(pool).await;
+
+    // Baseline: a totally bogus id returns 404 with the canonical body.
+    let bogus = uuid::Uuid::new_v4();
+    let bogus_resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/hosts/{bogus}")))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    // Same id-shape, different owner — must produce the same response.
+    let resp = app
+        .oneshot(get(&format!("/api/v1/hosts/{}", foreign_host.id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "cross-user 404 must be byte-identical to a genuine 404"
+    );
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+/// When the dev-auth shim is disabled (`AppState::dev_user_id == None`) and
+/// no real auth backend has been wired, every `DevUser`-guarded route must
+/// return 401 with the canonical error envelope rather than the backend
+/// hard-bailing on startup.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
+    let state = AppState {
+        db: Db::from_pool(pool),
+        dev_user_id: None,
+    };
+    let app = router(state);
+
+    // GET hosts is DevUser-guarded.
+    let resp = app.clone().oneshot(get("/api/v1/hosts")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+    // The wire body must not echo any operator-facing detail; the static
+    // "unauthorized" message is all the client gets, regardless of why.
+    assert_eq!(body["error"]["message"], "unauthorized");
+    assert!(
+        !body.to_string().contains("dev_auth"),
+        "401 body must not leak dev-auth implementation detail: {body}"
+    );
+
+    // POST is also guarded — body never reaches the validator.
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/hosts",
+            json!({
+                "display_name": "x",
+                "hostname": "h.example.com",
+                "default_username": "deploy",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["message"], "unauthorized");
 }
 
 // ----------------------------------------------------------------------

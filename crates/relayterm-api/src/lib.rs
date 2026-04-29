@@ -23,11 +23,14 @@ pub use error::ApiError;
 pub struct AppState {
     pub db: Db,
     /// Dev-only owner id stamped onto every created row until auth lands.
-    /// See [`dev_user`](crate::dev_user) for the rationale.
-    pub dev_user_id: UserId,
+    /// `None` when `dev_auth.enabled = false` (the shim is off but real
+    /// auth has not yet been wired up); in that mode `DevUser` extractors
+    /// return `401`. See [`dev_user`](crate::dev_user) for the full
+    /// transition story.
+    pub dev_user_id: Option<UserId>,
 }
 
-impl FromRef<AppState> for UserId {
+impl FromRef<AppState> for Option<UserId> {
     fn from_ref(state: &AppState) -> Self {
         state.dev_user_id
     }

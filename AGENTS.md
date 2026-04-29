@@ -208,4 +208,5 @@ Prefer fewer abstractions, explicit over clever. Ask before adding a top-level d
 
 ---
 
-*(no entries yet — first session will add them as encountered)*
+- 2026-04-28 · API `get_by_id` ownership · The `.filter(|x| x.owner_id == caller)` guard belongs on **every** `get_by_id` handler, not only `list` and `create`. The hosts route initially shipped without it while server-profiles and ssh-identities had it, which would leak cross-user existence by id. · Any time `repository.get(id)` returns a row that is not already scoped to the caller, filter by `owner_id` before mapping `None` → 404. Cross-user reads must be byte-identical to a genuine 404.
+- 2026-04-28 · dev-auth stopgap transitions · Stopgap auth shims (e.g. the `DevUser` extractor) must be configured for two-phase coexistence with real auth, not a hard bail when the shim is disabled. A `bail!`-on-disable forces a single coordinated cutover with no dark-launch window. · `if cfg.dev_auth.enabled { Some(id) } else { None }` plus a 401 from the extractor leaves room to land real auth alongside the shim and migrate handlers one at a time.

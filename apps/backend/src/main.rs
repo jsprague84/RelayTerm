@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
 use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{CreateUser, UserRepository};
@@ -26,24 +26,34 @@ async fn main() -> anyhow::Result<()> {
         .context("connect to postgres")?;
 
     // STOPGAP — see `bootstrap_dev_user_for_unimplemented_auth` below.
-    // Once real auth lands, the operator flips `dev_auth.enabled = false`,
-    // this branch fails the boot, and the bootstrap call (and this whole
-    // block) is deleted in the same change.
-    if !cfg.dev_auth.enabled {
-        bail!(
-            "dev_auth.enabled = false but no real auth backend is wired up yet — \
-             remove the bootstrap call in apps/backend/src/main.rs as part of \
-             landing real authentication, then drop the dev_auth config field"
+    //
+    // Two-phase removal of this shim:
+    //   1. Land real auth alongside the shim. While both are wired the
+    //      shim wins and tags requests with the dev user.
+    //   2. Flip `dev_auth.enabled = false`. The backend keeps starting;
+    //      `DevUser`-guarded routes return 401 until each handler is
+    //      ported to the real auth extractor.
+    //   3. Delete the bootstrap call, the `DevUser` module, and the
+    //      `dev_auth` config field in the same change that retires the
+    //      last `DevUser` use site.
+    let dev_user_id = if cfg.dev_auth.enabled {
+        let id = bootstrap_dev_user_for_unimplemented_auth(&db)
+            .await
+            .context("bootstrap dev user for unimplemented auth")?;
+        warn!(
+            dev_user_id = %id,
+            "AUTH NOT IMPLEMENTED — every request is attributed to the hardcoded dev user; \
+             flip dev_auth.enabled to false once real auth is wired",
         );
-    }
-    let dev_user_id = bootstrap_dev_user_for_unimplemented_auth(&db)
-        .await
-        .context("bootstrap dev user for unimplemented auth")?;
-    warn!(
-        %dev_user_id,
-        "AUTH NOT IMPLEMENTED — every request is attributed to the hardcoded dev user; \
-         flip dev_auth.enabled to false once real auth lands",
-    );
+        Some(id)
+    } else {
+        warn!(
+            "dev_auth.enabled = false — DevUser-guarded routes will return 401 until \
+             every handler is ported to the real auth extractor, then this whole shim \
+             can be deleted",
+        );
+        None
+    };
 
     let state = AppState { db, dev_user_id };
     let app = router(state);
@@ -69,13 +79,8 @@ async fn main() -> anyhow::Result<()> {
 /// is intentionally long and unambiguous so a code search for `unimplemented_auth`
 /// surfaces this and the matching `DevUser` extractor in one shot.
 ///
-/// When real auth lands the migration is:
-/// 1. Implement the session/passkey middleware.
-/// 2. Delete this function and its call site in `main`.
-/// 3. Delete `relayterm_api::DevUser` and `AppState::dev_user_id`.
-/// 4. Drop the `dev_auth` config field.
-///
-/// Idempotent so a re-deploy behaves the same as a fresh container.
+/// Removal sequence is in the `main()` doc-comment above; the fixture is
+/// idempotent so a re-deploy behaves the same as a fresh container.
 async fn bootstrap_dev_user_for_unimplemented_auth(db: &Db) -> anyhow::Result<UserId> {
     let users = db.users();
     if let Some(existing) = users.get_by_email(DEV_USER_EMAIL).await? {

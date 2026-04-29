@@ -40,14 +40,18 @@ async fn list(
 
 async fn get_by_id(
     State(state): State<AppState>,
-    _user: DevUser,
+    user: DevUser,
     Path(id): Path<HostId>,
 ) -> Result<Json<HostResponse>, ApiError> {
+    // Cross-user reads must be indistinguishable from a missing row — the
+    // ownership mismatch and the genuinely-absent case both produce the
+    // same `NotFound` response so we don't leak existence by id.
     let host = state
         .db
         .hosts()
         .get(id)
         .await?
+        .filter(|h| h.owner_id == user.0)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok(Json(host.into()))
 }

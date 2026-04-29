@@ -14,7 +14,7 @@ use axum::{
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::validation::ValidationError;
 use serde::Serialize;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Stable error code strings emitted on the wire. The enum keeps the set
 /// closed so handlers can't invent ad-hoc codes that clients then depend on.
@@ -22,6 +22,7 @@ use tracing::error;
 #[allow(unreachable_pub)]
 pub enum ErrorCode {
     InvalidInput,
+    Unauthorized,
     NotFound,
     Conflict,
     InternalError,
@@ -31,6 +32,7 @@ impl ErrorCode {
     fn as_str(self) -> &'static str {
         match self {
             Self::InvalidInput => "invalid_input",
+            Self::Unauthorized => "unauthorized",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::InternalError => "internal_error",
@@ -44,6 +46,17 @@ pub enum ApiError {
     /// 400 — input failed validation at the API boundary.
     #[error("invalid input: {0}")]
     Validation(String),
+
+    /// 401 — no authenticated identity available.
+    ///
+    /// **The wrapped detail is operator-facing only and is NEVER echoed to
+    /// the client.** It is logged at `warn!` when the response is built;
+    /// the wire body collapses to the static `"unauthorized"` message.
+    /// Do not put credential hints, token fragments, or transient session
+    /// state in this string — even though it is currently redacted at the
+    /// boundary, treat it as a server-side log line.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 
     /// 404 — the addressed entity does not exist (or is not visible to the caller).
     #[error("{entity} not found")]
@@ -65,6 +78,11 @@ impl ApiError {
                 StatusCode::BAD_REQUEST,
                 ErrorCode::InvalidInput,
                 msg.clone(),
+            ),
+            Self::Unauthorized(_) => (
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::Unauthorized,
+                "unauthorized".to_owned(),
             ),
             Self::NotFound { entity } => (
                 StatusCode::NOT_FOUND,
@@ -98,8 +116,13 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        if let Self::Internal(detail) = &self {
-            error!(detail = %detail, "internal API error");
+        // Both branches keep the wrapped detail server-side only. The wire
+        // body comes from `parts()` and is always one of a small set of
+        // static-or-derived-from-static strings.
+        match &self {
+            Self::Internal(detail) => error!(detail = %detail, "internal API error"),
+            Self::Unauthorized(detail) => warn!(detail = %detail, "unauthorized request"),
+            _ => {}
         }
         let (status, code, message) = self.parts();
         let body = ErrorEnvelope {

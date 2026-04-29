@@ -47,6 +47,10 @@ async fn create(
         .ok_or(ApiError::NotFound {
             entity: "ssh_identity",
         })?;
+    // Tripwires for refactors that move the prefetch elsewhere — the
+    // `.filter()`s above already guarantee the id match in release, so a
+    // mismatch here would mean `repository.get(id)` started returning a
+    // different row than asked for. Cheap to keep, free at runtime.
     debug_assert_eq!(host.id, input.host_id);
     debug_assert_eq!(identity.id, input.ssh_identity_id);
 
