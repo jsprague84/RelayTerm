@@ -11,13 +11,19 @@ use crate::ids::{ServerProfileId, TerminalSessionAttachmentId, TerminalSessionId
 
 /// Lifecycle status of a [`TerminalSession`].
 ///
-/// Transitions:
+/// Transitions (target shape — not all edges are wired yet):
+/// - `Starting` → `Active` once the orchestrator has a real PTY/SSH channel.
+///   PTY allocation is unimplemented, so a session created today stays
+///   in `Starting` until it's explicitly closed.
 /// - `Active` → `Detached` when the last attached client drops.
 /// - `Detached` → `Active` when a client reattaches.
-/// - either → `Closed` on inactivity timeout, explicit close, or a hard error.
+/// - any → `Closed` on inactivity timeout, explicit close, or a hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalSessionStatus {
+    /// Session metadata exists but no PTY/SSH channel is open yet. Initial
+    /// state set by the orchestrator on `POST /api/v1/terminal-sessions`.
+    Starting,
     Active,
     Detached,
     Closed,
@@ -27,6 +33,7 @@ impl TerminalSessionStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Starting => "starting",
             Self::Active => "active",
             Self::Detached => "detached",
             Self::Closed => "closed",
@@ -37,6 +44,7 @@ impl TerminalSessionStatus {
     #[must_use]
     pub fn from_str_tag(value: &str) -> Option<Self> {
         Some(match value {
+            "starting" => Self::Starting,
             "active" => Self::Active,
             "detached" => Self::Detached,
             "closed" => Self::Closed,

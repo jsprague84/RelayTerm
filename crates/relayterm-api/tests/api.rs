@@ -28,21 +28,25 @@ use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
     CreateHost, CreateKnownHostEntry, CreateServerProfile, CreateSshIdentity, CreateUser,
-    HostRepository, KnownHostEntryRepository, ServerProfileRepository, SshIdentityRepository,
-    UserRepository,
+    HostRepository, KnownHostEntryRepository, ServerProfileRepository, SessionEventRepository,
+    SshIdentityRepository, TerminalSessionRepository, UserRepository,
 };
+use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
+use relayterm_core::terminal_session::TerminalSessionStatus;
 use relayterm_core::validation::{
     validate_host_display_name, validate_hostname, validate_ssh_port, validate_ssh_username,
 };
 use relayterm_db::{
     Db, PgHostRepository, PgKnownHostEntryRepository, PgServerProfileRepository,
-    PgSshIdentityRepository, PgUserRepository,
+    PgSessionEventRepository, PgSshIdentityRepository, PgTerminalSessionRepository,
+    PgUserRepository,
 };
 use relayterm_ssh::{
     AuthAttemptKind, AuthCheckOutcome, AuthCheckTarget, CapturedHostKey, HostKeyPreflightService,
     ProbeError, ProbeTarget, SshAuthCheckService, SshAuthChecker, SshHostKeyProbe,
 };
+use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -88,14 +92,29 @@ async fn setup_with_auth_check_service(
     auth_check: Arc<SshAuthCheckService>,
 ) -> (Router, UserId) {
     let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(probe)),
         auth_check,
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     (router(state), user_id)
+}
+
+/// Build a `TerminalSessionManager` wired to the same Postgres pool the
+/// router will use. Each test gets its own manager — registry state is
+/// per-test, which matches production semantics (the registry is not
+/// durable; a backend restart drops it).
+fn test_terminal_manager(db: &Db) -> Arc<TerminalSessionManager> {
+    use relayterm_core::repository::{SessionEventRepository, TerminalSessionRepository};
+    Arc::new(TerminalSessionManager::new(
+        Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+    ))
 }
 
 /// Vault service backed by a deterministic test master key. Tests that
@@ -500,11 +519,14 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
 /// hard-bailing on startup.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
         dev_user_id: None,
     };
     let app = router(state);
@@ -681,11 +703,14 @@ async fn post_ssh_identity_empty_name_returns_400(pool: PgPool) {
 async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
     // dev-auth off → DevUser extractor short-circuits with 401 BEFORE any
     // vault work happens. The request body never reaches the vault.
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
         dev_user_id: None,
     };
     let app = router(state);
@@ -713,11 +738,14 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
     let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -1443,11 +1471,14 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
     // Without a vault, the route can't decrypt the identity. Must 503.
     let user_id = create_user(&pool, "dev").await;
     let probe = FakeProbe::new(captured_for_test("SHA256:any"));
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(Arc::new(probe))),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -2010,13 +2041,16 @@ async fn auth_check_returns_authentication_failed_safely(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) {
     let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(Arc::new(ErroringAuthChecker(
             ProbeError::Unreachable,
         )))),
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -2052,11 +2086,14 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
     // Without a vault, the route can't decrypt the identity → 503 with
     // the static service-unavailable body. The auth checker is never called.
     let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: None,
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -2111,11 +2148,14 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
         dev_user_id: None,
     };
     let app = router(state);
@@ -2195,11 +2235,14 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         std::time::Duration::from_millis(50),
         4,
     ));
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: svc,
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -2255,11 +2298,14 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         std::time::Duration::from_secs(60),
         1,
     ));
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
     let state = AppState {
-        db: Db::from_pool(pool.clone()),
+        db,
         vault: Some(test_vault()),
         preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         auth_check: svc,
+        terminal_sessions,
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -2330,4 +2376,757 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
     release.notify_one();
     let first_resp = first.await.unwrap();
     assert_eq!(first_resp.status(), StatusCode::OK);
+}
+
+// ----------------------------------------------------------------------
+// Terminal sessions
+//
+// The terminal-session lifecycle surface is the metadata-only foundation
+// for the future PTY-bearing orchestrator. These tests pin the wire
+// contract: PTY/SSH side-effects MUST NOT happen, ownership rules apply,
+// host-key trust is a precondition, and lifecycle events are written.
+// ----------------------------------------------------------------------
+
+/// Provision a profile owned by `user_id` AND pin a trusted host-key
+/// entry for its host. Returns the profile id, ready for a successful
+/// `POST /terminal-sessions` call.
+async fn make_trusted_profile(
+    pool: &PgPool,
+    user_id: UserId,
+    vault: &VaultService,
+    name: &str,
+    hostname: &str,
+    fingerprint: &str,
+) -> relayterm_core::ids::ServerProfileId {
+    let profile_id = make_owned_profile(pool, user_id, vault, name, hostname).await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pin_trusted_entry(pool, profile.host_id, fingerprint).await;
+    profile_id
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_returns_starting_placeholder(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "host.example.com",
+        "SHA256:term-create",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({
+                "server_profile_id": profile_id,
+                "cols": 120,
+                "rows": 30,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+
+    assert_eq!(body["status"], "starting");
+    assert_eq!(body["cols"], 120);
+    assert_eq!(body["rows"], 30);
+    assert_eq!(
+        body["server_profile_id"].as_str().unwrap(),
+        profile_id.to_string()
+    );
+    assert!(body["id"].is_string());
+    assert!(body["created_at"].is_string());
+    assert!(body["closed_at"].is_null());
+
+    // Stub message must explicitly disclaim PTY readiness.
+    let message = body["message"].as_str().unwrap().to_lowercase();
+    assert!(
+        message.contains("pty") && message.contains("not implemented"),
+        "create response message must signal stub scope, got: {message}",
+    );
+
+    // Body must NOT contain any key material, terminal I/O, or
+    // ownership/internals fields.
+    let raw = body.to_string();
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "owner_id",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "create-terminal-session body must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // A `created` lifecycle event was persisted.
+    let session_id = body["id"].as_str().unwrap();
+    let session_uuid: uuid::Uuid = session_id.parse().unwrap();
+    let events = PgSessionEventRepository::new(pool.clone())
+        .list_for_session(relayterm_core::ids::TerminalSessionId::from_uuid(
+            session_uuid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, SessionEventKind::Created);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_defaults_dimensions_when_omitted(pool: PgPool) {
+    // Default is 80x24; a client that doesn't supply cols/rows should
+    // still get a metadata row in starting status.
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "default-dim.example.com",
+        "SHA256:default-dim",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    assert_eq!(body["cols"], 80);
+    assert_eq!(body["rows"], 24);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_without_trusted_host_key_returns_409(pool: PgPool) {
+    // No trust entry pinned → host-key is `unknown`. The route must NOT
+    // create a session row; it must return a 409 conflict so the client
+    // is forced to run `trust-host-key` first.
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "untrusted.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("host_key"),
+        "conflict message should name the host_key entity, got: {}",
+        body["error"]["message"]
+    );
+
+    // No metadata row was inserted.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count.0, 0,
+        "untrusted host-key must NOT yield a session row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_with_revoked_only_pin_returns_409(pool: PgPool) {
+    // A revoked entry is not "trusted" — the create route must refuse.
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "revoked.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let seeded = PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:revoked-term".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    revoke_entry(&pool, seeded.id).await;
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+
+    // Symmetry with the untrusted-pin variant: no metadata row may be
+    // written. A regression that inserts the row before checking the
+    // trust gate would pass the status check alone.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count.0, 0,
+        "revoked-only host-key must NOT yield a session row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_unknown_profile_returns_404(pool: PgPool) {
+    let (app, _user_id) = setup(pool).await;
+    let bogus = uuid::Uuid::new_v4();
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": bogus}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+/// A foreign-owned profile must produce a 404 byte-identical to a
+/// genuine 404. Cross-user existence MUST NOT leak through the create
+/// surface.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_foreign_owned_profile_returns_indistinguishable_404(pool: PgPool) {
+    let other_user = create_user(&pool, "other").await;
+    // Pin a trusted entry against the foreign profile so a successful
+    // path is open if the route forgot the ownership filter.
+    let foreign_id = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign",
+        "foreign.example.com",
+    )
+    .await;
+    let foreign = PgServerProfileRepository::new(pool.clone())
+        .get(foreign_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pin_trusted_entry(&pool, foreign.host_id, "SHA256:foreign-trust").await;
+
+    let (app, _dev_user) = setup(pool.clone()).await;
+
+    let bogus = uuid::Uuid::new_v4();
+    let bogus_resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": bogus}),
+        ))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": foreign_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "foreign-profile create must produce a byte-identical 404",
+    );
+
+    // No row was created — the dev user's listing must be empty.
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions WHERE server_profile_id = $1")
+            .bind(foreign_id.into_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_invalid_dimensions_returns_400(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "dim.example.com",
+        "SHA256:dim",
+    )
+    .await;
+
+    // cols = 0 — out of range.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id, "cols": 0, "rows": 24}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+
+    // rows = 5000 — over the cap.
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id, "cols": 80, "rows": 5_000}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0, "validation failures must not create rows");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_terminal_sessions_returns_only_current_user(pool: PgPool) {
+    let other_user = create_user(&pool, "other").await;
+    // Provision a foreign session directly via the repository — bypasses
+    // the API to model "another user already created a session somehow."
+    let foreign_profile = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign",
+        "foreign-list.example.com",
+    )
+    .await;
+    let foreign_repo = PgTerminalSessionRepository::new(pool.clone());
+    let _ = foreign_repo
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: other_user,
+            server_profile_id: foreign_profile,
+            status: TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let (app, user_id) = setup(pool.clone()).await;
+
+    // Empty list to start.
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/terminal-sessions"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        0,
+        "dev user's list must NOT include the other user's session",
+    );
+
+    // Create one session for the dev user; confirm it shows up alone.
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "mine",
+        "mine.example.com",
+        "SHA256:mine-list",
+    )
+    .await;
+    let create = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let resp = app.oneshot(get("/api/v1/terminal-sessions")).await.unwrap();
+    let body = read_body(resp).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["server_profile_id"].as_str().unwrap(),
+        profile_id.to_string()
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn get_terminal_session_unknown_id_returns_404(pool: PgPool) {
+    let (app, _user_id) = setup(pool).await;
+    let bogus = uuid::Uuid::new_v4();
+    let resp = app
+        .oneshot(get(&format!("/api/v1/terminal-sessions/{bogus}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Foreign-owned session must look like a genuine 404. Cross-user 404 is
+/// byte-identical.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn get_terminal_session_foreign_owned_returns_indistinguishable_404(pool: PgPool) {
+    let other_user = create_user(&pool, "other").await;
+    let foreign_profile = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-get",
+        "foreign-get.example.com",
+    )
+    .await;
+    let foreign_session = PgTerminalSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: other_user,
+            server_profile_id: foreign_profile,
+            status: TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let (app, _dev_user) = setup(pool).await;
+
+    let bogus = uuid::Uuid::new_v4();
+    let bogus_resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/terminal-sessions/{bogus}")))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(get(&format!(
+            "/api/v1/terminal-sessions/{}",
+            foreign_session.id
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "foreign-owned terminal session GET must match a genuine 404",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn close_terminal_session_marks_closed_and_writes_event(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "close.example.com",
+        "SHA256:close",
+    )
+    .await;
+
+    let create = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let session_id = read_body(create).await["id"].as_str().unwrap().to_owned();
+
+    let close = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{session_id}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+    let body = read_body(close).await;
+    assert_eq!(body["status"], "closed");
+    assert_eq!(body["already_closed"], false);
+    assert!(body["closed_at"].is_string());
+
+    // The DB row is closed.
+    let row = PgTerminalSessionRepository::new(pool.clone())
+        .get(relayterm_core::ids::TerminalSessionId::from_uuid(
+            session_id.parse().unwrap(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
+    assert!(row.closed_at.is_some());
+
+    // Closed event was appended.
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(row.id)
+        .await
+        .unwrap();
+    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&SessionEventKind::Created));
+    assert!(kinds.contains(&SessionEventKind::Closed));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn close_terminal_session_double_close_is_idempotent(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "idem.example.com",
+        "SHA256:idem-close",
+    )
+    .await;
+    let create = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    let session_id = read_body(create).await["id"].as_str().unwrap().to_owned();
+
+    let first = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{session_id}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(read_body(first).await["already_closed"], false);
+
+    let second = app
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{session_id}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = read_body(second).await;
+    assert_eq!(body["already_closed"], true);
+    assert_eq!(body["status"], "closed");
+
+    // Only ONE Closed event exists on the second close.
+    let session_uuid: uuid::Uuid = session_id.parse().unwrap();
+    let events = PgSessionEventRepository::new(pool)
+        .list_for_session(relayterm_core::ids::TerminalSessionId::from_uuid(
+            session_uuid,
+        ))
+        .await
+        .unwrap();
+    let closed_count = events
+        .iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed_count, 1,
+        "second close must NOT append another Closed event"
+    );
+}
+
+/// Closing a foreign-owned session looks like a genuine 404 — same status,
+/// same body. No status change on the foreign row.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool: PgPool) {
+    let other_user = create_user(&pool, "other").await;
+    let foreign_profile = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-close",
+        "foreign-close.example.com",
+    )
+    .await;
+    let foreign_session = PgTerminalSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: other_user,
+            server_profile_id: foreign_profile,
+            status: TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let (app, _dev_user) = setup(pool.clone()).await;
+
+    let bogus = uuid::Uuid::new_v4();
+    let bogus_resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{bogus}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{}/close", foreign_session.id),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "foreign-owned terminal session close must match a genuine 404",
+    );
+
+    // Foreign row was NOT mutated.
+    let row = PgTerminalSessionRepository::new(pool)
+        .get(foreign_session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        TerminalSessionStatus::Starting,
+        "foreign session row must not transition on a denied close",
+    );
+    assert!(row.closed_at.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        terminal_sessions,
+        dev_user_id: None,
+    };
+    let app = router(state);
+
+    for req in [
+        json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": uuid::Uuid::new_v4()}),
+        ),
+        get("/api/v1/terminal-sessions"),
+        get(&format!(
+            "/api/v1/terminal-sessions/{}",
+            uuid::Uuid::new_v4()
+        )),
+        json_post(
+            &format!("/api/v1/terminal-sessions/{}/close", uuid::Uuid::new_v4()),
+            json!({}),
+        ),
+    ] {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = read_body(resp).await;
+        assert_eq!(body["error"]["code"], "unauthorized");
+        assert_eq!(body["error"]["message"], "unauthorized");
+    }
+}
+
+/// The create response's `message` must explicitly disclaim PTY/SSH
+/// readiness so a future "helpful" rewording is forced through review.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_message_does_not_overclaim_pty_or_ssh(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "scope.example.com",
+        "SHA256:scope-msg",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({"server_profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let message = body["message"].as_str().unwrap().to_lowercase();
+
+    assert!(
+        message.contains("pty") && message.contains("not implemented"),
+        "create message must signal PTY-not-implemented scope, got: {message}",
+    );
+    for forbidden in [
+        "session opened",
+        "shell ready",
+        "shell spawned",
+        "connected to",
+        "authenticated",
+        "logged in",
+    ] {
+        assert!(
+            !message.contains(forbidden),
+            "create message must not imply `{forbidden}`: {message}",
+        );
+    }
 }

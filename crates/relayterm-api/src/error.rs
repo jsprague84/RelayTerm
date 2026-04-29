@@ -14,6 +14,7 @@ use axum::{
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::validation::ValidationError;
 use relayterm_ssh::{HostKeyPreflightError, ProbeError, SshAuthCheckError};
+use relayterm_terminal::TerminalSessionManagerError;
 use relayterm_vault::VaultError;
 use serde::Serialize;
 use tracing::{error, warn};
@@ -231,6 +232,20 @@ impl From<SshAuthCheckError> for ApiError {
             SshAuthCheckError::Saturated => {
                 Self::ServiceUnavailable("auth-check concurrency limit reached".to_owned())
             }
+        }
+    }
+}
+
+impl From<TerminalSessionManagerError> for ApiError {
+    fn from(err: TerminalSessionManagerError) -> Self {
+        match err {
+            TerminalSessionManagerError::InvalidDimensions { field, message } => {
+                Self::Validation(format!("{field}: {message}"))
+            }
+            TerminalSessionManagerError::NotFound => Self::NotFound {
+                entity: "terminal_session",
+            },
+            TerminalSessionManagerError::Repository(e) => e.into(),
         }
     }
 }

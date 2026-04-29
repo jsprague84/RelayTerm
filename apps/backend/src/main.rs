@@ -3,11 +3,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
-use relayterm_core::repository::{CreateUser, UserRepository};
+use relayterm_core::repository::{
+    CreateUser, SessionEventRepository, TerminalSessionRepository, UserRepository,
+};
 use relayterm_db::Db;
 use relayterm_ssh::{
     HostKeyPreflightService, RusshAuthChecker, RusshHostKeyProbe, SshAuthCheckService,
 };
+use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
@@ -98,11 +101,26 @@ async fn main() -> anyhow::Result<()> {
     // directly. SCOPE: no interactive session, no command execution.
     let auth_check = Arc::new(SshAuthCheckService::new(Arc::new(RusshAuthChecker::new())));
 
+    // Terminal session orchestrator. Owns the in-memory runtime registry
+    // and writes session metadata + lifecycle events to Postgres. The
+    // registry is NOT durable — a backend restart leaves any pre-restart
+    // metadata rows operator-visible as stale records until they're
+    // explicitly closed via `POST /api/v1/terminal-sessions/:id/close`.
+    //
+    // SCOPE: this slice manages session lifecycle metadata only. Real
+    // PTY allocation, SSH channel ownership, and replay-buffer state are
+    // future slices.
+    let terminal_sessions = Arc::new(TerminalSessionManager::new(
+        Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+    ));
+
     let state = AppState {
         db,
         vault,
         preflight,
         auth_check,
+        terminal_sessions,
         dev_user_id,
     };
     let app = router(state);

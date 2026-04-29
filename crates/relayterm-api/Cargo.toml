@@ -11,6 +11,7 @@ relayterm-core = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-protocol = { workspace = true }
 relayterm-ssh = { workspace = true }
+relayterm-terminal = { workspace = true }
 relayterm-vault = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -33,6 +34,7 @@ postgres-tests = []
 [dev-dependencies]
 relayterm-db = { workspace = true }
 relayterm-ssh = { workspace = true }
+relayterm-terminal = { workspace = true }
 relayterm-vault = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

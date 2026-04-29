@@ -11,10 +11,12 @@ use crate::AppState;
 mod hosts;
 mod server_profiles;
 mod ssh_identities;
+mod terminal_sessions;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .nest("/hosts", hosts::router())
         .nest("/server-profiles", server_profiles::router())
         .nest("/ssh-identities", ssh_identities::router())
+        .nest("/terminal-sessions", terminal_sessions::router())
 }
