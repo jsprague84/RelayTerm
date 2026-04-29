@@ -13,6 +13,7 @@ use axum::{
 };
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::validation::ValidationError;
+use relayterm_ssh::{HostKeyPreflightError, ProbeError};
 use relayterm_vault::VaultError;
 use serde::Serialize;
 use tracing::{error, warn};
@@ -26,6 +27,7 @@ pub enum ErrorCode {
     Unauthorized,
     NotFound,
     Conflict,
+    BadGateway,
     ServiceUnavailable,
     InternalError,
 }
@@ -37,6 +39,7 @@ impl ErrorCode {
             Self::Unauthorized => "unauthorized",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
+            Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
             Self::InternalError => "internal_error",
         }
@@ -68,6 +71,14 @@ pub enum ApiError {
     /// 409 — uniqueness or referential constraint violated.
     #[error("{entity} conflict")]
     Conflict { entity: &'static str },
+
+    /// 502 — an upstream system the request depends on (e.g. an SSH peer
+    /// during preflight) failed in a way that's not the client's fault.
+    /// The wrapped detail is operator-facing only; the wire body collapses
+    /// to the static `bad gateway` message so peer-side topology and
+    /// version banners never leak through.
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
 
     /// 503 — a backend dependency required for the request is intentionally
     /// not configured (e.g. vault disabled). The wrapped detail is logged
@@ -104,6 +115,11 @@ impl ApiError {
                 ErrorCode::Conflict,
                 format!("{entity} conflict"),
             ),
+            Self::BadGateway(_) => (
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::BadGateway,
+                "bad gateway".to_owned(),
+            ),
             Self::ServiceUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::ServiceUnavailable,
@@ -137,6 +153,7 @@ impl IntoResponse for ApiError {
         match &self {
             Self::Internal(detail) => error!(detail = %detail, "internal API error"),
             Self::Unauthorized(detail) => warn!(detail = %detail, "unauthorized request"),
+            Self::BadGateway(detail) => warn!(detail = %detail, "bad gateway"),
             Self::ServiceUnavailable(detail) => {
                 warn!(detail = %detail, "service unavailable");
             }
@@ -171,6 +188,29 @@ impl From<RepositoryError> for ApiError {
             }
             RepositoryError::Database(msg) => Self::Internal(msg),
         }
+    }
+}
+
+impl From<HostKeyPreflightError> for ApiError {
+    fn from(err: HostKeyPreflightError) -> Self {
+        match err {
+            // The decrypted private blob did not parse as an OpenSSH PEM —
+            // a vault-issued row should always round-trip, so a failure
+            // here is a data-integrity bug rather than a client problem.
+            HostKeyPreflightError::InvalidIdentity => {
+                Self::Internal("ssh identity material is malformed".to_owned())
+            }
+            // All probe failures collapse to `bad gateway`. The variant is
+            // logged operator-side via the warn! in IntoResponse; the wire
+            // body is static.
+            HostKeyPreflightError::Probe(probe) => Self::BadGateway(format!("ssh probe: {probe}")),
+        }
+    }
+}
+
+impl From<ProbeError> for ApiError {
+    fn from(err: ProbeError) -> Self {
+        Self::BadGateway(format!("ssh probe: {err}"))
     }
 }
 

@@ -5,9 +5,12 @@
 //! implemented at this layer; `dev_user` injects a stopgap [`UserId`] until
 //! they are.
 
+use std::sync::Arc;
+
 use axum::{Router, extract::FromRef};
 use relayterm_core::ids::UserId;
 use relayterm_db::Db;
+use relayterm_ssh::HostKeyPreflightService;
 use relayterm_vault::VaultService;
 use tower_http::trace::TraceLayer;
 
@@ -27,6 +30,16 @@ pub struct AppState {
     /// means vault-backed identity creation is disabled — the
     /// `POST /api/v1/ssh-identities` route returns `503` in that mode.
     pub vault: Option<VaultService>,
+    /// Host-key preflight service. Captures the server's host key during
+    /// KEX and classifies it against the host's pinned `known_host_entries`
+    /// rows. Wraps a probe (production: russh; tests: a fake) plus the
+    /// pure classification logic. Held behind `Arc` so `AppState` stays
+    /// `Clone` and the same probe instance is shared across handlers.
+    ///
+    /// **Scope**: this service does NOT validate SSH authentication or
+    /// PTY readiness — see `HostKeyPreflightService` docs for the full
+    /// "what it proves vs does not prove" list.
+    pub preflight: Arc<HostKeyPreflightService>,
     /// Dev-only owner id stamped onto every created row until auth lands.
     /// `None` when `dev_auth.enabled = false` (the shim is off but real
     /// auth has not yet been wired up); in that mode `DevUser` extractors

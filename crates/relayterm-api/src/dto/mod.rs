@@ -10,5 +10,6 @@
 //!    and **never** the encrypted private key on `SshIdentity`.
 
 pub(crate) mod host;
+pub(crate) mod preflight;
 pub(crate) mod server_profile;
 pub(crate) mod ssh_identity;

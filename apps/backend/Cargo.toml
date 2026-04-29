@@ -15,6 +15,7 @@ relayterm-api = { workspace = true }
 relayterm-core = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-observability = { workspace = true }
+relayterm-ssh = { workspace = true }
 relayterm-vault = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }

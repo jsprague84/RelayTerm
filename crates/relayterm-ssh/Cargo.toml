@@ -8,8 +8,18 @@ publish.workspace = true
 
 [dependencies]
 relayterm-core = { workspace = true }
-relayterm-vault = { workspace = true }
+async-trait = { workspace = true }
+russh = { workspace = true }
+ssh-key = { workspace = true, features = ["alloc", "ed25519"] }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

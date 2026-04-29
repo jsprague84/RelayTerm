@@ -15,6 +15,9 @@
 
 #![cfg(feature = "postgres-tests")]
 
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -24,14 +27,22 @@ use http_body_util::BodyExt as _;
 use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
-    CreateHost, CreateSshIdentity, CreateUser, HostRepository, SshIdentityRepository,
+    CreateHost, CreateKnownHostEntry, CreateServerProfile, CreateSshIdentity, CreateUser,
+    HostRepository, KnownHostEntryRepository, ServerProfileRepository, SshIdentityRepository,
     UserRepository,
 };
 use relayterm_core::ssh_identity::SshKeyType;
 use relayterm_core::validation::{
     validate_host_display_name, validate_hostname, validate_ssh_port, validate_ssh_username,
 };
-use relayterm_db::{Db, PgHostRepository, PgSshIdentityRepository, PgUserRepository};
+use relayterm_db::{
+    Db, PgHostRepository, PgKnownHostEntryRepository, PgServerProfileRepository,
+    PgSshIdentityRepository, PgUserRepository,
+};
+use relayterm_ssh::{
+    CapturedHostKey, HostKeyPreflightService, ProbeError, ProbeTarget, SshHostKeyProbe,
+};
+use relayterm_vault::VaultService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -50,10 +61,15 @@ async fn create_user(pool: &PgPool, label: &str) -> UserId {
 }
 
 async fn setup(pool: PgPool) -> (Router, UserId) {
+    setup_with_probe(pool, default_probe()).await
+}
+
+async fn setup_with_probe(pool: PgPool, probe: Arc<dyn SshHostKeyProbe>) -> (Router, UserId) {
     let user_id = create_user(&pool, "dev").await;
     let state = AppState {
         db: Db::from_pool(pool),
         vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(probe)),
         dev_user_id: Some(user_id),
     };
     (router(state), user_id)
@@ -62,8 +78,74 @@ async fn setup(pool: PgPool) -> (Router, UserId) {
 /// Vault service backed by a deterministic test master key. Tests that
 /// don't exercise the vault still need *some* vault instance because the
 /// API state requires it for the `POST /ssh-identities` route.
-fn test_vault() -> relayterm_vault::VaultService {
-    relayterm_vault::VaultService::new(relayterm_vault::VaultMasterKey::from_bytes([0x77u8; 32]))
+fn test_vault() -> VaultService {
+    VaultService::new(relayterm_vault::VaultMasterKey::from_bytes([0x77u8; 32]))
+}
+
+/// Probe used by tests that don't go through the preflight surface.
+/// Returns an unreachable error if it ever IS called — that's a test
+/// bug, not a real probe failure.
+fn default_probe() -> Arc<dyn SshHostKeyProbe> {
+    Arc::new(FailingProbe)
+}
+
+struct FailingProbe;
+
+#[async_trait]
+impl SshHostKeyProbe for FailingProbe {
+    async fn capture_host_key(&self, _target: ProbeTarget) -> Result<CapturedHostKey, ProbeError> {
+        // Surface as Transport so a test that hits this by mistake fails
+        // with a 502 instead of a misleading 500.
+        Err(ProbeError::Transport)
+    }
+}
+
+/// Probe that returns a configured fingerprint and records every call.
+/// Used to exercise the preflight + trust paths without a real SSH peer.
+#[derive(Clone)]
+struct FakeProbe {
+    captured: CapturedHostKey,
+    calls: Arc<Mutex<Vec<ProbeTarget>>>,
+}
+
+impl FakeProbe {
+    fn new(captured: CapturedHostKey) -> Self {
+        Self {
+            captured,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl SshHostKeyProbe for FakeProbe {
+    async fn capture_host_key(&self, target: ProbeTarget) -> Result<CapturedHostKey, ProbeError> {
+        self.calls.lock().unwrap().push(target);
+        Ok(self.captured.clone())
+    }
+}
+
+/// Probe that always errors — exercises the BadGateway path.
+struct ErrorProbe(ProbeError);
+
+#[async_trait]
+impl SshHostKeyProbe for ErrorProbe {
+    async fn capture_host_key(&self, _target: ProbeTarget) -> Result<CapturedHostKey, ProbeError> {
+        Err(match &self.0 {
+            ProbeError::Unreachable => ProbeError::Unreachable,
+            ProbeError::Timeout => ProbeError::Timeout,
+            ProbeError::BadHostKey => ProbeError::BadHostKey,
+            ProbeError::Transport => ProbeError::Transport,
+        })
+    }
+}
+
+fn captured_for_test(fingerprint: &str) -> CapturedHostKey {
+    CapturedHostKey {
+        key_type: SshKeyType::Ed25519,
+        fingerprint_sha256: fingerprint.to_owned(),
+        public_key: b"ssh-ed25519 AAAA-host-key".to_vec(),
+    }
 }
 
 async fn read_body(resp: axum::response::Response) -> Value {
@@ -273,6 +355,7 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let state = AppState {
         db: Db::from_pool(pool),
         vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         dev_user_id: None,
     };
     let app = router(state);
@@ -452,6 +535,7 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let state = AppState {
         db: Db::from_pool(pool.clone()),
         vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         dev_user_id: None,
     };
     let app = router(state);
@@ -482,6 +566,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
     let state = AppState {
         db: Db::from_pool(pool.clone()),
         vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
         dev_user_id: Some(user_id),
     };
     let app = router(state);
@@ -740,5 +825,677 @@ async fn create_server_profile_missing_identity_returns_404(pool: PgPool) {
             .as_str()
             .unwrap()
             .contains("ssh_identity")
+    );
+}
+
+// ----------------------------------------------------------------------
+// Preflight + trust-host-key
+//
+// These tests use a fake `SshHostKeyProbe` so the preflight surface can
+// be exercised end-to-end without spinning up an SSH server. The vault
+// path IS exercised — every test goes through `vault.decrypt_private_key`
+// against a real vault-issued blob.
+// ----------------------------------------------------------------------
+
+/// Provision a profile owned by `user_id`, using a real vault-issued
+/// SSH identity so the decrypt path runs end-to-end.
+async fn make_owned_profile(
+    pool: &PgPool,
+    user_id: UserId,
+    vault: &VaultService,
+    name: &str,
+    hostname: &str,
+) -> relayterm_core::ids::ServerProfileId {
+    let host = PgHostRepository::new(pool.clone())
+        .create(CreateHost {
+            owner_id: user_id,
+            display_name: validate_host_display_name(name).unwrap(),
+            hostname: validate_hostname(hostname).unwrap(),
+            port: validate_ssh_port(22).unwrap(),
+            default_username: validate_ssh_username("deploy").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let generated = vault
+        .generate_ssh_identity(SshKeyType::Ed25519, name)
+        .unwrap();
+    let identity = PgSshIdentityRepository::new(pool.clone())
+        .create(CreateSshIdentity {
+            owner_id: user_id,
+            name: name.to_owned(),
+            key_type: generated.key_type,
+            public_key: generated.public_key_openssh,
+            encrypted_private_key: generated.encrypted_private_key.into_bytes(),
+            fingerprint_sha256: generated.fingerprint_sha256,
+        })
+        .await
+        .unwrap();
+
+    PgServerProfileRepository::new(pool.clone())
+        .create(CreateServerProfile {
+            owner_id: user_id,
+            name: relayterm_core::validation::validate_profile_name(name).unwrap(),
+            host_id: host.id,
+            ssh_identity_id: identity.id,
+            username_override: None,
+            tags: vec![],
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+async fn setup_with_fake_probe(pool: PgPool, fingerprint: &str) -> (Router, UserId, FakeProbe) {
+    let probe = FakeProbe::new(captured_for_test(fingerprint));
+    let probe_handle = probe.clone();
+    let (app, user_id) = setup_with_probe(pool, Arc::new(probe)).await;
+    (app, user_id, probe_handle)
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_unknown_when_no_known_host_entries(pool: PgPool) {
+    let (app, user_id, probe) = setup_with_fake_probe(pool.clone(), "SHA256:fake-fp").await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "host-1.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["host_key_status"], "unknown");
+    assert_eq!(body["host_key_type"], "ed25519");
+    assert_eq!(body["host_key_fingerprint"], "SHA256:fake-fp");
+    assert_eq!(body["port"], 22);
+    assert_eq!(body["hostname"], "host-1.example.com");
+
+    // No private-key material leaks via the preflight response.
+    let raw = body.to_string();
+    assert!(!raw.contains("encrypted_private_key"));
+    assert!(!raw.contains("BEGIN OPENSSH PRIVATE KEY"));
+    assert!(!raw.contains("private_key"));
+
+    // Probe was actually called with the host's coordinates.
+    let calls = probe.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].hostname, "host-1.example.com");
+    assert_eq!(calls[0].port, 22);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_trusted_when_pinned_entry_matches(pool: PgPool) {
+    let fp = "SHA256:trusted-fp";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "trusted.example.com",
+    )
+    .await;
+
+    // Look up the host_id and pre-pin the fingerprint.
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: fp.to_owned(),
+            public_key: b"ssh-ed25519 AAAA-host-key".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["host_key_status"], "trusted");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_changed_when_pinned_fingerprint_differs(pool: PgPool) {
+    let new_fp = "SHA256:NEW-fp";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), new_fp).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "rotated.example.com",
+    )
+    .await;
+
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:OLD-fp".to_owned(),
+            public_key: b"ssh-ed25519 OLD-host-key".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["host_key_status"], "changed");
+    assert_eq!(body["host_key_fingerprint"], new_fp);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_returns_502_on_probe_failure(pool: PgPool) {
+    let (app, user_id) =
+        setup_with_probe(pool.clone(), Arc::new(ErrorProbe(ProbeError::Unreachable))).await;
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "down.example.com").await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "bad_gateway");
+    // Static wire body — no ProbeError variant text leaks.
+    assert_eq!(body["error"]["message"], "bad gateway");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_unknown_profile_returns_404(pool: PgPool) {
+    let (app, _user_id, _probe) = setup_with_fake_probe(pool, "SHA256:never").await;
+    let bogus = uuid::Uuid::new_v4();
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+/// A preflight against another user's profile must produce a response
+/// byte-identical to a genuine 404 — same status, same body. This is the
+/// `API get_by_id ownership` lesson from AGENTS.md applied to preflight.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgPool) {
+    // Provision a profile owned by ANOTHER user.
+    let other_user = create_user(&pool, "other").await;
+    let foreign_id = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign",
+        "foreign.example.com",
+    )
+    .await;
+
+    let (app, _dev_user, _probe) = setup_with_fake_probe(pool, "SHA256:never").await;
+
+    let bogus = uuid::Uuid::new_v4();
+    let bogus_resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{foreign_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "cross-user preflight 404 must match a genuine 404"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn trust_host_key_records_pinned_entry_when_expected_matches(pool: PgPool) {
+    let fp = "SHA256:trust-me";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "trustme.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": fp }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["host_key_fingerprint"], fp);
+    assert_eq!(body["host_key_type"], "ed25519");
+    assert!(body["trusted_at"].is_string());
+    assert!(body["known_host_entry_id"].is_string());
+
+    // The entry exists in DB and is trusted.
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(profile.host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].fingerprint_sha256, fp);
+    assert!(entries[0].trusted_at.is_some());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn trust_host_key_rejects_when_expected_fingerprint_does_not_match(pool: PgPool) {
+    // Probe captures `actual-fp`; caller submits `stale-fp`. The route
+    // must NOT pin anything.
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), "SHA256:actual-fp").await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "stale.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": "SHA256:stale-fp" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+
+    // No entry persisted.
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(profile.host_id)
+        .await
+        .unwrap();
+    assert!(
+        entries.is_empty(),
+        "mismatched expected fingerprint must NOT auto-pin"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn trust_host_key_does_not_overwrite_a_changed_pinned_key(pool: PgPool) {
+    // An ed25519 entry with fingerprint OLD is pinned. The host now
+    // presents NEW. Even if the caller posts NEW as their expected
+    // fingerprint, the route must refuse to pin (the classifier's
+    // `Changed` verdict wins).
+    let new_fp = "SHA256:NEW-fp";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), new_fp).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "changed.example.com",
+    )
+    .await;
+
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:OLD-fp".to_owned(),
+            public_key: b"ssh-ed25519 OLD".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": new_fp }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+
+    // Original (OLD) entry still the only one — NEW was NOT silently pinned.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(profile.host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].fingerprint_sha256, "SHA256:OLD-fp");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn trust_host_key_rejects_malformed_fingerprint(pool: PgPool) {
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), "SHA256:any").await;
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "any.example.com").await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": "MD5:not-supported" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn trust_host_key_is_idempotent_for_already_trusted_fingerprint(pool: PgPool) {
+    let fp = "SHA256:idempotent-fp";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "idem.example.com").await;
+
+    // First trust.
+    let r1 = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": fp }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let body1 = read_body(r1).await;
+    let id1 = body1["known_host_entry_id"].as_str().unwrap().to_owned();
+    let trusted_at_1 = body1["trusted_at"].as_str().unwrap().to_owned();
+
+    // Second trust with the same fingerprint — must succeed and return
+    // the same row id; trusted_at preserved.
+    let r2 = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": fp }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let body2 = read_body(r2).await;
+    assert_eq!(body2["known_host_entry_id"].as_str().unwrap(), id1);
+    assert_eq!(body2["trusted_at"].as_str().unwrap(), trusted_at_1);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
+    // Without a vault, the route can't decrypt the identity. Must 503.
+    let user_id = create_user(&pool, "dev").await;
+    let probe = FakeProbe::new(captured_for_test("SHA256:any"));
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(Arc::new(probe))),
+        dev_user_id: Some(user_id),
+    };
+    let app = router(state);
+
+    // Need a profile to address. Build via direct repos using a fake
+    // identity row (no vault available, so create the row directly with
+    // opaque bytes — this test never tries to decrypt them, just to reach
+    // the vault-check guard).
+    let host = PgHostRepository::new(pool.clone())
+        .create(CreateHost {
+            owner_id: user_id,
+            display_name: validate_host_display_name("Vaultless").unwrap(),
+            hostname: validate_hostname("v.example.com").unwrap(),
+            port: validate_ssh_port(22).unwrap(),
+            default_username: validate_ssh_username("deploy").unwrap(),
+        })
+        .await
+        .unwrap();
+    let identity = PgSshIdentityRepository::new(pool.clone())
+        .create(CreateSshIdentity {
+            owner_id: user_id,
+            name: "vaultless".to_owned(),
+            key_type: SshKeyType::Ed25519,
+            public_key: b"ssh-ed25519 PUB".to_vec(),
+            encrypted_private_key: b"opaque".to_vec(),
+            fingerprint_sha256: format!("SHA256:vaultless-{}", uuid::Uuid::new_v4()),
+        })
+        .await
+        .unwrap();
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .create(CreateServerProfile {
+            owner_id: user_id,
+            name: relayterm_core::validation::validate_profile_name("vaultless").unwrap(),
+            host_id: host.id,
+            ssh_identity_id: identity.id,
+            username_override: None,
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{}/host-key-preflight", profile.id),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+    assert_eq!(body["error"]["message"], "service unavailable");
+}
+
+/// Helper: drive a row in the `known_host_entries` table to revoked.
+/// Used to exercise the "revoked must never be silently re-trusted" rule.
+async fn revoke_entry(pool: &PgPool, entry_id: relayterm_core::ids::KnownHostEntryId) {
+    sqlx::query("UPDATE known_host_entries SET revoked_at = NOW() WHERE id = $1")
+        .bind(entry_id.into_uuid())
+        .execute(pool)
+        .await
+        .expect("revoke entry");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn trust_host_key_refuses_to_re_trust_a_revoked_fingerprint(pool: PgPool) {
+    // A revoked entry exists for fp=X. The server presents fp=X again.
+    // The classifier (which filters revoked rows) returns Unknown; the
+    // captured fingerprint matches the caller's expected fingerprint.
+    // Without an explicit revoked-aware guard the route would silently
+    // pin and "trust" the revoked key. This test pins down the contract:
+    // 409, no row mutation.
+    let fp = "SHA256:was-revoked";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "rev.example.com").await;
+
+    // Seed a revoked entry with the same fingerprint the probe will return.
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let seeded = PgKnownHostEntryRepository::new(pool.clone())
+        .create(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: fp.to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    revoke_entry(&pool, seeded.id).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": fp }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+
+    // Row still revoked; trusted_at NOT stamped.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(profile.host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, seeded.id);
+    assert!(entries[0].revoked_at.is_some(), "row must remain revoked");
+    assert!(
+        entries[0].trusted_at.is_none(),
+        "trust-host-key must NOT have stamped trusted_at on a revoked row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_treats_revoked_match_as_unknown(pool: PgPool) {
+    // The classifier filters revoked rows out of `Trusted` — a revoked-
+    // and-reappearing key surfaces as `unknown`, NOT `trusted`. The trust
+    // route's separate guard then refuses to pin it; this test pins down
+    // the read-side half of that contract so the wire signal is correct.
+    let fp = "SHA256:revoked-key";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let profile_id =
+        make_owned_profile(&pool, user_id, &test_vault(), "primary", "rev2.example.com").await;
+
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let seeded = PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: fp.to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    revoke_entry(&pool, seeded.id).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body["host_key_status"], "unknown",
+        "a revoked match must NOT classify as trusted",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn preflight_response_message_does_not_overclaim_auth_or_session_readiness(pool: PgPool) {
+    // The wire message must NOT imply that SSH authentication succeeded
+    // or that a session can be opened. Pin down the actual phrasing for
+    // each status so a future "helpful" rewording trips the test before
+    // it reaches users.
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), "SHA256:scope-check").await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "scope.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("KEX-stage probe only"),
+        "message must signal the KEX-only scope, got: {message}"
+    );
+    // Belt-and-braces: must not say things that imply auth/session
+    // readiness was checked.
+    let lower = message.to_lowercase();
+    assert!(
+        !lower.contains("authenticated") && !lower.contains("authentication succeeded"),
+        "message must not imply authentication: {message}"
+    );
+    assert!(
+        !lower.contains("session is ready") && !lower.contains("ready to use"),
+        "message must not imply session readiness: {message}"
     );
 }

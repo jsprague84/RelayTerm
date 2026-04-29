@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use relayterm_api::{AppState, router};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{CreateUser, UserRepository};
 use relayterm_db::Db;
+use relayterm_ssh::{HostKeyPreflightService, RusshHostKeyProbe};
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
@@ -74,9 +77,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Host-key preflight service. The probe is the russh-backed
+    // implementation; tests inject a fake via `AppState` directly. Held
+    // behind `Arc` so clones of `AppState` share one instance.
+    //
+    // SCOPE: this attests to host-key reachability classification only —
+    // not SSH authentication or PTY readiness. See the doc-comment on
+    // `HostKeyPreflightService` for the full "proves vs does not prove"
+    // contract.
+    let preflight = Arc::new(HostKeyPreflightService::new(Arc::new(
+        RusshHostKeyProbe::new(),
+    )));
+
     let state = AppState {
         db,
         vault,
+        preflight,
         dev_user_id,
     };
     let app = router(state);

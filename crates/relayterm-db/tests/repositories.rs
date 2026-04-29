@@ -357,6 +357,150 @@ async fn known_host_entry_round_trip(pool: PgPool) {
     assert_eq!(listed.len(), 1);
 }
 
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn known_host_entry_record_trusted_inserts_with_timestamp(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let entry = repo
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:trusted-fp".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        entry.trusted_at.is_some(),
+        "fresh insert must stamp trusted_at"
+    );
+    assert!(entry.revoked_at.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn known_host_entry_record_trusted_is_idempotent(pool: PgPool) {
+    // Re-recording the same (host_id, fingerprint) returns the existing
+    // row with the original `trusted_at` preserved — important so the
+    // audit timestamp doesn't drift on every retry.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let first = repo
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:idem".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let second = repo
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:idem".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(first.id, second.id, "must return the same row on re-trust");
+    assert_eq!(
+        first.trusted_at, second.trusted_at,
+        "trusted_at must not drift"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn known_host_entry_record_trusted_rejects_revoked_row(pool: PgPool) {
+    // A revoked row must NEVER be silently re-trusted. `record_trusted`
+    // returns Conflict so the API layer can surface a clear 409 instead
+    // of misreporting success. The row stays revoked.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let entry = repo
+        .create(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:revoked-fp".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE known_host_entries SET revoked_at = NOW() WHERE id = $1")
+        .bind(entry.id.into_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = repo
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:revoked-fp".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RepositoryError::Conflict { entity: "known_host_entry", ref constraint } if constraint == "revoked"),
+        "expected revoked conflict, got: {err:?}",
+    );
+
+    // The row is still revoked and untrusted.
+    let row = repo
+        .find_by_fingerprint(host.id, "SHA256:revoked-fp")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.revoked_at.is_some(), "revoked_at must remain set");
+    assert!(
+        row.trusted_at.is_none(),
+        "trusted_at must NOT have been stamped",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn known_host_entry_record_trusted_stamps_existing_untrusted_row(pool: PgPool) {
+    // A pre-existing row inserted via plain `create` (no trusted_at) gets
+    // stamped on re-record.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let untrusted = repo
+        .create(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:was-untrusted".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(untrusted.trusted_at.is_none());
+
+    let trusted = repo
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:was-untrusted".to_owned(),
+            public_key: b"ssh-ed25519 AAAA".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(trusted.id, untrusted.id);
+    assert!(
+        trusted.trusted_at.is_some(),
+        "record_trusted must stamp the row"
+    );
+}
+
 // ----------------------------------------------------------------------
 // TerminalSession
 // ----------------------------------------------------------------------

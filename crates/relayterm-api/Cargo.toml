@@ -10,6 +10,7 @@ publish.workspace = true
 relayterm-core = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-protocol = { workspace = true }
+relayterm-ssh = { workspace = true }
 relayterm-vault = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -21,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 # Integration tests under `tests/` require a live Postgres reachable via
@@ -30,11 +32,14 @@ postgres-tests = []
 
 [dev-dependencies]
 relayterm-db = { workspace = true }
+relayterm-ssh = { workspace = true }
 relayterm-vault = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
 http-body-util = "0.1"
 serde_json = { workspace = true }
 sqlx = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
 

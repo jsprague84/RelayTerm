@@ -211,6 +211,25 @@ pub trait KnownHostEntryRepository: Send + Sync {
         host_id: HostId,
         fingerprint_sha256: &str,
     ) -> Result<Option<KnownHostEntry>, RepositoryError>;
+    /// Idempotently record a trusted known-host entry.
+    ///
+    /// Behavior:
+    /// 1. If no row exists for `(host_id, fingerprint_sha256)`, insert
+    ///    one stamped with `trusted_at = NOW()`.
+    /// 2. If a row exists AND `revoked_at IS NULL`, stamp `trusted_at`
+    ///    only if it was previously unset (preserves audit history).
+    /// 3. If a row exists AND `revoked_at` is set, return
+    ///    [`RepositoryError::Conflict`] with constraint `"revoked"`.
+    ///    A revoked fingerprint must NEVER be silently re-trusted —
+    ///    recovery is an explicit operator action that does not have an
+    ///    implementation in this slice.
+    ///
+    /// Used only by the explicit trust-host-key route. Never called by
+    /// the preflight path: preflight is read-only against this table.
+    async fn record_trusted(
+        &self,
+        input: CreateKnownHostEntry,
+    ) -> Result<KnownHostEntry, RepositoryError>;
 }
 
 #[async_trait]
