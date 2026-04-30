@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+
+use crate::replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};
 
 use chrono::{DateTime, Utc};
 use relayterm_core::ids::{
@@ -129,9 +131,16 @@ struct LiveRuntime {
     /// Handle to the running PTY bridge. Cheap to share across handlers
     /// (`Arc`); [`SshPtyHandle`] methods are `&self`.
     handle: Arc<dyn SshPtyHandle>,
-    /// Broadcast surface attachments subscribe to. New subscribers see
-    /// only NEW frames — there is no replay buffer yet.
+    /// Broadcast surface attachments subscribe to. The forwarder pushes
+    /// every frame into both this channel AND `replay` so the wire
+    /// fanout stays single-source-of-truth and lagging subscribers can
+    /// recover via the replay path.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// Shared bounded replay buffer for this session. Behind `Mutex` so
+    /// the forwarder can push from one task while attach handlers
+    /// snapshot it from another. `Arc` shared with the
+    /// [`LiveRuntimeView`] handed to handlers.
+    replay: Arc<Mutex<ReplayBuffer>>,
     /// Forwarder task handle. Tied to the lifetime of the runtime entry
     /// so the manager can detach it cleanly on close. Never awaited
     /// from a request handler — the task will exit when the bridge's
@@ -159,36 +168,17 @@ impl Drop for LiveRuntime {
     }
 }
 
-/// Per-output broadcast frame: the raw PTY bytes plus the monotonic
-/// sequence number stamped at fanout time. Subscribers project this
-/// into a [`relayterm_protocol::ServerMsg::Output`].
-///
-/// The `Debug` impl is manual and redacts `data` to a length-only
-/// summary so a stray `?frame` in a `tracing` macro can never leak raw
-/// terminal output. AGENTS.md / SPEC.md: PTY output bytes MUST NEVER
-/// appear in logs at any level.
-#[derive(Clone)]
-pub struct OutputFrame {
-    pub seq: u64,
-    pub data: Arc<[u8]>,
-}
-
-impl std::fmt::Debug for OutputFrame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputFrame")
-            .field("seq", &self.seq)
-            .field("len", &self.data.len())
-            .field("data", &"<redacted pty output>")
-            .finish()
-    }
-}
-
 /// Read-only handle handed to attachment tasks so they can subscribe
-/// to the live output broadcast without holding the manager's lock.
+/// to the live output broadcast and snapshot the replay buffer without
+/// holding the manager's outer lock.
 #[derive(Clone)]
 pub struct LiveRuntimeView {
     pub handle: Arc<dyn SshPtyHandle>,
     pub output_tx: broadcast::Sender<OutputFrame>,
+    /// Shared replay buffer for this live session. The handler grabs
+    /// the lock briefly during the attach handshake to compute a
+    /// `ReplayRange` from a client-provided `last_seen_seq`.
+    pub replay: Arc<Mutex<ReplayBuffer>>,
 }
 
 impl std::fmt::Debug for LiveRuntimeView {
@@ -196,6 +186,7 @@ impl std::fmt::Debug for LiveRuntimeView {
         f.debug_struct("LiveRuntimeView")
             .field("handle", &"<dyn SshPtyHandle>")
             .field("output_tx", &"<broadcast::Sender<OutputFrame>>")
+            .field("replay", &"<Mutex<ReplayBuffer>>")
             .finish()
     }
 }
@@ -485,6 +476,7 @@ impl TerminalSessionManager {
         } = start;
         let handle: Arc<dyn SshPtyHandle> = Arc::from(handle);
         let (output_tx, _) = broadcast::channel::<OutputFrame>(ATTACHMENT_FANOUT_CAPACITY);
+        let replay = Arc::new(Mutex::new(ReplayBuffer::new(ReplayBufferConfig::DEFAULT)));
 
         let next_seq = {
             let runtimes = self
@@ -501,12 +493,14 @@ impl TerminalSessionManager {
         let events_repo = self.events.clone();
         let output_tx_for_task = output_tx.clone();
         let next_seq_for_task = next_seq.clone();
+        let replay_for_task = replay.clone();
         let forwarder_session_id = session_id;
         let forwarder_owner_id = owner_id;
         let forwarder = tokio::spawn(forward_pty_output(
             output_rx,
             output_tx_for_task,
             next_seq_for_task,
+            replay_for_task,
             sessions_repo,
             events_repo,
             forwarder_session_id,
@@ -541,6 +535,7 @@ impl TerminalSessionManager {
         let candidate = LiveRuntime {
             handle: handle.clone(),
             output_tx,
+            replay,
             forwarder,
             driver,
         };
@@ -903,7 +898,23 @@ impl TerminalSessionManager {
             .map(|l| LiveRuntimeView {
                 handle: l.handle.clone(),
                 output_tx: l.output_tx.clone(),
+                replay: l.replay.clone(),
             })
+    }
+
+    /// Snapshot the replay buffer for a session at the caller's
+    /// `last_seen_seq`. Returns `Ok(None)` when the session has no live
+    /// PTY (stub session, or PTY torn down), so the WS handler can fall
+    /// back to live-only attach. The lock is held only for the snapshot
+    /// — callers should NOT keep the lock across `.await`.
+    pub fn replay_since(
+        &self,
+        session_id: TerminalSessionId,
+        last_seen_seq: Option<u64>,
+    ) -> Option<Result<ReplayRange, ReplayWindowLost>> {
+        let view = self.runtime_view(session_id)?;
+        let buf = view.replay.lock().expect("replay buffer lock poisoned");
+        Some(buf.replay_since(last_seen_seq))
     }
 
     /// Mark an attachment detached.
@@ -1193,10 +1204,12 @@ impl TerminalSessionManager {
 /// appends a `closed` lifecycle event with the bridge's reason. The
 /// runtime entry is NOT removed here — close_session handles that to
 /// keep registry mutation centralised.
+#[allow(clippy::too_many_arguments)]
 async fn forward_pty_output(
     mut output_rx: tokio::sync::mpsc::Receiver<SshPtyEvent>,
     output_tx: broadcast::Sender<OutputFrame>,
     next_seq: Arc<AtomicU64>,
+    replay: Arc<Mutex<ReplayBuffer>>,
     sessions: Arc<dyn TerminalSessionRepository>,
     events: Arc<dyn SessionEventRepository>,
     session_id: TerminalSessionId,
@@ -1208,13 +1221,22 @@ async fn forward_pty_output(
         match evt {
             SshPtyEvent::Output(bytes) => {
                 let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                let frame = OutputFrame {
+                    seq,
+                    data: Arc::from(bytes.into_boxed_slice()),
+                };
+                // Mirror the frame into the bounded replay ring BEFORE
+                // fanning out so a transient subscriber that races with
+                // attach can recover via the replay path. The lock is
+                // held briefly and never across an `.await`.
+                {
+                    let mut buf = replay.lock().expect("replay buffer lock poisoned");
+                    buf.push(frame.clone());
+                }
                 // `send` returns the number of subscribers reached; we
                 // ignore — broadcast::Sender has no failure mode short
                 // of "no subscribers", which is fine.
-                let _ = output_tx.send(OutputFrame {
-                    seq,
-                    data: Arc::from(bytes.into_boxed_slice()),
-                });
+                let _ = output_tx.send(frame);
             }
             SshPtyEvent::Exit { status: _ } => {
                 // Recorded operator-side via tracing only. The wire signal

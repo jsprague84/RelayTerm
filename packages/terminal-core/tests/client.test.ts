@@ -232,4 +232,99 @@ describe("TerminalSessionClient", () => {
     transport.simulateServerMsg({ type: "pong" });
     expect(pongs).toBe(0);
   });
+
+  it("forwards lastSeenSeq into the attach frame", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({
+      url: "ws://test/ws",
+      sessionId: "ses-1",
+      lastSeenSeq: 42,
+    });
+    expect(transport.sent[0]).toEqual<ClientMsg>({
+      type: "attach",
+      session_id: "ses-1",
+      last_seen_seq: 42,
+      client_id: null,
+    });
+  });
+
+  it("tracks lastSeenSeq across live output frames", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws" });
+    transport.simulateServerMsg(ATTACH_OK);
+    expect(client.lastSeenSeq).toBe(0);
+
+    transport.simulateServerMsg({ type: "output", seq: 7, data: "" });
+    expect(client.lastSeenSeq).toBe(7);
+    transport.simulateServerMsg({ type: "output", seq: 12, data: "" });
+    expect(client.lastSeenSeq).toBe(12);
+    // Out-of-order arrival never lowers the bookmark — the renderer
+    // wants the highest seq it has actually seen.
+    transport.simulateServerMsg({ type: "output", seq: 9, data: "" });
+    expect(client.lastSeenSeq).toBe(12);
+  });
+
+  it("emits replay_start, replay_end, and advances lastSeenSeq", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws", lastSeenSeq: 4 });
+    transport.simulateServerMsg(ATTACH_OK);
+
+    const events: Array<{
+      type: string;
+      from_seq?: number;
+      to_seq?: number;
+      latest_seq?: number;
+    }> = [];
+    client.on("replay_start", (m) =>
+      events.push({ type: m.type, from_seq: m.from_seq, to_seq: m.to_seq }),
+    );
+    client.on("replay_end", (m) =>
+      events.push({ type: m.type, latest_seq: m.latest_seq }),
+    );
+
+    transport.simulateServerMsg({
+      type: "replay_start",
+      from_seq: 5,
+      to_seq: 7,
+    });
+    transport.simulateServerMsg({ type: "output", seq: 5, data: "" });
+    transport.simulateServerMsg({ type: "output", seq: 6, data: "" });
+    transport.simulateServerMsg({ type: "output", seq: 7, data: "" });
+    transport.simulateServerMsg({ type: "replay_end", latest_seq: 7 });
+
+    expect(events).toEqual([
+      { type: "replay_start", from_seq: 5, to_seq: 7 },
+      { type: "replay_end", latest_seq: 7 },
+    ]);
+    expect(client.lastSeenSeq).toBe(7);
+  });
+
+  it("emits replay_window_lost with safe metadata only", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws", lastSeenSeq: 1 });
+    transport.simulateServerMsg(ATTACH_OK);
+
+    const sentinel = "REDACT-MARKER-WINDOW-LOST-3F";
+    let payload: unknown = null;
+    client.on("replay_window_lost", (m) => {
+      payload = m;
+    });
+
+    transport.simulateServerMsg({
+      type: "replay_window_lost",
+      requested_seq: 1,
+      oldest_available_seq: 12,
+      latest_seq: 20,
+    });
+    expect(JSON.stringify(payload)).not.toContain(sentinel);
+    expect(payload).toEqual({
+      type: "replay_window_lost",
+      requested_seq: 1,
+      oldest_available_seq: 12,
+      latest_seq: 20,
+    });
+    // The renderer is expected to skip ahead — the bookmark advances
+    // to latest_seq so the next attach starts from the post-loss point.
+    expect(client.lastSeenSeq).toBe(20);
+  });
 });

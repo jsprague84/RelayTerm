@@ -126,7 +126,7 @@ The protocol is JSON-over-WebSocket; binary frames are rejected with `invalid_me
 | `type`     | Fields                                       | Server reply                                                                                                                                                                                                |
 |------------|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ping`     | none                                         | `pong`.                                                                                                                                                                                                     |
-| `attach`   | `session_id?`, `last_seen_seq?`, `client_id?` | Rejected with `error { code: "invalid_message" }` — the route already attaches on upgrade, so a redundant attach frame would orphan the first row. `last_seen_seq` is reserved for the future replay slice. |
+| `attach`   | `session_id?`, `last_seen_seq?`, `client_id?` | Drives the replay handshake. The first `attach` after upgrade is accepted: with `last_seen_seq` set the server emits `replay_start` → buffered `output` frames → `replay_end` (or a single `replay_window_lost` if the bookmark predates the buffer); without it, the loop continues straight to live fanout. A SECOND explicit `attach` is a protocol violation and is rejected with `error { code: "invalid_message", message: "already attached" }`. See "Output sequence + in-memory replay buffer contract" for the per-message wire shape. |
 | `input`    | `data: string`                               | Rejected with `error { code: "pty_not_implemented" }`. The payload is NEVER reflected back, logged, or forwarded. The handler's only side effect is the static error frame.                                 |
 | `resize`   | `cols: u16`, `rows: u16`                     | `ack { kind: "resize" }` on success; `error { code: "invalid_input" }` for cols/rows outside `1..=4096`. Updates the runtime hint and appends a `resized` `session_event`.                                  |
 | `detach`   | none                                         | `session_detached { session_id, attachment_id }`, then the server initiates a clean WebSocket close. Stamps `detached_at` on the attachment row and appends a `detached` event. Idempotent.                 |
@@ -141,8 +141,10 @@ The protocol is JSON-over-WebSocket; binary frames are rejected with `invalid_me
 | `ack`               | `kind: "resize"`                                                                                        | Acknowledges a state-changing non-data client message. New `kind` variants append.                                                                             |
 | `session_detached`  | `session_id`, `attachment_id`                                                                           | Server confirms detach bookkeeping landed.                                                                                                                     |
 | `session_closed`    | `session_id`                                                                                            | Server confirms session-close transition landed.                                                                                                               |
-| `output`            | `seq: u64`, `data: string`                                                                              | Reserved for the future PTY-bearing slice. Never emitted by this implementation.                                                                               |
-| `replay_window_lost`| none                                                                                                    | Reserved for the future replay slice. Never emitted by this implementation.                                                                                    |
+| `output`            | `seq: u64`, `data: string`                                                                              | Carries one PTY output frame, base64-inside-JSON. `seq` is monotonic per session starting at `1`; replayed and live frames share the same variant. See "Output sequence + in-memory replay buffer contract." |
+| `replay_start`      | `from_seq: u64`, `to_seq: u64`                                                                          | Marks the start of a replay handshake. Emitted at most once per attach, BEFORE the first replayed `output` frame. Skipped when the snapshot is empty.          |
+| `replay_end`        | `latest_seq: u64`                                                                                       | Marks the end of replay; live `output` frames resume at `latest_seq + 1`.                                                                                       |
+| `replay_window_lost`| `requested_seq: u64`, `oldest_available_seq: u64?`, `latest_seq: u64`                                   | The bookmark predates the bounded replay buffer. The handler continues live attach AFTER emitting this — the renderer is expected to reset its grid.            |
 | `error`             | `code: ErrorCode`, `message: string`                                                                    | `code` is one of `invalid_message`, `invalid_input`, `pty_not_implemented`, `internal`. `message` is short and static — never echoes input or operator detail. |
 
 #### Lifecycle events written by the WebSocket handler
@@ -168,7 +170,7 @@ If the underlying transport drops (client disconnect, network failure, abrupt cl
 
 #### Future work (explicit out-of-scope for this slice)
 
-PTY allocation and `russh::Channel` ownership; forwarding `Input` bytes to the SSH peer; emitting `output` frames with monotonic sequence numbers; the replay ring buffer and the `replay_window_lost` recovery path; multi-client (collaborative) attach behavior; backend-restart recovery for `starting` rows; binary frame format; and `ConnectInfo`-based `remote_addr` capture all belong to later, deliberate slices.
+Multi-client (collaborative) attach behavior; backend-restart recovery for `starting` rows; binary frame format; and `ConnectInfo`-based `remote_addr` capture all belong to later, deliberate slices. (PTY allocation, `Input` forwarding, sequence-numbered `output` frames, and the in-memory replay ring buffer have all landed in the live SSH PTY bridge slice and the replay buffer slice that follows it.)
 
 ### Frontend terminal-core contract
 
@@ -214,8 +216,10 @@ States and the legal transitions out of each:
 | `ack`                          | `AckMsg`                          | Generic ack (`kind: "resize"` today).                                                  |
 | `resize_ack`                   | `AckMsg`                          | Convenience event fired in addition to `ack` when `kind === "resize"`.                 |
 | `pong`                         | `PongMsg`                         | Reply to `ping`.                                                                       |
-| `output`                       | `OutputMsg`                       | Reserved for the future PTY slice; never emitted today.                                |
-| `replay_window_lost`           | `ReplayWindowLostMsg`             | Reserved for the future replay slice; never emitted today.                             |
+| `output`                       | `OutputMsg`                       | Live or replayed PTY output; carries `seq` and base64 `data`.                          |
+| `replay_start`                 | `ReplayStartMsg`                  | Bracketing frame emitted before replayed `output` frames.                              |
+| `replay_end`                   | `ReplayEndMsg`                    | Bracketing frame emitted after replayed `output` frames; carries `latest_seq`.         |
+| `replay_window_lost`           | `ReplayWindowLostMsg`             | The client's `lastSeenSeq` predated the buffer's window; carries seq metadata only.    |
 | `error`                        | `TerminalClientError`             | Transport, decode, unexpected-first-frame, server `error`, or send-while-not-attached. |
 | `input_rejected_or_stubbed`    | `{reason, attempted}`             | See "Send guards" above; never includes payload bytes.                                 |
 
@@ -295,7 +299,6 @@ After the host key is pinned and trusted (preceding section), an operator may op
 
 It does **NOT** yet provide:
 
-- Replay or resume across reconnects. A client that drops MUST treat its byte stream as truncated; the server's monotonic `seq` exists for the future replay slice but no ring buffer is persisted yet.
 - Multi-client collaborative attach. Today the manager registers fan-out via a `tokio::sync::broadcast` channel, but only one WS attachment per session is exercised by the API tests.
 - Backend-restart recovery for live sessions. A restart drops the in-memory runtime registry; metadata rows survive but their PTYs are gone — the operator must explicitly close orphaned rows.
 - A binary frame format. Output is base64 inside JSON; a binary slice is future work.
@@ -397,6 +400,72 @@ Future work (still explicit out-of-scope): a replay ring buffer + sequence-numbe
 
 Replay buffer + sequence-number-based resume across reconnects; multi-client collaborative attach UX; binary frame format for `Output`; backend-restart recovery for `active` rows; per-session inactivity-timeout reaping for detached PTYs; password-bootstrap / `ssh-copy-id` flow; user-uploaded private keys; SFTP / file-browser surface; session recording; production terminal UI (host/profile picker, polished workspace, theme/preferences persistence); listing / filtering existing sessions in the launcher. Each is a separate, deliberate slice.
 
+### Output sequence + in-memory replay buffer contract
+
+After the live SSH PTY bridge slice, every PTY output frame the orchestrator forwards over the WebSocket carries a monotonic per-session `seq`. A bounded **in-memory** replay buffer mirrors the same frames so a client that briefly disconnects can resume without losing scrollback. This section defines the wire contract, the bounds, and the explicit non-durability guarantees.
+
+**Scope (load-bearing — this slice).** A client that supplies `last_seen_seq` on its `Attach` frame and whose bookmark is still inside the buffer's window WILL receive every missed `output` frame, in order, before live fanout resumes. It does **NOT** mean:
+
+- Replay survives a backend restart. The buffer is process memory only; a restart drops it and any reconnect after restart that supplies a `last_seen_seq` will surface as `replay_window_lost`.
+- Replay survives a session close. The bounded buffer is held inside the live runtime entry; closing the session (explicit `Close`, last-attachment auto-close, or PTY teardown) drops it alongside the runtime.
+- The PTY survives the last detach long enough to make replay across "leave the page, come back later" useful. The conservative detach policy from the live bridge slice still applies — the PTY closes when the last attachment leaves. Replay is most useful for **short** disconnects (network blip, tab focus jitter, race between explicit detach and reattach by another tab) and as the wire foundation for the future TTL/reaper slice.
+- Multi-writer / collaborative replay semantics. Today only one WS attachment per session is exercised; the buffer is shaped for future fan-in but not promised.
+
+#### Sequence number contract
+
+- The first PTY output frame for a freshly created session has `seq = 1`. Every subsequent frame increments by exactly one (`AtomicU64::fetch_add(1, SeqCst)`). The orchestrator's PTY forwarder is the SINGLE place that assigns `seq`; clients cannot inject an `output` frame.
+- Replayed frames re-use the original `seq` they were stamped with on the live wire — they are NOT renumbered. A client that bridges replayed frames into live frames sees one continuous, gap-free stream.
+- A gap in `seq` on the live wire signals one of two recoverable conditions: (a) the per-attachment broadcast's bounded fanout queue lagged and dropped frames (the renderer can request replay on the next reconnect); or (b) a `replay_window_lost` frame was emitted and the renderer was told to reset its grid.
+- `seq` is per-session: closing and re-creating a session yields a fresh counter starting at `1`.
+
+#### Replay buffer policy
+
+- **Bounds**: default cap is `1024` frames OR `1 MiB` of payload bytes, whichever bound is hit first. Eviction is FIFO from the front after every push. The single most recent frame is always retained even when it overshoots `max_bytes` — dropping it would leave nothing to replay.
+- **Storage**: in-process memory only, behind a `Mutex<ReplayBuffer>` shared with the WS handler. The buffer is created when the live PTY runtime is bound and dropped when the runtime is dropped (`close_session`, last-attachment auto-close, or forwarder exit).
+- **Privacy invariants** (re-asserted): the buffer stores raw PTY bytes; `Debug` redacts payload bytes to `seq + len` only; the buffer is NEVER mirrored to Postgres, disk, or any log surface; `tracing` macros that format an `OutputFrame` cannot leak the bytes.
+- **Input is never buffered**: only PTY OUTPUT frames are written to the buffer. Client `Input` bytes flow straight to the SSH PTY and are never echoed via the broadcast or the buffer.
+
+#### Wire-stable replay messages added
+
+The protocol adds three `ServerMsg` variants that bracket replay:
+
+- `replay_start { from_seq, to_seq }` — emitted once at the start of a successful replay handshake, BEFORE the first replayed `output` frame. Skipped when the snapshot is empty.
+- `output { seq, data }` — replayed frames use the SAME variant as live frames, carrying their original `seq`.
+- `replay_end { latest_seq }` — emitted once after the last replayed frame. `latest_seq` is the highest `seq` the orchestrator has stamped at the moment replay finished; the next live frame will be `latest_seq + 1`.
+- `replay_window_lost { requested_seq, oldest_available_seq, latest_seq }` — emitted exactly once when the client's `last_seen_seq` predates the bounded buffer's oldest retained frame. `oldest_available_seq` is `null` when the buffer is empty. The handler then continues live attach — a lost replay window is NOT a session-fatal error; the renderer is expected to reset its grid before live frames resume.
+
+The `output` frame itself is unchanged on the wire — the existing `seq + data` shape covers both replayed and live frames.
+
+#### Replay handshake on attach
+
+The WebSocket route already attaches the session on upgrade (writes the attachment row, registers the runtime entry, emits `session_attached`). The replay handshake hangs off the FIRST `Attach` frame the client sends:
+
+- `Attach { last_seen_seq: null }` — no replay request, the loop continues straight to live fanout. This is the brand-new-attach path; the server NEVER dumps pre-attach scrollback to a fresh client (that's product policy, not a missing feature).
+- `Attach { last_seen_seq: Some(n) }` where `n + 1 >= oldest_available_seq` — the server snapshots the buffer, emits `replay_start` → buffered `output` frames → `replay_end`, then continues live fanout. To avoid double-delivery of frames the broadcast subscriber queued in parallel during attach, the handler tracks a `min_live_seq` floor and drops any incoming live frame whose `seq <= floor`.
+- `Attach { last_seen_seq: Some(n) }` where the bookmark predates the buffer's window — the server emits `replay_window_lost { requested_seq: n, oldest_available_seq, latest_seq }` and continues live attach. The floor is raised to `latest_seq` so the renderer doesn't see a frame it was just told it missed.
+- A SECOND explicit `Attach` frame on the same socket is a protocol violation and is rejected with `error { code: invalid_message, message: "already attached" }`. The socket stays open.
+- An `Attach` against a session whose live PTY runtime is gone (stub session, post-teardown) is treated as a no-op — the bookmark refers to a vanished PTY.
+
+#### Frontend (`@relayterm/terminal-core`) changes
+
+- `TerminalSessionClient.lastSeenSeq` is a public getter that mirrors the highest `seq` observed on the wire (replayed or live). Clients pass it back into the next `attach({ lastSeenSeq })` call to request replay.
+- New typed events: `replay_start`, `replay_end`, `replay_window_lost`. The redaction rule still applies — `replay_*` event payloads carry only seq metadata and never the missed bytes.
+- The `output` event's payload shape is unchanged (`OutputMsg`); the renderer doesn't need to special-case replayed vs live frames.
+
+#### Diagnostic UI
+
+`apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` surfaces the bookmark in its status header (`last_seen_seq: N`) and gains a "reconnect with last_seen_seq" button that tears down + reconnects with the captured bookmark. The event log gains lines for `replay_start`, `replay_end`, `replay_window_lost` with seq metadata only — never the missed bytes.
+
+#### Logging and reflection prohibitions (re-affirmed)
+
+- The replay buffer's `Debug` impl redacts payload bytes (`<redacted pty output>`); `ReplayRange::Debug` formats `frame_count + latest_seq` only.
+- `replay_window_lost` errors carry seq metadata only; the missed bytes are unrecoverable from this surface by design.
+- `replay_start` / `replay_end` wire frames are metadata only; the bytes ride on the standard `output` frame variant.
+
+#### Future work (explicit out-of-scope for this slice)
+
+Backend VT observer / `libghostty-vt` snapshot engine (the future replacement for the byte-level replay buffer when a renderer needs structured grid state); durable session recording in Postgres; binary `output` frame format; multi-writer collaborative replay; long-lived detached PTY TTL / reaper that lets replay span "leave the page, come back later" intervals; full mobile/Tauri reconnect UX; renderer-driven replay visualisation (e.g. fast-forward of a long replay buffer).
+
 ### Authenticated SSH credential check contract
 
 After the host key is pinned and trusted (see preceding section), an operator may run an authenticated check to confirm the configured `ssh_identity` actually authenticates against the target. The check is deliberately scoped to "did the credentials work?" — it never opens a PTY, runs a shell, or executes a command, so it cannot be abused to drive arbitrary SSH activity through the API.
@@ -430,7 +499,7 @@ It does **NOT** mean a PTY can be allocated, a shell can be spawned, a command c
 
 ## Behavior contracts
 
-- **Reconnect replay**: when a client reconnects with `(session_id, last_seen_seq)`, the backend MUST send all events with `seq > last_seen_seq` from the ring buffer in order, then resume live streaming. If `last_seen_seq` is older than the ring buffer's tail, the backend returns a `replay_window_lost` error and the client must request a full re-render or close the session. **Status (this slice):** the WebSocket protocol carries `last_seen_seq` on `attach` already, but the backend does not yet persist a ring buffer to replay from — the `output` and `replay_window_lost` frames are reserved for a later slice and MUST NOT be emitted until that work lands.
+- **Reconnect replay**: when a client reconnects with `(session_id, last_seen_seq)`, the backend MUST send all events with `seq > last_seen_seq` from the ring buffer in order, then resume live streaming. If `last_seen_seq` is older than the ring buffer's tail, the backend returns a `replay_window_lost` error and the client must request a full re-render or close the session. **Status (this slice):** the in-memory replay buffer is in place and the wire path is live. See "Output sequence + in-memory replay buffer contract" for the per-frame contract, the bounded buffer policy, and the explicit non-durability guarantees.
 - **Renderer swap**: the user MAY change the active renderer for a session at any time. The new renderer subscribes from the current sequence number; no replay is required.
 - **Session lifecycle**: a session enters `detached` immediately on client drop, NOT after a timeout. A `detached` session continues to receive PTY output and append to the ring buffer until `inactivity_timeout` or explicit close. Audit log records every state transition.
 - **Host-key change**: on `check_server_key` mismatch, the backend rejects the connection, logs an `audit_event`, and surfaces the mismatch to the user; it does NOT silently update the known_hosts entry. The preflight + trust-host-key endpoints (see "SSH preflight + known-host trust contract") implement this for the pre-session probe; the same rule applies to live sessions once they land.

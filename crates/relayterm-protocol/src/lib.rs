@@ -195,13 +195,53 @@ pub enum ServerMsg {
     /// inside a string field — `\xff` is not valid UTF-8. A binary frame
     /// format is future work; clients SHOULD route every `Output` through
     /// [`output_data_decode`] / [`output_data_encode`] (or an equivalent)
-    /// and write the raw bytes to the renderer. `seq` is a monotonic
-    /// per-session counter the orchestrator stamps so the future replay
-    /// slice can reason about ordering — it is NOT a guarantee that any
-    /// gap in `seq` is recoverable in this slice.
+    /// and write the raw bytes to the renderer.
+    ///
+    /// `seq` is a monotonic per-session counter the orchestrator stamps.
+    /// The first frame for a freshly created session has `seq == 1`, and
+    /// every subsequent frame increments by exactly one. Replayed frames
+    /// (see [`Self::ReplayStart`]/[`Self::ReplayEnd`]) re-use the original
+    /// `seq` they were stamped with. Clients track the highest `seq`
+    /// they've observed and may send it back via
+    /// [`ClientMsg::Attach::last_seen_seq`] to resume after a transient
+    /// disconnect. Gaps in `seq` are NEVER expected on the live wire —
+    /// they signal either a slow-consumer fanout drop (which the in-memory
+    /// replay buffer fills) or a [`Self::ReplayWindowLost`] event when the
+    /// requested resume point is older than the bounded buffer retains.
     Output { seq: SeqNo, data: String },
-    /// Replay window has expired; the client must reset.
-    ReplayWindowLost,
+    /// Server is about to deliver replayed [`Self::Output`] frames.
+    ///
+    /// Emitted at most once per attach, BEFORE any live `Output` fanout,
+    /// when the client supplied a `last_seen_seq` on `Attach` AND the
+    /// bounded replay buffer still contains at least one frame newer than
+    /// that bookmark. `from_seq` is the `seq` of the first replayed frame,
+    /// `to_seq` the last. The renderer SHOULD treat replayed bytes as
+    /// equivalent to live output — a replay is always contiguous with the
+    /// live stream that follows.
+    ReplayStart { from_seq: SeqNo, to_seq: SeqNo },
+    /// All replayed frames have been delivered. `latest_seq` is the
+    /// highest sequence number the orchestrator has stamped at the moment
+    /// the replay finished; live frames from this point forward will
+    /// continue from `latest_seq + 1`. Emitted at most once per attach,
+    /// always paired with a preceding [`Self::ReplayStart`].
+    ReplayEnd { latest_seq: SeqNo },
+    /// The client's requested `last_seen_seq` is older than the oldest
+    /// frame the in-memory replay buffer still retains. The orchestrator
+    /// CANNOT make the client whole; the renderer is expected to clear
+    /// its grid (or otherwise invalidate state) and resume from the live
+    /// stream.
+    ///
+    /// Includes `requested_seq` (what the client asked to resume from),
+    /// `oldest_available_seq` (the oldest frame still buffered, or `None`
+    /// if the buffer is empty), and `latest_seq` (the most recently
+    /// stamped frame at the time the gap was detected). The handler
+    /// continues live attach AFTER emitting this — the session is NOT
+    /// closed solely because replay was lost.
+    ReplayWindowLost {
+        requested_seq: SeqNo,
+        oldest_available_seq: Option<SeqNo>,
+        latest_seq: SeqNo,
+    },
     /// Server confirms the attachment has been recorded as detached.
     /// The session row stays alive; only this client's attachment is closed.
     SessionDetached {
@@ -300,7 +340,27 @@ mod tests {
                 },
                 "output",
             ),
-            (ServerMsg::ReplayWindowLost, "replay_window_lost"),
+            (
+                ServerMsg::ReplayStart {
+                    from_seq: SeqNo(1),
+                    to_seq: SeqNo(2),
+                },
+                "replay_start",
+            ),
+            (
+                ServerMsg::ReplayEnd {
+                    latest_seq: SeqNo(2),
+                },
+                "replay_end",
+            ),
+            (
+                ServerMsg::ReplayWindowLost {
+                    requested_seq: SeqNo(1),
+                    oldest_available_seq: Some(SeqNo(5)),
+                    latest_seq: SeqNo(7),
+                },
+                "replay_window_lost",
+            ),
             (
                 ServerMsg::SessionDetached {
                     session_id,
@@ -394,6 +454,134 @@ mod tests {
             debug.contains("data_len"),
             "Debug should still surface the length so logs are useful: {debug}",
         );
+    }
+
+    #[test]
+    fn attach_round_trips_with_last_seen_seq() {
+        // The replay handshake hangs off ClientMsg::Attach::last_seen_seq.
+        // A nullable u64 must round-trip cleanly; missing fields default
+        // to None on the wire.
+        let original = ClientMsg::Attach {
+            session_id: None,
+            last_seen_seq: Some(SeqNo(42)),
+            client_id: Some("tab-7".to_owned()),
+        };
+        let json = serde_json::to_value(&original).unwrap();
+        assert_eq!(json["last_seen_seq"], 42);
+        let back: ClientMsg = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMsg::Attach { last_seen_seq, .. } => {
+                assert_eq!(last_seen_seq, Some(SeqNo(42)));
+            }
+            other => panic!("round-trip changed variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_window_lost_preserves_optional_oldest() {
+        // `oldest_available_seq` is `None` when the buffer is empty at
+        // detection time. It must round-trip without becoming a defaulted
+        // SeqNo(0) — the renderer relies on the distinction between
+        // "buffer empty" and "buffer holds a known oldest frame."
+        for oldest in [None, Some(SeqNo(9))] {
+            let msg = ServerMsg::ReplayWindowLost {
+                requested_seq: SeqNo(1),
+                oldest_available_seq: oldest,
+                latest_seq: SeqNo(20),
+            };
+            let json = serde_json::to_value(&msg).unwrap();
+            let back: ServerMsg = serde_json::from_value(json).unwrap();
+            match back {
+                ServerMsg::ReplayWindowLost {
+                    requested_seq,
+                    oldest_available_seq,
+                    latest_seq,
+                } => {
+                    assert_eq!(requested_seq, SeqNo(1));
+                    assert_eq!(oldest_available_seq, oldest);
+                    assert_eq!(latest_seq, SeqNo(20));
+                }
+                other => panic!("round-trip changed variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn replay_start_round_trips() {
+        let msg = ServerMsg::ReplayStart {
+            from_seq: SeqNo(11),
+            to_seq: SeqNo(15),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            ServerMsg::ReplayStart { from_seq, to_seq } => {
+                assert_eq!(from_seq, SeqNo(11));
+                assert_eq!(to_seq, SeqNo(15));
+            }
+            other => panic!("round-trip changed variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_control_frames_carry_only_seq_metadata() {
+        // Sentinel guard: the replay control frames (Start / End /
+        // WindowLost) must NEVER carry payload bytes. Stamping payload
+        // into them would let an `output` byte sequence reach a
+        // tracing log via the route's `?msg` debug formatter. Keeping
+        // them metadata-only at the type level is the load-bearing
+        // privacy invariant.
+        let sentinel = "REDACT-MARKER-REPLAY-CONTROL-FRAME-7B";
+        let frames: Vec<ServerMsg> = vec![
+            ServerMsg::ReplayStart {
+                from_seq: SeqNo(1),
+                to_seq: SeqNo(99),
+            },
+            ServerMsg::ReplayEnd {
+                latest_seq: SeqNo(99),
+            },
+            ServerMsg::ReplayWindowLost {
+                requested_seq: SeqNo(1),
+                oldest_available_seq: Some(SeqNo(50)),
+                latest_seq: SeqNo(99),
+            },
+            ServerMsg::ReplayWindowLost {
+                requested_seq: SeqNo(1),
+                oldest_available_seq: None,
+                latest_seq: SeqNo(0),
+            },
+        ];
+        for frame in &frames {
+            let json = serde_json::to_string(frame).unwrap();
+            assert!(
+                !json.contains(sentinel),
+                "replay control frame leaked sentinel: {json}",
+            );
+            // Defense-in-depth: assert the JSON payload contains ONLY
+            // numeric / null seq fields and the type tag, no `data`,
+            // no `bytes`, no `payload`.
+            for forbidden in ["data", "bytes", "payload"] {
+                assert!(
+                    !json.contains(forbidden),
+                    "replay control frame must not have payload field `{forbidden}`: {json}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_end_round_trips() {
+        let msg = ServerMsg::ReplayEnd {
+            latest_seq: SeqNo(20),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            ServerMsg::ReplayEnd { latest_seq } => {
+                assert_eq!(latest_seq, SeqNo(20));
+            }
+            other => panic!("round-trip changed variant: {other:?}"),
+        }
     }
 
     #[test]

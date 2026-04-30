@@ -23,6 +23,8 @@ export {
   type OutputMsg,
   type PingMsg,
   type PongMsg,
+  type ReplayEndMsg,
+  type ReplayStartMsg,
   type ReplayWindowLostMsg,
   type ResizeMsg,
   type SeqNo,

@@ -69,7 +69,20 @@ describe("decodeServerMsg", () => {
     { type: "output", seq: 17, data: "hello" },
     { type: "error", code: "pty_not_live", message: "no live pty" },
     { type: "error", code: "ssh_start_failed", message: "ssh pty error" },
-    { type: "replay_window_lost" },
+    { type: "replay_start", from_seq: 4, to_seq: 6 },
+    { type: "replay_end", latest_seq: 6 },
+    {
+      type: "replay_window_lost",
+      requested_seq: 1,
+      oldest_available_seq: 5,
+      latest_seq: 7,
+    },
+    {
+      type: "replay_window_lost",
+      requested_seq: 9,
+      oldest_available_seq: null,
+      latest_seq: 0,
+    },
     {
       type: "session_detached",
       session_id: "s",

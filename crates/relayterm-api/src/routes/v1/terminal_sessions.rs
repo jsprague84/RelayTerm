@@ -40,7 +40,7 @@ use relayterm_ssh::{SshPtyConfig, SshPtyError, SshPtyTarget};
 use relayterm_terminal::{
     AttachSessionRequest as ManagerAttachRequest,
     CreateTerminalSessionRequest as ManagerCreateRequest, LIVE_PTY_CREATE_MESSAGE, OutputFrame,
-    TerminalSessionManager, TerminalSessionManagerError,
+    ReplayRange, ReplayWindowLost, TerminalSessionManager, TerminalSessionManagerError,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -356,6 +356,22 @@ struct SocketState {
     /// `Some` once the attach handshake bound a live PTY to this socket;
     /// the broadcast subscription is owned here for the duration.
     live: Option<LiveSubscription>,
+    /// `true` after the first client `Attach` frame has been observed
+    /// (or the implicit no-replay path was taken). The protocol allows
+    /// at most one client-initiated `Attach` per socket: the first
+    /// carries the optional `last_seen_seq` that drives replay; any
+    /// subsequent `Attach` frame is a protocol violation. `false`
+    /// initially so we know to honour the first one.
+    replay_handshake_done: bool,
+    /// Minimum live `seq` the broadcast subscription is allowed to
+    /// emit. The replay path snapshots the buffer and emits frames
+    /// 1..=N synchronously, but the broadcast subscriber has been
+    /// queuing the SAME N frames in parallel since attach. Without a
+    /// floor, the renderer would see every replayed frame twice. The
+    /// floor is set to `range.latest_seq` after a successful replay;
+    /// the broadcast handler drops any incoming frame whose `seq <=
+    /// floor` before sending it on the wire.
+    min_live_seq: u64,
 }
 
 struct LiveSubscription {
@@ -437,6 +453,8 @@ async fn run_attached_socket(
         detached: false,
         closed: false,
         live: live_subscription,
+        replay_handshake_done: false,
+        min_live_seq: 0,
     };
 
     loop {
@@ -464,6 +482,15 @@ async fn run_attached_socket(
                 pty_frame = sub.rx.recv() => {
                     match pty_frame {
                         Ok(frame) => {
+                            // Drop frames the replay handshake already
+                            // sent. The replay snapshot and the live
+                            // broadcast subscription both observe the
+                            // SAME backlog after an `Attach` with
+                            // `last_seen_seq`, so without this floor the
+                            // renderer would see the older frames twice.
+                            if frame.seq <= state.min_live_seq {
+                                continue;
+                            }
                             // Output bytes from the remote PTY. NEVER log
                             // the raw payload at any level.
                             let msg = ServerMsg::Output {
@@ -475,9 +502,14 @@ async fn run_attached_socket(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Slow consumer: missed frames. The future
-                            // replay slice fills this gap; for now the
-                            // renderer just sees the next frames in line.
+                            // Slow consumer: the broadcast's bounded
+                            // queue overflowed and dropped some frames.
+                            // The renderer will see a `seq` gap in
+                            // the live stream; on the next reconnect
+                            // it can request replay by passing
+                            // `last_seen_seq`, and the bounded replay
+                            // buffer will fill the gap when possible
+                            // (or surface `replay_window_lost`).
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -601,18 +633,69 @@ async fn handle_text_frame(
         ClientMsg::Ping => {
             send_msg(socket, &ServerMsg::Pong).await;
         }
-        ClientMsg::Attach { .. } => {
-            // The route already attached this socket on upgrade. A second
-            // explicit Attach is meaningless in this slice; reject it
-            // rather than re-attach (which would orphan the first row).
-            send_msg(
-                socket,
-                &ServerMsg::Error {
-                    code: ProtoErrorCode::InvalidMessage,
-                    message: "already attached".to_owned(),
-                },
-            )
-            .await;
+        ClientMsg::Attach {
+            session_id: _,
+            last_seen_seq,
+            client_id: _,
+        } => {
+            // The route already wrote the attachment row on upgrade and
+            // sent `SessionAttached`. The client's optional follow-up
+            // `Attach` frame carries `last_seen_seq` for the replay
+            // handshake. Allow at most one such frame per socket — a
+            // second `Attach` is a protocol violation (it cannot trigger
+            // a re-attach without orphaning the first row).
+            if state.replay_handshake_done {
+                send_msg(
+                    socket,
+                    &ServerMsg::Error {
+                        code: ProtoErrorCode::InvalidMessage,
+                        message: "already attached".to_owned(),
+                    },
+                )
+                .await;
+                return true;
+            }
+            state.replay_handshake_done = true;
+            // No bookmark → no replay request, just continue live attach.
+            // Do NOT replay the entire buffer to a brand-new attach —
+            // that would dump pre-attach scrollback to a renderer that
+            // didn't ask for it. The product contract says replay is
+            // strictly opt-in via `last_seen_seq`.
+            //
+            // `Some(0)` is treated as `None` here: seq numbers start at
+            // 1, so a bookmark of 0 carries no resume information beyond
+            // "no frames seen yet." Collapsing the two shapes at the
+            // wire boundary keeps `min_live_seq` at its 0 default, which
+            // is load-bearing for the no-bookmark path — every frame
+            // the broadcast subscriber queued since upgrade passes the
+            // floor check and reaches the renderer.
+            let bookmark = last_seen_seq.map(|s| s.0).filter(|seq| *seq > 0);
+            if bookmark.is_none() {
+                return true;
+            }
+            // Replay only makes sense when a live PTY runtime exists for
+            // the session. Stub sessions have no buffer; treat as a
+            // no-op (the client's bookmark refers to a vanished PTY).
+            let Some(replay) = manager.replay_since(session_id, bookmark) else {
+                return true;
+            };
+            match replay {
+                Ok(range) => {
+                    // Raise the live-seq floor BEFORE emitting so any
+                    // broadcast frames the subscriber has already
+                    // queued won't double-deliver — drop them in the
+                    // pty_frame branch.
+                    state.min_live_seq = state.min_live_seq.max(range.latest_seq);
+                    emit_replay_range(socket, range).await;
+                }
+                Err(lost) => {
+                    // Same floor: skip ahead so the live stream picks
+                    // up at the next stamped frame, not at one the
+                    // renderer was told it missed.
+                    state.min_live_seq = state.min_live_seq.max(lost.latest);
+                    emit_replay_window_lost(socket, lost).await;
+                }
+            }
         }
         ClientMsg::Input { data } => {
             // Forward to the live PTY if bound. The payload is NEVER
@@ -800,6 +883,54 @@ async fn send_error(socket: &mut WebSocket, err: &TerminalSessionManagerError) {
         &ServerMsg::Error {
             code,
             message: message.to_owned(),
+        },
+    )
+    .await;
+}
+
+/// Drain a `ReplayRange` to the socket as `ReplayStart` → buffered
+/// `Output` frames → `ReplayEnd`. Empty ranges still emit nothing — a
+/// client that asked to resume from `latest_seq` itself doesn't need
+/// the bracketing frames. The `seq` on each replayed `Output` is the
+/// original sequence the orchestrator stamped (NOT renumbered) so a
+/// client that bridges replay → live frames sees one continuous stream.
+async fn emit_replay_range(socket: &mut WebSocket, range: ReplayRange) {
+    if range.frames.is_empty() {
+        return;
+    }
+    let from_seq = SeqNo(range.frames.first().expect("non-empty checked above").seq);
+    let to_seq = SeqNo(range.frames.last().expect("non-empty checked above").seq);
+    if !send_msg(socket, &ServerMsg::ReplayStart { from_seq, to_seq }).await {
+        return;
+    }
+    for frame in &range.frames {
+        let msg = ServerMsg::Output {
+            seq: SeqNo(frame.seq),
+            data: output_data_encode(&frame.data),
+        };
+        if !send_msg(socket, &msg).await {
+            return;
+        }
+    }
+    let _ = send_msg(
+        socket,
+        &ServerMsg::ReplayEnd {
+            latest_seq: SeqNo(range.latest_seq),
+        },
+    )
+    .await;
+}
+
+/// Surface a window-lost replay as the typed wire frame. The session is
+/// NOT closed — the handler continues live attach so the renderer can
+/// reset its grid and resume from the next live frame.
+async fn emit_replay_window_lost(socket: &mut WebSocket, lost: ReplayWindowLost) {
+    let _ = send_msg(
+        socket,
+        &ServerMsg::ReplayWindowLost {
+            requested_seq: SeqNo(lost.requested),
+            oldest_available_seq: lost.oldest_available.map(SeqNo),
+            latest_seq: SeqNo(lost.latest),
         },
     )
     .await;

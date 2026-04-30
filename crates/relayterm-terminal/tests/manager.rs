@@ -1285,3 +1285,146 @@ async fn write_pty_input_after_final_detach_returns_pty_not_live() {
         "no input bytes should reach the fake bridge after auto-close",
     );
 }
+
+// ----------------------------------------------------------------------
+// Replay buffer integration through the manager
+// ----------------------------------------------------------------------
+
+/// Wait until the manager's replay buffer for `session` reports at least
+/// `expected_seq` as its latest, then return the current snapshot. The
+/// bridge → forwarder → broadcast/replay handoff is async, so a freshly
+/// injected output frame is observable only after the forwarder runs.
+async fn wait_for_latest_seq(
+    mgr: &TerminalSessionManager,
+    session: TerminalSessionId,
+    expected_seq: u64,
+) -> u64 {
+    for _ in 0..200 {
+        if let Some(Ok(range)) = mgr.replay_since(session, None) {
+            if range.latest_seq >= expected_seq {
+                return range.latest_seq;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("replay buffer never reached seq >= {expected_seq}");
+}
+
+#[tokio::test]
+async fn replay_since_starts_empty_with_zero_latest() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    // No frames pushed yet: an empty range with latest_seq=0.
+    let range = mgr
+        .replay_since(session.id, None)
+        .expect("live PTY exists")
+        .expect("no window-lost on a fresh attach");
+    assert!(range.frames.is_empty());
+    assert_eq!(range.latest_seq, 0);
+}
+
+#[tokio::test]
+async fn forwarder_pushes_each_output_frame_into_replay_buffer() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    fixture.inject_output(b"first".to_vec()).await;
+    fixture.inject_output(b"second".to_vec()).await;
+    fixture.inject_output(b"third".to_vec()).await;
+    let _ = wait_for_latest_seq(&mgr, session.id, 3).await;
+
+    let range = mgr
+        .replay_since(session.id, None)
+        .unwrap()
+        .expect("buffer has frames, no window-lost");
+    let seqs: Vec<u64> = range.frames.iter().map(|f| f.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "seq must start at 1 and increment by one"
+    );
+    assert_eq!(range.latest_seq, 3);
+    let bytes: Vec<&[u8]> = range.frames.iter().map(|f| f.data.as_ref()).collect();
+    assert_eq!(bytes, vec![&b"first"[..], &b"second"[..], &b"third"[..]]);
+}
+
+#[tokio::test]
+async fn replay_since_returns_only_frames_newer_than_bookmark() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+
+    for byte in [b'a', b'b', b'c', b'd'] {
+        fixture.inject_output(vec![byte]).await;
+    }
+    let _ = wait_for_latest_seq(&mgr, session.id, 4).await;
+
+    let range = mgr
+        .replay_since(session.id, Some(2))
+        .unwrap()
+        .expect("buffer covers bookmark");
+    let seqs: Vec<u64> = range.frames.iter().map(|f| f.seq).collect();
+    assert_eq!(seqs, vec![3, 4]);
+    assert_eq!(range.latest_seq, 4);
+}
+
+#[tokio::test]
+async fn replay_since_returns_none_for_stub_session() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    // No live PTY → handler should be able to detect this and skip the
+    // replay handshake entirely.
+    assert!(mgr.replay_since(session.id, None).is_none());
+}
+
+#[tokio::test]
+async fn close_session_drops_replay_buffer_with_runtime() {
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    fixture.inject_output(b"banner".to_vec()).await;
+    let _ = wait_for_latest_seq(&mgr, session.id, 1).await;
+
+    mgr.close_session(session.id, owner).await.unwrap();
+    assert!(
+        mgr.replay_since(session.id, None).is_none(),
+        "closing the session must drop the replay buffer alongside the runtime",
+    );
+}
+
+#[tokio::test]
+async fn write_pty_input_does_not_appear_in_replay_buffer() {
+    // Replay covers PTY OUTPUT only — client `Input` bytes are forwarded
+    // to the remote shell and never echoed via the broadcast (the echo
+    // arrives back as Output bytes from the PTY). Asserting this directly
+    // pins the contract that the replay path can never leak client input.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    mgr.write_pty_input(owner, session.id, b"keystroke".to_vec())
+        .await
+        .unwrap();
+
+    let range = mgr
+        .replay_since(session.id, None)
+        .unwrap()
+        .expect("no window-lost on empty buffer");
+    assert!(
+        range.frames.is_empty(),
+        "input must not be mirrored to the replay buffer",
+    );
+}

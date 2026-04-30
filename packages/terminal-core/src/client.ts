@@ -36,6 +36,8 @@ import {
   type OutputMsg,
   type PingMsg,
   type PongMsg,
+  type ReplayEndMsg,
+  type ReplayStartMsg,
   type ReplayWindowLostMsg,
   type ResizeMsg,
   type SeqNo,
@@ -105,6 +107,8 @@ interface ClientEvents {
   resize_ack: AckMsg;
   pong: PongMsg;
   output: OutputMsg;
+  replay_start: ReplayStartMsg;
+  replay_end: ReplayEndMsg;
   replay_window_lost: ReplayWindowLostMsg;
   error: TerminalClientError;
   input_rejected_or_stubbed: InputRejectionReason;
@@ -119,7 +123,17 @@ export interface AttachOptions {
    * bookkeeping only.
    */
   sessionId?: SessionId;
-  /** Reserved for the future replay slice. */
+  /**
+   * Resume bookmark for the in-memory replay buffer. When supplied,
+   * the server emits any buffered `output` frames newer than
+   * `lastSeenSeq` (bracketed by `replay_start` / `replay_end`) BEFORE
+   * resuming the live stream. If the bookmark predates the bounded
+   * buffer's window, the server emits a single `replay_window_lost`
+   * frame with diagnostic seq metadata and continues live attach. A
+   * brand-new attach should leave this `undefined` rather than passing
+   * `0` — `0` is also treated as "no bookmark," but `undefined` is
+   * the explicit shape.
+   */
   lastSeenSeq?: SeqNo;
   /** Stable client identifier (e.g. browser tab id). */
   clientId?: string;
@@ -145,6 +159,13 @@ export class TerminalSessionClient {
    * event the SPEC contract guarantees.
    */
   #attachedIds: { sessionId: SessionId; attachmentId: AttachmentId } | null = null;
+  /**
+   * Highest output `seq` observed on the wire (replayed or live).
+   * Reset to `0` only on construction; persists across `state_change`
+   * transitions so a renderer that reconnects can read it back via
+   * `lastSeenSeq` and pass it to the next `attach()` call.
+   */
+  #lastSeenSeq: SeqNo = 0;
 
   constructor(options: TerminalSessionClientOptions) {
     this.#transport = options.transport;
@@ -157,6 +178,18 @@ export class TerminalSessionClient {
 
   get state(): TerminalSessionState {
     return this.#state;
+  }
+
+  /**
+   * Highest output `seq` this client has observed (replayed or live).
+   * `0` until the first `output` frame lands. Pass this back to the
+   * next `attach()` call as `lastSeenSeq` to request replay across a
+   * reconnect — the bounded server-side buffer fills the gap when
+   * possible and emits `replay_window_lost` when the bookmark predates
+   * the buffer.
+   */
+  get lastSeenSeq(): SeqNo {
+    return this.#lastSeenSeq;
   }
 
   /**
@@ -335,9 +368,32 @@ export class TerminalSessionClient {
         }
         return;
       case "output":
+        // Track the highest seq we've seen so the renderer can pass it
+        // back as `lastSeenSeq` on the next attach. Replayed and live
+        // frames arrive on the same `output` channel and carry their
+        // original seq, so we can update unconditionally.
+        if (msg.seq > this.#lastSeenSeq) {
+          this.#lastSeenSeq = msg.seq;
+        }
         this.#emitter.emit("output", msg);
         return;
+      case "replay_start":
+        this.#emitter.emit("replay_start", msg);
+        return;
+      case "replay_end":
+        if (msg.latest_seq > this.#lastSeenSeq) {
+          this.#lastSeenSeq = msg.latest_seq;
+        }
+        this.#emitter.emit("replay_end", msg);
+        return;
       case "replay_window_lost":
+        // Skip ahead to the server's latest_seq — the renderer is
+        // expected to reset its grid; the next live frame will be
+        // `latest_seq + 1` and the bookmark must reflect that the
+        // missed frames are unrecoverable.
+        if (msg.latest_seq > this.#lastSeenSeq) {
+          this.#lastSeenSeq = msg.latest_seq;
+        }
         this.#emitter.emit("replay_window_lost", msg);
         return;
       case "session_detached":
@@ -455,6 +511,8 @@ export type {
   PongMsg,
   AckMsg,
   OutputMsg,
+  ReplayEndMsg,
+  ReplayStartMsg,
   ReplayWindowLostMsg,
   SessionAttachedMsg,
   SessionDetachedMsg,

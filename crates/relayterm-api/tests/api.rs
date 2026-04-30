@@ -4778,3 +4778,479 @@ async fn ws_input_after_auto_close_does_not_reach_bridge(pool: PgPool) {
         "no input bytes should reach the bridge after final detach + auto-close",
     );
 }
+
+// ----------------------------------------------------------------------
+// Replay buffer / sequence-number wire path
+// ----------------------------------------------------------------------
+
+/// Drain the socket until an `Output` frame whose seq matches
+/// `expected_seq` arrives. The forwarder runs on a separate task so a
+/// just-injected frame may need a few scheduler turns to appear. Returns
+/// the decoded payload bytes for the asserted frame.
+async fn await_output_with_seq(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    expected_seq: u64,
+) -> Vec<u8> {
+    for _ in 0..200 {
+        let msg = recv_server_msg(socket).await;
+        match msg {
+            relayterm_protocol::ServerMsg::Output { seq, data } if seq.0 == expected_seq => {
+                return relayterm_protocol::output_data_decode(&data)
+                    .expect("output data must be valid base64");
+            }
+            relayterm_protocol::ServerMsg::Output { .. } => continue,
+            relayterm_protocol::ServerMsg::Pong => continue,
+            other => {
+                panic!("unexpected frame while awaiting Output(seq={expected_seq}): {other:?}")
+            }
+        }
+    }
+    panic!("never received Output frame with seq={expected_seq}");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_live_output_carries_monotonic_seq_starting_at_one(pool: PgPool) {
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-seq.example.com",
+        "SHA256:ws-seq",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached
+
+    // Inject three output frames; the wire MUST carry seq=1, 2, 3.
+    handle.inject_output(b"first".to_vec()).await;
+    handle.inject_output(b"second".to_vec()).await;
+    handle.inject_output(b"third".to_vec()).await;
+
+    let mut seqs: Vec<u64> = Vec::new();
+    let mut datas: Vec<Vec<u8>> = Vec::new();
+    while seqs.len() < 3 {
+        let msg = recv_server_msg(&mut socket).await;
+        match msg {
+            relayterm_protocol::ServerMsg::Output { seq, data } => {
+                seqs.push(seq.0);
+                datas.push(relayterm_protocol::output_data_decode(&data).unwrap());
+            }
+            relayterm_protocol::ServerMsg::Pong => continue,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    assert_eq!(seqs, vec![1, 2, 3]);
+    assert_eq!(
+        datas,
+        vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_with_last_seen_seq_replays_buffered_frames(pool: PgPool) {
+    // First socket primes the replay buffer with frames 1..=3, then
+    // detaches. A second socket attaches and explicitly sends
+    // `Attach { last_seen_seq: 1 }` — the server MUST emit
+    // ReplayStart{2,3}, Output(2), Output(3), ReplayEnd{3}.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-replay.example.com",
+        "SHA256:ws-replay",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+    let addr = spawn_app(app).await;
+
+    // First attach: prime the replay buffer with three frames. We do
+    // NOT send Detach (which would auto-close the live session); we
+    // just drop the socket and wait for the cleanup tail to finish.
+    {
+        let mut s1 = open_ws(addr, session_id).await;
+        let _ = recv_server_msg(&mut s1).await;
+        handle.inject_output(b"alpha".to_vec()).await;
+        handle.inject_output(b"beta".to_vec()).await;
+        handle.inject_output(b"gamma".to_vec()).await;
+        let _ = await_output_with_seq(&mut s1, 3).await;
+        // Drop without explicit Detach is also problematic — it triggers
+        // auto-close. Use explicit Detach but only if we're certain the
+        // session will remain alive for the second socket via another
+        // attachment.
+        // → To keep the live PTY alive across detach, hold s1 open until
+        //   AFTER s2 has attached, then detach s1 cleanly.
+        // Open s2 first:
+        let mut s2 = open_ws(addr, session_id).await;
+        let _ = recv_server_msg(&mut s2).await; // SessionAttached(Active)
+        send_client_msg(
+            &mut s2,
+            &relayterm_protocol::ClientMsg::Attach {
+                session_id: Some(session_id),
+                last_seen_seq: Some(relayterm_core::SeqNo(1)),
+                client_id: Some("replay-test/1.0".to_owned()),
+            },
+        )
+        .await;
+
+        // Expect: ReplayStart { from_seq: 2, to_seq: 3 }, Output(2),
+        // Output(3), ReplayEnd { latest_seq: 3 }.
+        let start = recv_server_msg(&mut s2).await;
+        match start {
+            relayterm_protocol::ServerMsg::ReplayStart { from_seq, to_seq } => {
+                assert_eq!(from_seq.0, 2);
+                assert_eq!(to_seq.0, 3);
+            }
+            other => panic!("expected ReplayStart, got {other:?}"),
+        }
+        let f2 = recv_server_msg(&mut s2).await;
+        match f2 {
+            relayterm_protocol::ServerMsg::Output { seq, data } => {
+                assert_eq!(seq.0, 2);
+                assert_eq!(
+                    relayterm_protocol::output_data_decode(&data).unwrap(),
+                    b"beta"
+                );
+            }
+            other => panic!("expected Output(2), got {other:?}"),
+        }
+        let f3 = recv_server_msg(&mut s2).await;
+        match f3 {
+            relayterm_protocol::ServerMsg::Output { seq, data } => {
+                assert_eq!(seq.0, 3);
+                assert_eq!(
+                    relayterm_protocol::output_data_decode(&data).unwrap(),
+                    b"gamma"
+                );
+            }
+            other => panic!("expected Output(3), got {other:?}"),
+        }
+        let end = recv_server_msg(&mut s2).await;
+        match end {
+            relayterm_protocol::ServerMsg::ReplayEnd { latest_seq } => {
+                assert_eq!(latest_seq.0, 3);
+            }
+            other => panic!("expected ReplayEnd, got {other:?}"),
+        }
+
+        // Drop both sockets cleanly.
+        drop(s2);
+        drop(s1);
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_without_last_seen_seq_does_not_dump_old_output(pool: PgPool) {
+    // A brand-new attach (no last_seen_seq) must NOT receive replayed
+    // frames — even when the buffer has them.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-no-replay.example.com",
+        "SHA256:ws-no-replay",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+    let addr = spawn_app(app).await;
+
+    // Prime via s1, hold open.
+    let mut s1 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s1).await;
+    handle.inject_output(b"old-output".to_vec()).await;
+    let _ = await_output_with_seq(&mut s1, 1).await;
+
+    // Second socket: attach, explicitly send Attach { last_seen_seq:
+    // None }. Server MUST NOT emit any replay frames.
+    let mut s2 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s2).await;
+    send_client_msg(
+        &mut s2,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: Some(session_id),
+            last_seen_seq: None,
+            client_id: None,
+        },
+    )
+    .await;
+
+    // Inject a NEW frame; s2 must see ONLY the new live frame (seq=2),
+    // not the prior buffered frame.
+    handle.inject_output(b"new-live".to_vec()).await;
+    let bytes = await_output_with_seq(&mut s2, 2).await;
+    assert_eq!(bytes, b"new-live");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_attach_with_in_bounds_bookmark_does_not_emit_replay_window_lost(pool: PgPool) {
+    // The buffer is bounded; force a tiny window indirectly: just attach
+    // with a bookmark we know is older than anything in the buffer (the
+    // PTY emits frames 1..=2; bookmark=1 is recoverable, but we force
+    // the lost path by asking for bookmark older than 1 is impossible
+    // since seq starts at 1). Instead, attach with bookmark > what was
+    // actually streamed: that doesn't trigger window lost (caller is
+    // ahead). To genuinely trigger window lost we need a bookmark older
+    // than the oldest retained frame. Default config retains 1024 frames
+    // / 1 MiB, so a small test cannot evict naturally.
+    //
+    // Strategy: prime a single frame seq=1, then attach with bookmark=
+    // u64::MAX/2 — that's "ahead of latest" which is empty range, NOT
+    // window lost. So instead, validate the inverse: there is no path in
+    // this slice that produces ReplayWindowLost without artificially
+    // shrinking the buffer or emitting >1024 frames. That coverage lives
+    // in the unit tests on `ReplayBuffer::replay_since`. The wire-side
+    // coverage we CAN provide here is "replay_window_lost is never
+    // emitted on a normal in-bounds attach."
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-no-window-lost.example.com",
+        "SHA256:ws-no-window-lost",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+    let addr = spawn_app(app).await;
+
+    let mut s1 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s1).await;
+    handle.inject_output(b"only".to_vec()).await;
+    let _ = await_output_with_seq(&mut s1, 1).await;
+
+    // Bookmark equals latest → empty range (no replay frames at all,
+    // and definitely no window-lost).
+    let mut s2 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s2).await;
+    send_client_msg(
+        &mut s2,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: Some(session_id),
+            last_seen_seq: Some(relayterm_core::SeqNo(1)),
+            client_id: None,
+        },
+    )
+    .await;
+
+    // Inject a new frame — the next frame on s2 should be Output(2),
+    // never a ReplayStart or ReplayEnd or ReplayWindowLost.
+    handle.inject_output(b"next".to_vec()).await;
+    let msg = recv_server_msg(&mut s2).await;
+    match msg {
+        relayterm_protocol::ServerMsg::Output { seq, data } => {
+            assert_eq!(seq.0, 2);
+            assert_eq!(
+                relayterm_protocol::output_data_decode(&data).unwrap(),
+                b"next"
+            );
+        }
+        other => panic!("bookmark==latest must skip the replay handshake entirely; got {other:?}",),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_replay_does_not_double_deliver_buffered_frames(pool: PgPool) {
+    // After a successful replay handshake, the live broadcast subscriber
+    // has been queueing the SAME frames in parallel. The handler MUST
+    // drop frames whose seq <= range.latest_seq so the renderer doesn't
+    // see the replayed frames twice.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-no-dup-replay.example.com",
+        "SHA256:ws-no-dup-replay",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+    let addr = spawn_app(app).await;
+
+    let mut s1 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s1).await;
+    for byte in [b'a', b'b'] {
+        handle.inject_output(vec![byte]).await;
+    }
+    let _ = await_output_with_seq(&mut s1, 2).await;
+
+    let mut s2 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s2).await;
+    // Bookmark = 1 → server replays only frame seq=2. The broadcast
+    // subscriber for s2 has been queueing frames 1 AND 2 since attach
+    // (the manager pushes to the broadcast on every output), so the
+    // handler MUST raise its `min_live_seq` floor to range.latest_seq=2
+    // BEFORE emitting the replay or the queued live frames will be
+    // double-delivered after the replay drain finishes.
+    send_client_msg(
+        &mut s2,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: Some(session_id),
+            last_seen_seq: Some(relayterm_core::SeqNo(1)),
+            client_id: None,
+        },
+    )
+    .await;
+
+    // Drain replay frames: ReplayStart, Output(2), ReplayEnd.
+    let _ = recv_server_msg(&mut s2).await; // ReplayStart
+    let _ = recv_server_msg(&mut s2).await; // Output(2)
+    let _ = recv_server_msg(&mut s2).await; // ReplayEnd
+
+    // Inject ONE more live frame; the next visible Output on s2 must be
+    // seq=3, not a duplicated seq=2.
+    handle.inject_output(b"c".to_vec()).await;
+    let msg = recv_server_msg(&mut s2).await;
+    match msg {
+        relayterm_protocol::ServerMsg::Output { seq, .. } => {
+            assert_eq!(
+                seq.0, 3,
+                "post-replay live frame must skip past the replayed window",
+            );
+        }
+        other => panic!("expected Output(3), got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_second_explicit_attach_is_rejected(pool: PgPool) {
+    // The first explicit Attach after upgrade is accepted (replay
+    // handshake). A second explicit Attach is a protocol violation:
+    // server MUST emit error { code: invalid_message, message:
+    // "already attached" } and keep the socket open.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-double-attach.example.com",
+        "SHA256:ws-double-attach",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    // First Attach with no bookmark — accepted, no reply.
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: None,
+            last_seen_seq: None,
+            client_id: None,
+        },
+    )
+    .await;
+    // Second Attach — rejected.
+    send_client_msg(
+        &mut socket,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: None,
+            last_seen_seq: None,
+            client_id: None,
+        },
+    )
+    .await;
+
+    let resp = recv_server_msg(&mut socket).await;
+    match resp {
+        relayterm_protocol::ServerMsg::Error { code, message } => {
+            assert_eq!(code, relayterm_protocol::ErrorCode::InvalidMessage);
+            assert!(
+                message.to_lowercase().contains("already attached"),
+                "second attach must signal already-attached: {message}",
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_replay_messages_do_not_leak_payload_in_serialization(pool: PgPool) {
+    // Make sure the replay path never round-trips raw bytes through any
+    // `Debug` / `Display` surface that gets logged. We assert at the
+    // wire serialization layer: a sentinel byte sequence injected into
+    // the PTY must never appear in the JSON-serialized replay control
+    // frames (ReplayStart / ReplayEnd). Output frames CARRY the bytes
+    // (base64) by design — that's their purpose — but the bracketing
+    // frames must stay metadata-only.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-replay-redact.example.com",
+        "SHA256:ws-replay-redact",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+    let addr = spawn_app(app).await;
+
+    let mut s1 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s1).await;
+    let sentinel = b"REDACT-MARKER-REPLAY-SHELL-9F";
+    // Two frames so a `last_seen_seq=1` bookmark triggers replay of
+    // exactly one buffered frame (the sentinel-bearing seq=2). Using
+    // a positive bookmark — `Some(0)` is treated as no-bookmark by
+    // the handler and would skip the replay handshake entirely.
+    handle.inject_output(b"prefix".to_vec()).await;
+    handle.inject_output(sentinel.to_vec()).await;
+    let _ = await_output_with_seq(&mut s1, 2).await;
+
+    let mut s2 = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut s2).await;
+    send_client_msg(
+        &mut s2,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: Some(session_id),
+            last_seen_seq: Some(relayterm_core::SeqNo(1)),
+            client_id: None,
+        },
+    )
+    .await;
+
+    let start = recv_server_msg(&mut s2).await;
+    let end = {
+        // Drain Output(2) between Start and End.
+        let _ = recv_server_msg(&mut s2).await; // Output(2)
+        recv_server_msg(&mut s2).await
+    };
+    let start_json = serde_json::to_string(&start).unwrap();
+    let end_json = serde_json::to_string(&end).unwrap();
+    let sentinel_str = std::str::from_utf8(sentinel).unwrap();
+    assert!(
+        !start_json.contains(sentinel_str),
+        "ReplayStart wire payload must be metadata only: {start_json}",
+    );
+    assert!(
+        !end_json.contains(sentinel_str),
+        "ReplayEnd wire payload must be metadata only: {end_json}",
+    );
+}

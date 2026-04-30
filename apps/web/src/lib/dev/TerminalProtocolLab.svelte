@@ -55,8 +55,16 @@
         return `session_detached attachment=${msg.attachment_id}`;
       case "session_closed":
         return `session_closed`;
+      case "replay_start":
+        return `replay_start from_seq=${msg.from_seq} to_seq=${msg.to_seq}`;
+      case "replay_end":
+        return `replay_end latest_seq=${msg.latest_seq}`;
       case "replay_window_lost":
-        return "replay_window_lost (reserved for future slice)";
+        return (
+          `replay_window_lost requested_seq=${msg.requested_seq} ` +
+          `oldest_available_seq=${msg.oldest_available_seq ?? "null"} ` +
+          `latest_seq=${msg.latest_seq}`
+        );
       case "error":
         return `error ${msg.code}: ${msg.message}`;
       case "pong":

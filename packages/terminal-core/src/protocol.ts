@@ -100,8 +100,28 @@ export interface OutputMsg {
   data: string;
 }
 
+export interface ReplayStartMsg {
+  type: "replay_start";
+  from_seq: SeqNo;
+  to_seq: SeqNo;
+}
+
+export interface ReplayEndMsg {
+  type: "replay_end";
+  latest_seq: SeqNo;
+}
+
 export interface ReplayWindowLostMsg {
   type: "replay_window_lost";
+  requested_seq: SeqNo;
+  /**
+   * Oldest `seq` the server's replay buffer still retains, or `null`
+   * when the buffer was empty at the moment the gap was detected. The
+   * renderer SHOULD reset its grid before live frames resume — none of
+   * the missed bytes are recoverable from this server-side surface.
+   */
+  oldest_available_seq: SeqNo | null;
+  latest_seq: SeqNo;
 }
 
 export interface SessionDetachedMsg {
@@ -126,6 +146,8 @@ export type ServerMsg =
   | SessionAttachedMsg
   | AckMsg
   | OutputMsg
+  | ReplayStartMsg
+  | ReplayEndMsg
   | ReplayWindowLostMsg
   | SessionDetachedMsg
   | SessionClosedMsg
@@ -138,6 +160,8 @@ const SERVER_MSG_TYPES: readonly ServerMsgType[] = [
   "session_attached",
   "ack",
   "output",
+  "replay_start",
+  "replay_end",
   "replay_window_lost",
   "session_detached",
   "session_closed",
@@ -249,7 +273,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function matchesShape(tag: ServerMsgType, value: Record<string, unknown>): boolean {
   switch (tag) {
     case "pong":
-    case "replay_window_lost":
       return true;
     case "session_attached":
       return (
@@ -263,6 +286,20 @@ function matchesShape(tag: ServerMsgType, value: Record<string, unknown>): boole
     case "output":
       return (
         typeof value["seq"] === "number" && typeof value["data"] === "string"
+      );
+    case "replay_start":
+      return (
+        typeof value["from_seq"] === "number" &&
+        typeof value["to_seq"] === "number"
+      );
+    case "replay_end":
+      return typeof value["latest_seq"] === "number";
+    case "replay_window_lost":
+      return (
+        typeof value["requested_seq"] === "number" &&
+        typeof value["latest_seq"] === "number" &&
+        (value["oldest_available_seq"] === null ||
+          typeof value["oldest_available_seq"] === "number")
       );
     case "session_detached":
       return (

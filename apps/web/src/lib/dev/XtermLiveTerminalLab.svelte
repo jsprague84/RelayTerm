@@ -80,6 +80,14 @@
   let clientState = $state<TerminalSessionState>("idle");
   let log = $state<LogLine[]>([]);
   let nextId = 0;
+  /**
+   * Highest output `seq` mirrored from the client. Updated from the
+   * `output` and `replay_end` event handlers; `0` until the first frame
+   * lands. The "reconnect with last seen seq" button reads this so an
+   * operator can manually exercise the replay handshake without
+   * tracking the bookmark by hand.
+   */
+  let lastSeenSeq = $state(0);
   let client: TerminalSessionClient | null = null;
   let renderer: XtermRenderer | null = null;
   let unsubInput: (() => void) | null = null;
@@ -100,8 +108,18 @@
         return `session_detached attachment=${msg.attachment_id}`;
       case "session_closed":
         return "session_closed";
+      case "replay_start":
+        return `replay_start from_seq=${msg.from_seq} to_seq=${msg.to_seq}`;
+      case "replay_end":
+        return `replay_end latest_seq=${msg.latest_seq}`;
       case "replay_window_lost":
-        return "replay_window_lost (reserved for future slice)";
+        // Metadata only — never the missed payload bytes (the lab does
+        // not have them; the server already ate them).
+        return (
+          `replay_window_lost requested_seq=${msg.requested_seq} ` +
+          `oldest_available_seq=${msg.oldest_available_seq ?? "null"} ` +
+          `latest_seq=${msg.latest_seq}`
+        );
       case "error":
         return `error ${msg.code}: ${msg.message}`;
       case "pong":
@@ -122,7 +140,7 @@
     return `${proto}//${window.location.host}${path}`;
   }
 
-  async function connect() {
+  async function connect(opts: { resumeFromBookmark?: boolean } = {}) {
     if (client) {
       append("info", "already connected; disconnect first");
       return;
@@ -140,6 +158,8 @@
       append("error", `initial cols/rows invalid: ${initial.reason}`);
       return;
     }
+    const bookmark =
+      opts.resumeFromBookmark && lastSeenSeq > 0 ? lastSeenSeq : undefined;
 
     const r = new XtermRenderer({
       fontFamily:
@@ -192,10 +212,28 @@
       }
       append("in", outputLogText(m.seq, decoded.bytes.byteLength));
       r.write(decoded.bytes);
+      // Mirror the client's bookmark into local state so the
+      // reconnect-with-last-seen-seq button reflects what the operator
+      // saw without us having to plumb a getter call into the template.
+      if (m.seq > lastSeenSeq) {
+        lastSeenSeq = m.seq;
+      }
     });
-    next.on("replay_window_lost", (m) =>
+    next.on("replay_start", (m) =>
       append("in", describeNonOutputServerMsg(m)),
     );
+    next.on("replay_end", (m) => {
+      append("in", describeNonOutputServerMsg(m));
+      if (m.latest_seq > lastSeenSeq) {
+        lastSeenSeq = m.latest_seq;
+      }
+    });
+    next.on("replay_window_lost", (m) => {
+      append("in", describeNonOutputServerMsg(m));
+      if (m.latest_seq > lastSeenSeq) {
+        lastSeenSeq = m.latest_seq;
+      }
+    });
     next.on("input_rejected_or_stubbed", (rej) =>
       append("info", `${rej.attempted} rejected: ${rej.reason}`),
     );
@@ -228,8 +266,14 @@
         url: buildWsUrl(sessionId.trim()),
         sessionId: sessionId.trim(),
         clientId: "xterm-live-terminal-lab",
+        lastSeenSeq: bookmark,
       });
-      append("out", "attach frame sent");
+      append(
+        "out",
+        bookmark === undefined
+          ? "attach frame sent"
+          : `attach frame sent with last_seen_seq=${bookmark}`,
+      );
     } catch (err) {
       append(
         "error",
@@ -254,6 +298,24 @@
   function disconnect() {
     teardown();
     append("info", "client + renderer disposed");
+  }
+
+  /**
+   * Tear down the current attachment and immediately reconnect with the
+   * highest output seq the lab has observed. Exercises the replay
+   * handshake end-to-end without the operator having to track the
+   * bookmark by hand. The connect path passes `lastSeenSeq` only when
+   * `resumeFromBookmark` is set AND the bookmark is positive; a
+   * never-streamed session won't issue a no-op replay request.
+   */
+  async function reconnectWithBookmark() {
+    if (lastSeenSeq <= 0) {
+      append("info", "no last_seen_seq yet — nothing to resume from");
+      return;
+    }
+    teardown();
+    append("info", `reconnecting with last_seen_seq=${lastSeenSeq}`);
+    await connect({ resumeFromBookmark: true });
   }
 
   function ping() {
@@ -362,7 +424,7 @@
     <button
       type="button"
       class="rounded-sm bg-emerald-700 px-3 py-1 text-xs hover:bg-emerald-600 disabled:opacity-50"
-      onclick={connect}
+      onclick={() => void connect()}
       disabled={clientState !== "idle"}
     >
       connect + attach + mount renderer
@@ -409,6 +471,14 @@
     </button>
     <button
       type="button"
+      class="rounded-sm bg-indigo-700 px-3 py-1 text-xs hover:bg-indigo-600 disabled:opacity-50"
+      onclick={() => void reconnectWithBookmark()}
+      disabled={lastSeenSeq <= 0}
+    >
+      reconnect with last_seen_seq
+    </button>
+    <button
+      type="button"
       class="ml-auto rounded-sm bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
       onclick={clearLog}
     >
@@ -416,8 +486,13 @@
     </button>
   </div>
 
-  <div class="mt-3 text-xs text-zinc-400">
-    state: <span class="font-mono text-zinc-200">{clientState}</span>
+  <div class="mt-3 flex flex-wrap items-baseline gap-4 text-xs text-zinc-400">
+    <span>
+      state: <span class="font-mono text-zinc-200">{clientState}</span>
+    </span>
+    <span>
+      last_seen_seq: <span class="font-mono text-zinc-200">{lastSeenSeq}</span>
+    </span>
   </div>
 
   <div
