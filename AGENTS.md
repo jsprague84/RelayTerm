@@ -139,6 +139,7 @@ If you're tempted to invent a new directory, propose it here first.
   - The backend protocol does not change to accommodate a renderer. If a renderer needs new data, it transforms what's already on the wire.
   - Raw terminal input/output (keystrokes, PTY bytes, decoded strings) must never be logged or surfaced outside the terminal viewport.
 - **Adding a new backend WebSocket message type** — define in `apps/backend/src/http/` protocol module; mirror schema with the web `lib/ws/` client. ...
+- **Adding a production app-shell view.** The production shell lives under `apps/web/src/lib/app/`. Production components MUST NOT import from `lib/dev/` or any `@relayterm/terminal-*` adapter package; renderer packages stay dev-lab-only until the production terminal workspace lands. To add a view: (1) extend `AppViewId` and `NAV_ITEMS` in `lib/app/navigation.ts` (id, label, description); (2) add a `*View.svelte` under `lib/app/views/` — placeholders should compose `PlaceholderView.svelte` with honest copy ("not implemented yet", a short bullet list of what currently exists, and a `futureWork` note); (3) wire the new id into the `{#if}` chain in `AppShell.svelte`; (4) extend the navigation tests in `tests/navigation.test.ts`. Do NOT show fake data, mock secret values, or any `private_key`/`encrypted_private_key` field. Update `apps/web/e2e/SMOKE.md` if a new stable selector should be in the verified set, and update SPEC.md "Production web app shell" if the contract changes.
 
 ## Decision tables
 
@@ -183,6 +184,8 @@ If you're tempted to invent a new directory, propose it here first.
 | Edit `apps/{desktop,mobile}/src-tauri/gen/**` by hand | Re-generate via `tauri android init` (mobile) or platform init (desktop); configure via capabilities |
 | Use a JWT for browser auth, or trust client-validated input | Server-side session; re-validate inputs at the axum boundary |
 | Redefine `RendererTheme`, `RendererThemeAnsi`, `RendererCursorStyle`, or `BaseTerminalRendererOptions` inside an adapter package | Import them from `@relayterm/terminal-core`; extend `BaseTerminalRendererOptions` for the adapter's option interface |
+| Import from `lib/dev/` or any `@relayterm/terminal-*` adapter inside `apps/web/src/lib/app/` | Production shell stays dev-free; reach the dev lab via the `devTools` snippet in `App.svelte`, gated by `import.meta.env.DEV` — see `tests/appShellIsolation.test.ts` |
+| Show fake data, mock secret values, or a `private_key`/`encrypted_private_key` field on a placeholder view | Use `PlaceholderView` with honest copy: a one-line summary, a "what currently exists on the backend" bullet list, and a `futureWork` note |
 
 ## Git workflow
 

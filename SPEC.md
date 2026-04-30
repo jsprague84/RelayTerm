@@ -464,6 +464,45 @@ The dev lab is gated behind `import.meta.env.DEV`, which Vite inlines as a const
 
 Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real wterm WASM/DOM runtime; honoring the neutral cosmetic knobs (font, cursor, theme, scrollback) via wterm's CSS custom properties; surfacing wterm's `onTitle` channel; wiring wterm's `DebugAdapter` into the dev lab. Each is a separate, deliberate slice.
 
+### Production web app shell
+
+The production-facing web app has a real shell now. The shell is layout, navigation, and dev/prod gating only — it is not the production terminal workspace, not real CRUD UI, and not real auth UI. Each of those is a deliberate later slice.
+
+**Scope (load-bearing — this slice).**
+
+1. The shell renders in production (`vite build` / preview) AND in development (`vite dev`).
+2. Navigation is a small local view-state model — no router. The discriminator (`AppViewId`) is `dashboard | terminal | sessions | servers | identities | settings`.
+3. Each non-dashboard view is a placeholder. Placeholder copy is honest: "not implemented yet", "future work", and a short bullet list of what currently exists on the backend. **Placeholders MUST NOT show fake data, mock secret values, or a `private_key` / `encrypted_private_key` field.** The SSH-identities placeholder explicitly does not surface secrets.
+4. Dev-lab tools (`TerminalProtocolLab`, `DevTerminalWorkbench`, the per-renderer lab and renderer diagnostics) stay dev-only. They are reachable only via the "Developer tools" section of the shell, which is gated by `import.meta.env.DEV` AND a `devTools` snippet passed from `App.svelte`. Vite's dead-code elimination drops the dev branch — and the dev-lab imports it pulls in — from the production bundle.
+5. The dashboard exposes a one-shot backend health probe (`GET /healthz`) via `lib/api/health.ts`. The probe does NOT poll, does NOT retry, and does NOT surface transport-error detail. Failure collapses to `down`; the underlying error is dropped on the floor (liveness probe, not diagnostic).
+
+**Architecture rule.** Production shell components (`lib/app/`) MUST NOT import anything from `lib/dev/` or any renderer adapter (`@relayterm/terminal-{xterm,ghostty-web,restty,wterm}`). Renderer packages stay dev-lab-only until the production terminal workspace lands. This is enforced by `appShellIsolation.test.ts`.
+
+**Package layout.**
+
+```
+apps/web/src/lib/app/
+├─ AppShell.svelte         # composes sidebar + topbar + view + (dev) tools
+├─ SidebarNav.svelte
+├─ TopBar.svelte
+├─ StatusBadge.svelte
+├─ navigation.ts           # NAV_ITEMS, AppViewId, DEFAULT_VIEW, findNavItem
+└─ views/
+   ├─ DashboardView.svelte    # backend health probe
+   ├─ TerminalView.svelte     # placeholder
+   ├─ SessionsView.svelte     # placeholder
+   ├─ ServersView.svelte      # placeholder
+   ├─ IdentitiesView.svelte   # placeholder, no secrets
+   ├─ SettingsView.svelte     # placeholder
+   └─ PlaceholderView.svelte  # shared layout for non-functional views
+apps/web/src/lib/api/
+└─ health.ts                  # checkHealth() helper
+```
+
+**Future work (explicit out-of-scope for this slice).**
+
+Production terminal workspace; production renderer selector; renderer-preference persistence; server / profile / identity CRUD UI; real auth UI (passkey enrollment, session list); mobile/Tauri shell integration; password bootstrap; private-key import; durable session-recording UI; a real router (URL-driven routes, deep-linking). Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.
@@ -614,13 +653,13 @@ The lab gains a renderer/session diagnostics panel so xterm and ghostty-web can 
 
 #### Dev renderer smoke verification (manual, MCP-driven)
 
-`apps/web/e2e/SMOKE.md` documents a small browser-level smoke procedure for the dev renderer lab. It is **manual**, driven by the Playwright MCP server, NOT a committed `@playwright/test` runner — adding committed browsers + a config + a CI surface is more churn than this slice warrants, and the dev lab is intentionally gated out of production. The smoke proves three things and nothing else:
+`apps/web/e2e/SMOKE.md` documents a small browser-level smoke procedure for the dev renderer lab AND the production app shell. It is **manual**, driven by the Playwright MCP server, NOT a committed `@playwright/test` runner — adding committed browsers + a config + a CI surface is more churn than this slice warrants, and the dev lab is intentionally gated out of production. The smoke proves three things and nothing else:
 
-- The dev workbench, the live terminal lab, the renderer selector, the diagnostics panel, and all four renderer options (`xterm`, `ghostty-web`, `restty`, `wterm`) are reachable under `vite dev`. xterm is the default-checked option.
+- Under `vite dev`, the production shell renders (sidebar nav, top bar, dashboard view), the dev-mode badge and dev-tools toggle are present, and clicking the toggle reveals the dev workbench / live terminal lab / renderer selector / diagnostics panel with all four renderer options (`xterm`, `ghostty-web`, `restty`, `wterm`). xterm is the default-checked option.
 - Selecting each renderer in idle does not crash the page, mirrors the choice into the diagnostics panel's `renderer` cell, and emits a single `[info] renderer set to <label> (idle)` line into the event log.
-- Under `vite preview` of the production bundle, the dev workbench / lab / selector / diagnostics / renderer options are ALL absent, and the production placeholder is visible.
+- Under `vite preview` of the production bundle, the production shell renders (sidebar nav, top bar, dashboard view), AND every dev-only surface is absent: dev-mode badge, dev-tools toggle, dev-tools panel, dev workbench, live terminal lab, renderer selector, renderer options, and diagnostics panel are ALL gone.
 
-Stable selectors are pinned via `data-testid` on the dev surfaces (`dev-terminal-workbench`, `xterm-live-terminal-lab`, `renderer-selector`, `renderer-option-{xterm,ghostty-web,restty,wterm}`, `renderer-diagnostics`, `lab-event-log`) and on the production placeholder (`production-terminal-placeholder`). The `idle` choice flip eagerly mirrors `setRenderer(diagnostics, choice)` so the panel reflects the operator's selection without needing a live attach — the docstring on `RendererDiagnosticsState.rendererId` already named this field "currently selected renderer."
+Stable selectors are pinned via `data-testid` on the production shell (`app-shell-main`, `top-bar-title`, `nav-{dashboard,terminal,sessions,servers,identities,settings}`, `production-view-dashboard`), the dev-only shell affordances (`dev-mode-badge`, `nav-devtools-toggle`, `dev-tools-panel`), and the dev lab (`dev-terminal-workbench`, `xterm-live-terminal-lab`, `renderer-selector`, `renderer-option-{xterm,ghostty-web,restty,wterm}`, `renderer-diagnostics`, `lab-event-log`). The `idle` choice flip eagerly mirrors `setRenderer(diagnostics, choice)` so the panel reflects the operator's selection without needing a live attach — the docstring on `RendererDiagnosticsState.rendererId` already named this field "currently selected renderer."
 
 The smoke does NOT cover: a real SSH end-to-end browser test (no PTY bytes flow; no backend is required); renderer-specific WASM/WebGPU/DOM behavior (no `mount()` is exercised because no session is attached); benchmarks or perf claims; mobile / Tauri shell; visual regression; persistent renderer preference. Each is a separate, deliberate slice.
 

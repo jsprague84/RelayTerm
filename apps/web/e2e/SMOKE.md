@@ -1,10 +1,11 @@
-# Dev renderer smoke — manual Playwright MCP procedure
+# Dev renderer + production shell smoke — manual Playwright MCP procedure
 
 This document captures the browser-level smoke verification for the
-**dev-only renderer lab**. It is intentionally a manual procedure driven
-by the Playwright MCP server, not a committed `@playwright/test` suite —
-the operator (human or agent) drives a real Chromium against the Vite
-dev/preview servers and asserts a small set of stable selectors.
+**dev-only renderer lab** AND the **production app shell**. It is
+intentionally a manual procedure driven by the Playwright MCP server,
+not a committed `@playwright/test` suite — the operator (human or agent)
+drives a real Chromium against the Vite dev/preview servers and asserts
+a small set of stable selectors.
 
 ## Why no committed Playwright runner
 
@@ -19,22 +20,33 @@ dev/preview servers and asserts a small set of stable selectors.
 
 ## Stable selectors
 
-The dev lab and the production placeholder expose these `data-testid`
-hooks. Treat them as the contract this smoke depends on; if you rename
-one, update this file in the same change.
+The dev lab and the production shell expose these `data-testid` hooks.
+Treat them as the contract this smoke depends on; if you rename one,
+update this file in the same change.
 
-| Selector                                          | Surface                                                |
-|---------------------------------------------------|--------------------------------------------------------|
-| `[data-testid="dev-terminal-workbench"]`          | Dev workbench root (only visible under `vite dev`).    |
-| `[data-testid="xterm-live-terminal-lab"]`         | Live terminal lab root (renderer host + diagnostics).  |
-| `[data-testid="renderer-selector"]`               | Radio group containing the four renderer options.      |
-| `[data-testid="renderer-option-xterm"]`           | xterm baseline radio (default-checked).                |
-| `[data-testid="renderer-option-ghostty-web"]`     | ghostty-web experimental radio.                        |
-| `[data-testid="renderer-option-restty"]`          | restty experimental radio.                             |
-| `[data-testid="renderer-option-wterm"]`           | wterm experimental radio.                              |
-| `[data-testid="renderer-diagnostics"]`            | Diagnostics panel (counters + selected renderer).      |
-| `[data-testid="lab-event-log"]`                   | Event log container (info/in/out/error rows).          |
-| `[data-testid="production-terminal-placeholder"]` | Production placeholder section (only in `vite build`). |
+| Selector                                          | Surface                                                       |
+|---------------------------------------------------|---------------------------------------------------------------|
+| `[data-testid="app-shell-main"]`                  | Production shell main pane (visible in dev AND prod).         |
+| `[data-testid="top-bar-title"]`                   | Shell top bar title (mirrors selected nav item).              |
+| `[data-testid="nav-dashboard"]`                   | Sidebar nav button — Dashboard (default-selected).            |
+| `[data-testid="nav-terminal"]`                    | Sidebar nav button — Terminal workspace placeholder.          |
+| `[data-testid="nav-sessions"]`                    | Sidebar nav button — Sessions placeholder.                    |
+| `[data-testid="nav-servers"]`                     | Sidebar nav button — Server profiles placeholder.             |
+| `[data-testid="nav-identities"]`                  | Sidebar nav button — SSH identities placeholder.              |
+| `[data-testid="nav-settings"]`                    | Sidebar nav button — Settings placeholder.                    |
+| `[data-testid="production-view-dashboard"]`       | Dashboard view (selected by default).                         |
+| `[data-testid="dev-mode-badge"]`                  | "dev build" badge in top bar (only visible under `vite dev`). |
+| `[data-testid="nav-devtools-toggle"]`             | Sidebar dev-tools toggle (only visible under `vite dev`).     |
+| `[data-testid="dev-tools-panel"]`                 | Dev tools panel rendered when toggle is open (dev only).      |
+| `[data-testid="dev-terminal-workbench"]`          | Dev workbench root (only visible under `vite dev`).           |
+| `[data-testid="xterm-live-terminal-lab"]`         | Live terminal lab root (renderer host + diagnostics).         |
+| `[data-testid="renderer-selector"]`               | Radio group containing the four renderer options.             |
+| `[data-testid="renderer-option-xterm"]`           | xterm baseline radio (default-checked).                       |
+| `[data-testid="renderer-option-ghostty-web"]`     | ghostty-web experimental radio.                               |
+| `[data-testid="renderer-option-restty"]`          | restty experimental radio.                                    |
+| `[data-testid="renderer-option-wterm"]`           | wterm experimental radio.                                     |
+| `[data-testid="renderer-diagnostics"]`            | Diagnostics panel (counters + selected renderer).             |
+| `[data-testid="lab-event-log"]`                   | Event log container (info/in/out/error rows).                 |
 
 Renderer-switching contract: clicking a renderer radio while idle (no
 session attached) records the choice and pushes a single info line to
@@ -70,34 +82,65 @@ the same MCP browser tools.
    browser_navigate http://localhost:5173/
    ```
 
-3. Assert dev surfaces are present and the production placeholder is
-   absent. Use `browser_evaluate` with this snippet:
+3. Assert the production shell renders AND the dev surfaces are
+   reachable via the dev-tools toggle. Use `browser_evaluate` with this
+   snippet:
 
    ```js
    () => {
      const has = (sel) => !!document.querySelector(sel);
      return {
-       workbench: has('[data-testid="dev-terminal-workbench"]'),
-       lab: has('[data-testid="xterm-live-terminal-lab"]'),
-       selector: has('[data-testid="renderer-selector"]'),
-       diagnostics: has('[data-testid="renderer-diagnostics"]'),
-       placeholder: has('[data-testid="production-terminal-placeholder"]'),
-       options: ["xterm", "ghostty-web", "restty", "wterm"].map((id) => ({
-         id,
-         present: has(`[data-testid="renderer-option-${id}"]`),
-         checked:
-           document.querySelector(`[data-testid="renderer-option-${id}"]`)
-             ?.checked ?? null,
-       })),
+       shell: has('[data-testid="app-shell-main"]'),
+       dashboard: has('[data-testid="production-view-dashboard"]'),
+       devModeBadge: has('[data-testid="dev-mode-badge"]'),
+       devToolsToggle: has('[data-testid="nav-devtools-toggle"]'),
+       devToolsPanel: has('[data-testid="dev-tools-panel"]'),
+       navItems: [
+         "dashboard",
+         "terminal",
+         "sessions",
+         "servers",
+         "identities",
+         "settings",
+       ].every((id) => has(`[data-testid="nav-${id}"]`)),
      };
    }
    ```
 
-   Expected: `workbench`, `lab`, `selector`, `diagnostics` all `true`;
-   `placeholder` is `false`; every renderer option is `present: true`;
-   `xterm` is the only one with `checked: true`.
+   Expected: `shell`, `dashboard`, `devModeBadge`, `devToolsToggle`,
+   `navItems` all `true`. `devToolsPanel` is `false` (the panel only
+   renders after the toggle is clicked).
 
-4. For each of `ghostty-web`, `restty`, `wterm`, `xterm` (in that
+4. Open the dev-tools panel and assert the renderer lab is reachable:
+
+   - `browser_click [data-testid="nav-devtools-toggle"]`
+   - Re-run the snippet from step 3 and confirm `devToolsPanel: true`.
+   - Run a follow-up snippet to confirm the lab surfaces:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         workbench: has('[data-testid="dev-terminal-workbench"]'),
+         lab: has('[data-testid="xterm-live-terminal-lab"]'),
+         selector: has('[data-testid="renderer-selector"]'),
+         diagnostics: has('[data-testid="renderer-diagnostics"]'),
+         options: ["xterm", "ghostty-web", "restty", "wterm"].map((id) => ({
+           id,
+           present: has(`[data-testid="renderer-option-${id}"]`),
+           checked:
+             document.querySelector(`[data-testid="renderer-option-${id}"]`)
+               ?.checked ?? null,
+         })),
+       };
+     }
+     ```
+
+   Expected: `workbench`, `lab`, `selector`, `diagnostics` all `true`;
+   every renderer option is `present: true`; `xterm` is the only one
+   with `checked: true`.
+
+5. For each of `ghostty-web`, `restty`, `wterm`, `xterm` (in that
    order):
 
    - `browser_click [data-testid="renderer-option-<id>"]`
@@ -112,7 +155,7 @@ the same MCP browser tools.
    `xterm` as the final click — confirm `renderer-option-xterm` is
    checked before closing the browser.
 
-5. `browser_console_messages level=error all=true`. The only allowed
+6. `browser_console_messages level=error all=true`. The only allowed
    error is the favicon `404` (`GET /favicon.ico 404`) — anything else
    fails the smoke.
 
@@ -133,30 +176,43 @@ the same MCP browser tools.
    browser_navigate http://localhost:4173/
    ```
 
-3. Assert production placeholder is visible and every dev-lab surface
-   is absent:
+3. Assert the production shell renders AND every dev-only surface is
+   absent (no dev-tools toggle, no dev-mode badge, no renderer lab):
 
    ```js
    () => {
      const has = (sel) => !!document.querySelector(sel);
      return {
+       shell: has('[data-testid="app-shell-main"]'),
+       dashboard: has('[data-testid="production-view-dashboard"]'),
+       devModeBadge: has('[data-testid="dev-mode-badge"]'),
+       devToolsToggle: has('[data-testid="nav-devtools-toggle"]'),
+       devToolsPanel: has('[data-testid="dev-tools-panel"]'),
        workbench: has('[data-testid="dev-terminal-workbench"]'),
        lab: has('[data-testid="xterm-live-terminal-lab"]'),
        selector: has('[data-testid="renderer-selector"]'),
        diagnostics: has('[data-testid="renderer-diagnostics"]'),
-       placeholder: has('[data-testid="production-terminal-placeholder"]'),
        rendererOptionsAbsent: [
          "xterm",
          "ghostty-web",
          "restty",
          "wterm",
        ].every((id) => !has(`[data-testid="renderer-option-${id}"]`)),
+       navItems: [
+         "dashboard",
+         "terminal",
+         "sessions",
+         "servers",
+         "identities",
+         "settings",
+       ].every((id) => has(`[data-testid="nav-${id}"]`)),
      };
    }
    ```
 
-   Expected: `workbench`, `lab`, `selector`, `diagnostics` all `false`;
-   `placeholder` is `true`; `rendererOptionsAbsent` is `true`.
+   Expected: `shell`, `dashboard`, `navItems` all `true`. `devModeBadge`,
+   `devToolsToggle`, `devToolsPanel`, `workbench`, `lab`, `selector`,
+   `diagnostics` all `false`. `rendererOptionsAbsent` is `true`.
 
 4. `browser_console_messages level=error all=true`. As above, the
    favicon `404` is the only allowed error.
