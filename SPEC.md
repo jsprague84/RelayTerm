@@ -381,9 +381,21 @@ Future work (still explicit out-of-scope): a replay ring buffer + sequence-numbe
 - Cell-grid validation: cols/rows are clamped to `1..=4096` client-side via `validateCellGrid` before any resize frame is sent; the backend's `invalid_input` rejection is a defense-in-depth.
 - Resize is driven through the renderer: a manual "apply resize" button calls `renderer.resize(cols, rows)`, xterm fires `onResize` synchronously, and the subscriber is the single place that calls `client.sendResize` — no duplicate wire frames.
 
+#### Dev workbench launcher
+
+`apps/web/src/lib/dev/DevTerminalWorkbench.svelte` pairs `POST /api/v1/terminal-sessions` with the existing live-terminal lab so an operator can go from "no session" to "live PTY rendered in xterm" without leaving the browser. It is also strictly diagnostic — the production terminal UI (host/profile picker, polished workspace, replay-aware reconnect) is a separate, deliberate slice and does NOT live here.
+
+- Gated behind `import.meta.env.DEV` at the call site (`App.svelte`). The launcher and the bare lab share the same dead-code-elimination story: the prod JS bundle is unchanged in size when this component is added.
+- Manual `server_profile_id` entry only. Listing or filtering host/profile rows is **not** implemented in this slice — the launcher refuses to expand into CRUD UI. The backend's `404 not_found` collapse for foreign-owned ids is the only access check the operator sees.
+- Validation runs client-side via `validateCreateRequest` (`apps/web/src/lib/api/terminalSessions.ts`) BEFORE any wire round-trip. Cols/rows are clamped to `1..=4096` and `server_profile_id` must be non-empty; the backend's `invalid_input` is defense-in-depth.
+- The typed helper `createTerminalSession` issues the POST and parses the response into a small typed shape. Unknown fields in the response are ignored (forward-compat); a missing required field collapses to `malformed_response`. The helper's status summary is `code/status` only — the wire `message` field is never echoed into the launcher's status line, and operator-facing detail (already redacted to static strings server-side) is dropped at the helper boundary as defense-in-depth.
+- On a successful create the launcher remounts the lab via `{#key launchId}` with `initialSessionId` / `initialCols` / `initialRows` / `autoConnect=true`. Each create yields a fresh `TerminalSessionClient` + `XtermRenderer` pair — no client/renderer state survives a relaunch. The lab still owns its own session id state after first render so the operator can edit and reconnect manually.
+- Status states: `idle` (no session created yet), `creating` (POST in flight, create button disabled), `created { session, launchId }` (lab auto-attaches), `error { summary }` (typed safe summary, lab is unmounted to its baseline form). `clear status` returns to `idle`; the lab continues to expose its own `dispose renderer + client` for live cleanup.
+- Tests in `apps/web/tests/terminalSessionsApi.test.ts` pin the helper's validation, request shaping, response parsing, and error mapping. The redaction sentinel pattern from `labLog.test.ts` is reused — no operator-facing string surfaces a wire message field.
+
 #### Future work (explicit out-of-scope for this slice)
 
-Replay buffer + sequence-number-based resume across reconnects; multi-client collaborative attach UX; binary frame format for `Output`; backend-restart recovery for `active` rows; per-session inactivity-timeout reaping for detached PTYs; password-bootstrap / `ssh-copy-id` flow; user-uploaded private keys; SFTP / file-browser surface; session recording. Each is a separate, deliberate slice.
+Replay buffer + sequence-number-based resume across reconnects; multi-client collaborative attach UX; binary frame format for `Output`; backend-restart recovery for `active` rows; per-session inactivity-timeout reaping for detached PTYs; password-bootstrap / `ssh-copy-id` flow; user-uploaded private keys; SFTP / file-browser surface; session recording; production terminal UI (host/profile picker, polished workspace, theme/preferences persistence); listing / filtering existing sessions in the launcher. Each is a separate, deliberate slice.
 
 ### Authenticated SSH credential check contract
 

@@ -21,10 +21,15 @@
  */
 
 import { decodeOutputData } from "@relayterm/terminal-core";
+import { CELL_GRID_MAX, CELL_GRID_MIN } from "../terminal/cellGrid.js";
 
-/** Wire-side cell-grid bounds — same as `relayterm_protocol::ResizeMsg`. */
-export const CELL_GRID_MIN = 1;
-export const CELL_GRID_MAX = 4096;
+/**
+ * Re-exported for callers that already imported the bounds from this
+ * module. The canonical location is `lib/terminal/cellGrid.ts`; new
+ * non-dev callers should import from there directly so they don't pull
+ * in this dev-only module's transitive surface.
+ */
+export { CELL_GRID_MAX, CELL_GRID_MIN };
 
 /**
  * Format the redaction-safe log line for an outbound `input` frame.

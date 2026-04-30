@@ -24,7 +24,7 @@
    *    adapter, and pinned by tests in `apps/web/tests/labLog.test.ts`
    *    and `packages/terminal-xterm/tests/xtermRenderer.test.ts`.
    */
-  import { onDestroy } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     TerminalSessionClient,
     WebSocketTerminalTransport,
@@ -44,15 +44,39 @@
     validateCellGrid,
   } from "./labLog";
 
+  /**
+   * Optional caller-controlled inputs. When `DevTerminalWorkbench`
+   * launches a session it remounts this component via `{#key sessionId}`
+   * so the props seed the form on first render only — the lab continues
+   * to own its `$state` after that. No `$derived` here on purpose: a
+   * later prop change must not silently overwrite a session id the
+   * operator has been editing. The workbench remounts to push a new id.
+   */
+  interface Props {
+    initialSessionId?: string;
+    initialCols?: number;
+    initialRows?: number;
+    autoConnect?: boolean;
+  }
+  let {
+    initialSessionId = "",
+    initialCols = 80,
+    initialRows = 24,
+    autoConnect = false,
+  }: Props = $props();
+
   interface LogLine {
     id: number;
     direction: "in" | "out" | "info" | "error";
     text: string;
   }
 
-  let sessionId = $state("");
-  let cols = $state(80);
-  let rows = $state(24);
+  // svelte-ignore state_referenced_locally
+  let sessionId = $state(initialSessionId);
+  // svelte-ignore state_referenced_locally
+  let cols = $state(initialCols);
+  // svelte-ignore state_referenced_locally
+  let rows = $state(initialRows);
   let clientState = $state<TerminalSessionState>("idle");
   let log = $state<LogLine[]>([]);
   let nextId = 0;
@@ -268,6 +292,19 @@
 
   onDestroy(() => {
     teardown();
+  });
+
+  // Workbench-driven auto-connect: when the parent has just created a
+  // session and wants the lab to attach without a manual click, it
+  // passes `autoConnect=true` alongside `initialSessionId`. The mount
+  // target ref is bound synchronously, so calling `connect()` from
+  // `onMount` is the first frame the renderer can mount into. We do
+  // NOT re-fire on subsequent prop changes — the workbench remounts
+  // this component via `{#key}` when it wants a fresh session.
+  onMount(() => {
+    if (autoConnect && sessionId.trim().length > 0) {
+      void connect();
+    }
   });
 </script>
 
