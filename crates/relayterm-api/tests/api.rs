@@ -121,6 +121,31 @@ async fn setup_with_full_state(
     (router(state), user_id)
 }
 
+/// Variant of [`setup_with_full_state`] that overrides the manager's
+/// detach TTL. Used by reconnect tests so the TTL-expiry path runs in
+/// well under a second of wall clock instead of the production 30s.
+async fn setup_with_full_state_short_ttl(
+    pool: PgPool,
+    probe: Arc<dyn SshHostKeyProbe>,
+    auth_check: Arc<SshAuthCheckService>,
+    pty_bridge: Arc<dyn SshPtyBridge>,
+    detach_ttl: std::time::Duration,
+) -> (Router, UserId) {
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager_with_short_ttl(&db, detach_ttl);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(probe)),
+        auth_check,
+        pty_bridge,
+        terminal_sessions,
+        dev_user_id: Some(user_id),
+    };
+    (router(state), user_id)
+}
+
 /// Build a `TerminalSessionManager` wired to the same Postgres pool the
 /// router will use. Each test gets its own manager — registry state is
 /// per-test, which matches production semantics (the registry is not
@@ -130,6 +155,22 @@ fn test_terminal_manager(db: &Db) -> Arc<TerminalSessionManager> {
     Arc::new(TerminalSessionManager::new(
         Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
         Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+    ))
+}
+
+/// Like [`test_terminal_manager`] but with a sub-second detach TTL so
+/// the timer-driven close path can be exercised without burning real
+/// wall-clock budget. Production code MUST construct via the
+/// SPEC-pinned default (`TerminalSessionManager::new`).
+fn test_terminal_manager_with_short_ttl(
+    db: &Db,
+    ttl: std::time::Duration,
+) -> Arc<TerminalSessionManager> {
+    use relayterm_core::repository::{SessionEventRepository, TerminalSessionRepository};
+    Arc::new(TerminalSessionManager::with_detach_ttl(
+        Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+        ttl,
     ))
 }
 
@@ -355,6 +396,13 @@ impl FakePtyHandleRecord {
 
     fn resize_log(&self) -> Vec<(u16, u16)> {
         self.resizes.lock().unwrap().clone()
+    }
+
+    /// `true` once the manager (or test) called `SshPtyHandle::close`
+    /// on this handle. Used by detached-session TTL tests to assert
+    /// the bridge stays alive within the TTL window.
+    fn was_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -3942,20 +3990,11 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
         other => panic!("expected SessionDetached, got {other:?}"),
     }
 
-    // The detach was the last attachment of a live PTY → the manager
-    // auto-closes the session and the handler emits a `SessionClosed`
-    // frame after the `SessionDetached`. See SPEC.md "detach / close
-    // semantics for this slice" — until a TTL/reaper exists, leaving
-    // a PTY running with zero attached clients is unsafe.
-    let resp = recv_server_msg(&mut socket).await;
-    match resp {
-        relayterm_protocol::ServerMsg::SessionClosed {
-            session_id: got_session,
-        } => {
-            assert_eq!(got_session, session_id);
-        }
-        other => panic!("expected SessionClosed after final detach, got {other:?}"),
-    }
+    // No `SessionClosed` is emitted: per the detached-session TTL
+    // contract the PTY survives the bounded reconnect window. A second
+    // recv on the socket must observe the server-initiated close
+    // (Message::Close) rather than another typed frame.
+    while (socket.next().await).is_some() {}
 
     // The attachment row's detached_at is stamped.
     let attachments = PgTerminalSessionRepository::new(pool.clone())
@@ -3965,7 +4004,7 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
     assert_eq!(attachments.len(), 1);
     assert!(attachments[0].detached_at.is_some());
 
-    // Exactly one Detached event AND one Closed event were written.
+    // Exactly one Detached event was written; NO Closed event yet.
     let events = PgSessionEventRepository::new(pool.clone())
         .list_for_session(session_id)
         .await
@@ -3980,17 +4019,17 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
         .count();
     assert_eq!(detached, 1, "exactly one Detached event must be written");
     assert_eq!(
-        closed, 1,
-        "explicit Detach of last live attachment must write exactly one Closed event",
+        closed, 0,
+        "TTL window has not expired; Detach must NOT close the session",
     );
-    // The session row itself is now Closed.
+    // The session row itself is in the Detached state, not Closed.
     let row = PgTerminalSessionRepository::new(pool)
         .get(session_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.status, TerminalSessionStatus::Closed);
-    assert!(row.closed_at.is_some());
+    assert_eq!(row.status, TerminalSessionStatus::Detached);
+    assert!(row.closed_at.is_none());
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -4093,23 +4132,25 @@ async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
         detached, 1,
         "socket drop must append a single Detached event"
     );
-    // Socket-drop on the last live-PTY attachment also auto-closes the
-    // session — cleanup tail's `detach_attachment` fires the close.
+    // Per the detached-session TTL contract a socket drop on the last
+    // live attachment leaves the PTY alive within `DETACHED_LIVE_PTY_TTL`.
+    // No `Closed` event is produced unless the timer expires or the
+    // operator issues an explicit close.
     let closed = events
         .iter()
         .filter(|e| e.kind == SessionEventKind::Closed)
         .count();
     assert_eq!(
-        closed, 1,
-        "socket drop on the last live attachment must auto-close the session",
+        closed, 0,
+        "socket drop must NOT close the session within the TTL window",
     );
     let row = PgTerminalSessionRepository::new(pool)
         .get(session_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.status, TerminalSessionStatus::Closed);
-    assert!(row.closed_at.is_some());
+    assert_eq!(row.status, TerminalSessionStatus::Detached);
+    assert!(row.closed_at.is_none());
 }
 
 // ----------------------------------------------------------------------
@@ -4566,7 +4607,7 @@ async fn ws_resize_forwards_to_live_pty(pool: PgPool) {
 }
 
 // ----------------------------------------------------------------------
-// Live SSH PTY bridge — final-detach auto-close lifecycle
+// Live SSH PTY bridge — final-detach TTL / reconnect lifecycle
 // ----------------------------------------------------------------------
 
 /// Drive a fresh WS attach against the supplied router and return the
@@ -4633,11 +4674,12 @@ async fn ws_explicit_close_remains_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_socket_drop_after_explicit_detach_does_not_duplicate_events(pool: PgPool) {
-    // Race: client sends `Detach`, the server emits SessionDetached +
-    // SessionClosed and closes the WS. The cleanup tail still runs (no
-    // explicit Close from the client). It MUST observe state.detached
-    // and skip — exactly one Detached event and one Closed event must
-    // be written even though `detach_attachment` could have fired twice.
+    // Race: client sends `Detach`, the server emits SessionDetached and
+    // closes the WS. The cleanup tail still runs (no explicit Close
+    // from the client). It MUST observe state.detached and skip — only
+    // one Detached event must land, the TTL close stays scheduled
+    // exactly once (no duplicate timer), and no Closed event has been
+    // written yet.
     let bridge = FakePtyBridge::new();
     let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
@@ -4678,19 +4720,32 @@ async fn ws_socket_drop_after_explicit_detach_does_not_duplicate_events(pool: Pg
         "Detach + cleanup-tail race must write exactly one Detached event",
     );
     assert_eq!(
-        closed, 1,
-        "Detach + cleanup-tail race must write exactly one Closed event",
+        closed, 0,
+        "TTL has not expired; no Closed event must exist after the race",
     );
+    let row = PgTerminalSessionRepository::new(pool)
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Detached);
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn ws_reattach_after_auto_close_returns_409(pool: PgPool) {
-    // After socket-drop auto-closes the live session, opening a new WS
-    // to the same id must fail with 409 (closed) — the row is gone for
-    // attach purposes. Demonstrates that the PTY didn't survive past
-    // the final detach.
+async fn ws_reattach_after_ttl_expiry_returns_409(pool: PgPool) {
+    // After socket-drop, the PTY survives the bounded TTL window. Once
+    // the timer fires the session row transitions to Closed and a new
+    // WS upgrade for the same id must surface 409. Uses a sub-second
+    // detach TTL so the test runs in well under a second.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id) = setup_with_full_state_short_ttl(
+        pool.clone(),
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge.clone() as Arc<dyn SshPtyBridge>,
+        std::time::Duration::from_millis(120),
+    )
+    .await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4707,9 +4762,9 @@ async fn ws_reattach_after_auto_close_returns_409(pool: PgPool) {
     socket.close(None).await.unwrap();
     drop(socket);
 
-    // Wait for the cleanup tail to run + auto-close to land in the DB.
+    // Wait for the TTL timer to fire and close the session.
     let repo = PgTerminalSessionRepository::new(pool.clone());
-    for _ in 0..50 {
+    for _ in 0..40 {
         let row = repo.get(session_id).await.unwrap().unwrap();
         if row.status == TerminalSessionStatus::Closed {
             break;
@@ -4720,7 +4775,7 @@ async fn ws_reattach_after_auto_close_returns_409(pool: PgPool) {
     assert_eq!(
         row.status,
         TerminalSessionStatus::Closed,
-        "auto-close must land before the reattach probe",
+        "TTL expiry must close the session before the reattach probe",
     );
 
     // A reattach must surface 409 — the WS upgrade gate sees the closed row.
@@ -4728,21 +4783,28 @@ async fn ws_reattach_after_auto_close_returns_409(pool: PgPool) {
     assert_eq!(
         status,
         axum::http::StatusCode::CONFLICT,
-        "reattach to an auto-closed session must return 409",
+        "reattach to a TTL-expired session must return 409",
     );
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn ws_input_after_auto_close_does_not_reach_bridge(pool: PgPool) {
-    // After auto-close, the PTY runtime is gone. A fresh WS upgrade is
-    // refused (asserted in the previous test), so the only surface that
-    // could reach the bridge is the in-flight WebSocket — but the
-    // server initiates a clean close after sending SessionClosed, so
-    // there's no second channel to send input through. We assert that
-    // the FakePtyBridge's last handle has no input recorded after the
-    // auto-close has settled.
+async fn ws_input_after_ttl_expiry_does_not_reach_bridge(pool: PgPool) {
+    // After the TTL fires the PTY runtime is gone. The in-flight
+    // WebSocket has already been closed by the server when Detach
+    // landed, so the only surface that could reach the bridge is a
+    // fresh upgrade — and the upgrade gate refuses with 409 (asserted
+    // separately). This pins the bridge-side invariant: no input
+    // bytes appear on the FakePtyBridge handle after a TTL-expired
+    // session's lifecycle settles.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id) = setup_with_full_state_short_ttl(
+        pool.clone(),
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge.clone() as Arc<dyn SshPtyBridge>,
+        std::time::Duration::from_millis(120),
+    )
+    .await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4760,8 +4822,8 @@ async fn ws_input_after_auto_close_does_not_reach_bridge(pool: PgPool) {
     send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
     while (socket.next().await).is_some() {}
 
-    // Confirm the row auto-closed.
-    for _ in 0..50 {
+    // Wait for the TTL timer to fire and close the session.
+    for _ in 0..40 {
         let row = PgTerminalSessionRepository::new(pool.clone())
             .get(session_id)
             .await
@@ -4775,7 +4837,7 @@ async fn ws_input_after_auto_close_does_not_reach_bridge(pool: PgPool) {
 
     assert!(
         handle.input_log().is_empty(),
-        "no input bytes should reach the bridge after final detach + auto-close",
+        "no input bytes should reach the bridge after final detach + TTL expiry",
     );
 }
 
@@ -5253,4 +5315,277 @@ async fn ws_replay_messages_do_not_leak_payload_in_serialization(pool: PgPool) {
         !end_json.contains(sentinel_str),
         "ReplayEnd wire payload must be metadata only: {end_json}",
     );
+}
+
+// ----------------------------------------------------------------------
+// Detached-session TTL: reconnect within the window, expire after it
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_detach_keeps_pty_alive_within_ttl_window(pool: PgPool) {
+    // Final detach must transition the row to Detached without closing
+    // the PTY. The bridge handle stays live until the TTL expires or
+    // an explicit close arrives. Uses a generous TTL so the assertion
+    // observes the live state without racing the timer.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_full_state_short_ttl(
+        pool.clone(),
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge.clone() as Arc<dyn SshPtyBridge>,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-ttl-alive.example.com",
+        "SHA256:ws-ttl-alive",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().expect("bridge produced handle");
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws_attached(addr, session_id).await;
+    send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
+    while (socket.next().await).is_some() {}
+
+    // Settle: the cleanup tail runs after the loop exits.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Row is Detached, NOT Closed.
+    let row = PgTerminalSessionRepository::new(pool)
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Detached);
+    assert!(row.closed_at.is_none());
+    // Bridge handle has not been closed (no close call recorded yet).
+    assert!(
+        !handle.was_closed(),
+        "PTY bridge must not be closed during the TTL window",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_reattach_within_ttl_resumes_active_session(pool: PgPool) {
+    // After detach, a fresh WS upgrade within the TTL window must
+    // succeed and the row must transition back to Active.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_full_state_short_ttl(
+        pool.clone(),
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge.clone() as Arc<dyn SshPtyBridge>,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-ttl-reattach.example.com",
+        "SHA256:ws-ttl-reattach",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+
+    {
+        let mut s1 = open_ws_attached(addr, session_id).await;
+        send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Detach).await;
+        while (s1.next().await).is_some() {}
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Reattach within the TTL window.
+    let mut s2 = open_ws(addr, session_id).await;
+    let attached = recv_server_msg(&mut s2).await;
+    match attached {
+        relayterm_protocol::ServerMsg::SessionAttached { status, .. } => {
+            assert_eq!(
+                status,
+                relayterm_protocol::SessionAttachStatus::Active,
+                "reattach within TTL must surface Active status",
+            );
+        }
+        other => panic!("expected SessionAttached, got {other:?}"),
+    }
+    let row = PgTerminalSessionRepository::new(pool.clone())
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        TerminalSessionStatus::Active,
+        "reattach must transition the row back to Active",
+    );
+    let kinds: Vec<_> = PgSessionEventRepository::new(pool)
+        .list_for_session(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(
+        kinds.contains(&SessionEventKind::Reattached),
+        "reattach must append a Reattached event, got {kinds:?}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_reattach_with_last_seen_seq_replays_missed_output_within_ttl(pool: PgPool) {
+    // Prime the buffer with frames 1..=2 via s1, detach without
+    // closing, then reattach with `last_seen_seq=1` — the server must
+    // emit ReplayStart{2,2}, Output(2), ReplayEnd{2}.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_full_state_short_ttl(
+        pool.clone(),
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge.clone() as Arc<dyn SshPtyBridge>,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-ttl-replay.example.com",
+        "SHA256:ws-ttl-replay",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().unwrap();
+    let addr = spawn_app(app).await;
+
+    {
+        let mut s1 = open_ws_attached(addr, session_id).await;
+        handle.inject_output(b"alpha".to_vec()).await;
+        handle.inject_output(b"beta".to_vec()).await;
+        let _ = await_output_with_seq(&mut s1, 2).await;
+        send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Detach).await;
+        while (s1.next().await).is_some() {}
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut s2 = open_ws(addr, session_id).await;
+    // Assert the upgrade-time attach landed as Active so a future
+    // change to the upgrade frame doesn't silently pass on the wrong
+    // shape.
+    match recv_server_msg(&mut s2).await {
+        relayterm_protocol::ServerMsg::SessionAttached { status, .. } => {
+            assert_eq!(
+                status,
+                relayterm_protocol::SessionAttachStatus::Active,
+                "reattach within TTL must surface Active status",
+            );
+        }
+        other => panic!("expected SessionAttached(Active), got {other:?}"),
+    }
+    send_client_msg(
+        &mut s2,
+        &relayterm_protocol::ClientMsg::Attach {
+            session_id: Some(session_id),
+            last_seen_seq: Some(relayterm_core::SeqNo(1)),
+            client_id: Some("ttl-replay-test/1.0".to_owned()),
+        },
+    )
+    .await;
+    match recv_server_msg(&mut s2).await {
+        relayterm_protocol::ServerMsg::ReplayStart { from_seq, to_seq } => {
+            assert_eq!(from_seq.0, 2);
+            assert_eq!(to_seq.0, 2);
+        }
+        other => panic!("expected ReplayStart, got {other:?}"),
+    }
+    match recv_server_msg(&mut s2).await {
+        relayterm_protocol::ServerMsg::Output { seq, data } => {
+            assert_eq!(seq.0, 2);
+            assert_eq!(
+                relayterm_protocol::output_data_decode(&data).unwrap(),
+                b"beta"
+            );
+        }
+        other => panic!("expected Output(2), got {other:?}"),
+    }
+    match recv_server_msg(&mut s2).await {
+        relayterm_protocol::ServerMsg::ReplayEnd { latest_seq } => {
+            assert_eq!(latest_seq.0, 2);
+        }
+        other => panic!("expected ReplayEnd, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_explicit_close_during_ttl_closes_immediately(pool: PgPool) {
+    // Close arriving via the HTTP route during the TTL window must
+    // close the session at once, cancelling the pending TTL task. No
+    // duplicate Closed event lands later when the timer would have
+    // expired.
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_full_state_short_ttl(
+        pool.clone(),
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        bridge.clone() as Arc<dyn SshPtyBridge>,
+        std::time::Duration::from_millis(150),
+    )
+    .await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-ttl-explicit-close.example.com",
+        "SHA256:ws-ttl-explicit-close",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app.clone()).await;
+
+    {
+        let mut s1 = open_ws_attached(addr, session_id).await;
+        send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Detach).await;
+        while (s1.next().await).is_some() {}
+    }
+
+    // Close while the TTL is still pending.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/terminal-sessions/{session_id}/close"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Wait past the TTL so any racing timer would have fired.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let closed = PgSessionEventRepository::new(pool.clone())
+        .list_for_session(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "explicit close during TTL must produce exactly one Closed event",
+    );
+    let row = PgTerminalSessionRepository::new(pool)
+        .get(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
 }
