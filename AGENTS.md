@@ -129,6 +129,7 @@ If you're tempted to invent a new directory, propose it here first.
   6. Wire the package into `apps/web` ONLY for the dev lab: register an id/label in `apps/web/src/lib/dev/rendererDiagnostics.ts` and add creation/switching to `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte`. Do not promote experimental renderers into the main app surface.
   7. Update the Stack table in this file with the package, version pin, and any API caveats (UTF-8 decode requirements, async init, asset/WASM wiring, bundle size, tree-shaking flags). Update `SPEC.md` with adapter limitations and tree-shaking notes.
   8. Verify the production bundle: confirm the new package is tree-shaken out of any non-dev build (`sideEffects: false` on the adapter, no top-level imports from app code).
+  9. Add a `data-testid="renderer-option-<id>"` attribute to the new radio in `XtermLiveTerminalLab.svelte` and extend the smoke selectors in `apps/web/e2e/SMOKE.md`. Re-run the manual Playwright MCP smoke (dev + production halves) so the new option is in the verified set. The smoke is intentionally manual; if it ever needs to be a committed runner, that is its own slice.
 
   Recurring rules for renderer work:
   - `xterm` is the compatibility baseline and the default. Don't change the default without an explicit ask.

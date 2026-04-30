@@ -117,7 +117,10 @@
   }
 </script>
 
-<section class="rounded-md border border-emerald-700/60 bg-emerald-950/20 p-4 text-sm">
+<section
+  class="rounded-md border border-emerald-700/60 bg-emerald-950/20 p-4 text-sm"
+  data-testid="dev-terminal-workbench"
+>
   <header class="flex items-baseline justify-between">
     <h2 class="text-base font-semibold text-emerald-200">
       Dev Terminal Workbench

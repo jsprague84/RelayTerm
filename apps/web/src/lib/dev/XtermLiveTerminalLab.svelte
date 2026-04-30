@@ -738,6 +738,19 @@
   async function setRendererChoice(next: RendererChoice) {
     if (next === rendererChoice) return;
     rendererChoice = next;
+    // Mirror the operator's choice into the diagnostics panel
+    // immediately. Without this, the panel's `renderer` field would
+    // continue to show the last MOUNTED renderer until the next
+    // `connect()`, which contradicts the field's docstring ("currently
+    // selected renderer"). On the IDLE branch below, the mount-duration
+    // counters are not disturbed because no mount happens. On the
+    // LIVE-RECONNECT branch the subsequent `connect()` will write the
+    // same renderer id again at the mount-time call site AND then call
+    // `markMountStart`/`markMountEnd`, which is the mount-duration
+    // update path; the early write here is harmlessly redundant in that
+    // case (idempotent), it is not a substitute for the mount-time
+    // bookkeeping.
+    setDiagnosticsRenderer(diagnostics, next);
     if (!client) {
       append("info", `renderer set to ${rendererLabel(next)} (idle)`);
       return;
@@ -842,7 +855,10 @@
   };
 </script>
 
-<section class="rounded-md border border-amber-700/60 bg-amber-950/30 p-4 text-sm">
+<section
+  class="rounded-md border border-amber-700/60 bg-amber-950/30 p-4 text-sm"
+  data-testid="xterm-live-terminal-lab"
+>
   <header class="flex items-baseline justify-between">
     <h2 class="text-base font-semibold text-amber-200">
       Xterm Live Terminal Lab
@@ -919,13 +935,17 @@
     </label>
   </div>
 
-  <div class="mt-3 flex flex-wrap items-baseline gap-2 text-xs">
+  <div
+    class="mt-3 flex flex-wrap items-baseline gap-2 text-xs"
+    data-testid="renderer-selector"
+  >
     <span class="text-zinc-400">renderer:</span>
     <label class="inline-flex items-center gap-1">
       <input
         type="radio"
         name="renderer"
         value="xterm"
+        data-testid="renderer-option-xterm"
         checked={rendererChoice === "xterm"}
         onchange={() => void setRendererChoice("xterm")}
       />
@@ -936,6 +956,7 @@
         type="radio"
         name="renderer"
         value="ghostty-web"
+        data-testid="renderer-option-ghostty-web"
         checked={rendererChoice === "ghostty-web"}
         onchange={() => void setRendererChoice("ghostty-web")}
       />
@@ -946,6 +967,7 @@
         type="radio"
         name="renderer"
         value="restty"
+        data-testid="renderer-option-restty"
         checked={rendererChoice === "restty"}
         onchange={() => void setRendererChoice("restty")}
       />
@@ -956,6 +978,7 @@
         type="radio"
         name="renderer"
         value="wterm"
+        data-testid="renderer-option-wterm"
         checked={rendererChoice === "wterm"}
         onchange={() => void setRendererChoice("wterm")}
       />
@@ -1083,6 +1106,7 @@
   <section
     class="mt-3 rounded-sm border border-zinc-800 bg-zinc-950/60 p-2 text-xs"
     aria-label="renderer diagnostics"
+    data-testid="renderer-diagnostics"
   >
     <header class="flex flex-wrap items-baseline justify-between gap-2">
       <span class="font-semibold text-zinc-200">renderer diagnostics</span>
@@ -1206,6 +1230,7 @@
 
   <div
     class="mt-2 max-h-48 overflow-auto rounded-sm border border-zinc-800 bg-zinc-950 p-2 font-mono text-xs"
+    data-testid="lab-event-log"
   >
     {#each log as line (line.id)}
       <div

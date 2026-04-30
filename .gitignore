@@ -28,3 +28,6 @@ Thumbs.db
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
+
+# Playwright MCP session artifacts (transient — NOT source)
+.playwright-mcp/

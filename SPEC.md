@@ -612,9 +612,21 @@ The lab gains a renderer/session diagnostics panel so xterm and ghostty-web can 
 - Status states: `idle` (no session created yet), `creating` (POST in flight, create button disabled), `created { session, launchId }` (lab auto-attaches), `error { summary }` (typed safe summary, lab is unmounted to its baseline form). `clear status` returns to `idle`; the lab continues to expose its own `dispose renderer + client` for live cleanup.
 - Tests in `apps/web/tests/terminalSessionsApi.test.ts` pin the helper's validation, request shaping, response parsing, and error mapping. The redaction sentinel pattern from `labLog.test.ts` is reused — no operator-facing string surfaces a wire message field.
 
+#### Dev renderer smoke verification (manual, MCP-driven)
+
+`apps/web/e2e/SMOKE.md` documents a small browser-level smoke procedure for the dev renderer lab. It is **manual**, driven by the Playwright MCP server, NOT a committed `@playwright/test` runner — adding committed browsers + a config + a CI surface is more churn than this slice warrants, and the dev lab is intentionally gated out of production. The smoke proves three things and nothing else:
+
+- The dev workbench, the live terminal lab, the renderer selector, the diagnostics panel, and all four renderer options (`xterm`, `ghostty-web`, `restty`, `wterm`) are reachable under `vite dev`. xterm is the default-checked option.
+- Selecting each renderer in idle does not crash the page, mirrors the choice into the diagnostics panel's `renderer` cell, and emits a single `[info] renderer set to <label> (idle)` line into the event log.
+- Under `vite preview` of the production bundle, the dev workbench / lab / selector / diagnostics / renderer options are ALL absent, and the production placeholder is visible.
+
+Stable selectors are pinned via `data-testid` on the dev surfaces (`dev-terminal-workbench`, `xterm-live-terminal-lab`, `renderer-selector`, `renderer-option-{xterm,ghostty-web,restty,wterm}`, `renderer-diagnostics`, `lab-event-log`) and on the production placeholder (`production-terminal-placeholder`). The `idle` choice flip eagerly mirrors `setRenderer(diagnostics, choice)` so the panel reflects the operator's selection without needing a live attach — the docstring on `RendererDiagnosticsState.rendererId` already named this field "currently selected renderer."
+
+The smoke does NOT cover: a real SSH end-to-end browser test (no PTY bytes flow; no backend is required); renderer-specific WASM/WebGPU/DOM behavior (no `mount()` is exercised because no session is attached); benchmarks or perf claims; mobile / Tauri shell; visual regression; persistent renderer preference. Each is a separate, deliberate slice.
+
 #### Future work (explicit out-of-scope for this slice)
 
-Replay buffer + sequence-number-based resume across reconnects; multi-client collaborative attach UX; binary frame format for `Output`; backend-restart recovery for `active` rows; per-session inactivity-timeout reaping for detached PTYs; password-bootstrap / `ssh-copy-id` flow; user-uploaded private keys; SFTP / file-browser surface; session recording; production terminal UI (host/profile picker, polished workspace, theme/preferences persistence); listing / filtering existing sessions in the launcher. Each is a separate, deliberate slice.
+Replay buffer + sequence-number-based resume across reconnects; multi-client collaborative attach UX; binary frame format for `Output`; backend-restart recovery for `active` rows; per-session inactivity-timeout reaping for detached PTYs; password-bootstrap / `ssh-copy-id` flow; user-uploaded private keys; SFTP / file-browser surface; session recording; production terminal UI (host/profile picker, polished workspace, theme/preferences persistence); listing / filtering existing sessions in the launcher; committed Playwright runner / CI integration of the dev renderer smoke; real-SSH browser end-to-end test; renderer-specific WASM/WebGPU/DOM smoke. Each is a separate, deliberate slice.
 
 ### Output sequence + in-memory replay buffer contract
 

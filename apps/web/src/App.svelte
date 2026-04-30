@@ -53,7 +53,10 @@
     <TerminalProtocolLab />
     <DevTerminalWorkbench />
   {:else}
-    <section class="rounded-md border border-zinc-800 p-4 text-sm">
+    <section
+      class="rounded-md border border-zinc-800 p-4 text-sm"
+      data-testid="production-terminal-placeholder"
+    >
       <h2 class="text-base font-semibold">Terminal</h2>
       <p class="mt-1 text-zinc-400">
         The production terminal UI is not implemented yet. Backend session
