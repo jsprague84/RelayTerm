@@ -701,9 +701,11 @@ async fn handle_text_frame(
                 )
                 .await;
             } else {
-                // UTF-8 string → bytes is the right shape for keystrokes
-                // from xterm.js: control sequences, paste, Unicode all
-                // round-trip. A binary frame format is future work.
+                // Backwards-compat fallback for clients that still wrap
+                // keystrokes in JSON `input { data: string }`. Control
+                // sequences, paste, and Unicode all round-trip via
+                // UTF-8. The default wire shape for input is the binary
+                // `Input` frame (RTB1) routed by `handle_binary_frame`.
                 let bytes = data.into_bytes();
                 if let Err(err) = manager.write_pty_input(user_id, session_id, bytes).await {
                     send_error(socket, &err).await;

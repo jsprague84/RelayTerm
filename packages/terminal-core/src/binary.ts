@@ -14,8 +14,8 @@
  *  -------|------|----------------------------------------------
  *      0  |   4  | magic = "RTB1"
  *      4  |   1  | kind: 0x01=Output, 0x02=Input
- *      5  |   1  | flags (reserved, must be 0; readers ignore unknown bits)
- *      6  |   2  | reserved (must be 0; readers ignore)
+ *      5  |   1  | flags (reserved, MUST be 0 in v1; readers reject non-zero)
+ *      6  |   2  | reserved (MUST be 0 in v1; readers reject non-zero)
  *      8  |   8  | seq u64 BE (Output: stamped; Input: 0)
  *     16  |   4  | payload_len u32 BE
  *     20  |   N  | payload bytes
