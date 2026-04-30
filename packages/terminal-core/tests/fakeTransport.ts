@@ -1,4 +1,5 @@
 import {
+  type BinaryFrame,
   type ClientMsg,
   type ServerMsg,
   type TerminalCloseEvent,
@@ -11,6 +12,7 @@ import { TypedEmitter } from "../src/events.js";
 
 interface Events {
   message: ServerMsg;
+  binary: BinaryFrame;
   close: TerminalCloseEvent;
   error: TerminalTransportError;
 }
@@ -23,6 +25,7 @@ interface Events {
  */
 export class FakeTransport implements TerminalTransport {
   readonly sent: ClientMsg[] = [];
+  readonly sentBinary: Uint8Array[] = [];
   readonly emitter = new TypedEmitter<Events>();
   state: TransportReadyState = "idle";
   /** When false, `connect()` rejects with a fake transport error. */
@@ -49,6 +52,16 @@ export class FakeTransport implements TerminalTransport {
     this.sent.push(message);
   }
 
+  sendBinary(frame: Uint8Array): void {
+    if (this.state !== "open") {
+      this.emitter.emit("error", { kind: "send_before_open" });
+      return;
+    }
+    // Defensive copy so a caller mutating its buffer can't change what
+    // the test sees later.
+    this.sentBinary.push(new Uint8Array(frame));
+  }
+
   close(_code?: number, _reason?: string): void {
     if (this.state === "closed") return;
     this.state = "closed";
@@ -63,6 +76,10 @@ export class FakeTransport implements TerminalTransport {
     return this.emitter.on("message", cb);
   }
 
+  onBinary(cb: (frame: BinaryFrame) => void): Unsubscribe {
+    return this.emitter.on("binary", cb);
+  }
+
   onClose(cb: (e: TerminalCloseEvent) => void): Unsubscribe {
     return this.emitter.on("close", cb);
   }
@@ -75,6 +92,10 @@ export class FakeTransport implements TerminalTransport {
 
   simulateServerMsg(msg: ServerMsg): void {
     this.emitter.emit("message", msg);
+  }
+
+  simulateBinary(frame: BinaryFrame): void {
+    this.emitter.emit("binary", frame);
   }
 
   simulateClose(event?: Partial<TerminalCloseEvent>): void {

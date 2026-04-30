@@ -33,8 +33,8 @@ use relayterm_core::repository::{
 };
 use relayterm_core::terminal_session::TerminalSessionStatus;
 use relayterm_protocol::{
-    AckKind, ClientMsg, ErrorCode as ProtoErrorCode, ServerMsg, SessionAttachStatus,
-    output_data_encode,
+    AckKind, BinaryFrameKind, ClientMsg, ErrorCode as ProtoErrorCode, ServerMsg,
+    SessionAttachStatus, decode_binary_frame, encode_binary_frame,
 };
 use relayterm_ssh::{SshPtyConfig, SshPtyError, SshPtyTarget};
 use relayterm_terminal::{
@@ -491,13 +491,12 @@ async fn run_attached_socket(
                             if frame.seq <= state.min_live_seq {
                                 continue;
                             }
-                            // Output bytes from the remote PTY. NEVER log
-                            // the raw payload at any level.
-                            let msg = ServerMsg::Output {
-                                seq: SeqNo(frame.seq),
-                                data: output_data_encode(&frame.data),
-                            };
-                            if !send_msg(&mut socket, &msg).await {
+                            // Output bytes from the remote PTY. Emitted
+                            // as a binary `Output` frame on the data
+                            // plane — JSON/base64 inflation belongs to
+                            // the legacy fallback and is not used here.
+                            // NEVER log the raw payload at any level.
+                            if !send_binary_output(&mut socket, frame.seq, &frame.data).await {
                                 break;
                             }
                         }
@@ -574,19 +573,8 @@ async fn handle_recv_outcome(
         Some(Ok(Message::Text(text))) => {
             handle_text_frame(socket, manager, user_id, session_id, state, &text).await
         }
-        Some(Ok(Message::Binary(_))) => {
-            // Binary frames have no defined meaning in the JSON-only
-            // protocol skeleton. Reject without echoing so a probing
-            // client can't confuse the audit log with arbitrary bytes.
-            let _ = send_msg(
-                socket,
-                &ServerMsg::Error {
-                    code: ProtoErrorCode::InvalidMessage,
-                    message: "binary frames are not accepted".to_owned(),
-                },
-            )
-            .await;
-            true
+        Some(Ok(Message::Binary(bytes))) => {
+            handle_binary_frame(socket, manager, user_id, session_id, state, &bytes).await
         }
         Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
             // axum handles WebSocket-protocol pings transparently;
@@ -894,11 +882,10 @@ async fn emit_replay_range(socket: &mut WebSocket, range: ReplayRange) {
         return;
     }
     for frame in &range.frames {
-        let msg = ServerMsg::Output {
-            seq: SeqNo(frame.seq),
-            data: output_data_encode(&frame.data),
-        };
-        if !send_msg(socket, &msg).await {
+        // Replayed output uses the SAME binary envelope as live output;
+        // the orchestrator-stamped seq is preserved so a renderer that
+        // bridges replay → live frames sees one continuous stream.
+        if !send_binary_output(socket, frame.seq, &frame.data).await {
             return;
         }
     }
@@ -937,4 +924,85 @@ async fn send_msg(socket: &mut WebSocket, msg: &ServerMsg) -> bool {
         }
     };
     socket.send(Message::Text(payload.into())).await.is_ok()
+}
+
+/// Emit a PTY output frame on the binary data plane. Returns `false` if
+/// the send failed (transport already gone) so the caller can short-
+/// circuit. The encoder caps payload at the protocol limit; an oversize
+/// PTY chunk is logged and dropped on the floor — losing a frame is
+/// preferable to bringing down the socket, and the bounded replay
+/// buffer covers the gap on the next reconnect.
+async fn send_binary_output(socket: &mut WebSocket, seq: u64, data: &[u8]) -> bool {
+    let encoded = match encode_binary_frame(BinaryFrameKind::Output, seq, data) {
+        Ok(buf) => buf,
+        Err(err) => {
+            // We never log the payload itself — only seq + classifier.
+            warn!(?err, seq, len = data.len(), "binary output encode failed");
+            return true;
+        }
+    };
+    socket.send(Message::Binary(encoded.into())).await.is_ok()
+}
+
+/// Decode an inbound binary frame and route it to the right handler.
+/// Currently the only valid client-bound binary kind is
+/// [`BinaryFrameKind::Input`]; an Output frame on the receive side is a
+/// protocol violation. Returns `false` to break the receive loop.
+async fn handle_binary_frame(
+    socket: &mut WebSocket,
+    manager: &Arc<TerminalSessionManager>,
+    user_id: UserId,
+    session_id: TerminalSessionId,
+    state: &mut SocketState,
+    bytes: &[u8],
+) -> bool {
+    let frame = match decode_binary_frame(bytes) {
+        Ok(frame) => frame,
+        Err(err) => {
+            // Static classifier only — we never reflect bytes from a
+            // malformed frame in case it carried terminal input.
+            debug!(?err, "binary frame decode failed");
+            let _ = send_msg(
+                socket,
+                &ServerMsg::Error {
+                    code: ProtoErrorCode::InvalidMessage,
+                    message: "invalid binary frame".to_owned(),
+                },
+            )
+            .await;
+            return true;
+        }
+    };
+    match frame.kind {
+        BinaryFrameKind::Input => {
+            if state.live.is_none() {
+                send_msg(
+                    socket,
+                    &ServerMsg::Error {
+                        code: ProtoErrorCode::PtyNotLive,
+                        message: "no live pty for this session".to_owned(),
+                    },
+                )
+                .await;
+            } else if let Err(err) = manager
+                .write_pty_input(user_id, session_id, frame.payload)
+                .await
+            {
+                send_error(socket, &err).await;
+            }
+        }
+        BinaryFrameKind::Output => {
+            // Output is server → client only. A client sending Output
+            // is malformed; reject without echoing payload.
+            let _ = send_msg(
+                socket,
+                &ServerMsg::Error {
+                    code: ProtoErrorCode::InvalidMessage,
+                    message: "client must not send output frames".to_owned(),
+                },
+            )
+            .await;
+        }
+    }
+    true
 }

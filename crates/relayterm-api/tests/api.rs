@@ -3454,8 +3454,15 @@ async fn open_ws(
     stream
 }
 
-/// Receive the next text frame and decode it as a [`ServerMsg`]. Panics
-/// on transport error / non-text frame so the test surfaces them loudly.
+/// Receive the next protocol frame and decode it.
+///
+/// Text frames are JSON-decoded into [`ServerMsg`]. Binary frames are
+/// decoded as [`relayterm_protocol::BinaryFrame`] of kind `Output` and
+/// translated into the equivalent `ServerMsg::Output { seq, data }` —
+/// `data` is re-encoded as base64 so existing assertions calling
+/// [`relayterm_protocol::output_data_decode`] keep working unchanged.
+/// A binary frame whose kind is anything other than `Output` is a
+/// protocol violation server-side and panics loudly here.
 async fn recv_server_msg(
     socket: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -3466,6 +3473,19 @@ async fn recv_server_msg(
         match socket.next().await {
             Some(Ok(Message::Text(text))) => {
                 return serde_json::from_str(&text).expect("server message must be valid JSON");
+            }
+            Some(Ok(Message::Binary(bytes))) => {
+                let frame = relayterm_protocol::decode_binary_frame(&bytes)
+                    .expect("server binary frame must be valid RTB1");
+                assert_eq!(
+                    frame.kind,
+                    relayterm_protocol::BinaryFrameKind::Output,
+                    "server only emits binary Output frames",
+                );
+                return relayterm_protocol::ServerMsg::Output {
+                    seq: relayterm_core::SeqNo(frame.seq),
+                    data: relayterm_protocol::output_data_encode(&frame.payload),
+                };
             }
             Some(Ok(Message::Close(_))) => panic!("socket closed before any text frame"),
             Some(Ok(_)) => continue, // skip ping/pong frames
@@ -3877,7 +3897,7 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn ws_binary_frame_is_rejected_without_echo(pool: PgPool) {
+async fn ws_malformed_binary_frame_is_rejected_without_echo(pool: PgPool) {
     use tokio_tungstenite::tungstenite::Message;
     let (app, user_id) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
@@ -3885,8 +3905,8 @@ async fn ws_binary_frame_is_rejected_without_echo(pool: PgPool) {
         user_id,
         &test_vault(),
         "primary",
-        "ws-binary.example.com",
-        "SHA256:ws-binary",
+        "ws-binary-bad.example.com",
+        "SHA256:ws-binary-bad",
     )
     .await;
     let session_id = create_session_via_api(&app, profile_id).await;
@@ -3894,9 +3914,8 @@ async fn ws_binary_frame_is_rejected_without_echo(pool: PgPool) {
     let mut socket = open_ws(addr, session_id).await;
     let _ = recv_server_msg(&mut socket).await;
 
-    // Sentinel bytes the test asserts the server never reflects. JSON
-    // protocol rejects binary frames wholesale — payload must not appear
-    // in the error response or in any subsequent frame.
+    // Sentinel bytes (no RTB1 magic) — the server must reject without
+    // reflecting any portion of the payload in its error envelope.
     let sentinel = b"REDACT-MARKER-BINARY-FRAME-22EE";
     socket
         .send(Message::Binary(sentinel.to_vec().into()))
@@ -3907,7 +3926,7 @@ async fn ws_binary_frame_is_rejected_without_echo(pool: PgPool) {
     let sentinel_str = std::str::from_utf8(sentinel).unwrap();
     assert!(
         !raw.contains(sentinel_str),
-        "binary frame rejection must NOT echo payload bytes: {raw}",
+        "malformed binary frame rejection must NOT echo payload bytes: {raw}",
     );
     match resp {
         relayterm_protocol::ServerMsg::Error { code, .. } => {
@@ -3915,6 +3934,96 @@ async fn ws_binary_frame_is_rejected_without_echo(pool: PgPool) {
         }
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_oversized_binary_frame_is_rejected_safely(pool: PgPool) {
+    use tokio_tungstenite::tungstenite::Message;
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-binary-huge.example.com",
+        "SHA256:ws-binary-huge",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await;
+
+    // Build a header that CLAIMS u32::MAX bytes of payload. The decoder
+    // must reject on the length cap BEFORE allocating, so the server
+    // does not fall over and we get a typed error frame back.
+    let mut buf = Vec::with_capacity(relayterm_protocol::BINARY_HEADER_LEN);
+    buf.extend_from_slice(&relayterm_protocol::BINARY_MAGIC_V1);
+    buf.push(relayterm_protocol::BinaryFrameKind::Input.as_u8());
+    buf.push(0);
+    buf.extend_from_slice(&[0u8, 0u8]);
+    buf.extend_from_slice(&0u64.to_be_bytes());
+    buf.extend_from_slice(&u32::MAX.to_be_bytes());
+    socket.send(Message::Binary(buf.into())).await.unwrap();
+    let resp = recv_server_msg(&mut socket).await;
+    match resp {
+        relayterm_protocol::ServerMsg::Error { code, .. } => {
+            assert_eq!(code, relayterm_protocol::ErrorCode::InvalidMessage);
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // Bridge must NOT have observed any input — the malformed frame is
+    // dropped before the manager is touched.
+    let handle = bridge.last_handle().expect("bridge produced handle");
+    assert!(
+        handle.input_log().is_empty(),
+        "no bytes should reach the bridge after a rejected binary frame",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn ws_binary_input_reaches_live_pty(pool: PgPool) {
+    use tokio_tungstenite::tungstenite::Message;
+    let bridge = FakePtyBridge::new();
+    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "primary",
+        "ws-binary-input.example.com",
+        "SHA256:ws-binary-input",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+    let handle = bridge.last_handle().expect("bridge produced handle");
+
+    let addr = spawn_app(app).await;
+    let mut socket = open_ws(addr, session_id).await;
+    let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
+
+    // Non-UTF-8 bytes — the binary path must carry them losslessly.
+    let payload = b"\x1bOP\x00\xff arrow-up?".to_vec();
+    let frame = relayterm_protocol::encode_binary_frame(
+        relayterm_protocol::BinaryFrameKind::Input,
+        0,
+        &payload,
+    )
+    .unwrap();
+    socket.send(Message::Binary(frame.into())).await.unwrap();
+
+    // Wait briefly for the manager forwarder to land the bytes on the
+    // bridge. The fake handle records each write.
+    for _ in 0..200 {
+        if !handle.input_log().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let log = handle.input_log();
+    let combined: Vec<u8> = log.iter().flat_map(|chunk| chunk.iter().copied()).collect();
+    assert_eq!(combined, payload, "fake bridge must observe exact bytes");
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]

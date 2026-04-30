@@ -46,7 +46,12 @@ import {
   type SessionClosedMsg,
   type SessionDetachedMsg,
   type SessionId,
+  encodeOutputData,
 } from "./protocol.js";
+import {
+  encodeBinaryFrame,
+  type BinaryFrame,
+} from "./binary.js";
 import type {
   TerminalCloseEvent,
   TerminalTransport,
@@ -171,6 +176,7 @@ export class TerminalSessionClient {
     this.#transport = options.transport;
     this.#unsubscribers.push(
       this.#transport.onMessage((msg) => this.#onMessage(msg)),
+      this.#transport.onBinary((frame) => this.#onBinary(frame)),
       this.#transport.onClose((event) => this.#onTransportClose(event)),
       this.#transport.onError((err) => this.#onTransportError(err)),
     );
@@ -239,15 +245,45 @@ export class TerminalSessionClient {
     this.#transport.send(ping);
   }
 
-  sendInput(data: string): void {
+  /**
+   * Send a keystroke / paste payload to the live PTY.
+   *
+   * Defaults to the binary `Input` envelope on the data plane (RTB1 v1):
+   * raw bytes are forwarded straight to the SSH PTY's stdin without a
+   * base64 round-trip. Pass `{ legacyJson: true }` to fall back to the
+   * JSON `input` frame — useful only for diagnostic/dev paths that need
+   * to exercise the legacy decoder. Strings are UTF-8 encoded; the
+   * caller can also hand a `Uint8Array` to bypass encoding entirely
+   * (e.g. for renderers that already produce bytes).
+   *
+   * Logging guarantee: the payload bytes never reach a tracing log,
+   * client error envelope, or rejection event — same redaction rule
+   * the backend enforces.
+   */
+  sendInput(
+    data: string | Uint8Array,
+    options: { legacyJson?: boolean } = {},
+  ): void {
     if (!this.#requireAttached("input")) return;
-    // The handler emits a stubbed-rejection event ourselves AFTER the
-    // backend rejects, but we still send so the wire path is exercised.
-    // We never log `data`; the TypedEmitter and transport must both
-    // refrain from including it in any error. The rejection event
-    // itself only carries the kind, never the bytes.
-    const input: InputMsg = { type: "input", data };
-    this.#transport.send(input);
+    if (options.legacyJson) {
+      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+      const input: InputMsg = { type: "input", data: text };
+      this.#transport.send(input);
+      return;
+    }
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const result = encodeBinaryFrame("input", 0, bytes);
+    if (!result.ok) {
+      // Only failure is `payload_too_large`. Surface a typed client
+      // error so a renderer with a misbehaving paste doesn't end up
+      // spinning silently. The payload is NOT included.
+      this.#emitError({
+        kind: "transport",
+        message: "input frame exceeds maximum payload size",
+      });
+      return;
+    }
+    this.#transport.sendBinary(result.bytes);
   }
 
   sendResize(cols: number, rows: number): void {
@@ -429,6 +465,43 @@ export class TerminalSessionClient {
     }
   }
 
+  #onBinary(frame: BinaryFrame): void {
+    if (frame.kind !== "output") {
+      // Server only emits binary Output frames; an Input frame from
+      // the server is a protocol violation. Surface as a typed error
+      // — payload is NOT echoed.
+      this.#emitError({
+        kind: "decode",
+        message: "unexpected binary frame kind from server",
+      });
+      return;
+    }
+    if (this.#state === "connecting") {
+      // Binary frames before the JSON `session_attached` is a protocol
+      // violation. Same as the JSON path: collapse to error.
+      this.#emitError({
+        kind: "unexpected_first_frame",
+        message: "received binary frame before session_attached",
+      });
+      this.#setState("error");
+      return;
+    }
+    if (frame.seq > this.#lastSeenSeq) {
+      this.#lastSeenSeq = frame.seq;
+    }
+    // Re-encode payload as base64 so the public `output` event shape
+    // stays identical to what the legacy JSON decoder produced. Renderer
+    // code that already calls `decodeOutputData(msg.data)` keeps working
+    // without change. A future slice may switch the public event to
+    // carry a `Uint8Array` directly; that's deferred.
+    const msg: OutputMsg = {
+      type: "output",
+      seq: frame.seq,
+      data: encodeOutputData(frame.payload),
+    };
+    this.#emitter.emit("output", msg);
+  }
+
   #onTransportClose(event: TerminalCloseEvent): void {
     if (this.#state === "closed" || this.#state === "detached") {
       return;
@@ -466,6 +539,16 @@ export class TerminalSessionClient {
         this.#emitError({
           kind: "decode",
           message: `failed to decode server frame (${err.decode?.kind ?? "unknown"})`,
+        });
+        return;
+      case "binary_decode":
+        // Binary frame failed structural check. The classifier kind is
+        // safe to surface (no payload bytes are ever included by the
+        // codec); callers see "binary frame: <kind>" so the source of
+        // the protocol break is obvious.
+        this.#emitError({
+          kind: "decode",
+          message: `failed to decode binary frame (${err.binaryDecode?.kind ?? "unknown"})`,
         });
         return;
       case "network":

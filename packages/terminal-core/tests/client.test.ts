@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   TerminalSessionClient,
+  decodeBinaryFrame,
+  decodeOutputData,
   type ClientMsg,
+  type OutputMsg,
   type SessionAttachedMsg,
   type SessionClosedMsg,
   type SessionDetachedMsg,
@@ -297,6 +300,93 @@ describe("TerminalSessionClient", () => {
       { type: "replay_end", latest_seq: 7 },
     ]);
     expect(client.lastSeenSeq).toBe(7);
+  });
+
+  it("sendInput sends a binary Input frame by default (no JSON `input` on the wire)", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws" });
+    transport.simulateServerMsg(ATTACH_OK);
+    transport.sent.length = 0; // discard the attach frame
+
+    const sentinel = "REDACT-MARKER-INPUT-BINARY-SEND";
+    client.sendInput(sentinel);
+    // No JSON `input` was sent.
+    expect(transport.sent.find((m) => m.type === "input")).toBeUndefined();
+    // A binary frame WAS sent — decode it and assert the payload bytes
+    // match the UTF-8 encoding of the sentinel.
+    expect(transport.sentBinary).toHaveLength(1);
+    const decoded = decodeBinaryFrame(transport.sentBinary[0]!);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.frame.kind).toBe("input");
+    expect(decoded.frame.seq).toBe(0);
+    expect(new TextDecoder().decode(decoded.frame.payload)).toBe(sentinel);
+  });
+
+  it("sendInput accepts Uint8Array directly (no UTF-8 round-trip)", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws" });
+    transport.simulateServerMsg(ATTACH_OK);
+    transport.sent.length = 0;
+
+    // Non-UTF-8 byte sequence — would be mangled by a string round-trip.
+    const bytes = new Uint8Array([0x1b, 0x00, 0xff, 0xfe, 0x42]);
+    client.sendInput(bytes);
+    expect(transport.sentBinary).toHaveLength(1);
+    const decoded = decodeBinaryFrame(transport.sentBinary[0]!);
+    if (!decoded.ok) throw new Error("decode failed");
+    expect(Array.from(decoded.frame.payload)).toEqual(Array.from(bytes));
+  });
+
+  it("sendInput({ legacyJson: true }) falls back to JSON `input` frame", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws" });
+    transport.simulateServerMsg(ATTACH_OK);
+    transport.sent.length = 0;
+
+    client.sendInput("hello", { legacyJson: true });
+    expect(transport.sent[0]).toEqual<ClientMsg>({ type: "input", data: "hello" });
+    expect(transport.sentBinary).toHaveLength(0);
+  });
+
+  it("binary Output frames advance lastSeenSeq and emit `output`", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws" });
+    transport.simulateServerMsg(ATTACH_OK);
+    expect(client.lastSeenSeq).toBe(0);
+
+    const events: OutputMsg[] = [];
+    client.on("output", (m) => events.push(m));
+    transport.simulateBinary({
+      kind: "output",
+      seq: 3,
+      payload: new TextEncoder().encode("[2J"),
+    });
+    expect(client.lastSeenSeq).toBe(3);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.seq).toBe(3);
+    // The `data` field is base64-encoded so existing renderer decoders
+    // keep working unchanged.
+    const decoded = decodeOutputData(events[0]!.data);
+    expect(new TextDecoder().decode(decoded)).toBe("[2J");
+  });
+
+  it("binary frame with unexpected kind surfaces a typed decode error", async () => {
+    const { transport, client } = makeClient();
+    await client.attach({ url: "ws://test/ws" });
+    transport.simulateServerMsg(ATTACH_OK);
+
+    const errors: TerminalClientError[] = [];
+    client.on("error", (e) => errors.push(e));
+    transport.simulateBinary({
+      kind: "input",
+      seq: 0,
+      payload: new TextEncoder().encode("REDACT-MARKER-BIN-CLIENT-7C"),
+    });
+    expect(errors[0]?.kind).toBe("decode");
+    for (const err of errors) {
+      expect(JSON.stringify(err)).not.toContain("REDACT-MARKER-BIN-CLIENT-7C");
+    }
   });
 
   it("emits replay_window_lost with safe metadata only", async () => {

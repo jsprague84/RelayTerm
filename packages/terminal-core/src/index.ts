@@ -42,6 +42,20 @@ export {
   encodeOutputData,
 } from "./protocol.js";
 
+export {
+  type BinaryDecodeFailure,
+  type BinaryDecodeResult,
+  type BinaryEncodeFailure,
+  type BinaryEncodeResult,
+  type BinaryFrame,
+  type BinaryFrameKind,
+  BINARY_HEADER_LEN,
+  BINARY_MAGIC_V1,
+  BINARY_MAX_PAYLOAD_LEN,
+  decodeBinaryFrame,
+  encodeBinaryFrame,
+} from "./binary.js";
+
 export { type Listener, type Unsubscribe } from "./events.js";
 
 export {

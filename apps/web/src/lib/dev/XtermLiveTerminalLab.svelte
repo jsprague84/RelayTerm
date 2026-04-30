@@ -572,9 +572,10 @@
     Wires <code>@relayterm/terminal-xterm</code> through
     <code>TerminalSessionClient</code> against a live
     <code>/api/v1/terminal-sessions/:id/ws</code>. Create a session via the
-    API first; this lab attaches to an existing id. Output is decoded via
-    <code>decodeOutputData</code> from the protocol core; the event log
-    redacts both input and output payloads (length only).
+    API first; this lab attaches to an existing id. Terminal data flows on
+    the binary <code>RTB1</code> envelope (input + output); JSON carries
+    only the control plane (attach/detach/resize/replay/lifecycle). The
+    event log redacts both input and output payloads (length + seq only).
   </p>
   <ul class="mt-2 list-disc pl-5 text-xs text-amber-200/70">
     <li>

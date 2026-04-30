@@ -119,7 +119,7 @@ It does **NOT** mean a PTY was allocated, an SSH channel was opened, a shell was
 
 #### Wire messages
 
-The protocol is JSON-over-WebSocket; binary frames are rejected with `invalid_message`. Message tags (`type`) and `code` strings are wire-stable; new variants/codes append, never renumber.
+The protocol uses **two parallel WebSocket frame shapes**: structured JSON messages for the control plane (attach/detach/resize/replay control, errors, lifecycle), and a small binary envelope (`RTB1`, see "Terminal data plane: binary envelope" below) for the hot terminal data path (`output` and `input`). Both shapes share the same socket; they're distinguished by the WebSocket frame type (text vs binary). Message tags (`type`) and `code` strings on the JSON plane are wire-stable; new variants/codes append, never renumber.
 
 **Client → server** ([`relayterm_protocol::ClientMsg`]):
 
@@ -127,7 +127,7 @@ The protocol is JSON-over-WebSocket; binary frames are rejected with `invalid_me
 |------------|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ping`     | none                                         | `pong`.                                                                                                                                                                                                     |
 | `attach`   | `session_id?`, `last_seen_seq?`, `client_id?` | Drives the replay handshake. The first `attach` after upgrade is accepted: with `last_seen_seq` set the server emits `replay_start` → buffered `output` frames → `replay_end` (or a single `replay_window_lost` if the bookmark predates the buffer); without it, the loop continues straight to live fanout. A SECOND explicit `attach` is a protocol violation and is rejected with `error { code: "invalid_message", message: "already attached" }`. See "Output sequence + in-memory replay buffer contract" for the per-message wire shape. |
-| `input`    | `data: string`                               | Rejected with `error { code: "pty_not_implemented" }`. The payload is NEVER reflected back, logged, or forwarded. The handler's only side effect is the static error frame.                                 |
+| `input`    | `data: string`                               | **Legacy fallback.** Carries one PTY input chunk as a UTF-8 string. The default wire shape for input is the binary `Input` frame (see "Terminal data plane: binary envelope"); the JSON form remains accepted by the backend for backwards compatibility and dev/diagnostic flows. Forwarded to the live PTY's stdin when bound; rejected with `error { code: "pty_not_live" }` otherwise. The payload is NEVER reflected back or logged.                                 |
 | `resize`   | `cols: u16`, `rows: u16`                     | `ack { kind: "resize" }` on success; `error { code: "invalid_input" }` for cols/rows outside `1..=4096`. Updates the runtime hint and appends a `resized` `session_event`.                                  |
 | `detach`   | none                                         | `session_detached { session_id, attachment_id }`, then the server initiates a clean WebSocket close. Stamps `detached_at` on the attachment row and appends a `detached` event. Idempotent.                 |
 | `close`    | none                                         | `session_closed { session_id }`, then the server initiates a clean WebSocket close. Transitions the session to `closed`, appends a `closed` event, drops live attachments. Idempotent.                      |
@@ -141,11 +141,39 @@ The protocol is JSON-over-WebSocket; binary frames are rejected with `invalid_me
 | `ack`               | `kind: "resize"`                                                                                        | Acknowledges a state-changing non-data client message. New `kind` variants append.                                                                             |
 | `session_detached`  | `session_id`, `attachment_id`                                                                           | Server confirms detach bookkeeping landed.                                                                                                                     |
 | `session_closed`    | `session_id`                                                                                            | Server confirms session-close transition landed.                                                                                                               |
-| `output`            | `seq: u64`, `data: string`                                                                              | Carries one PTY output frame, base64-inside-JSON. `seq` is monotonic per session starting at `1`; replayed and live frames share the same variant. See "Output sequence + in-memory replay buffer contract." |
+| `output`            | `seq: u64`, `data: string`                                                                              | **Legacy fallback only.** The protocol still defines this base64-inside-JSON shape so a debug client (or a JSON-only consumer) can reason about it; the backend currently emits PTY output exclusively as binary `Output` frames (see "Terminal data plane: binary envelope"). `seq` semantics are identical between forms — monotonic per session starting at `1`; replayed and live frames share the same variant. See "Output sequence + in-memory replay buffer contract." |
 | `replay_start`      | `from_seq: u64`, `to_seq: u64`                                                                          | Marks the start of a replay handshake. Emitted at most once per attach, BEFORE the first replayed `output` frame. Skipped when the snapshot is empty.          |
 | `replay_end`        | `latest_seq: u64`                                                                                       | Marks the end of replay; live `output` frames resume at `latest_seq + 1`.                                                                                       |
 | `replay_window_lost`| `requested_seq: u64`, `oldest_available_seq: u64?`, `latest_seq: u64`                                   | The bookmark predates the bounded replay buffer. The handler continues live attach AFTER emitting this — the renderer is expected to reset its grid.            |
 | `error`             | `code: ErrorCode`, `message: string`                                                                    | `code` is one of `invalid_message`, `invalid_input`, `pty_not_implemented`, `internal`. `message` is short and static — never echoes input or operator detail. |
+
+#### Terminal data plane: binary envelope
+
+The hot terminal data path — PTY output server→client and renderer keystrokes client→server — flows on **binary** WebSocket frames carrying the RelayTerm v1 envelope (`RTB1`). The control plane stays JSON; only `Output` and `Input` payload bytes ride the binary surface.
+
+**Envelope layout (big-endian, fixed 20-byte header):**
+
+| offset | size | field                                                                          |
+|-------:|-----:|--------------------------------------------------------------------------------|
+|     0  |   4  | magic `b"RTB1"` (0x52 0x54 0x42 0x31)                                          |
+|     4  |   1  | kind: `0x01 = Output`, `0x02 = Input`                                          |
+|     5  |   1  | flags (reserved, MUST be `0` in v1; readers ignore unknown bits)               |
+|     6  |   2  | reserved (MUST be `0`; readers ignore)                                         |
+|     8  |   8  | `seq` u64 (Output: orchestrator-stamped seq; Input: `0`, ignored on receive)   |
+|    16  |   4  | `payload_len` u32                                                              |
+|    20  |   N  | payload bytes                                                                  |
+
+**Payload limits.** A single binary frame carries at most **1 MiB** of payload. The decoder enforces the cap *before* allocating, so a malicious peer cannot OOM the process by stamping `0xFFFFFFFF` in `payload_len`. The encoder refuses to put an oversized frame on the wire.
+
+**Versioning.** The magic carries a `1` suffix. A future revision (`b"RTB2"` etc.) appends a new magic and may run side-by-side; readers MUST reject any magic they don't recognise. Unknown `kind` bytes likewise reject as `invalid_message` so an unrelated wire format cannot be silently misinterpreted as a v1 frame.
+
+**Compatibility decision (this slice).** The backend prefers binary frames for live and replayed `Output`. JSON `Output { seq, data }` remains *defined* in the protocol as a debug/legacy shape — its renderer-side decoder is kept so a JSON-only consumer can still reason about the surface — but the backend does not currently emit it. Inbound `Input` is accepted as either shape: clients SHOULD send the binary `Input` frame; the JSON `input` frame remains accepted for backwards compatibility and dev/diagnostic flows. The replay control frames (`replay_start`, `replay_end`, `replay_window_lost`) and every other lifecycle/error message stay JSON.
+
+**Logging and reflection prohibitions (binary plane).** The same redaction rule the JSON plane enforces applies in full to the binary plane:
+
+- The raw payload bytes of any binary `Input` or `Output` frame MUST NEVER appear in tracing logs, panic messages, error responses, or any frame the server emits. The Rust [`BinaryFrame`] type's `Debug` impl masks the payload at the type level as a last line of defense; the TS decoder's structured `BinaryDecodeFailure` shape carries only a classifier, never bytes.
+- A malformed binary frame (bad magic, unknown kind, length mismatch, oversize claim, truncated header, non-zero reserved) MUST be rejected with the static JSON `error { code: "invalid_message", message: "invalid binary frame" }`. The handler does not echo any portion of the offending bytes.
+- A client that sends a binary `Output` frame is malformed (Output is server→client only) and MUST receive `error { code: "invalid_message", message: "client must not send output frames" }`. The frame's bytes are dropped without inspection.
 
 #### Lifecycle events written by the WebSocket handler
 
@@ -170,7 +198,7 @@ If the underlying transport drops (client disconnect, network failure, abrupt cl
 
 #### Future work (explicit out-of-scope for this slice)
 
-Multi-client (collaborative) attach behavior; backend-restart recovery for `starting` rows; binary frame format; and `ConnectInfo`-based `remote_addr` capture all belong to later, deliberate slices. (PTY allocation, `Input` forwarding, sequence-numbered `output` frames, and the in-memory replay ring buffer have all landed in the live SSH PTY bridge slice and the replay buffer slice that follows it.)
+Multi-client (collaborative) attach behavior; backend-restart recovery for `starting` rows; and `ConnectInfo`-based `remote_addr` capture all belong to later, deliberate slices. (PTY allocation, `Input` forwarding, sequence-numbered `output` frames, the in-memory replay ring buffer, and the binary `RTB1` envelope for the terminal data plane have all landed in the live SSH PTY bridge slice, the replay buffer slice that follows it, and the binary-envelope slice on top of those.)
 
 ### Frontend terminal-core contract
 

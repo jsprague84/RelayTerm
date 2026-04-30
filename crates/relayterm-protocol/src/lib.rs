@@ -13,6 +13,23 @@
 //! shapes below.
 //!
 //! No transport behavior lives here — only the shape of payloads.
+//!
+//! ## Two wire shapes
+//!
+//! - **JSON control plane** (this file): the [`ClientMsg`] / [`ServerMsg`]
+//!   variants below. Carries lifecycle, replay control, errors, and the
+//!   structured fallback `Output { seq, data }` form.
+//! - **Binary terminal data plane** ([`mod@binary`]): a small framed
+//!   envelope that carries raw PTY bytes losslessly without base64
+//!   inflation. Live and replayed `Output` frames are emitted on this
+//!   surface; renderer keystroke `Input` is sent on this surface too.
+
+mod binary;
+
+pub use binary::{
+    BINARY_HEADER_LEN, BINARY_MAGIC_V1, BinaryFrame, BinaryFrameDecodeError, BinaryFrameKind,
+    MAX_PAYLOAD_LEN as BINARY_MAX_PAYLOAD_LEN, decode_binary_frame, encode_binary_frame,
+};
 
 use std::fmt;
 

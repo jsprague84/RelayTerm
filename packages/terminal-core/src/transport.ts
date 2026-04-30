@@ -3,9 +3,11 @@
  *
  * The transport is responsible for:
  *  - opening a WebSocket
- *  - encoding outbound `ClientMsg` values
+ *  - encoding outbound `ClientMsg` values (JSON control plane) and raw
+ *    binary frames (data plane: `Input`)
  *  - decoding inbound text frames into typed `ServerMsg` (or a structured
  *    decode failure that callers can map to a protocol error event)
+ *  - decoding inbound binary frames into typed `BinaryFrame`
  *  - emitting transport-level close/error events
  *
  * It deliberately knows nothing about renderers, attach/detach state, or
@@ -24,6 +26,11 @@ import {
   type DecodeFailure,
   type ServerMsg,
 } from "./protocol.js";
+import {
+  decodeBinaryFrame,
+  type BinaryDecodeFailure,
+  type BinaryFrame,
+} from "./binary.js";
 import { TypedEmitter, type Unsubscribe } from "./events.js";
 
 export interface TerminalCloseEvent {
@@ -40,19 +47,27 @@ export interface TerminalTransportError {
    * Structured kind so callers don't have to substring-match.
    * - `network`: underlying socket fired `error` (no message text exposed —
    *   browsers redact it anyway).
-   * - `decode`: a server frame failed to decode; payload is NOT included.
+   * - `decode`: a server JSON frame failed to decode; payload is NOT included.
+   * - `binary_decode`: an inbound binary frame failed to decode; payload
+   *   bytes are NOT included.
    * - `send_before_open`: caller invoked `send` before `connect` resolved.
    */
-  kind: "network" | "decode" | "send_before_open";
+  kind: "network" | "decode" | "binary_decode" | "send_before_open";
   /** Decode failure detail when `kind === "decode"`. */
   decode?: DecodeFailure;
+  /** Decode failure detail when `kind === "binary_decode"`. */
+  binaryDecode?: BinaryDecodeFailure;
 }
 
 export interface TerminalTransport {
   connect(url: string): Promise<void>;
   send(message: ClientMsg): void;
+  /** Send a raw pre-encoded binary frame (data plane). */
+  sendBinary(frame: Uint8Array): void;
   close(code?: number, reason?: string): void;
   onMessage(cb: (message: ServerMsg) => void): Unsubscribe;
+  /** Subscribe to inbound binary frames (data plane). */
+  onBinary(cb: (frame: BinaryFrame) => void): Unsubscribe;
   onClose(cb: (event: TerminalCloseEvent) => void): Unsubscribe;
   onError(cb: (error: TerminalTransportError) => void): Unsubscribe;
   /** Current readyState mirror, for state-machine consumers. */
@@ -68,6 +83,7 @@ export type TransportReadyState =
 
 interface TransportEvents {
   message: ServerMsg;
+  binary: BinaryFrame;
   close: TerminalCloseEvent;
   error: TerminalTransportError;
 }
@@ -79,7 +95,15 @@ interface TransportEvents {
  */
 export interface WebSocketLike {
   readyState: number;
-  send(data: string): void;
+  /**
+   * Configures the format binary frames are surfaced in to listeners.
+   * The transport sets this to `"arraybuffer"` so `MessageEvent.data` is
+   * a `Uint8Array`-friendly buffer instead of a `Blob`. Optional on the
+   * interface so test fakes don't have to implement it (production
+   * `WebSocket` requires it).
+   */
+  binaryType?: "blob" | "arraybuffer";
+  send(data: string | ArrayBufferView | ArrayBuffer): void;
   close(code?: number, reason?: string): void;
   addEventListener<K extends keyof WebSocketLikeEventMap>(
     type: K,
@@ -158,6 +182,16 @@ export class WebSocketTerminalTransport implements TerminalTransport {
         reject(err instanceof Error ? err : new Error(String(err)));
         return;
       }
+      // The data plane carries raw binary frames; ask the browser to
+      // surface them as ArrayBuffers (default is `Blob` which would
+      // force an async unwrap before decode).
+      try {
+        socket.binaryType = "arraybuffer";
+      } catch {
+        // Test fakes / non-browser environments may forbid setting it.
+        // Fall through; if a binary frame ever arrives without an
+        // ArrayBuffer we'll surface a typed decode error in `#bind`.
+      }
       this.#socket = socket;
       this.#bind(socket);
     });
@@ -171,6 +205,16 @@ export class WebSocketTerminalTransport implements TerminalTransport {
     this.#socket.send(encodeClientMsg(message));
   }
 
+  sendBinary(frame: Uint8Array): void {
+    if (this.#state !== "open" || !this.#socket) {
+      this.#emitter.emit("error", { kind: "send_before_open" });
+      return;
+    }
+    // Pass the underlying ArrayBuffer slice. Browsers accept either
+    // ArrayBufferView or ArrayBuffer; using the view keeps zero-copy.
+    this.#socket.send(frame);
+  }
+
   close(code?: number, reason?: string): void {
     if (!this.#socket) {
       this.#state = "closed";
@@ -182,6 +226,10 @@ export class WebSocketTerminalTransport implements TerminalTransport {
 
   onMessage(cb: (message: ServerMsg) => void): Unsubscribe {
     return this.#emitter.on("message", cb);
+  }
+
+  onBinary(cb: (frame: BinaryFrame) => void): Unsubscribe {
+    return this.#emitter.on("binary", cb);
   }
 
   onClose(cb: (event: TerminalCloseEvent) => void): Unsubscribe {
@@ -201,25 +249,39 @@ export class WebSocketTerminalTransport implements TerminalTransport {
       resolve?.();
     };
     this.#onMessage = (event) => {
-      // The protocol is JSON-only. ArrayBuffer / Blob frames are rejected
-      // upstream by the backend; here we surface a decode error rather
-      // than try to decode binary data.
-      if (typeof event.data !== "string") {
+      const data = event.data;
+      if (typeof data === "string") {
+        const result = decodeServerMsg(data);
+        if (!result.ok) {
+          this.#emitter.emit("error", {
+            kind: "decode",
+            decode: result.failure,
+          });
+          return;
+        }
+        this.#emitter.emit("message", result.message);
+        return;
+      }
+      // Binary frame (data plane). Coerce to a Uint8Array view; if the
+      // peer somehow sent a Blob we cannot decode synchronously and
+      // surface a typed failure instead of leaking bytes.
+      const bytes = coerceBinaryData(data);
+      if (bytes === null) {
         this.#emitter.emit("error", {
-          kind: "decode",
-          decode: { kind: "invalid_json" },
+          kind: "binary_decode",
+          binaryDecode: { kind: "truncated_header" },
         });
         return;
       }
-      const result = decodeServerMsg(event.data);
+      const result = decodeBinaryFrame(bytes);
       if (!result.ok) {
         this.#emitter.emit("error", {
-          kind: "decode",
-          decode: result.failure,
+          kind: "binary_decode",
+          binaryDecode: result.failure,
         });
         return;
       }
-      this.#emitter.emit("message", result.message);
+      this.#emitter.emit("binary", result.frame);
     };
     this.#onClose = (event) => {
       const wasConnecting = this.#state === "connecting";
@@ -247,6 +309,8 @@ export class WebSocketTerminalTransport implements TerminalTransport {
     socket.addEventListener("error", this.#onError);
   }
 
+  // ----- helpers -----
+
   #unbind(): void {
     const socket = this.#socket;
     if (!socket) {
@@ -262,4 +326,29 @@ export class WebSocketTerminalTransport implements TerminalTransport {
     this.#onError = null;
     this.#socket = null;
   }
+}
+
+/**
+ * Coerce the inbound binary `MessageEvent.data` into a `Uint8Array`.
+ *
+ * `WebSocket` with `binaryType === "arraybuffer"` hands us an
+ * `ArrayBuffer`; node's `ws` and some test fakes hand a `Uint8Array` /
+ * `Buffer` directly. A `Blob` cannot be decoded synchronously (it
+ * requires `await blob.arrayBuffer()`), so we return `null` and the
+ * caller surfaces a typed decode failure rather than awaiting on the
+ * hot path. A correctly-configured production socket never lands in
+ * the Blob branch.
+ */
+function coerceBinaryData(data: unknown): Uint8Array | null {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    ArrayBuffer.isView(data as ArrayBufferView)
+  ) {
+    const view = data as ArrayBufferView;
+    return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  }
+  return null;
 }

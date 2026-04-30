@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   WebSocketTerminalTransport,
+  encodeBinaryFrame,
+  type BinaryFrame,
   type ServerMsg,
   type TerminalTransportError,
   type WebSocketLike,
@@ -9,7 +11,8 @@ import {
 
 class FakeBrowserSocket implements WebSocketLike {
   readyState = 0;
-  readonly sent: string[] = [];
+  binaryType: "blob" | "arraybuffer" = "blob";
+  readonly sent: (string | ArrayBufferView | ArrayBuffer)[] = [];
   // The unified listener type erases the per-event payload at storage
   // time; addEventListener / fire still preserve it at the call site.
   readonly listeners: Map<keyof WebSocketLikeEventMap, Set<(e: unknown) => void>> = new Map();
@@ -33,7 +36,7 @@ class FakeBrowserSocket implements WebSocketLike {
     this.listeners.get(type)?.delete(cb as (e: unknown) => void);
   }
 
-  send(data: string): void {
+  send(data: string | ArrayBufferView | ArrayBuffer): void {
     this.sent.push(data);
   }
 
@@ -114,5 +117,65 @@ describe("WebSocketTerminalTransport", () => {
     transport.onError((e) => errors.push(e));
     transport.send({ type: "ping" });
     expect(errors[0]).toEqual({ kind: "send_before_open" });
+  });
+
+  it("decodes binary Output frames into onBinary listeners", async () => {
+    const socket = new FakeBrowserSocket();
+    const transport = new WebSocketTerminalTransport({ factory: () => socket });
+    const connecting = transport.connect("ws://test/ws");
+    socket.fire("open", { type: "open" });
+    await connecting;
+    const seen: BinaryFrame[] = [];
+    transport.onBinary((f) => seen.push(f));
+    const enc = encodeBinaryFrame("output", 7, new TextEncoder().encode("ok"));
+    expect(enc.ok).toBe(true);
+    if (!enc.ok) return;
+    socket.fire("message", {
+      type: "message",
+      data: enc.bytes.buffer.slice(
+        enc.bytes.byteOffset,
+        enc.bytes.byteOffset + enc.bytes.byteLength,
+      ),
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.kind).toBe("output");
+    expect(seen[0]?.seq).toBe(7);
+    expect(new TextDecoder().decode(seen[0]?.payload)).toBe("ok");
+  });
+
+  it("emits binary_decode error for malformed binary frames without echoing payload", async () => {
+    const socket = new FakeBrowserSocket();
+    const transport = new WebSocketTerminalTransport({ factory: () => socket });
+    const connecting = transport.connect("ws://test/ws");
+    socket.fire("open", { type: "open" });
+    await connecting;
+    const errors: TerminalTransportError[] = [];
+    transport.onError((e) => errors.push(e));
+    const sentinel = new TextEncoder().encode("REDACT-MARKER-BIN-DECODE");
+    socket.fire("message", { type: "message", data: sentinel.buffer });
+    expect(errors[0]?.kind).toBe("binary_decode");
+    for (const err of errors) {
+      expect(JSON.stringify(err)).not.toContain("REDACT-MARKER-BIN-DECODE");
+    }
+  });
+
+  it("sendBinary forwards raw bytes to the socket", async () => {
+    const socket = new FakeBrowserSocket();
+    const transport = new WebSocketTerminalTransport({ factory: () => socket });
+    const connecting = transport.connect("ws://test/ws");
+    socket.fire("open", { type: "open" });
+    await connecting;
+    const frame = new Uint8Array([0x52, 0x54, 0x42, 0x31, 0x02]);
+    transport.sendBinary(frame);
+    expect(socket.sent[0]).toBe(frame);
+  });
+
+  it("connect() requests arraybuffer binaryType so binary decode is sync", async () => {
+    const socket = new FakeBrowserSocket();
+    const transport = new WebSocketTerminalTransport({ factory: () => socket });
+    const connecting = transport.connect("ws://test/ws");
+    socket.fire("open", { type: "open" });
+    await connecting;
+    expect(socket.binaryType).toBe("arraybuffer");
   });
 });
