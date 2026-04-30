@@ -35,6 +35,9 @@ update this file in the same change.
 | `[data-testid="nav-identities"]`                  | Sidebar nav button — SSH identities placeholder.              |
 | `[data-testid="nav-settings"]`                    | Sidebar nav button — Settings placeholder.                    |
 | `[data-testid="production-view-dashboard"]`       | Dashboard view (selected by default).                         |
+| `[data-testid="production-view-servers"]`         | Servers view (read-only inventory of hosts + profiles).       |
+| `[data-testid="production-view-identities"]`      | Identities view (read-only public-key list).                  |
+| `[data-testid="dashboard-inventory-counts"]`      | Dashboard inventory counts card (hosts/profiles/identities).  |
 | `[data-testid="dev-mode-badge"]`                  | "dev build" badge in top bar (only visible under `vite dev`). |
 | `[data-testid="nav-devtools-toggle"]`             | Sidebar dev-tools toggle (only visible under `vite dev`).     |
 | `[data-testid="dev-tools-panel"]`                 | Dev tools panel rendered when toggle is open (dev only).      |

@@ -496,12 +496,46 @@ apps/web/src/lib/app/
    ├─ SettingsView.svelte     # placeholder
    └─ PlaceholderView.svelte  # shared layout for non-functional views
 apps/web/src/lib/api/
-└─ health.ts                  # checkHealth() helper
+├─ apiErrors.ts                # shared LoadError, fetchJsonList, readErrorEnvelope, describeLoadError
+├─ health.ts                   # checkHealth() helper
+├─ hosts.ts                    # listHosts() + parseHost()
+├─ serverProfiles.ts           # listServerProfiles() + parseServerProfile() + resolveProfileLinks()
+└─ sshIdentities.ts            # listSshIdentities() + parseSshIdentity() + publicKeyPreview()
 ```
 
 **Future work (explicit out-of-scope for this slice).**
 
 Production terminal workspace; production renderer selector; renderer-preference persistence; server / profile / identity CRUD UI; real auth UI (passkey enrollment, session list); mobile/Tauri shell integration; password bootstrap; private-key import; durable session-recording UI; a real router (URL-driven routes, deep-linking). Each is a separate slice.
+
+### Production inventory read-only views
+
+The Servers and Identities views are display-only inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. Create / edit / delete UI, host-key trust, auth-check, terminal launch, and SSH identity generation/deletion remain future work.
+
+**Scope (load-bearing — this slice).**
+
+1. **Servers view** (`apps/web/src/lib/app/views/ServersView.svelte`) renders two grouped sections: a Hosts list (display name, hostname, port, default username) and a Profiles list (name, linked host summary if resolvable from the fetched hosts, effective username with explicit "(host default)" / "(override)" attribution, tags, and last-connected timestamp). Hosts and profiles are fetched in parallel via `Promise.all`; either failure collapses the whole view to a single safe error summary keyed off the first failed resource.
+2. **Identities view** (`apps/web/src/lib/app/views/IdentitiesView.svelte`) renders one row per identity with name, key type, full SHA-256 fingerprint, a one-line public-key preview (`publicKeyPreview` truncates the base64 body to keep tables tight), created-at, last-used-at, and a "Copy public key" button. The button copies ONLY `identity.public_key` — never the fingerprint, never any other field. Clipboard failures collapse to a static `Copy failed` label without echoing origin/permission detail.
+3. **Dashboard counts** (`DashboardView.svelte`) shows `hosts` / `profiles` / `identities` cardinality using the same helpers. The counts are nice-to-have: any failure collapses to an unobtrusive `—` placeholder so the per-view error surface stays the canonical triage path. No polling.
+4. **No secret material is rendered.** `SshIdentity` (TypeScript DTO) does not declare an `encrypted_private_key` or `private_key` field. The runtime parser in `parseSshIdentity` builds the DTO field-by-field, so a backend bug or hostile fixture that includes those keys cannot smuggle them onto the parsed object. `tests/inventoryApi.test.ts` pins this with sentinel strings asserted absent from the parsed object, the serialized JSON, and the formatted preview.
+5. **Loading / empty / error states are honest.** Loading states render an unobtrusive "Loading…" placeholder. Empty states say "CRUD UI is not implemented yet — created through the backend API today." Error states render the formatted summary and nothing else (no retry-storm, no auto-reload).
+6. **Architecture rule preserved.** The new helpers and views live entirely under `lib/app/` and `lib/api/`; no import touches `lib/dev/` or any renderer adapter. `appShellIsolation.test.ts` continues to pass.
+
+**Redaction posture (load-bearing).**
+
+- The shared error reader (`readErrorEnvelope` in `apiErrors.ts`) extracts ONLY `code` and `message` from the backend's `{ error: { code, message } }` envelope; sibling fields (including any future `operator_detail`) are dropped.
+- `describeLoadError` formats the UI summary as a function of `kind` + `status` + `code` only — it never echoes the wire `message` of an HTTP error or the thrown message of a transport error. The typed error object preserves both so programmatic callers can branch, but the formatter is the single point that reaches the UI.
+- The helpers do NOT log raw response bodies. `inventoryApi.test.ts` pins `console.log/warn/error` as untouched on success and on transport failure.
+- The OpenSSH public-key preview is a pure string operation on the supplied argument; nothing in the helper looks up a private-key field by side channel.
+
+**Wire shapes (mirror of `crates/relayterm-api/src/dto/`).**
+
+- `Host` — `{ id, display_name, hostname, port, default_username, created_at, updated_at }`. The parser rejects ports outside `1..=65535` or non-integer values; unknown extra fields are silently dropped so a future safe addition does not break older clients.
+- `ServerProfile` — `{ id, name, host_id, ssh_identity_id, username_override, tags[], created_at, updated_at, last_connected_at }`. Parser rejects non-string tag entries. `resolveProfileLinks(profile, hosts)` produces `{ host, effectiveUsername, inheritedFromHost }` — the join is done on the client; a missing `host_id` is rendered honestly as "host not in your inventory" and `effectiveUsername` falls back to `null` when neither override nor host default is reachable.
+- `SshIdentity` — `{ id, name, key_type, public_key, fingerprint_sha256, created_at, last_used_at }`. `key_type` is constrained to the wire-stable `ed25519 | rsa | ecdsa_p256 | ecdsa_p384 | ecdsa_p521` set; unknown algorithm tags collapse to `malformed_response`.
+
+**Future work (explicit out-of-scope for this slice).**
+
+CRUD forms (create / edit / delete) for hosts, profiles, and identities; SSH identity generation UI; private-key import; host-key preflight and trust UI; auth-check UI; terminal session launch from the production shell; per-row "view details" / `get_by_id` panels; password bootstrap / `ssh-copy-id`; durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice.
 
 ### Live SSH PTY bridge contract
 
