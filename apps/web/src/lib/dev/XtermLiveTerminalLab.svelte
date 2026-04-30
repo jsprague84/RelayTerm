@@ -5,26 +5,34 @@
    * implements `TerminalRenderer`. The lab can switch between the
    * baseline `XtermRenderer` (`@relayterm/terminal-xterm`), the
    * experimental `GhosttyWebRenderer` (`@relayterm/terminal-ghostty-web`),
-   * and the experimental `ResttyRenderer` (`@relayterm/terminal-restty`)
+   * the experimental `ResttyRenderer` (`@relayterm/terminal-restty`),
+   * and the experimental `WtermRenderer` (`@relayterm/terminal-wterm`)
    * at runtime — switching disposes the previous renderer and remounts.
    * This is NOT the production terminal UI; it exists to prove the
    * live-PTY data path renders end-to-end and that the renderer-neutral
    * seam holds across adapter implementations.
    *
    * Gated behind `import.meta.env.DEV`. The production bundle's
-   * dead-code elimination drops the JS branch (terminal-xterm,
-   * terminal-ghostty-web, and terminal-restty all declare
-   * `sideEffects: false`, letting Rollup tree-shake xterm,
-   * ghostty-web's WASM-data-URL bundle, and restty's WASM/WebGPU
-   * payload respectively); the xterm css side-effect import is the
-   * documented compromise — see App.svelte. ghostty-web and restty
-   * ship no CSS.
+   * dead-code elimination drops the JS branch — terminal-ghostty-web
+   * and terminal-restty declare `sideEffects: false`, while
+   * terminal-xterm and terminal-wterm pin only their `src/styles.ts`
+   * file (and any CSS it pulls in) as side-effectful so Rollup can
+   * tree-shake the JS surface even though each adapter re-exports
+   * an upstream CSS stylesheet via its own `/styles` entry.
+   * ghostty-web and restty ship no CSS at all; xterm and wterm both
+   * ship optional CSS (xterm's grid sheet, wterm's `.wterm` host
+   * class, theme variables, and selection styling). The lab imports
+   * the CSS via the adapter packages
+   * (`@relayterm/terminal-xterm/styles`,
+   * `@relayterm/terminal-wterm/styles`) so apps/web does not depend
+   * on the upstream CSS path directly — pnpm strict mode would
+   * otherwise refuse to resolve a transitive-only import.
    *
    * Contracts re-asserted in this file:
    *  - Renderer-neutral: the lab touches every renderer ONLY through
    *    the shared `TerminalRenderer` interface. No `@xterm/xterm`,
-   *    `ghostty-web`, or `restty` import here — those are encapsulated
-   *    by the adapter packages.
+   *    `ghostty-web`, `restty`, or `@wterm/dom` import here — those
+   *    are encapsulated by the adapter packages.
    *  - Output decode is centralised in `@relayterm/terminal-core` via the
    *    `decodeOutputData` helper, wrapped here by `safeDecodeOutput` so a
    *    malformed frame collapses to a typed log line, never an exception.
@@ -53,6 +61,15 @@
   import "@relayterm/terminal-xterm/styles";
   import { GhosttyWebRenderer } from "@relayterm/terminal-ghostty-web";
   import { ResttyRenderer } from "@relayterm/terminal-restty";
+  import { WtermRenderer } from "@relayterm/terminal-wterm";
+  // wterm renders into the DOM via CSS-themed cells; the side-effect
+  // import wires the `.wterm` host class, theme variables, and
+  // selection styling. The adapter package re-exports the upstream
+  // CSS through its own `/styles` entry — apps/web does not depend
+  // on `@wterm/dom` directly, so importing it here would crash pnpm's
+  // strict resolver. Restricted to the dev-lab module so a production
+  // build without the lab tree-shakes the import.
+  import "@relayterm/terminal-wterm/styles";
   import {
     CELL_GRID_MAX,
     CELL_GRID_MIN,
@@ -113,12 +130,14 @@
    * Stable identifiers for the swappable renderer adapters. xterm
    * remains the compatibility baseline; ghostty-web is an experimental
    * libghostty-vt-via-WASM adapter; restty is an experimental
-   * libghostty-vt + WebGPU/WebGL2 adapter via its xterm-compat shim.
-   * The adapter contract (`TerminalRenderer`) is identical for all of
-   * them — switching only flips which constructor we call at attach
-   * time. The id type and the operator-facing label both come from
-   * `rendererDiagnostics.ts` so the diagnostics summary and the lab UI
-   * never disagree on names.
+   * libghostty-vt + WebGPU/WebGL2 adapter via its xterm-compat shim;
+   * wterm is the experimental DOM/mobile/accessibility-oriented
+   * adapter built on `@wterm/dom`'s Zig+WASM core wrapped by a
+   * CSS-themed grid renderer. The adapter contract (`TerminalRenderer`)
+   * is identical for all of them — switching only flips which
+   * constructor we call at attach time. The id type and the
+   * operator-facing label both come from `rendererDiagnostics.ts` so
+   * the diagnostics summary and the lab UI never disagree on names.
    */
   type RendererChoice = RendererId;
   const rendererLabel = diagnosticsRendererLabel;
@@ -153,6 +172,16 @@
         // documented as silently dropped on this adapter — see
         // `packages/terminal-restty/src/options.ts`.
         return new ResttyRenderer({ ...themed, cols: grid.cols, rows: grid.rows });
+      case "wterm":
+        // wterm theming/typography goes through CSS variables on the
+        // `.wterm` host element rather than constructor options; the
+        // adapter accepts the neutral cosmetic knobs and silently
+        // drops them — see `packages/terminal-wterm/src/options.ts`.
+        // `cursorBlink` is the one cosmetic knob wterm consumes via
+        // the constructor (it toggles a CSS class). `autoResize`
+        // defaults to `false` so the lab's explicit cols/rows controls
+        // drive sizing for parity with the other adapters.
+        return new WtermRenderer({ ...themed, cols: grid.cols, rows: grid.rows });
     }
   }
 
@@ -672,12 +701,13 @@
       return;
     }
     // Renderer resize fires the renderer's `onResize` synchronously
-    // (xterm and ghostty-web both fan out within `Terminal.resize`),
-    // which the subscriber translates into `client.sendResize`. We
-    // don't fire `client.sendResize` here too — that would double the
-    // wire frame. If the renderer isn't mounted (no client either)
-    // there is nothing to send; the resize button stays disabled in
-    // that state.
+    // (xterm, ghostty-web, restty, and wterm all fan out within
+    // their underlying terminal's `resize` call), which the
+    // subscriber translates into `client.sendResize`. We don't fire
+    // `client.sendResize` here too — that would double the wire
+    // frame. If the renderer isn't mounted (no client either) there
+    // is nothing to send; the resize button stays disabled in that
+    // state.
     renderer?.resize(cols, rows);
     append("out", `manual resize cols=${cols} rows=${rows}`);
   }
@@ -692,8 +722,9 @@
    *
    * `reconnectInFlight` is cleared in a `finally` so a synchronous
    * throw out of `connect()` (for example a renderer `mount()` that
-   * rejects because ghostty-web's WASM init failed) cannot leave the
-   * UI permanently stuck in "reconnecting…". `connect()`'s own
+   * rejects because ghostty-web's or wterm's WASM init failed)
+   * cannot leave the UI permanently stuck in "reconnecting…".
+   * `connect()`'s own
    * happy-path resets `reconnectInFlight` via the `state_change →
    * attached` handler; the `finally` here is a belt-and-suspenders
    * safety net for the throw paths it doesn't cover.
@@ -920,7 +951,28 @@
       />
       <span class="font-mono text-amber-300">restty (experimental)</span>
     </label>
+    <label class="inline-flex items-center gap-1">
+      <input
+        type="radio"
+        name="renderer"
+        value="wterm"
+        checked={rendererChoice === "wterm"}
+        onchange={() => void setRendererChoice("wterm")}
+      />
+      <span class="font-mono text-amber-300">wterm (experimental)</span>
+    </label>
     <span class="text-zinc-500">— switching disposes the current renderer and remounts</span>
+    <p class="basis-full text-xs text-zinc-500">
+      <strong>wterm</strong> renders into the DOM (Zig+WASM core, CSS-themed grid),
+      so selection, copy/paste, IME composition, and mobile soft
+      keyboards flow through the platform's native text-handling
+      primitives — that's the entire reason wterm is the
+      mobile/accessibility-oriented experiment. Theming and font
+      controls go through the <code>.wterm</code> CSS host (see
+      <code>@wterm/dom/src/terminal.css</code>); the neutral cosmetic
+      options accepted by the adapter are silently dropped on this
+      renderer.
+    </p>
   </div>
 
   <div class="mt-3 flex flex-wrap gap-2">

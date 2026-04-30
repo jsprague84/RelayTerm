@@ -34,9 +34,10 @@ import type { TerminalSessionState } from "@relayterm/terminal-core";
  * Stable identifiers for the swappable renderer adapters. Mirrors the
  * `RendererChoice` type used by the lab — duplicated here so this
  * module has no dependency on the Svelte component that consumes it.
- * If a future renderer is added (wterm / native), extend both lists.
+ * If a future renderer is added (e.g. a native Tauri renderer),
+ * extend both this list and `rendererLabel` below.
  */
-export type RendererId = "xterm" | "ghostty-web" | "restty";
+export type RendererId = "xterm" | "ghostty-web" | "restty" | "wterm";
 
 /**
  * Operator-facing label for a renderer id. Lives next to the id so the
@@ -52,6 +53,8 @@ export function rendererLabel(id: RendererId): string {
       return "ghostty-web experimental";
     case "restty":
       return "restty experimental";
+    case "wterm":
+      return "wterm experimental";
   }
 }
 

@@ -81,6 +81,7 @@ describe("rendererLabel", () => {
     expect(rendererLabel("xterm")).toBe("xterm baseline");
     expect(rendererLabel("ghostty-web")).toBe("ghostty-web experimental");
     expect(rendererLabel("restty")).toBe("restty experimental");
+    expect(rendererLabel("wterm")).toBe("wterm experimental");
   });
 });
 

@@ -19,6 +19,9 @@ importers:
       '@relayterm/terminal-restty':
         specifier: workspace:*
         version: link:../../packages/terminal-restty
+      '@relayterm/terminal-wterm':
+        specifier: workspace:*
+        version: link:../../packages/terminal-wterm
       '@relayterm/terminal-xterm':
         specifier: workspace:*
         version: link:../../packages/terminal-xterm
@@ -84,6 +87,22 @@ importers:
       restty:
         specifier: 0.1.35
         version: 0.1.35(typescript@5.9.3)
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(jiti@2.6.1)(lightningcss@1.32.0)
+
+  packages/terminal-wterm:
+    dependencies:
+      '@relayterm/terminal-core':
+        specifier: workspace:*
+        version: link:../terminal-core
+      '@wterm/dom':
+        specifier: 0.2.1
+        version: 0.2.1
     devDependencies:
       typescript:
         specifier: ^5.7.0
@@ -583,6 +602,12 @@ packages:
 
   '@vitest/utils@3.2.4':
     resolution: {integrity: sha512-fB2V0JFrQSMsCo9HiSq3Ezpdv4iYaXRG1Sx8edX3MwxfyNn83mKiGzOcH+Fkxt4MHxr3y42fQi1oeAInqgX2QA==}
+
+  '@wterm/core@0.2.1':
+    resolution: {integrity: sha512-g+xrTei6qovjH0QI/HFyAyV2TCAuH/d3FJl2Vh/aObDX6FqA8PjwkafBwESSOaEvSeUQhU5d37ELtUSWMZP46A==}
+
+  '@wterm/dom@0.2.1':
+    resolution: {integrity: sha512-ojJqz6oJku/rxBOObLdq+Jd7gNwrCtx1jY11hP/x2/kcLLaEvbIsAmrjuVBxgTyFxBcBq0Ru6TdFbDdfMBH+vw==}
 
   '@xterm/addon-fit@0.10.0':
     resolution: {integrity: sha512-UFYkDm4HUahf2lnEyHvio51TNGiLK66mqP2JoATy7hRZeXaGMRDr00JiSF7m63vR5WKATF605yEggJKsw0JpMQ==}
@@ -1324,6 +1349,12 @@ snapshots:
       '@vitest/pretty-format': 3.2.4
       loupe: 3.2.1
       tinyrainbow: 2.0.0
+
+  '@wterm/core@0.2.1': {}
+
+  '@wterm/dom@0.2.1':
+    dependencies:
+      '@wterm/core': 0.2.1
 
   '@xterm/addon-fit@0.10.0(@xterm/xterm@5.5.0)':
     dependencies:

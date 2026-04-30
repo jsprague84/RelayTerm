@@ -7,7 +7,7 @@
 
 ## Overview
 
-RelayTerm is a web/mobile SSH terminal where SSH sessions live on a Rust backend, the browser/Tauri client only renders, and the terminal state is owned by a session orchestrator that survives client disconnects. Clients can detach and reconnect arbitrarily; on reconnect the backend replays missed output by sequence number. The terminal renderer is intentionally pluggable (xterm.js baseline, plus wterm / ghostty-web / restty experiments) so renderer choice doesn't affect session correctness.
+RelayTerm is a web/mobile SSH terminal where SSH sessions live on a Rust backend, the browser/Tauri client only renders, and the terminal state is owned by a session orchestrator that survives client disconnects. Clients can detach and reconnect arbitrarily; on reconnect the backend replays missed output by sequence number. The terminal renderer is intentionally pluggable (xterm.js baseline, plus ghostty-web / restty / wterm experiments) so renderer choice doesn't affect session correctness.
 
 **Primary users:** TODO — who connects and from which devices (desktop browser, Tauri desktop, Tauri Android), and at what frequency.
 **Goals:** TODO — top 2-3 outcomes (e.g. "tabs survive flaky mobile networks," "single audited backend issues all SSH credentials," "renderer is swappable per device class").
@@ -362,7 +362,7 @@ The production `apps/web` build (`pnpm -r build`) emits a ~28 KB JS bundle. The 
 
 #### Future work (explicit out-of-scope for this slice)
 
-Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; wterm renderer adapter; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real ghostty-web WASM runtime. Each is a separate, deliberate slice.
+Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real ghostty-web WASM runtime. Each is a separate, deliberate slice.
 
 ### restty experimental renderer adapter
 
@@ -414,7 +414,54 @@ The dev lab is gated behind `import.meta.env.DEV`, which Vite inlines as a const
 
 #### Future work (explicit out-of-scope for this slice)
 
-Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; wterm renderer adapter; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real restty WASM/WebGPU runtime; honoring the neutral cosmetic knobs (font, cursor, theme, scrollback) via `Restty`'s native APIs; restty pane / plugin / shader-stage surface integration. Each is a separate, deliberate slice.
+Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real restty WASM/WebGPU runtime; honoring the neutral cosmetic knobs (font, cursor, theme, scrollback) via `Restty`'s native APIs; restty pane / plugin / shader-stage surface integration. Each is a separate, deliberate slice.
+
+### wterm experimental renderer adapter
+
+`@relayterm/terminal-wterm` is the fourth concrete `TerminalRenderer` implementation. It is **experimental** — xterm.js remains the compatibility baseline; `@relayterm/terminal-ghostty-web` and `@relayterm/terminal-restty` remain the two libghostty-vt-based experiments; this adapter wraps `@wterm/dom` (npm `@wterm/dom@0.2.x`, depending transitively on `@wterm/core@0.2.x`), a DOM-rendered terminal emulator with a Zig+WASM core. The adapter is the **DOM/mobile/accessibility-oriented** experiment in the renderer lineup: text selection, copy, paste, IME composition, and mobile soft keyboards flow through the platform's native text-handling primitives because the cell grid renders into ordinary DOM nodes (`.term-row > span`), not a canvas/WebGPU surface. Landing this adapter proves a substantively different rendering style can drop in behind the renderer-neutral seam without backend protocol or `terminal-core` changes.
+
+#### Adapter contract
+
+1. The same `TerminalRenderer` interface from `@relayterm/terminal-core` (`mount` / `write` / `focus` / `resize` / `dispose` / `onInput` / `onResize`) bridges wterm's `WTerm` orchestrator bidirectionally.
+2. `apps/web`'s dev-only live terminal lab can switch between xterm baseline (default), ghostty-web experimental, restty experimental, and wterm experimental at runtime; switching disposes the previous renderer and remounts the new one without tearing down the wire protocol.
+3. The same redaction rule pinned by the sibling adapters (`tests/xtermRenderer.test.ts`, `tests/ghosttyWebRenderer.test.ts`, `tests/resttyRenderer.test.ts`) holds verbatim — no `console.*` in the adapter, no payload bytes inside thrown errors, no neutral-knob echo into the underlying constructor's options blob. `tests/wtermRenderer.test.ts` pins the rule with the same sentinel-string approach.
+
+What this slice does NOT promise:
+
+- A polished terminal UI. The wterm adapter is wired up only inside the dev lab; production builds tree-shake it out.
+- Full theming parity with `XtermRenderer`. wterm consumes typography/theme via CSS custom properties on the `.wterm` host element (see `@wterm/dom/src/terminal.css`), not via `WTermOptions`; the adapter accepts the neutral cosmetic knobs (`fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`, `scrollbackLines`, `theme`) for cross-renderer shape-parity and silently drops them during the option mapping. `cursorBlink` is the one cosmetic knob that flows through to the `WTerm` constructor.
+- Validation of wterm behavior in jsdom. Vitest exercises the adapter against a mocked `@wterm/dom` module — the real WASM/DOM runtime is verified only in a browser dev session. The mock pins option mapping, the pre-mount write queue, the pre-mount latest-resize cache, idempotent dispose, the dispose-during-pending-init cancellation path (which destroys the just-constructed `WTerm` instead of leaking a render loop), the static init-failure error message, and the input-redaction rule.
+- Honoring `WTerm`'s `onTitle` callback. Title-change is not a channel on the renderer-neutral interface; the adapter does not wire it. Adding it later is a deliberate change.
+- Surfacing wterm's `DebugAdapter` in the dev lab UI. The `wtermOnly.debug` knob passes through to `WTermOptions.debug` for adapter-local experimentation, but enabling it makes wterm's own `DebugAdapter` log render-path traces (including bytes the bridge processed) outside the adapter's redaction surface. The dev lab UI does NOT expose a debug checkbox today; if a future slice adds one, it must NOT be wired into any path that captures real terminal input or output, and the adapter test suite must continue to pin that the adapter itself surfaces zero console output regardless of `debug` value.
+
+#### Package layout
+
+`packages/terminal-wterm/` is a workspace package alongside `terminal-core`, `terminal-xterm`, `terminal-ghostty-web`, and `terminal-restty`. Keys:
+
+- `src/WtermRenderer.ts` — the only file in the repo that imports `@wterm/dom`. Implements `TerminalRenderer`. `mount` is async because `WTerm.init()` loads the WASM bridge before the renderer can write or render. The adapter constructs the `WTerm` synchronously inside `mount(element)` (because `WTerm`'s constructor takes the host element and immediately mutates it — appending a child grid div and adding the `.wterm` class) and then awaits `init()` before flushing the pre-mount write queue. A synchronous `dispose()` issued during the awaited `init()` destroys the just-constructed `WTerm` and skips the queue flush.
+- `src/options.ts` — renderer-neutral `WtermRendererOptions` mirroring `XtermRendererOptions`, `GhosttyWebRendererOptions`, and `ResttyRendererOptions` (`fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`, `theme`). `cursorBlink` is forwarded to the `WTerm` constructor (it toggles a CSS class on the host); the rest are accepted on the neutral surface for cross-adapter shape-parity and silently dropped during the option mapping. Theming/typography for wterm is documented as going through CSS variables on the `.wterm` host (`--term-fg`, `--term-bg`, `--term-color-{0..15}`, `--term-font-family`, `--term-font-size`, `--term-line-height`, `--term-row-height`) rather than constructor arguments. A `wtermOnly` escape hatch carries adapter-local knobs (`autoResize`, `wasmUrl`, `debug`) and is documented as **non-portable**. The `autoResize` default flips from wterm's own `true` to `false` on the adapter, so the caller drives sizing explicitly via `renderer.resize(cols, rows)` for parity with xterm/ghostty-web/restty; opt back into wterm's `ResizeObserver`-driven auto-fit by setting `wtermOnly.autoResize: true`. An optional `cols` / `rows` initial cell grid is accepted on the constructor and forwarded into the `WTerm` constructor.
+- `package.json` declares `"sideEffects": false`. `@wterm/core@0.2.x` inlines its WASM payload as a base64 module inside the shipped JS (`wasm-inline.js`, ~17 KB), so no separate asset wiring is required for Vite consumers; combined with the `sideEffects: false` marker on this adapter, the production `apps/web` bundle tree-shakes both `@wterm/dom`/`@wterm/core` and this adapter when the dev lab is dead-code-eliminated. Caveat: `@wterm/dom` does not declare `sideEffects` in its own `package.json`, so if a future code change made the adapter reachable from a non-dev path the WASM payload would land in the prod JS bundle.
+
+#### Renderer-neutral rule (re-affirmed)
+
+- `terminal-core` still imports nothing from `@wterm/*` (or `@xterm/*`, `ghostty-web`, `restty`).
+- `WtermRenderer` is the **only** `@wterm/dom` consumer in the repo. `terminal-core` does not depend on `@wterm/dom`. `terminal-xterm`, `terminal-ghostty-web`, and `terminal-restty` do not depend on `@wterm/dom`. `apps/web` depends on `@relayterm/terminal-wterm` (workspace) — never directly on `@wterm/dom`.
+- Constructor takes `WtermRendererCtorOptions` (the neutral options plus optional `cols` / `rows`); the underlying `WTerm` instance is private.
+- `write` accepts `string | Uint8Array`. `WTerm.write(data)` accepts both directly via the `WasmBridge` (`writeString` UTF-8-encodes; `writeRaw` takes bytes), so the adapter forwards both shapes unchanged — no UTF-8 decode step inside the adapter (unlike `restty/xterm`). `write` before `mount` queues; the queue is flushed on `mount` resolution. `write` after `dispose` is a silent no-op.
+- `dispose` is synchronous and idempotent. It tears down the underlying `WTerm` via `destroy()` (which clears the host element's `innerHTML`, detaches the click listener, disconnects the optional internal `ResizeObserver`, and tears down the `InputHandler`), the pre-mount write queue, the cached pre-mount resize, and the listener sets. The `@wterm/core` WASM module itself stays loaded for the page; that's intentional — re-initialising it would tear shared state out from under any future renderer instance.
+- The wire protocol stays RelayTerm-shaped. A live PTY's `Output` bytes hand identical payloads to all four renderers; `Input` flows back through the same `TerminalSessionClient`.
+
+#### Diagnostic UI
+
+The dev-only live terminal lab — `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` — adds a `wterm experimental` choice to the `renderer:` radio group. Switching while attached tears down the current renderer and `TerminalSessionClient` and immediately reconnects with the new renderer; switching while idle records the choice for the next `connect()`. The event log records ONLY the renderer name on switch — no payload bytes. The redaction rules pinned by `apps/web/tests/labLog.test.ts`, `tests/xtermRenderer.test.ts`, `tests/ghosttyWebRenderer.test.ts`, `tests/resttyRenderer.test.ts`, and `tests/wtermRenderer.test.ts` continue to hold across renderer switches. The lab's helper text calls out that wterm's DOM rendering changes the selection / copy-paste / IME / mobile-keyboard model relative to canvas/WebGPU adapters.
+
+#### Production bundle behavior
+
+The dev lab is gated behind `import.meta.env.DEV`, which Vite inlines as a constant; Rollup eliminates the dead branch, which makes the `apps/web` imports of `@relayterm/terminal-xterm`, `@relayterm/terminal-ghostty-web`, `@relayterm/terminal-restty`, and `@relayterm/terminal-wterm` unreachable. The xterm and wterm adapter packages pin `./src/styles.ts` and `**/*.css` as side-effectful (because they re-export an upstream CSS file via a dedicated `/styles` entry); ghostty-web and restty declare `sideEffects: false` outright. So Rollup drops the JS wrappers, which in turn drops the underlying libraries — xterm.js's parser/renderer, ghostty-web's WASM data URL, restty's WASM/WebGPU payload, and `@wterm/dom`/`@wterm/core`'s DOM/WASM bundle — and a check of the production bundle shows zero JS references to `WTerm`/`WasmBridge`. The `@relayterm/terminal-wterm/styles` side-effect import is the same documented compromise xterm has: routing the CSS through the adapter package (rather than `@wterm/dom/css` directly) is necessary because pnpm's strict resolver refuses an `apps/web` import of an undeclared transitive dep, and the CSS side-effect itself is not eliminated by Rollup the way the JS branch is. Both xterm's grid sheet and wterm's `.wterm` host stylesheet land in the prod CSS bundle today; ghostty-web and restty ship no CSS so their adapters contribute nothing. Caveat: none of `@xterm/xterm`, ghostty-web 0.4.0, restty 0.1.x, or `@wterm/dom` 0.2.x declare `sideEffects` in their own `package.json`, so if a future code change made any of these adapters reachable from a non-dev path the corresponding payload would land in the prod JS bundle.
+
+#### Future work (explicit out-of-scope for this slice)
+
+Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real wterm WASM/DOM runtime; honoring the neutral cosmetic knobs (font, cursor, theme, scrollback) via wterm's CSS custom properties; surfacing wterm's `onTitle` channel; wiring wterm's `DebugAdapter` into the dev lab. Each is a separate, deliberate slice.
 
 ### Live SSH PTY bridge contract
 
@@ -690,7 +737,7 @@ TODO — explicit list of features deferred so the agent doesn't "helpfully" imp
 - Multi-user shared sessions / "screen-share."
 - Public-cloud-hosted multi-tenant deployment (v1 is single-tenant Docker Compose).
 - iOS Tauri build (Android first; iOS later).
-- libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) and the experimental ghostty-web (`@relayterm/terminal-ghostty-web`) and restty (`@relayterm/terminal-restty`) adapters have landed; wterm is a future sibling under `packages/terminal-<name>/`.
+- libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) and the experimental ghostty-web (`@relayterm/terminal-ghostty-web`), restty (`@relayterm/terminal-restty`), and wterm (`@relayterm/terminal-wterm`) adapters have all landed under `packages/terminal-<name>/`.
 
 ## Open questions
 

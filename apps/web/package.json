@@ -16,6 +16,7 @@
     "@relayterm/terminal-core": "workspace:*",
     "@relayterm/terminal-ghostty-web": "workspace:*",
     "@relayterm/terminal-restty": "workspace:*",
+    "@relayterm/terminal-wterm": "workspace:*",
     "@relayterm/terminal-xterm": "workspace:*"
   },
   "devDependencies": {
