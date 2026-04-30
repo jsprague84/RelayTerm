@@ -119,7 +119,23 @@ If you're tempted to invent a new directory, propose it here first.
 
 > TODO: fill in numbered procedures for RelayTerm's recurring changes.
 
-- **Adding a new terminal renderer adapter** — create `packages/terminal-<name>/` mirroring `terminal-xterm`'s public interface; wire it into `apps/web/src/terminals/`. ...
+- **Adding a new terminal renderer adapter.** Mirrors the shape established by `@relayterm/terminal-xterm` (baseline), `@relayterm/terminal-ghostty-web`, and `@relayterm/terminal-restty`. The architectural rule: `terminal-core` stays renderer-agnostic, and the backend protocol stays renderer-neutral — never reshape either to accommodate a renderer. Steps:
+  1. Scaffold `packages/terminal-<name>/` (package name `@relayterm/terminal-<name>`); implement `TerminalRenderer` from `@relayterm/terminal-core`.
+  2. Keep exports minimal and renderer-neutral. Renderer-specific knobs go behind a `<renderer>Only` escape hatch on the options object — never on the `TerminalRenderer` surface.
+  3. Do NOT add the renderer's runtime as a dep of `terminal-core`. Only the adapter package depends on the underlying lib.
+  4. Add adapter unit tests (vitest). Mock the underlying terminal when WASM/WebGPU/jsdom is awkward — see `terminal-ghostty-web` and `terminal-restty` tests for the mock pattern.
+  5. Add redaction tests covering input, output, log, and error paths. Raw terminal bytes/strings must never appear in console, logs, or thrown error messages.
+  6. Wire the package into `apps/web` ONLY for the dev lab: register an id/label in `apps/web/src/lib/dev/rendererDiagnostics.ts` and add creation/switching to `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte`. Do not promote experimental renderers into the main app surface.
+  7. Update the Stack table in this file with the package, version pin, and any API caveats (UTF-8 decode requirements, async init, asset/WASM wiring, bundle size, tree-shaking flags). Update `SPEC.md` with adapter limitations and tree-shaking notes.
+  8. Verify the production bundle: confirm the new package is tree-shaken out of any non-dev build (`sideEffects: false` on the adapter, no top-level imports from app code).
+
+  Recurring rules for renderer work:
+  - `xterm` is the compatibility baseline and the default. Don't change the default without an explicit ask.
+  - Experimental renderers must be labeled experimental in UI, diagnostics, and docs.
+  - Renderer diagnostics in `rendererDiagnostics.ts` are metadata only — not formal benchmarks. Don't present them as perf claims.
+  - Renderer-specific APIs must not leak into `TerminalRenderer` or `terminal-core`.
+  - The backend protocol does not change to accommodate a renderer. If a renderer needs new data, it transforms what's already on the wire.
+  - Raw terminal input/output (keystrokes, PTY bytes, decoded strings) must never be logged or surfaced outside the terminal viewport.
 - **Adding a new backend WebSocket message type** — define in `apps/backend/src/http/` protocol module; mirror schema with the web `lib/ws/` client. ...
 
 ## Decision tables
