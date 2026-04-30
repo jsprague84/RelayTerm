@@ -70,6 +70,32 @@
     toneForPhase,
     type LabPhase,
   } from "./liveTerminalState.js";
+  import {
+    createRendererDiagnostics,
+    markDispose,
+    markMountEnd,
+    markMountStart,
+    recordAttached,
+    recordClosed,
+    recordDetached,
+    recordError,
+    recordInput,
+    recordLastSeenSeq,
+    recordOutput,
+    recordPing,
+    recordPong,
+    recordReplayEnd,
+    recordReplayStart,
+    recordReplayWindowLost,
+    recordResizeAck,
+    recordResizeSend,
+    rendererLabel as diagnosticsRendererLabel,
+    resetRendererDiagnostics,
+    setClientState as setDiagnosticsClientState,
+    setRenderer as setDiagnosticsRenderer,
+    summarizeDiagnosticsAsJson,
+    type RendererId,
+  } from "./rendererDiagnostics.js";
 
   /**
    * Optional caller-controlled inputs. When `DevTerminalWorkbench`
@@ -84,18 +110,12 @@
    * remains the compatibility baseline; ghostty-web is an experimental
    * adapter wrapping libghostty-vt via WASM. The adapter contract
    * (`TerminalRenderer`) is identical for both — switching only flips
-   * which constructor we call at attach time.
+   * which constructor we call at attach time. The id type and the
+   * operator-facing label both come from `rendererDiagnostics.ts` so
+   * the diagnostics summary and the lab UI never disagree on names.
    */
-  type RendererChoice = "xterm" | "ghostty-web";
-
-  function rendererLabel(choice: RendererChoice): string {
-    switch (choice) {
-      case "xterm":
-        return "xterm baseline";
-      case "ghostty-web":
-        return "ghostty-web experimental";
-    }
-  }
+  type RendererChoice = RendererId;
+  const rendererLabel = diagnosticsRendererLabel;
 
   function newRenderer(choice: RendererChoice): TerminalRenderer {
     const themed = {
@@ -192,6 +212,32 @@
    * instead of momentarily flashing `idle`.
    */
   let reconnectInFlight = $state(false);
+  /**
+   * Renderer/session diagnostics counters. The state record lives in
+   * `rendererDiagnostics.ts` and is intentionally pure: every mutation
+   * goes through a function that takes a metadata-only argument list
+   * (byte counts, seq numbers, never payloads). The Svelte 5 runic
+   * proxy detects deep mutations so the panel re-renders without us
+   * threading a `snapshot()` getter through the template.
+   *
+   * This panel is dev diagnostic tooling — NOT a benchmark suite.
+   * Browser, machine, renderer, font, and workload all affect numbers;
+   * the lab UI repeats this disclaimer next to any timing.
+   */
+  // svelte-ignore state_referenced_locally
+  let diagnostics = $state(
+    createRendererDiagnostics({ renderer: initialRenderer }),
+  );
+  /**
+   * Last clipboard-copy attempt status, surfaced inline in the panel.
+   * `fallback` is the catch-all for "clipboard API unavailable OR
+   * `writeText` rejected" — at the dev-lab level we don't distinguish
+   * "no secure context" from "permission denied" because the operator
+   * remediation is the same: copy from the event log. A separate
+   * `error` state would be dead code today; if a future slice surfaces
+   * a more nuanced clipboard error path, add it then.
+   */
+  let copyStatus = $state<"idle" | "ok" | "fallback">("idle");
   let client: TerminalSessionClient | null = null;
   let renderer: TerminalRenderer | null = null;
   let unsubInput: (() => void) | null = null;
@@ -306,16 +352,25 @@
     const r = newRenderer(choice);
     // `mount` may return a Promise for renderers that load WASM
     // (ghostty-web). Awaiting unconditionally is safe — the xterm
-    // adapter is sync and resolves immediately.
+    // adapter is sync and resolves immediately. Diagnostics bracket
+    // the mount call so the panel can show "this renderer took N ms
+    // to mount" — a coarse, dev-only signal, not a benchmark.
+    setDiagnosticsRenderer(diagnostics, choice);
+    markMountStart(diagnostics);
     await r.mount(mountTarget);
+    markMountEnd(diagnostics);
     r.focus();
     renderer = r;
-    append("info", `renderer mounted: ${rendererLabel(choice)}`);
+    append(
+      "info",
+      `renderer mounted: ${rendererLabel(choice)} (${diagnostics.mountDurationMs ?? "?"}ms)`,
+    );
 
     const transport = new WebSocketTerminalTransport();
     const next = new TerminalSessionClient({ transport });
     next.on("state_change", (s) => {
       clientState = s;
+      setDiagnosticsClientState(diagnostics, s);
       append("info", `state → ${s}`);
       if (s === "attached") {
         // A fresh attachment owns the TTL clock now; clear any stale
@@ -339,6 +394,7 @@
       }
     });
     next.on("attached", (m) => {
+      recordAttached(diagnostics);
       append("in", describeNonOutputServerMsg(m));
       // Drive the renderer to the user-supplied cell grid; xterm fires
       // `onResize` synchronously inside `Terminal.resize`, and the
@@ -347,10 +403,27 @@
       // would emit a duplicate frame.
       r.resize(cols, rows);
     });
-    next.on("detached", (m) => append("in", describeNonOutputServerMsg(m)));
-    next.on("closed", (m) => append("in", describeNonOutputServerMsg(m)));
-    next.on("ack", (m) => append("in", describeNonOutputServerMsg(m)));
-    next.on("pong", (m) => append("in", describeNonOutputServerMsg(m)));
+    next.on("detached", (m) => {
+      recordDetached(diagnostics);
+      append("in", describeNonOutputServerMsg(m));
+    });
+    next.on("closed", (m) => {
+      recordClosed(diagnostics);
+      append("in", describeNonOutputServerMsg(m));
+    });
+    next.on("ack", (m) => {
+      // The protocol's only ack kind today is `resize`. `recordResizeAck`
+      // is keyed off `kind` defensively so a future ack kind doesn't
+      // silently inflate the resize counter.
+      if (m.kind === "resize") {
+        recordResizeAck(diagnostics);
+      }
+      append("in", describeNonOutputServerMsg(m));
+    });
+    next.on("pong", (m) => {
+      recordPong(diagnostics);
+      append("in", describeNonOutputServerMsg(m));
+    });
     next.on("output", (m) => {
       // Decode base64 → bytes via the centralised helper. A decode
       // failure must never echo the offending payload — the lab logs a
@@ -365,6 +438,10 @@
         return;
       }
       append("in", outputLogText(m.seq, decoded.bytes.byteLength));
+      // Diagnostics counter takes ONLY seq + byteLength; the bytes
+      // themselves never enter the diagnostics surface. The renderer
+      // is the only consumer of the decoded payload below.
+      recordOutput(diagnostics, m.seq, decoded.bytes.byteLength);
       r.write(decoded.bytes);
       // Mirror the client's bookmark into local state so the
       // reconnect-with-last-seen-seq button reflects what the operator
@@ -372,29 +449,38 @@
       if (m.seq > lastSeenSeq) {
         lastSeenSeq = m.seq;
       }
+      recordLastSeenSeq(diagnostics, m.seq);
     });
     next.on("replay_start", (m) => {
       replayActive = true;
+      recordReplayStart(diagnostics);
       append("in", describeNonOutputServerMsg(m));
     });
     next.on("replay_end", (m) => {
       replayActive = false;
+      recordReplayEnd(diagnostics);
       append("in", describeNonOutputServerMsg(m));
       if (m.latest_seq > lastSeenSeq) {
         lastSeenSeq = m.latest_seq;
       }
+      recordLastSeenSeq(diagnostics, m.latest_seq);
     });
     next.on("replay_window_lost", (m) => {
       replayActive = false;
+      recordReplayWindowLost(diagnostics);
       append("in", describeNonOutputServerMsg(m));
       if (m.latest_seq > lastSeenSeq) {
         lastSeenSeq = m.latest_seq;
       }
+      recordLastSeenSeq(diagnostics, m.latest_seq);
     });
     next.on("input_rejected_or_stubbed", (rej) =>
       append("info", `${rej.attempted} rejected: ${rej.reason}`),
     );
-    next.on("error", (e) => append("error", describeError(e)));
+    next.on("error", (e) => {
+      recordError(diagnostics);
+      append("error", describeError(e));
+    });
 
     // Renderer → client. Length is computed off the payload before we
     // hand it to `sendInput`; the redacted log line never sees the
@@ -404,6 +490,10 @@
     // `byteLength`.
     unsubInput = r.onInput((data) => {
       const bytes = inputByteLength(data);
+      // Diagnostics counter takes ONLY the byte count; the payload is
+      // forwarded to the client below but never enters the
+      // diagnostics surface. Same redaction rule as `redactInputLogText`.
+      recordInput(diagnostics, bytes);
       append("out", redactInputLogText(bytes));
       next.sendInput(
         typeof data === "string" ? data : new TextDecoder().decode(data),
@@ -414,6 +504,7 @@
         cols = size.cols;
         rows = size.rows;
         next.sendResize(size.cols, size.rows);
+        recordResizeSend(diagnostics);
         append("out", `renderer resize cols=${size.cols} rows=${size.rows}`);
       }) ?? null;
 
@@ -456,6 +547,14 @@
     unsubResize = null;
     client?.dispose();
     client = null;
+    // `markDispose` is only stamped when a renderer actually existed.
+    // Calling `teardown()` from a never-mounted state (e.g. `connect`
+    // bailed before `r.mount` resolved) must not inflate the dispose
+    // counter — the diagnostics summary tracks adapter dispose calls,
+    // not lab-internal cleanup hops.
+    if (renderer !== null) {
+      markDispose(diagnostics);
+    }
     renderer?.dispose();
     renderer = null;
     clientState = "idle";
@@ -547,6 +646,7 @@
 
   function ping() {
     client?.sendPing();
+    recordPing(diagnostics);
     append("out", "ping");
   }
 
@@ -626,6 +726,45 @@
 
   function clearLog() {
     log = [];
+  }
+
+  /**
+   * Reset the diagnostics counters without disposing the current
+   * renderer/client. The currently selected renderer and observed
+   * client state are preserved — see `resetRendererDiagnostics`. Used
+   * by the operator to start a fresh measurement window mid-session.
+   */
+  function resetDiagnostics() {
+    resetRendererDiagnostics(diagnostics);
+    copyStatus = "idle";
+    append("info", "diagnostics counters reset");
+  }
+
+  /**
+   * Copy the diagnostics summary to the clipboard as JSON. The summary
+   * is metadata-only — see `summarizeDiagnostics` — so the resulting
+   * clipboard string carries no payload bytes by construction. The
+   * `navigator.clipboard` API can fail (no secure context, denied
+   * permission); in that case the lab logs the JSON to the event log
+   * so the operator can copy it from there as a fallback.
+   */
+  async function copyDiagnostics() {
+    const json = summarizeDiagnosticsAsJson(diagnostics);
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      try {
+        await navigator.clipboard.writeText(json);
+        copyStatus = "ok";
+        append("info", "diagnostics summary copied to clipboard");
+        return;
+      } catch {
+        // fall through to the fallback path
+      }
+    }
+    copyStatus = "fallback";
+    // The summary itself is metadata-only. Logging it is safe — the
+    // redaction rule still holds because no payload byte was ever in
+    // the summary in the first place.
+    append("info", `diagnostics summary (clipboard unavailable): ${json}`);
   }
 
   onDestroy(() => {
@@ -863,6 +1002,125 @@
       <span class="font-mono text-amber-300">{ttlText.label}</span>
     {/if}
   </div>
+
+  <section
+    class="mt-3 rounded-sm border border-zinc-800 bg-zinc-950/60 p-2 text-xs"
+    aria-label="renderer diagnostics"
+  >
+    <header class="flex flex-wrap items-baseline justify-between gap-2">
+      <span class="font-semibold text-zinc-200">renderer diagnostics</span>
+      <span class="text-zinc-500">
+        dev diagnostics, not a benchmark — browser/machine/renderer/font/workload all affect numbers
+      </span>
+    </header>
+    <dl class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 font-mono sm:grid-cols-3 lg:grid-cols-4">
+      <div>
+        <dt class="text-zinc-400">renderer</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.rendererId === null
+            ? "none"
+            : rendererLabel(diagnostics.rendererId)}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">phase</dt>
+        <dd class={TONE_CLASS[toneForPhase(phase)]}>{labelForPhase(phase)}</dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">client_state</dt>
+        <dd class="text-zinc-200">{diagnostics.clientState ?? "—"}</dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">mount duration</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.mountDurationMs === null
+            ? "—"
+            : `${diagnostics.mountDurationMs}ms`}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">mounts / disposes</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.mountCount} / {diagnostics.disposeCount}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">input frames / bytes</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.inputFrames} / {diagnostics.inputBytes}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">output frames / bytes</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.outputFrames} / {diagnostics.outputBytes}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">last_output_seq</dt>
+        <dd class="text-zinc-200">{diagnostics.lastOutputSeq}</dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">last_seen_seq</dt>
+        <dd class="text-zinc-200">{diagnostics.lastSeenSeq}</dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">resize sends / acks</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.resizeSends} / {diagnostics.resizeAcks}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">ping / pong</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.pingCount} / {diagnostics.pongCount}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">replay s/e/lost</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.replayStartCount}/{diagnostics.replayEndCount}/{diagnostics.replayWindowLostCount}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">attach / detach / close</dt>
+        <dd class="text-zinc-200">
+          {diagnostics.attachCount}/{diagnostics.detachCount}/{diagnostics.closeCount}
+        </dd>
+      </div>
+      <div>
+        <dt class="text-zinc-400">errors</dt>
+        <dd class={diagnostics.errorCount > 0 ? "text-rose-300" : "text-zinc-200"}>
+          {diagnostics.errorCount}
+        </dd>
+      </div>
+    </dl>
+    <p class="mt-2 text-zinc-500">
+      Renderer scrollback is NOT preserved across renderer switches in this slice — switching disposes the previous renderer's grid.
+    </p>
+    <div class="mt-2 flex flex-wrap gap-2">
+      <button
+        type="button"
+        class="rounded-sm bg-zinc-700 px-2 py-1 text-xs hover:bg-zinc-600"
+        onclick={resetDiagnostics}
+      >
+        reset diagnostics
+      </button>
+      <button
+        type="button"
+        class="rounded-sm bg-zinc-700 px-2 py-1 text-xs hover:bg-zinc-600"
+        onclick={() => void copyDiagnostics()}
+        title="copy a metadata-only summary to the clipboard (no payload bytes)"
+      >
+        copy diagnostics JSON
+      </button>
+      {#if copyStatus === "ok"}
+        <span class="self-center text-emerald-300">copied</span>
+      {:else if copyStatus === "fallback"}
+        <span class="self-center text-amber-300">clipboard unavailable — see event log</span>
+      {/if}
+    </div>
+  </section>
 
   <div
     bind:this={mountTarget}
