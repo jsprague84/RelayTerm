@@ -1,19 +1,27 @@
 <script lang="ts">
   /**
    * Dev-only lab for exercising a live SSH PTY through the
-   * `@relayterm/terminal-core` client and `@relayterm/terminal-xterm`
-   * renderer. This is NOT the production terminal UI; it exists to prove
-   * the live-PTY data path renders end-to-end so the production UI slice
-   * can be built on top without re-validating the seam.
+   * `@relayterm/terminal-core` client against any renderer adapter that
+   * implements `TerminalRenderer`. The lab can switch between the
+   * baseline `XtermRenderer` (`@relayterm/terminal-xterm`) and the
+   * experimental `GhosttyWebRenderer` (`@relayterm/terminal-ghostty-web`)
+   * at runtime — switching disposes the previous renderer and remounts.
+   * This is NOT the production terminal UI; it exists to prove the
+   * live-PTY data path renders end-to-end and that the renderer-neutral
+   * seam holds across adapter implementations.
    *
-   * Gated behind `import.meta.env.DEV`. The production bundle's dead-code
-   * elimination drops the JS branch (terminal-xterm's `sideEffects` field
-   * tree-shakes xterm itself away); the css side-effect import is the
-   * documented compromise — see App.svelte.
+   * Gated behind `import.meta.env.DEV`. The production bundle's
+   * dead-code elimination drops the JS branch (terminal-xterm and
+   * terminal-ghostty-web both declare `sideEffects: false`, letting
+   * Rollup tree-shake xterm and ghostty-web's WASM-data-URL bundle
+   * respectively); the xterm css side-effect import is the documented
+   * compromise — see App.svelte. ghostty-web ships no CSS.
    *
    * Contracts re-asserted in this file:
-   *  - Renderer-neutral: the lab only touches `XtermRenderer` through the
-   *    `TerminalRenderer` adapter package. No `@xterm/xterm` import here.
+   *  - Renderer-neutral: the lab touches both renderers ONLY through
+   *    the shared `TerminalRenderer` interface. No `@xterm/xterm`
+   *    or `ghostty-web` import here — those are encapsulated by the
+   *    adapter packages.
    *  - Output decode is centralised in `@relayterm/terminal-core` via the
    *    `decodeOutputData` helper, wrapped here by `safeDecodeOutput` so a
    *    malformed frame collapses to a typed log line, never an exception.
@@ -35,10 +43,12 @@
     WebSocketTerminalTransport,
     type ServerMsg,
     type TerminalClientError,
+    type TerminalRenderer,
     type TerminalSessionState,
   } from "@relayterm/terminal-core";
   import { XtermRenderer } from "@relayterm/terminal-xterm";
   import "@relayterm/terminal-xterm/styles";
+  import { GhosttyWebRenderer } from "@relayterm/terminal-ghostty-web";
   import {
     CELL_GRID_MAX,
     CELL_GRID_MIN,
@@ -69,17 +79,61 @@
    * later prop change must not silently overwrite a session id the
    * operator has been editing. The workbench remounts to push a new id.
    */
+  /**
+   * Stable identifiers for the swappable renderer adapters. xterm
+   * remains the compatibility baseline; ghostty-web is an experimental
+   * adapter wrapping libghostty-vt via WASM. The adapter contract
+   * (`TerminalRenderer`) is identical for both — switching only flips
+   * which constructor we call at attach time.
+   */
+  type RendererChoice = "xterm" | "ghostty-web";
+
+  function rendererLabel(choice: RendererChoice): string {
+    switch (choice) {
+      case "xterm":
+        return "xterm baseline";
+      case "ghostty-web":
+        return "ghostty-web experimental";
+    }
+  }
+
+  function newRenderer(choice: RendererChoice): TerminalRenderer {
+    const themed = {
+      fontFamily:
+        'ui-monospace, "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+      fontSize: 13,
+      cursorBlink: true,
+      cursorStyle: "block" as const,
+      scrollbackLines: 2000,
+      theme: {
+        background: "#0a0a0a",
+        foreground: "#e4e4e7",
+        cursor: "#e4e4e7",
+      },
+    };
+    switch (choice) {
+      case "xterm":
+        return new XtermRenderer(themed);
+      case "ghostty-web":
+        // ghostty-web has no analogue for `lineHeight`; the adapter
+        // accepts it on the neutral surface and silently drops it.
+        return new GhosttyWebRenderer(themed);
+    }
+  }
+
   interface Props {
     initialSessionId?: string;
     initialCols?: number;
     initialRows?: number;
     autoConnect?: boolean;
+    initialRenderer?: RendererChoice;
   }
   let {
     initialSessionId = "",
     initialCols = 80,
     initialRows = 24,
     autoConnect = false,
+    initialRenderer = "xterm",
   }: Props = $props();
 
   interface LogLine {
@@ -94,6 +148,8 @@
   let cols = $state(initialCols);
   // svelte-ignore state_referenced_locally
   let rows = $state(initialRows);
+  // svelte-ignore state_referenced_locally
+  let rendererChoice = $state<RendererChoice>(initialRenderer);
   let clientState = $state<TerminalSessionState>("idle");
   let log = $state<LogLine[]>([]);
   let nextId = 0;
@@ -137,7 +193,7 @@
    */
   let reconnectInFlight = $state(false);
   let client: TerminalSessionClient | null = null;
-  let renderer: XtermRenderer | null = null;
+  let renderer: TerminalRenderer | null = null;
   let unsubInput: (() => void) | null = null;
   let unsubResize: (() => void) | null = null;
   let mountTarget: HTMLDivElement | null = null;
@@ -246,22 +302,15 @@
     const bookmark =
       opts.resumeFromBookmark && lastSeenSeq > 0 ? lastSeenSeq : undefined;
 
-    const r = new XtermRenderer({
-      fontFamily:
-        'ui-monospace, "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-      fontSize: 13,
-      cursorBlink: true,
-      cursorStyle: "block",
-      scrollbackLines: 2000,
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e4e4e7",
-        cursor: "#e4e4e7",
-      },
-    });
-    r.mount(mountTarget);
+    const choice = rendererChoice;
+    const r = newRenderer(choice);
+    // `mount` may return a Promise for renderers that load WASM
+    // (ghostty-web). Awaiting unconditionally is safe — the xterm
+    // adapter is sync and resolves immediately.
+    await r.mount(mountTarget);
     r.focus();
     renderer = r;
+    append("info", `renderer mounted: ${rendererLabel(choice)}`);
 
     const transport = new WebSocketTerminalTransport();
     const next = new TerminalSessionClient({ transport });
@@ -507,13 +556,62 @@
       append("error", `resize refused: ${v.reason}`);
       return;
     }
-    // Renderer resize fires xterm's `onResize` synchronously, which the
-    // subscriber translates into `client.sendResize`. We don't fire
-    // `client.sendResize` here too — that would double the wire frame.
-    // If the renderer isn't mounted (no client either) there is nothing
-    // to send; the resize button stays disabled in that state.
+    // Renderer resize fires the renderer's `onResize` synchronously
+    // (xterm and ghostty-web both fan out within `Terminal.resize`),
+    // which the subscriber translates into `client.sendResize`. We
+    // don't fire `client.sendResize` here too — that would double the
+    // wire frame. If the renderer isn't mounted (no client either)
+    // there is nothing to send; the resize button stays disabled in
+    // that state.
     renderer?.resize(cols, rows);
     append("out", `manual resize cols=${cols} rows=${rows}`);
+  }
+
+  /**
+   * Switch renderer adapters. While idle the choice is recorded for the
+   * next `connect()`. While attached, we tear down the current
+   * client+renderer and immediately reconnect with the new renderer
+   * choice, exercising the renderer-neutral seam end-to-end. The event
+   * log records ONLY the new renderer name — never any payload — so
+   * the redaction rule still holds.
+   *
+   * `reconnectInFlight` is cleared in a `finally` so a synchronous
+   * throw out of `connect()` (for example a renderer `mount()` that
+   * rejects because ghostty-web's WASM init failed) cannot leave the
+   * UI permanently stuck in "reconnecting…". `connect()`'s own
+   * happy-path resets `reconnectInFlight` via the `state_change →
+   * attached` handler; the `finally` here is a belt-and-suspenders
+   * safety net for the throw paths it doesn't cover.
+   *
+   * Race note: rapid consecutive switches can fire two overlapping
+   * `connect()` calls (the second sees `client === null` after the
+   * first's teardown but before the first's `attach` resolves). For a
+   * dev lab this is acceptable — the operator can stop and reset.
+   * Productizing renderer-swap UX is out of scope for this slice.
+   */
+  async function setRendererChoice(next: RendererChoice) {
+    if (next === rendererChoice) return;
+    rendererChoice = next;
+    if (!client) {
+      append("info", `renderer set to ${rendererLabel(next)} (idle)`);
+      return;
+    }
+    reconnectInFlight = true;
+    teardown({ keepDetachClock: false });
+    append(
+      "info",
+      `switching renderer to ${rendererLabel(next)}; reconnecting`,
+    );
+    try {
+      await connect();
+    } catch (err) {
+      append(
+        "error",
+        `renderer switch failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      reconnectInFlight = false;
+    }
   }
 
   function detach() {
@@ -634,6 +732,31 @@
         bind:value={rows}
       />
     </label>
+  </div>
+
+  <div class="mt-3 flex flex-wrap items-baseline gap-2 text-xs">
+    <span class="text-zinc-400">renderer:</span>
+    <label class="inline-flex items-center gap-1">
+      <input
+        type="radio"
+        name="renderer"
+        value="xterm"
+        checked={rendererChoice === "xterm"}
+        onchange={() => void setRendererChoice("xterm")}
+      />
+      <span class="font-mono text-zinc-200">xterm baseline</span>
+    </label>
+    <label class="inline-flex items-center gap-1">
+      <input
+        type="radio"
+        name="renderer"
+        value="ghostty-web"
+        checked={rendererChoice === "ghostty-web"}
+        onchange={() => void setRendererChoice("ghostty-web")}
+      />
+      <span class="font-mono text-amber-300">ghostty-web (experimental)</span>
+    </label>
+    <span class="text-zinc-500">— switching disposes the current renderer and remounts</span>
   </div>
 
   <div class="mt-3 flex flex-wrap gap-2">

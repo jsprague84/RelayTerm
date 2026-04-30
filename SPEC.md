@@ -313,6 +313,57 @@ The dev-only live-terminal lab — `apps/web/src/lib/dev/XtermLiveTerminalLab.sv
 
 Real PTY byte streaming through `output` frames; ghostty-web / restty / wterm renderer adapters; renderer benchmarking harness; persistent per-renderer preferences; production terminal UI; renderer-swap UX; mobile/Tauri shell integration. Each is a separate, deliberate slice.
 
+### ghostty-web experimental renderer adapter
+
+`@relayterm/terminal-ghostty-web` is the second concrete `TerminalRenderer` implementation. It is **experimental** — xterm.js remains the compatibility baseline. The adapter wraps `ghostty-web`, which embeds Ghostty's libghostty-vt parser via WebAssembly and exposes an xterm.js-API-compatible `Terminal` class. Landing this adapter proves the renderer-neutral seam holds end-to-end without backend protocol or `terminal-core` changes.
+
+**Scope (load-bearing — this slice).** A successful integration attests ONLY to:
+
+1. The same `TerminalRenderer` interface from `@relayterm/terminal-core` (`mount` / `write` / `focus` / `resize` / `dispose` / `onInput` / `onResize`) bridges ghostty-web bidirectionally, with the renderer's WASM `init()` resolved before `Terminal` construction.
+2. `apps/web`'s dev-only live terminal lab can switch between xterm baseline and ghostty-web experimental at runtime; switching disposes the previous renderer and remounts the new one without tearing down the `TerminalSessionClient` or the wire protocol.
+3. The backend protocol, the session client, and `terminal-core` remain unchanged and renderer-neutral.
+
+It does **NOT** yet:
+
+- Replace xterm as the production renderer. The production terminal UI is still not built; the dev lab is the only consumer.
+- Persist a per-renderer preference. The lab defaults to xterm on every page load.
+- Validate ghostty-web behavior in jsdom. Vitest exercises the adapter against a mocked `ghostty-web` module — the real WASM runtime is verified only in a browser dev session. The mock pins option mapping, init memoization, the pre-mount write queue, idempotent dispose, the dispose-during-pending-mount cancellation path, and the input-redaction rule.
+
+#### Package layout
+
+`packages/terminal-ghostty-web/` is a workspace package alongside `terminal-core` and `terminal-xterm`. Keys:
+
+- `src/GhosttyWebRenderer.ts` — the only file in the repo that imports `ghostty-web`. Implements `TerminalRenderer`. `mount` is async because ghostty-web's one-time `init()` loads a shared WASM module before any `Terminal` can be constructed; the promise is memoized at module scope so multiple renderer instances share one load.
+- `src/options.ts` — renderer-neutral `GhosttyWebRendererOptions` mirroring `XtermRendererOptions` (`fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`, `theme`). `lineHeight` has no analogue in ghostty-web's `ITerminalOptions` and is silently dropped during the option mapping; this is documented adapter behavior, not a regression. A `ghosttyOnly` escape hatch passes raw ghostty-web options through and is documented as **non-portable**.
+- `package.json` declares `"sideEffects": false`. ghostty-web inlines its WASM payload as a base64 data URL inside its shipped JS bundle (no separate asset wiring is required for Vite consumers); combined with the `sideEffects: false` marker on this adapter, the production `apps/web` bundle tree-shakes both ghostty-web and this adapter when the dev lab is dead-code-eliminated.
+
+#### Adapter contract
+
+- `GhosttyWebRenderer` is the **only** `ghostty-web` consumer in the repo. `terminal-core` does not depend on `ghostty-web`. `terminal-xterm` does not depend on `ghostty-web`. `apps/web` depends on `@relayterm/terminal-ghostty-web` (workspace) — never directly on `ghostty-web`.
+- Constructor takes `GhosttyWebRendererOptions` only; the underlying `Terminal` instance is private.
+- `mount` is `async`. Calling it more than once on a live renderer rejects with `already mounted`. Calling it after `dispose` rejects with `cannot mount after dispose`. A synchronous `dispose()` issued **during** the awaited `init()` cancels the open silently — no `Terminal` is constructed and no DOM is touched after disposal.
+- `write` before `mount` queues; the queue is flushed on `mount` resolution. `write` after `dispose` is a silent no-op.
+- `dispose` is synchronous and idempotent. It tears down the WASM-backed `Terminal`, the `onData`/`onResize` subscriptions, the pre-mount write queue, and the listener sets. The shared `init()` WASM module stays loaded — re-disposing it would tear it out from under any other live `Terminal` on the page.
+- A throwing user listener inside `onInput` is caught and dropped, identical to `XtermRenderer` — it MUST NOT interrupt sibling listeners or surface the input bytes through the error envelope. `tests/ghosttyWebRenderer.test.ts` pins the redaction rule with the same sentinel-string approach as the xterm adapter.
+
+#### Renderer-neutral rule (re-affirmed)
+
+- `terminal-core` still imports nothing from `ghostty-web` (or `@xterm/*`).
+- `GhosttyWebRendererOptions` is shape-compatible with `XtermRendererOptions` for the portable knobs, so an app can swap renderers by changing only the import. Renderer-only escape-hatch fields (`xtermOnly`, `ghosttyOnly`) are explicitly NOT promised to behave the same across adapters.
+- The wire protocol stays RelayTerm-shaped. A live PTY's `Output` bytes hand identical payloads to either renderer; `Input` flows back through the same `TerminalSessionClient`.
+
+#### Diagnostic UI
+
+The dev-only live terminal lab — `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` — exposes a `renderer:` radio group switching between xterm baseline (default) and ghostty-web experimental. Switching while attached tears down the current renderer and `TerminalSessionClient` and immediately reconnects with the new renderer; switching while idle records the choice for the next `connect()`. The event log records ONLY the renderer name on switch — no payload bytes. The redaction rules pinned by `apps/web/tests/labLog.test.ts`, `tests/xtermRenderer.test.ts`, and `tests/ghosttyWebRenderer.test.ts` continue to hold across renderer switches.
+
+#### Production bundle behavior
+
+The production `apps/web` build (`pnpm -r build`) emits a ~28 KB JS bundle. The dev lab is gated behind `import.meta.env.DEV`, which Vite inlines as a constant; Rollup eliminates the dead branch, which makes the `apps/web` imports of `@relayterm/terminal-xterm` and `@relayterm/terminal-ghostty-web` unreachable. Both adapter packages declare `sideEffects: false` (xterm pins only `./src/styles.ts` and `**/*.css` as side-effectful), so Rollup drops the wrappers, which in turn drops the underlying libraries — xterm.js's parser/renderer and ghostty-web's ~400 KB inlined WASM data URL. Only the xterm CSS side-effect import remains in the prod CSS bundle; ghostty-web ships no CSS so its adapter contributes nothing to the styles bundle. Caveat: ghostty-web 0.4.0 itself does not declare `sideEffects` in its `package.json`, so if a future code change made the adapter reachable from a non-dev path, the WASM data URL would land in the prod JS bundle.
+
+#### Future work (explicit out-of-scope for this slice)
+
+Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; restty and wterm renderer adapters; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real ghostty-web WASM runtime. Each is a separate, deliberate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.

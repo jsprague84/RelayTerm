@@ -49,6 +49,7 @@ Do not change without asking.
 | vite | `^7` | Stable Environment API; `oxc` minifier default. |
 | tailwindcss | `^4` | CSS-first config (`@theme`); auto content detection. |
 | xterm.js | `^5` (`@xterm/xterm`) | Scoped package; legacy `xterm` is unmaintained. |
+| ghostty-web | `0.4.0` | libghostty-vt parser via WASM; xterm.js-API-compatible `Terminal`. WASM payload is inlined as a base64 data URL inside the shipped JS — no separate asset wiring needed under Vite. Used only by `@relayterm/terminal-ghostty-web`; consumed via the renderer-neutral `TerminalRenderer` interface. Requires `await init()` once before constructing a `Terminal`. |
 | tauri | `^2` | Adds Android/iOS; v1 conf schema is incompatible. |
 | ssh-key | `^0.6` | OpenSSH keypair gen + `authorized_keys` text + SHA-256 fingerprint. RustCrypto; pulls `ed25519` feature only — no RSA/ECDSA generators yet. |
 | chacha20poly1305 | `^0.10` | XChaCha20-Poly1305 AEAD for the vault envelope. 24-byte nonce → safe random nonces. `alloc` feature; no `std`. |
