@@ -30,10 +30,10 @@ pub mod replay;
 
 pub use manager::{
     AttachSessionOutcome, AttachSessionRequest, AttachmentRuntime, CloseTerminalSessionOutcome,
-    CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DetachOutcome,
-    DetachSessionOutcome, LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE, LiveRuntimeView,
-    ResizeSessionOutcome, RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
-    STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager, TerminalSessionManagerError,
-    TerminalSessionRuntime,
+    CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DETACHED_LIVE_PTY_TTL, DetachInfo,
+    DetachOutcome, DetachSessionOutcome, LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE,
+    LiveRuntimeView, ResizeSessionOutcome, RuntimeSessionStatus,
+    STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE, STUB_PTY_NOT_IMPLEMENTED_MESSAGE,
+    TerminalSessionManager, TerminalSessionManagerError, TerminalSessionRuntime,
 };
 pub use replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};

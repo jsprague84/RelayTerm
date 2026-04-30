@@ -540,15 +540,16 @@ async fn run_attached_socket(
     // Cleanup: if the user closed the session through this socket the
     // attachment is already gone from the registry. Otherwise mark the
     // attachment detached. The manager's `detach_attachment` helper
-    // is the single lifecycle entry point — it auto-closes the session
-    // when this is the last attachment of a live PTY (see SPEC.md
-    // "detach / close semantics for this slice"). Idempotent in two
-    // ways: (a) `detach_session` is COALESCE-on-detached_at so a race
-    // with the explicit Detach frame can't write a second `Detached`
-    // event; (b) `close_session` is itself idempotent and the helper
-    // skips the auto-close when the detach observed the row as already
-    // detached, so a second cleanup-tail pass cannot write a duplicate
-    // `Closed` event.
+    // is the single lifecycle entry point — when this is the last
+    // attachment of a live PTY it schedules a bounded TTL close (see
+    // SPEC.md "Detached-session TTL contract"). The PTY survives until
+    // a reattach cancels the timer, the TTL expires, or an explicit
+    // close arrives. Idempotent in two ways: (a) `detach_session` is
+    // COALESCE-on-detached_at so a race with the explicit Detach frame
+    // can't write a second `Detached` event; (b) the helper skips the
+    // schedule when the detach observed the row as already detached,
+    // so a second cleanup-tail pass cannot install a duplicate timer
+    // or churn the row state.
     if !state.detached && !state.closed {
         if let Err(err) = manager
             .detach_attachment(user_id, session_id, state.attachment_id, None)
@@ -772,14 +773,13 @@ async fn handle_text_frame(
             }
         }
         ClientMsg::Detach => {
-            // The manager's `detach_attachment` helper detaches AND, if
-            // this is the last attachment of a live PTY, also closes
-            // the session (until a TTL/reaper for detached live sessions
-            // exists, leaving a PTY running with zero clients is unsafe
-            // — see SPEC.md). The handler emits both `SessionDetached`
-            // and `SessionClosed` when both transitions fired so the
-            // client's state machine sees the same lifecycle the
-            // backend persisted.
+            // The manager's `detach_attachment` helper detaches the
+            // attachment row AND, if this is the last attachment of a
+            // live PTY, schedules a TTL close so the PTY survives a
+            // brief reconnect window — see SPEC.md "Detached-session
+            // TTL contract." Reconnect within `DETACHED_LIVE_PTY_TTL`
+            // cancels the close; outside it the session is reaped and
+            // a fresh attach surfaces 409 from the upgrade gate.
             match manager
                 .detach_attachment(user_id, session_id, state.attachment_id, None)
                 .await
@@ -794,16 +794,6 @@ async fn handle_text_frame(
                         },
                     )
                     .await;
-                    if let Some(close) = out.also_closed {
-                        state.closed = true;
-                        send_msg(
-                            socket,
-                            &ServerMsg::SessionClosed {
-                                session_id: close.session.id,
-                            },
-                        )
-                        .await;
-                    }
                     let _ = socket.send(Message::Close(None)).await;
                     return false;
                 }

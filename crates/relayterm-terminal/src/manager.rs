@@ -5,6 +5,7 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use crate::replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};
 
@@ -75,6 +76,21 @@ pub const LIVE_PTY_ATTACH_MESSAGE: &str =
 /// rather than blocking the SSH driver. The renderer that lagged sees
 /// missing bytes; the future replay slice will close the gap.
 const ATTACHMENT_FANOUT_CAPACITY: usize = 256;
+
+/// How long a live PTY is allowed to linger after the last client
+/// detaches before the orchestrator tears it down.
+///
+/// **Conservative on purpose.** Detached persistence is a reconnect
+/// convenience — not durability — and an unbounded value would let a
+/// forgotten tab pin a remote shell open indefinitely. Reconnect within
+/// this window cancels the scheduled close; outside it the PTY closes
+/// and a fresh attach to the same session id surfaces the standard
+/// `409 conflict { entity: "terminal_session" }` from the upgrade gate.
+///
+/// Wire-stable enough that the diagnostic UI surfaces it; if this needs
+/// to become operator-tunable, route it through `AppState` rather than
+/// changing the constant in place.
+pub const DETACHED_LIVE_PTY_TTL: Duration = Duration::from_secs(30);
 
 /// In-memory status for a runtime registry entry.
 ///
@@ -153,6 +169,35 @@ struct LiveRuntime {
     /// AGENTS.md prohibits `tokio::spawn`-and-forget for long-lived
     /// tasks; this field is the orchestrator-side tracker.
     driver: Option<tokio::task::JoinHandle<()>>,
+    /// `Some` only while the session is in the **detached-but-alive**
+    /// window. Carries the deadline plus the TTL close task. Cleared
+    /// (and the task aborted) on reattach or explicit close.
+    detach_close: Option<DetachClose>,
+}
+
+/// In-memory bookkeeping for a session that has been detached but whose
+/// PTY is still alive within the [`DETACHED_LIVE_PTY_TTL`] window.
+///
+/// Held inside [`LiveRuntime::detach_close`]; aborted on reattach (the
+/// reconnecting client cancels the close) or via `Drop` on the runtime
+/// when the session closes for any other reason.
+struct DetachClose {
+    info: DetachInfo,
+    /// Spawned task that fires `close_session` when the TTL elapses.
+    /// Aborted on reattach OR via `Drop` on the runtime so an explicit
+    /// close never races with the timer.
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Public, payload-only view of the detached-window state for a single
+/// session. Returned by [`TerminalSessionManager::detach_state`] for
+/// diagnostic surfaces; the operator can render `expires_at - now()` as
+/// a "session closes in N seconds" hint without touching internal
+/// runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetachInfo {
+    pub detached_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 impl Drop for LiveRuntime {
@@ -164,6 +209,9 @@ impl Drop for LiveRuntime {
         self.forwarder.abort();
         if let Some(driver) = self.driver.take() {
             driver.abort();
+        }
+        if let Some(d) = self.detach_close.take() {
+            d.handle.abort();
         }
     }
 }
@@ -274,22 +322,24 @@ pub struct DetachSessionOutcome {
 
 /// Combined outcome for the [`TerminalSessionManager::detach_attachment`]
 /// helper. Carries the regular detach result plus, when the manager
-/// auto-closed the session because this was the last attachment of a
-/// live PTY, the close outcome.
+/// scheduled a TTL close because this was the last attachment of a live
+/// PTY, the deadline metadata.
 ///
-/// Auto-close policy (this slice): until a TTL/reaper exists, leaving a
-/// live SSH PTY running with zero attachments is unsafe — see SPEC.md.
-/// The manager closes the session in that case so PTY/forwarder/driver
-/// teardown happens deterministically.
+/// The session is **not closed yet** when `detached_pending_close` is
+/// `Some` — the PTY survives until the deadline OR until the next
+/// reattach cancels it OR until an explicit close arrives. The fact
+/// that the close is scheduled is exposed so the WS handler can tell
+/// the renderer "you've been detached; reconnect within N seconds to
+/// resume."
 #[derive(Debug, Clone)]
 pub struct DetachOutcome {
     pub detach: DetachSessionOutcome,
-    /// `Some(close_outcome)` if the manager closed the session because
-    /// this detach left a live PTY with zero attachments. `None` when
+    /// `Some(info)` when this detach left a live PTY with zero
+    /// attachments and the manager scheduled a TTL close. `None` when
     /// the session had no live PTY, when other attachments remain, or
-    /// when this detach was already-idempotent (the close had already
-    /// happened or there was nothing live to close).
-    pub also_closed: Option<CloseTerminalSessionOutcome>,
+    /// when this detach was already-idempotent (the previous detach
+    /// already scheduled or executed the close).
+    pub detached_pending_close: Option<DetachInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +407,12 @@ pub struct TerminalSessionManager {
     /// shape) — today the WS handler enforces one at a time, but the
     /// registry is shaped for the eventual expansion.
     attachments: RwLock<HashMap<TerminalSessionAttachmentId, AttachmentRuntime>>,
+    /// How long a live PTY lingers after the last client detaches. The
+    /// default ([`DETACHED_LIVE_PTY_TTL`]) is the production value;
+    /// tests construct managers with a shorter TTL via
+    /// [`Self::with_detach_ttl`] so they don't have to burn real
+    /// wall-clock budget driving the timer.
+    detach_ttl: Duration,
 }
 
 impl TerminalSessionManager {
@@ -365,12 +421,34 @@ impl TerminalSessionManager {
         sessions: Arc<dyn TerminalSessionRepository>,
         events: Arc<dyn SessionEventRepository>,
     ) -> Self {
+        Self::with_detach_ttl(sessions, events, DETACHED_LIVE_PTY_TTL)
+    }
+
+    /// Construct a manager with a custom detach TTL. Used by unit and
+    /// integration tests so the TTL-expiry path can be exercised in
+    /// real time. Production code SHOULD use [`Self::new`] so the
+    /// SPEC-pinned [`DETACHED_LIVE_PTY_TTL`] is the single source of
+    /// truth.
+    #[must_use]
+    pub fn with_detach_ttl(
+        sessions: Arc<dyn TerminalSessionRepository>,
+        events: Arc<dyn SessionEventRepository>,
+        detach_ttl: Duration,
+    ) -> Self {
         Self {
             sessions,
             events,
             runtimes: RwLock::new(HashMap::new()),
             attachments: RwLock::new(HashMap::new()),
+            detach_ttl,
         }
+    }
+
+    /// Currently-configured detach TTL. Diagnostic getter for tests
+    /// and the dev-only operator surfaces.
+    #[must_use]
+    pub fn detach_ttl(&self) -> Duration {
+        self.detach_ttl
     }
 
     /// Create a metadata row in `Starting` status, append the `created`
@@ -538,6 +616,7 @@ impl TerminalSessionManager {
             replay,
             forwarder,
             driver,
+            detach_close: None,
         };
         let leftover = {
             let mut runtimes = self
@@ -711,7 +790,9 @@ impl TerminalSessionManager {
     }
 
     /// Tear down a runtime entry's live PTY (if any) without holding
-    /// any registry lock. Best-effort.
+    /// any registry lock. Best-effort. Drops the [`LiveRuntime`] which
+    /// fires its `Drop` impl: forwarder + driver + any pending TTL
+    /// close task are aborted as a unit.
     async fn shutdown_runtime(&self, entry: RuntimeEntry) {
         if let Some(live) = entry.live {
             // Notify the bridge handle so the SSH session is torn down
@@ -755,6 +836,13 @@ impl TerminalSessionManager {
             return Err(TerminalSessionManagerError::SessionClosed);
         }
 
+        // Cancel any pending TTL close BEFORE we write the attachment
+        // row. The TTL task could otherwise fire mid-attach and close
+        // the session out from under the new client. The check is
+        // cheap (single registry-write lock) and safe to run on every
+        // attach — sessions without a pending close just no-op.
+        let was_detached_pending_close = self.cancel_pending_close(session.id);
+
         let attachment = self
             .sessions
             .create_attachment(CreateTerminalSessionAttachment {
@@ -784,6 +872,28 @@ impl TerminalSessionManager {
             })
             .await?;
 
+        // If this attach landed inside a TTL window, transition the row
+        // from `Detached` back to `Active` and append a `Reattached`
+        // lifecycle event so the audit log reflects the resume. We do
+        // this AFTER the `Attached` event so the audit ordering matches
+        // the wire ordering: `attached(new attachment)` →
+        // `reattached(session)`.
+        if was_detached_pending_close {
+            self.sessions
+                .set_status(session.id, TerminalSessionStatus::Active, None)
+                .await?;
+            let _ = self
+                .events
+                .create(CreateSessionEvent {
+                    session_id: session.id,
+                    kind: SessionEventKind::Reattached,
+                    payload: serde_json::json!({
+                        "attachment_id": attachment.id,
+                    }),
+                })
+                .await;
+        }
+
         let runtime = AttachmentRuntime {
             id: attachment.id,
             session_id: session.id,
@@ -809,6 +919,30 @@ impl TerminalSessionManager {
             message,
             live: live_view,
         })
+    }
+
+    /// Abort any pending TTL close task for `session_id` and return
+    /// whether one was found. Pure registry mutation; the lock is held
+    /// only across the take/abort. Used by [`Self::attach_session`] to
+    /// cancel the close before the new client races with the timer.
+    fn cancel_pending_close(&self, session_id: TerminalSessionId) -> bool {
+        let close_task = {
+            let mut runtimes = self
+                .runtimes
+                .write()
+                .expect("runtime registry lock poisoned");
+            runtimes
+                .get_mut(&session_id)
+                .and_then(|e| e.live.as_mut())
+                .and_then(|l| l.detach_close.take())
+        };
+        match close_task {
+            Some(d) => {
+                d.handle.abort();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Forward an input byte buffer to the live PTY. Returns
@@ -997,34 +1131,36 @@ impl TerminalSessionManager {
     }
 
     /// Detach a single attachment AND, if this leaves a live PTY with
-    /// zero attached clients, close the session.
+    /// zero attached clients, schedule a bounded TTL close.
     ///
     /// This is the lifecycle helper the WebSocket route uses on every
     /// detach path (explicit `Detach` frame, socket-drop cleanup tail).
-    /// Until a TTL/reaper for detached live sessions exists, leaving a
-    /// PTY running with no clients is unsafe — see SPEC.md "detach /
-    /// close semantics for this slice."
     ///
     /// Behaviour:
     /// * `detach_session` runs first and is idempotent against the
     ///   attachment row.
     /// * If the call observed `already_detached == true`, the manager
-    ///   does NOT auto-close — that path runs every time the WS
+    ///   does NOT schedule a close — that path runs every time the WS
     ///   handler's cleanup tail fires after an explicit detach, and
-    ///   re-closing the session is what causes duplicate `Closed`
-    ///   events.
+    ///   re-scheduling would duplicate the lifecycle bookkeeping.
     /// * If the session does not have a live PTY (stub session, or PTY
     ///   already torn down by the forwarder), the manager does NOT
-    ///   auto-close.
+    ///   schedule a close — there is nothing live to reap.
     /// * If other attachments are still live for this session, the
-    ///   manager does NOT auto-close.
-    /// * Otherwise: close the session (which writes the `Closed` event
-    ///   and aborts the forwarder + bridge driver via `LiveRuntime`'s
-    ///   Drop). `close_session` is itself idempotent, so a race that
-    ///   double-fires this helper still results in exactly one `Closed`
-    ///   event.
+    ///   manager does NOT schedule a close.
+    /// * Otherwise: transition the session row to `Detached`, append a
+    ///   single `Detached` (already done by `detach_session`) lifecycle
+    ///   event, and spawn a TTL close task. The PTY survives until the
+    ///   timer fires OR the next [`Self::attach_session`] cancels it OR
+    ///   an explicit close arrives. Re-running this helper on the same
+    ///   session while the close is already scheduled is a no-op.
+    ///
+    /// Takes `&Arc<Self>` so the spawned TTL task can hold a `Weak<Self>`
+    /// back to the manager — the task is cancellable in either
+    /// direction (manager drops → upgrade fails → task exits silently;
+    /// reattach → handle aborted).
     pub async fn detach_attachment(
-        &self,
+        self: &Arc<Self>,
         owner_id: UserId,
         session_id: TerminalSessionId,
         attachment_id: TerminalSessionAttachmentId,
@@ -1034,10 +1170,10 @@ impl TerminalSessionManager {
             .detach_session(owner_id, session_id, attachment_id, last_seen_seq)
             .await?;
 
-        // Decide whether the auto-close should fire. The decision is
-        // made under read locks then released BEFORE the close await so
-        // the future stays Send.
-        let should_auto_close = if detach.already_detached {
+        // Decide whether to schedule a TTL close. The decision is made
+        // under read locks then released BEFORE the close-or-spawn
+        // section so the future stays Send.
+        let should_schedule = if detach.already_detached {
             false
         } else {
             let any_remaining_attachment = self
@@ -1056,27 +1192,143 @@ impl TerminalSessionManager {
             !any_remaining_attachment && session_has_live_pty
         };
 
-        let also_closed = if should_auto_close {
-            match self.close_session(session_id, owner_id).await {
-                Ok(out) if !out.already_closed => Some(out),
-                Ok(_) => None,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        %session_id,
-                        "failed to auto-close live session on final detach"
-                    );
-                    None
-                }
-            }
+        let detached_pending_close = if should_schedule {
+            self.schedule_detach_close(session_id, owner_id).await
         } else {
             None
         };
 
         Ok(DetachOutcome {
             detach,
-            also_closed,
+            detached_pending_close,
         })
+    }
+
+    /// Mark a session row `Detached` and spawn the TTL close task.
+    ///
+    /// Returns the new [`DetachInfo`] when the close was scheduled, or
+    /// `None` when the session already has a pending close (idempotent),
+    /// when the live runtime vanished between the detach and this call,
+    /// or when the row mutate failed (in which case the error is
+    /// logged operator-side; the API caller still sees a successful
+    /// detach because the attachment-level bookkeeping landed).
+    async fn schedule_detach_close(
+        self: &Arc<Self>,
+        session_id: TerminalSessionId,
+        owner_id: UserId,
+    ) -> Option<DetachInfo> {
+        // Persist the `Detached` transition first so the row reflects
+        // reality even if the spawn races with a future restart. A
+        // failure here is operator-visible but non-fatal for safety:
+        // the TTL task still runs and `close_session` re-issues the
+        // status write at expiry, so the session never escapes the
+        // bounded window even when this transient write fails. The
+        // audit-log oddness — a `Reattached` event landing without a
+        // preceding `Detached` row state — is logged at `error` so
+        // operator dashboards surface the inconsistency.
+        if let Err(err) = self
+            .sessions
+            .set_status(session_id, TerminalSessionStatus::Detached, None)
+            .await
+        {
+            tracing::error!(
+                ?err,
+                %session_id,
+                "failed to mark session detached on final detach; row may briefly stay Active inside the TTL window",
+            );
+        }
+
+        let now = Utc::now();
+        let ttl = self.detach_ttl;
+        let info = DetachInfo {
+            detached_at: now,
+            expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
+        };
+
+        // Spawn the TTL close task. The task holds a `Weak<Self>` so a
+        // manager drop releases it cleanly without the task pinning the
+        // registry alive. On wake-up the upgrade is checked; if the
+        // manager is gone the task exits silently.
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let Some(mgr) = weak.upgrade() else {
+                return;
+            };
+            mgr.expire_detach_close(session_id, owner_id).await;
+        });
+
+        // Install the close task on the live runtime. If a previous
+        // detach already scheduled one (idempotent re-detach), abort
+        // the new task and keep the original deadline so the close
+        // doesn't drift forward on every cleanup-tail run.
+        let mut runtimes = self
+            .runtimes
+            .write()
+            .expect("runtime registry lock poisoned");
+        let Some(live) = runtimes.get_mut(&session_id).and_then(|e| e.live.as_mut()) else {
+            // Live runtime vanished between detach and now — close task
+            // is meaningless; abort it and surface None.
+            handle.abort();
+            return None;
+        };
+        if let Some(existing) = live.detach_close.as_ref() {
+            let kept = existing.info;
+            handle.abort();
+            Some(kept)
+        } else {
+            live.detach_close = Some(DetachClose { info, handle });
+            Some(info)
+        }
+    }
+
+    /// TTL task body. Closes the session iff it is still in the
+    /// detached-pending-close window — a reattach in the meantime
+    /// would have aborted the task, but `tokio::sync::abort` is a
+    /// best-effort signal and a racing wake-up still hits this path.
+    /// Idempotency is preserved because `close_session` is itself
+    /// idempotent and the pre-check filters out the reattached case.
+    async fn expire_detach_close(&self, session_id: TerminalSessionId, owner_id: UserId) {
+        // If the runtime no longer has a `detach_close` entry, a
+        // reattach beat us here. Bail out before touching the DB so the
+        // audit log doesn't pick up a Closed event for a session that
+        // is now Active.
+        let still_pending = self
+            .runtimes
+            .read()
+            .expect("runtime registry lock poisoned")
+            .get(&session_id)
+            .and_then(|e| e.live.as_ref())
+            .map(|l| l.detach_close.is_some())
+            .unwrap_or(false);
+        if !still_pending {
+            return;
+        }
+        match self.close_session(session_id, owner_id).await {
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    ?err,
+                    %session_id,
+                    "failed to close session on detach TTL expiry"
+                );
+            }
+        }
+    }
+
+    /// Public read of the detached-window state for a session. Returns
+    /// `Some(info)` while the session is in the bounded TTL window,
+    /// `None` when it is attached, has no live PTY, or the close
+    /// already fired.
+    #[must_use]
+    pub fn detach_state(&self, session_id: TerminalSessionId) -> Option<DetachInfo> {
+        self.runtimes
+            .read()
+            .expect("runtime registry lock poisoned")
+            .get(&session_id)
+            .and_then(|e| e.live.as_ref())
+            .and_then(|l| l.detach_close.as_ref())
+            .map(|d| d.info)
     }
 
     /// Update the runtime PTY dimensions for a session and append a

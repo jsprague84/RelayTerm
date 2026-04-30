@@ -22,8 +22,8 @@ use relayterm_core::terminal_session::{
 };
 use relayterm_ssh::{ClosedReason, SshPtyError, SshPtyEvent, SshPtyHandle, SshPtyStart};
 use relayterm_terminal::{
-    AttachSessionRequest, CreateTerminalSessionRequest, LIVE_PTY_ATTACH_MESSAGE,
-    RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
+    AttachSessionRequest, CreateTerminalSessionRequest, DETACHED_LIVE_PTY_TTL,
+    LIVE_PTY_ATTACH_MESSAGE, RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
     STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager, TerminalSessionManagerError,
 };
 
@@ -235,12 +235,29 @@ impl SessionEventRepository for InMemoryRepo {
     }
 }
 
-fn build_manager() -> (TerminalSessionManager, InMemoryRepo) {
+fn build_manager() -> (Arc<TerminalSessionManager>, InMemoryRepo) {
     let repo = InMemoryRepo::default();
-    let mgr = TerminalSessionManager::new(
+    let mgr = Arc::new(TerminalSessionManager::new(
         Arc::new(repo.clone()) as Arc<dyn TerminalSessionRepository>,
         Arc::new(repo.clone()) as Arc<dyn SessionEventRepository>,
-    );
+    ));
+    (mgr, repo)
+}
+
+/// Manager with a sub-second detach TTL so the timer-driven close
+/// path can be exercised without burning real wall-clock budget. Pure
+/// test helper — production code MUST use [`TerminalSessionManager::new`]
+/// so the SPEC-pinned [`DETACHED_LIVE_PTY_TTL`] is the single source
+/// of truth.
+fn build_manager_with_short_ttl(
+    ttl: std::time::Duration,
+) -> (Arc<TerminalSessionManager>, InMemoryRepo) {
+    let repo = InMemoryRepo::default();
+    let mgr = Arc::new(TerminalSessionManager::with_detach_ttl(
+        Arc::new(repo.clone()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(repo.clone()) as Arc<dyn SessionEventRepository>,
+        ttl,
+    ));
     (mgr, repo)
 }
 
@@ -1025,11 +1042,11 @@ async fn pty_teardown_marks_session_closed_via_forwarder() {
 }
 
 // ----------------------------------------------------------------------
-// detach_attachment: final-detach auto-close for live PTY sessions
+// detach_attachment: final-detach schedules TTL close for live PTY sessions
 // ----------------------------------------------------------------------
 
 #[tokio::test]
-async fn detach_attachment_closes_live_session_on_final_detach() {
+async fn detach_attachment_schedules_ttl_close_on_final_detach() {
     let (mgr, repo) = build_manager();
     let owner = UserId::new();
     let session = mgr.create_session(req(owner)).await.unwrap().session;
@@ -1041,25 +1058,28 @@ async fn detach_attachment_closes_live_session_on_final_detach() {
         .unwrap()
         .attachment;
 
-    // Detach the only attachment — should auto-close the live session.
+    // Detach the only attachment — must schedule TTL, NOT close.
     let outcome = mgr
         .detach_attachment(owner, session.id, attachment.id, None)
         .await
         .unwrap();
     assert!(!outcome.detach.already_detached);
-    let close = outcome
-        .also_closed
-        .expect("final detach of a live session must auto-close");
-    assert!(!close.already_closed);
-    assert_eq!(close.session.status, TerminalSessionStatus::Closed);
-    assert!(close.session.closed_at.is_some());
+    let info = outcome
+        .detached_pending_close
+        .expect("final detach of a live session must schedule a TTL close");
+    assert!(info.expires_at > info.detached_at);
 
-    // Live runtime + attachment registry both empty.
-    assert!(mgr.runtime(session.id).is_none());
-    assert!(mgr.live(session.id).is_none());
+    // Session row reflects Detached but live runtime is still bound.
+    let row = repo.snapshot_session(session.id).unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Detached);
+    assert!(row.closed_at.is_none(), "TTL not yet expired");
+    assert!(mgr.live(session.id).is_some());
     assert_eq!(mgr.attachment_count(), 0);
+    let state = mgr.detach_state(session.id).expect("ttl state present");
+    assert_eq!(state.detached_at, info.detached_at);
+    assert_eq!(state.expires_at, info.expires_at);
 
-    // Exactly one Detached event and one Closed event were written.
+    // Exactly one Detached event was written; NO Closed event yet.
     let events = repo.snapshot_events();
     let detached = events
         .iter()
@@ -1070,11 +1090,14 @@ async fn detach_attachment_closes_live_session_on_final_detach() {
         .filter(|e| e.kind == SessionEventKind::Closed)
         .count();
     assert_eq!(detached, 1, "exactly one Detached event must be written");
-    assert_eq!(closed, 1, "exactly one Closed event must be written");
+    assert_eq!(
+        closed, 0,
+        "TTL window has not yet expired; no Closed event must exist",
+    );
 }
 
 #[tokio::test]
-async fn detach_attachment_does_not_close_when_other_attachments_remain() {
+async fn detach_attachment_does_not_schedule_when_other_attachments_remain() {
     let (mgr, repo) = build_manager();
     let owner = UserId::new();
     let session = mgr.create_session(req(owner)).await.unwrap().session;
@@ -1096,19 +1119,20 @@ async fn detach_attachment_does_not_close_when_other_attachments_remain() {
         .await
         .unwrap();
     assert!(
-        outcome.also_closed.is_none(),
-        "another attachment is still live"
+        outcome.detached_pending_close.is_none(),
+        "another attachment is still live; no TTL must be scheduled"
     );
-    // Session remains Active, runtime stays bound.
+    // Session remains Active, runtime stays bound, no detach state.
     let row = repo.snapshot_session(session.id).unwrap();
     assert_eq!(row.status, TerminalSessionStatus::Active);
     assert!(mgr.live(session.id).is_some());
+    assert!(mgr.detach_state(session.id).is_none());
     assert_eq!(mgr.attachment_count(), 1);
 }
 
 #[tokio::test]
-async fn detach_attachment_does_not_close_stub_session() {
-    // No live PTY → no auto-close even if the only attachment detaches.
+async fn detach_attachment_does_not_schedule_stub_session() {
+    // No live PTY → no TTL even if the only attachment detaches.
     let (mgr, repo) = build_manager();
     let owner = UserId::new();
     let session = mgr.create_session(req(owner)).await.unwrap().session;
@@ -1123,8 +1147,8 @@ async fn detach_attachment_does_not_close_stub_session() {
         .await
         .unwrap();
     assert!(
-        outcome.also_closed.is_none(),
-        "stub session must not auto-close"
+        outcome.detached_pending_close.is_none(),
+        "stub session must not schedule a TTL close"
     );
     let row = repo.snapshot_session(session.id).unwrap();
     assert_eq!(row.status, TerminalSessionStatus::Starting);
@@ -1133,8 +1157,8 @@ async fn detach_attachment_does_not_close_stub_session() {
 #[tokio::test]
 async fn detach_attachment_idempotent_on_already_detached_row() {
     // Mirrors the WS race: explicit Detach frame fires, the cleanup tail
-    // also fires `detach_attachment` — must NOT write a second Closed
-    // event.
+    // also fires `detach_attachment` — must NOT install a second TTL or
+    // append duplicate Detached events.
     let (mgr, repo) = build_manager();
     let owner = UserId::new();
     let session = mgr.create_session(req(owner)).await.unwrap().session;
@@ -1150,7 +1174,7 @@ async fn detach_attachment_idempotent_on_already_detached_row() {
         .detach_attachment(owner, session.id, attachment.id, None)
         .await
         .unwrap();
-    assert!(first.also_closed.is_some());
+    assert!(first.detached_pending_close.is_some());
     let second = mgr
         .detach_attachment(owner, session.id, attachment.id, None)
         .await
@@ -1160,9 +1184,53 @@ async fn detach_attachment_idempotent_on_already_detached_row() {
         "second detach must observe the row as already_detached",
     );
     assert!(
-        second.also_closed.is_none(),
-        "second detach must NOT auto-close again",
+        second.detached_pending_close.is_none(),
+        "second detach must NOT install a second TTL",
     );
+
+    let detached = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Detached)
+        .count();
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        detached, 1,
+        "race between Detach and cleanup-tail must write exactly one Detached event",
+    );
+    assert_eq!(
+        closed, 0,
+        "TTL has not expired; no Closed event must exist after the race",
+    );
+}
+
+#[tokio::test]
+async fn explicit_close_during_ttl_cancels_timer_and_closes_once() {
+    // Final detach scheduled a TTL; explicit close before expiry must
+    // cancel the timer and write exactly one Closed event.
+    let (mgr, repo) = build_manager();
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+    mgr.detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    assert!(mgr.detach_state(session.id).is_some());
+
+    let close = mgr.close_session(session.id, owner).await.unwrap();
+    assert!(!close.already_closed);
+    assert!(mgr.runtime(session.id).is_none());
+    assert!(mgr.live(session.id).is_none());
 
     let closed = repo
         .snapshot_events()
@@ -1171,7 +1239,7 @@ async fn detach_attachment_idempotent_on_already_detached_row() {
         .count();
     assert_eq!(
         closed, 1,
-        "race between Detach and cleanup-tail must write exactly one Closed event",
+        "explicit close during TTL must produce exactly one Closed event",
     );
 }
 
@@ -1208,11 +1276,11 @@ async fn explicit_close_remains_idempotent() {
 }
 
 #[tokio::test]
-async fn detach_after_explicit_close_does_not_auto_close_again() {
+async fn detach_after_explicit_close_does_not_schedule_ttl() {
     // Race scenario: explicit Close ran (registry attachment removed,
     // session row Closed); a subsequent detach call (e.g. from a
-    // misbehaving external caller) must NOT trigger another auto-close
-    // — there's no live PTY to close.
+    // misbehaving external caller) must NOT schedule a TTL close —
+    // there's no live PTY left.
     let (mgr, repo) = build_manager();
     let owner = UserId::new();
     let session = mgr.create_session(req(owner)).await.unwrap().session;
@@ -1231,10 +1299,10 @@ async fn detach_after_explicit_close_does_not_auto_close_again() {
         .await
         .unwrap();
     // The runtime entry was dropped by close_session, so the helper's
-    // "session has live pty" check is false → no auto-close.
+    // "session has live pty" check is false → no TTL.
     assert!(
-        detach.also_closed.is_none(),
-        "detach after close must NOT auto-close again",
+        detach.detached_pending_close.is_none(),
+        "detach after close must NOT schedule a TTL",
     );
 
     let closed = repo
@@ -1244,15 +1312,17 @@ async fn detach_after_explicit_close_does_not_auto_close_again() {
         .count();
     assert_eq!(
         closed, 1,
-        "explicit close + later detach must write exactly one Closed event",
+        "explicit close + later detach must still produce exactly one Closed event",
     );
 }
 
 #[tokio::test]
-async fn write_pty_input_after_final_detach_returns_pty_not_live() {
-    // After final detach auto-closed the session, the PTY runtime is
-    // gone — input must surface PtyNotLive (or NotFound), and never
-    // reach the (now-aborted) bridge.
+async fn write_pty_input_during_ttl_window_still_routes_to_handle() {
+    // After final detach scheduled a TTL, the PTY runtime is still
+    // alive — no client is currently attached, but the manager should
+    // still let an authorized owner write into the bridge if they hold
+    // a session id (e.g. a server-side automation). This pins the
+    // contract that the TTL window keeps the live PTY usable.
     let (mgr, _) = build_manager();
     let owner = UserId::new();
     let session = mgr.create_session(req(owner)).await.unwrap().session;
@@ -1264,26 +1334,14 @@ async fn write_pty_input_after_final_detach_returns_pty_not_live() {
         .await
         .unwrap()
         .attachment;
-
     mgr.detach_attachment(owner, session.id, attachment.id, None)
         .await
         .unwrap();
 
-    let err = mgr
-        .write_pty_input(owner, session.id, b"after-detach".to_vec())
+    mgr.write_pty_input(owner, session.id, b"during-ttl".to_vec())
         .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            TerminalSessionManagerError::PtyNotLive | TerminalSessionManagerError::NotFound
-        ),
-        "input after auto-close must surface PtyNotLive or NotFound, got {err:?}",
-    );
-    assert!(
-        inputs.lock().unwrap().is_empty(),
-        "no input bytes should reach the fake bridge after auto-close",
-    );
+        .expect("PTY remains live during TTL window");
+    assert_eq!(inputs.lock().unwrap().clone(), vec![b"during-ttl".to_vec()]);
 }
 
 // ----------------------------------------------------------------------
@@ -1427,4 +1485,182 @@ async fn write_pty_input_does_not_appear_in_replay_buffer() {
         range.frames.is_empty(),
         "input must not be mirrored to the replay buffer",
     );
+}
+
+// ----------------------------------------------------------------------
+// TTL-driven detached-session reconnect / expiry
+// ----------------------------------------------------------------------
+
+/// Wait until the live runtime entry's `detach_state` reports `None`
+/// — i.e. the TTL expired and the session was reaped. Bounded so a
+/// hung scheduler doesn't burn CI time. Used by tests that assert the
+/// timer-driven close path works in real time.
+async fn wait_for_runtime_gone(mgr: &TerminalSessionManager, session: TerminalSessionId) {
+    for _ in 0..400 {
+        if mgr.runtime(session).is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("runtime entry never released after TTL expiry");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ttl_expiry_closes_pty_and_writes_one_closed_event() {
+    let (mgr, repo) = build_manager_with_short_ttl(std::time::Duration::from_millis(80));
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    mgr.detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+
+    // The TTL is 80ms; allow generous slack for the spawned task to
+    // wake, run the close, and clear the runtime entry.
+    wait_for_runtime_gone(&mgr, session.id).await;
+    let row = repo.snapshot_session(session.id).unwrap();
+    assert_eq!(
+        row.status,
+        TerminalSessionStatus::Closed,
+        "TTL expiry must transition the row to Closed",
+    );
+    assert!(row.closed_at.is_some());
+    assert!(mgr.live(session.id).is_none());
+    assert!(mgr.detach_state(session.id).is_none());
+
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(closed, 1, "TTL expiry must write exactly one Closed event",);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattach_within_ttl_cancels_close_and_resumes_active() {
+    let (mgr, repo) = build_manager_with_short_ttl(std::time::Duration::from_millis(500));
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let a1 = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+    mgr.detach_attachment(owner, session.id, a1.id, None)
+        .await
+        .unwrap();
+    assert!(mgr.detach_state(session.id).is_some());
+
+    // Reattach BEFORE the TTL elapses.
+    let _ = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap();
+    assert!(
+        mgr.detach_state(session.id).is_none(),
+        "reattach must cancel the pending TTL close",
+    );
+    let row = repo.snapshot_session(session.id).unwrap();
+    assert_eq!(
+        row.status,
+        TerminalSessionStatus::Active,
+        "reattach must transition the row back to Active",
+    );
+
+    // Audit log records the resume.
+    let kinds: Vec<_> = repo.snapshot_events().into_iter().map(|e| e.kind).collect();
+    assert!(
+        kinds.contains(&SessionEventKind::Reattached),
+        "reattach must append a Reattached event, got {kinds:?}",
+    );
+
+    // Wait past the original TTL — the close MUST NOT fire because the
+    // task was cancelled.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        mgr.live(session.id).is_some(),
+        "PTY must survive past the original TTL after reattach",
+    );
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(closed, 0, "reattach must prevent the TTL close from firing",);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ttl_expiry_after_explicit_close_is_a_noop() {
+    // Explicit close ran before the timer fired. The TTL task wakes,
+    // sees the runtime gone, and must NOT write a second Closed event.
+    let (mgr, repo) = build_manager_with_short_ttl(std::time::Duration::from_millis(80));
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+    mgr.detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    mgr.close_session(session.id, owner).await.unwrap();
+
+    // Wait well past the TTL.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let closed = repo
+        .snapshot_events()
+        .into_iter()
+        .filter(|e| e.kind == SessionEventKind::Closed)
+        .count();
+    assert_eq!(
+        closed, 1,
+        "explicit close + late TTL wake must produce exactly one Closed event",
+    );
+}
+
+#[tokio::test]
+async fn detach_ttl_default_matches_pinned_constant() {
+    let (mgr, _) = build_manager();
+    assert_eq!(mgr.detach_ttl(), DETACHED_LIVE_PTY_TTL);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_of_manager_aborts_ttl_close_task() {
+    // Manager drop releases the Arc; the spawned TTL task holds only a
+    // Weak<Self>, so its upgrade fails on wake and the task exits
+    // silently. We don't assert on the close itself (the repo is gone
+    // alongside the manager); instead we assert the test simply
+    // doesn't hang or panic.
+    let (mgr, _) = build_manager_with_short_ttl(std::time::Duration::from_millis(50));
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+    mgr.detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+
+    // Drop the manager and any clones the test holds.
+    drop(mgr);
+
+    // Sleep past the TTL so the spawned task definitely wakes.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }

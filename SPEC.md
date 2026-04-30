@@ -36,7 +36,7 @@ Source of truth is `apps/backend/migrations/` and `crates/relayterm-core/`. Init
 - **ssh_identity** (`ssh_identities`) — a backend-managed credential record (keypair + algorithm metadata). Bound to a `user`, NOT to a host. `encrypted_private_key` is opaque ciphertext produced by the vault crate (XChaCha20-Poly1305 with a 32-byte master key from typed config); the envelope carries a magic prefix and version byte so future schemes can be introduced without schema churn. Plaintext private bytes never leave the vault and never appear in API responses or logs.
 - **server_profile** (`server_profiles`) — the user-facing binding of a `host` to an `ssh_identity`. This is the row a user picks from a "connect to..." list. Carries optional `username_override` and `tags`. Splitting host + identity from this binding lets a single key be reused across many hosts.
 - **known_host_entry** (`known_host_entries`) — pinned public key per host. Every `check_server_key` decision in the SSH layer must consult this table; `trusted_at` is set when the user confirms a fingerprint, `revoked_at` when the entry is invalidated.
-- **terminal_session** (`terminal_sessions`) — long-lived SSH session METADATA only. The live `russh::Channel`, replay ring buffer, libghostty-vt parser state, and PTY descriptors are owned by the orchestrator at runtime and are NEVER persisted. `cols`/`rows` are the last requested PTY size — purely a hint for resume. Status is one of `starting`, `active`, `detached`, `closed`; `starting` is the placeholder set on `POST /api/v1/terminal-sessions` BEFORE a real PTY exists. `active` / `detached` are reserved for the future PTY-bearing slice.
+- **terminal_session** (`terminal_sessions`) — long-lived SSH session METADATA only. The live `russh::Channel`, replay ring buffer, libghostty-vt parser state, and PTY descriptors are owned by the orchestrator at runtime and are NEVER persisted. `cols`/`rows` are the last requested PTY size — purely a hint for resume. Status is one of `starting`, `active`, `detached`, `closed`; `starting` is the placeholder set on `POST /api/v1/terminal-sessions` BEFORE a real PTY exists. `active` is set when a live PTY runtime is bound; `detached` is set during the bounded `DETACHED_LIVE_PTY_TTL` reconnect window after the last client leaves.
 - **terminal_session_attachment** (`terminal_session_attachments`) — one row per historical client attachment. `last_seen_seq` records the last sequence number that attachment acknowledged before detaching, used for resume bookkeeping. The replay buffer itself stays in memory.
 - **session_event** (`session_events`) — append-only lifecycle log for a `terminal_session`: `created`, `attached`, `detached`, `reattached`, `resized`, `replay_started`, `replay_completed`, `closed`. NOT a per-output log.
 - **audit_event** (`audit_events`) — append-only security log: auth outcomes, key vault access, host-key mismatch, profile/identity mutations, session open/close. `actor_id` is nullable for pre-auth events.
@@ -345,26 +345,39 @@ A precise `live_pty_started` event variant (and matching migration to the `sessi
 
 The wire body for 4xx/5xx is always the static `code/message` envelope; peer banners, russh error text, SQL fragments, encrypted blobs, and PEM markers NEVER leak. Decrypted private-key bytes live only inside `SshPtyTarget` and the russh internal parse — both wipe on drop.
 
-#### Detach / close semantics for this slice (load-bearing)
+#### Detached-session TTL contract (load-bearing)
 
-The current live-PTY persistence policy is **conservative**: until a replay buffer + TTL/reaper for detached live sessions exists, RelayTerm MUST NOT leave a live SSH PTY running with zero attached clients. This rule is what keeps the slice safe to ship without a background sweep job — every PTY has a deterministic teardown owner.
+A live SSH PTY survives the **last** client detach for a bounded TTL window so a brief reconnect can pick up where it left off without losing the remote shell. The current policy:
+
+- **TTL duration**: `relayterm_terminal::DETACHED_LIVE_PTY_TTL = 30s`. Pinned in the manager crate; tests inject a sub-second value via `TerminalSessionManager::with_detach_ttl`. Any change goes through this constant — there is no per-session override on the wire.
+- **Scope**: in-memory only. The replay buffer, the TTL timer task, and the live `russh::Channel` all live in the orchestrator's runtime registry. Postgres holds the `terminal_sessions` row and the lifecycle event log; it does NOT hold any of the runtime state.
+- **Backend restart**: drops every detached session along with the rest of the runtime registry. A pre-restart `detached` row is operator-visible until it's explicitly closed via `POST /:id/close`. A restart is therefore equivalent to an immediate TTL expiry from the client's perspective.
+- **No durable terminal output**: PTY bytes are mirrored only into the in-memory replay buffer alongside the broadcast channel; nothing about TTL persistence puts any byte into Postgres.
 
 The orchestrator's [`TerminalSessionManager::detach_attachment`] is the single lifecycle entry point for any detach (explicit `Detach` frame or socket-drop cleanup tail). Its policy:
 
 1. Detach the attachment first — `detach_session` is COALESCE-on-`detached_at` so the first call wins on the row, the `detached` event fires exactly once, and the runtime entry is removed.
-2. **If this was the last attachment of a live PTY, also close the session.** The manager calls `close_session`, which transitions the row to `closed`, writes the `closed` event, and via `LiveRuntime`'s `Drop` aborts both the orchestrator's forwarder task and the SSH bridge's driver task.
-3. If the session has no live PTY (stub session, or PTY already torn down by the forwarder when the remote shell exited) the manager does NOT auto-close.
-4. If other attachments remain (multi-client read attach is future work, but the registry is shaped for it) the manager does NOT auto-close.
-5. If the detach observed `already_detached == true`, the manager does NOT auto-close — that's the path that runs when an explicit `Detach` frame and the WebSocket cleanup tail both fire. `close_session` is itself idempotent, but the early skip guarantees a single `Closed` event under the race.
+2. **If this was the last attachment of a live PTY, schedule a TTL close**. The manager transitions the row to `detached`, spawns a `tokio::sleep(DETACHED_LIVE_PTY_TTL)` task that calls `close_session` on wake, and stores the `JoinHandle` on the live runtime so it can be aborted later. The PTY, the broadcast channel, and the replay buffer all stay alive.
+3. If the session has no live PTY (stub session, or PTY already torn down by the forwarder when the remote shell exited) the manager does NOT schedule a close — there's nothing live to reap.
+4. If other attachments remain (multi-client read attach is future work, but the registry is shaped for it) the manager does NOT schedule a close.
+5. If the detach observed `already_detached == true`, the manager does NOT install a second timer — that's the path that runs when an explicit `Detach` frame and the WebSocket cleanup tail both fire. The original deadline is preserved so the close doesn't drift forward on every cleanup-tail run.
+
+Reattach within the TTL window: [`TerminalSessionManager::attach_session`] cancels the pending close task BEFORE writing the new attachment row, transitions the row from `detached` back to `active`, and appends a `reattached` lifecycle event. The client sees the standard `SessionAttached(Active)` frame and can issue an `Attach { last_seen_seq: n }` to drive the replay handshake.
+
+TTL expiry: the spawned task wakes after `DETACHED_LIVE_PTY_TTL`, re-checks under lock that no reattach happened in the meantime (a reattach would have aborted the handle), and calls `close_session`. `close_session` is idempotent so a racing wake-up after an explicit close still produces exactly one `Closed` event.
 
 Wire-side behaviour:
 
-- Client `Detach` on the last attachment of a live session: server emits `SessionDetached`, then `SessionClosed`, then closes the WebSocket. The client's state machine MUST treat this sequence as terminal — neither `Detach` nor `Close` will produce any further frames.
-- Client `Close`: server emits `SessionClosed`, closes the WebSocket. Idempotent at the route layer (`POST /:id/close` returns `already_closed = true` on a second call) and at the manager.
-- Socket drop without an explicit `Detach`/`Close`: the cleanup tail fires `detach_attachment`, which writes the `detached` event AND auto-closes if this was the last live attachment. A reattach to the auto-closed session id returns `409 conflict { entity: "terminal_session" }` from the upgrade gate.
-- Race coverage: explicit `Detach` followed by socket-drop cleanup tail writes exactly one `Detached` and exactly one `Closed` event. Duplicate calls to `close_session` from any source still write exactly one `Closed` event.
+- Client `Detach`: server emits `SessionDetached`, then closes the WebSocket. **No** `SessionClosed` is sent — the session enters the TTL window. The client SHOULD expose a "reconnect with `last_seen_seq`" affordance for the duration of the window.
+- Client `Close`: server emits `SessionClosed`, closes the WebSocket, and cancels any pending TTL task. Idempotent at the route layer (`POST /:id/close` returns `already_closed = true` on a second call) and at the manager.
+- Socket drop without an explicit `Detach`/`Close`: the cleanup tail fires `detach_attachment`, which writes the `detached` event AND schedules the TTL close if this was the last live attachment. The PTY survives the bounded reconnect window.
+- Reattach during the TTL window: the WebSocket upgrade succeeds, `SessionAttached { status: Active }` lands, and the row transitions back to `active` with a `reattached` event.
+- Reattach AFTER the TTL window: the upgrade gate sees a `closed` row and returns `409 conflict { entity: "terminal_session" }`.
+- Race coverage: explicit `Detach` followed by socket-drop cleanup tail writes exactly one `Detached` event and installs exactly one TTL timer. Duplicate calls to `close_session` from any source (explicit close + late TTL wake) still write exactly one `Closed` event.
 
-Future work (still explicit out-of-scope): a replay ring buffer + sequence-number-based resume, plus a TTL/reaper that lets a detached live PTY linger for a bounded window, will replace this conservative policy with the SPEC's original "detached PTY survives until inactivity timeout" contract. The ring buffer is the load-bearing precondition — without it, a reconnecting client cannot pick up where it left off.
+Replay interaction during reconnect: the in-memory replay buffer is held inside the live runtime entry — it survives the detach alongside the PTY for the TTL window. A reattach with a bookmark inside the buffer's window receives the standard `replay_start` → buffered `output` → `replay_end` handshake. A bookmark older than the buffer's oldest retained frame surfaces `replay_window_lost` and the handler continues live attach. The replay window is identical to the TTL: lose the PTY, lose the buffer.
+
+Future-VT-snapshot relationship: when the libghostty-vt observer slice lands, the snapshot will become an additional resume surface for clients that want a structured grid (e.g. for fast-forward), but the byte-replay contract above is the load-bearing one for renderer-neutral catch-up. The TTL window is the same for both — the snapshot lives inside the same live runtime entry.
 
 #### Logging and reflection prohibitions (re-affirmed)
 
@@ -407,8 +420,8 @@ After the live SSH PTY bridge slice, every PTY output frame the orchestrator for
 **Scope (load-bearing — this slice).** A client that supplies `last_seen_seq` on its `Attach` frame and whose bookmark is still inside the buffer's window WILL receive every missed `output` frame, in order, before live fanout resumes. It does **NOT** mean:
 
 - Replay survives a backend restart. The buffer is process memory only; a restart drops it and any reconnect after restart that supplies a `last_seen_seq` will surface as `replay_window_lost`.
-- Replay survives a session close. The bounded buffer is held inside the live runtime entry; closing the session (explicit `Close`, last-attachment auto-close, or PTY teardown) drops it alongside the runtime.
-- The PTY survives the last detach long enough to make replay across "leave the page, come back later" useful. The conservative detach policy from the live bridge slice still applies — the PTY closes when the last attachment leaves. Replay is most useful for **short** disconnects (network blip, tab focus jitter, race between explicit detach and reattach by another tab) and as the wire foundation for the future TTL/reaper slice.
+- Replay survives a session close. The bounded buffer is held inside the live runtime entry; closing the session (explicit `Close`, TTL expiry on the detached-session window, or PTY teardown) drops it alongside the runtime.
+- The PTY survives "leave the page, come back hours later" intervals. The detached-session TTL slice gives the PTY a bounded **`DETACHED_LIVE_PTY_TTL = 30s`** window after the last detach (see "Detached-session TTL contract"); reconnect within that window resumes via the in-memory replay buffer, reconnect after it produces a `409` from the upgrade gate. Long-running tmux/screen-style persistence is still future work — the TTL is sized for short disconnects (network blip, tab focus jitter, race between explicit detach and reattach by another tab).
 - Multi-writer / collaborative replay semantics. Today only one WS attachment per session is exercised; the buffer is shaped for future fan-in but not promised.
 
 #### Sequence number contract
@@ -421,7 +434,7 @@ After the live SSH PTY bridge slice, every PTY output frame the orchestrator for
 #### Replay buffer policy
 
 - **Bounds**: default cap is `1024` frames OR `1 MiB` of payload bytes, whichever bound is hit first. Eviction is FIFO from the front after every push. The single most recent frame is always retained even when it overshoots `max_bytes` — dropping it would leave nothing to replay.
-- **Storage**: in-process memory only, behind a `Mutex<ReplayBuffer>` shared with the WS handler. The buffer is created when the live PTY runtime is bound and dropped when the runtime is dropped (`close_session`, last-attachment auto-close, or forwarder exit).
+- **Storage**: in-process memory only, behind a `Mutex<ReplayBuffer>` shared with the WS handler. The buffer is created when the live PTY runtime is bound and dropped when the runtime is dropped (`close_session`, detached-TTL expiry, or forwarder exit).
 - **Privacy invariants** (re-asserted): the buffer stores raw PTY bytes; `Debug` redacts payload bytes to `seq + len` only; the buffer is NEVER mirrored to Postgres, disk, or any log surface; `tracing` macros that format an `OutputFrame` cannot leak the bytes.
 - **Input is never buffered**: only PTY OUTPUT frames are written to the buffer. Client `Input` bytes flow straight to the SSH PTY and are never echoed via the broadcast or the buffer.
 
@@ -464,7 +477,7 @@ The WebSocket route already attaches the session on upgrade (writes the attachme
 
 #### Future work (explicit out-of-scope for this slice)
 
-Backend VT observer / `libghostty-vt` snapshot engine (the future replacement for the byte-level replay buffer when a renderer needs structured grid state); durable session recording in Postgres; binary `output` frame format; multi-writer collaborative replay; long-lived detached PTY TTL / reaper that lets replay span "leave the page, come back later" intervals; full mobile/Tauri reconnect UX; renderer-driven replay visualisation (e.g. fast-forward of a long replay buffer).
+Backend VT observer / `libghostty-vt` snapshot engine (the future replacement for the byte-level replay buffer when a renderer needs structured grid state); durable session recording in Postgres; binary `output` frame format; multi-writer collaborative replay; long-running tmux/screen-style detached-PTY persistence beyond the bounded `DETACHED_LIVE_PTY_TTL`; full mobile/Tauri reconnect UX; renderer-driven replay visualisation (e.g. fast-forward of a long replay buffer).
 
 ### Authenticated SSH credential check contract
 
@@ -501,7 +514,7 @@ It does **NOT** mean a PTY can be allocated, a shell can be spawned, a command c
 
 - **Reconnect replay**: when a client reconnects with `(session_id, last_seen_seq)`, the backend MUST send all events with `seq > last_seen_seq` from the ring buffer in order, then resume live streaming. If `last_seen_seq` is older than the ring buffer's tail, the backend returns a `replay_window_lost` error and the client must request a full re-render or close the session. **Status (this slice):** the in-memory replay buffer is in place and the wire path is live. See "Output sequence + in-memory replay buffer contract" for the per-frame contract, the bounded buffer policy, and the explicit non-durability guarantees.
 - **Renderer swap**: the user MAY change the active renderer for a session at any time. The new renderer subscribes from the current sequence number; no replay is required.
-- **Session lifecycle**: a session enters `detached` immediately on client drop, NOT after a timeout. A `detached` session continues to receive PTY output and append to the ring buffer until `inactivity_timeout` or explicit close. Audit log records every state transition.
+- **Session lifecycle**: a session enters `detached` immediately on client drop, NOT after a timeout. A `detached` session continues to receive PTY output and append to the ring buffer until the `DETACHED_LIVE_PTY_TTL` window expires or an explicit close arrives. Reconnect inside the window resumes via `last_seen_seq`. Audit log records every state transition. See "Detached-session TTL contract" for the full policy.
 - **Host-key change**: on `check_server_key` mismatch, the backend rejects the connection, logs an `audit_event`, and surfaces the mismatch to the user; it does NOT silently update the known_hosts entry. The preflight + trust-host-key endpoints (see "SSH preflight + known-host trust contract") implement this for the pre-session probe; the same rule applies to live sessions once they land.
 - **Key vault access**: the encrypted private key is decrypted only inside the SSH session task. Decrypted bytes never cross a boundary (no log, no IPC payload, no DB write).
 
@@ -529,7 +542,7 @@ TODO — explicit list of features deferred so the agent doesn't "helpfully" imp
 TODO — known ambiguities for the owner to resolve. Each: question, options considered, current default if any.
 
 - Replay buffer policy: fixed bytes vs fixed events vs time-window? Default: TODO.
-- How long does a `detached` session linger before auto-close? Default: TODO.
+- How long does a `detached` session linger before auto-close? **Default**: `relayterm_terminal::DETACHED_LIVE_PTY_TTL = 30s`. In-memory only (lost on backend restart). See "Detached-session TTL contract" for the full lifecycle.
 - Should the renderer choice be per-session or per-device? Default: per-device.
 
 ---
