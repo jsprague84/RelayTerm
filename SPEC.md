@@ -275,7 +275,7 @@ ghostty-web / restty / wterm renderer adapters; real PTY byte streaming through 
 
 #### Diagnostic UI
 
-`apps/web/src/lib/dev/XtermRendererLab.svelte` is a developer-only lab that mounts `XtermRenderer` against a real backend WebSocket. It (a) shows a static local banner explaining PTY streaming is not implemented, (b) routes renderer keystrokes through `TerminalSessionClient.sendInput` so the existing `pty_not_implemented` rejection surfaces in the event log as the expected response, and (c) follows the same redaction rule as the protocol lab — the log shows byte length only, never the input payload. Both labs gate on `import.meta.env.DEV`; the production bundle drops the JS via Rollup tree-shaking (verified empirically — JS bundle is ~28KB without the lab vs. ~322KB with it eagerly included before the `sideEffects` marker landed).
+The dev-only live-terminal lab — `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` — is the manual exercise surface for the renderer adapter; see "Live SSH PTY bridge contract → Diagnostic UI" below for its contract. The xterm baseline renderer adapter has no separate dev lab — the protocol-only `TerminalProtocolLab` covers the renderer-less wire path, and the live-terminal lab covers the renderer-bridged path. Both labs gate on `import.meta.env.DEV`; the production bundle drops the JS via Rollup tree-shaking (JS bundle is ~28KB without the labs vs. ~322KB with the renderer eagerly included before the `sideEffects` marker landed).
 
 #### Future work (explicit out-of-scope for this slice)
 
@@ -368,6 +368,18 @@ Future work (still explicit out-of-scope): a replay ring buffer + sequence-numbe
 - Raw `input` payloads MUST NEVER appear in logs, panic messages, error responses, or any server-emitted frame. Both the protocol's `Debug` impl and the SSH bridge's `Debug` impl mask these bytes at the type level.
 - Raw `output` PTY bytes MUST NEVER appear in logs at any level. The bridge → orchestrator → fanout path forwards `Vec<u8>` end-to-end with no `Debug`/`Display` rendering of the payload.
 - `error` frames carry only the typed wire-stable `code` plus a short, static, public `message`.
+
+#### Diagnostic UI
+
+`apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` is the dev-only end-to-end lab for a live SSH PTY session. It is NOT the production terminal UI — it exists to manually exercise the data path so the production UI slice can build on a validated seam. Contracts:
+
+- Gated behind `import.meta.env.DEV`. The production bundle drops the JS branch via Vite dead-code elimination; only the xterm.css side-effect (~3KB) lands in the prod CSS bundle as the documented compromise.
+- Renderer-neutral: the lab consumes `XtermRenderer` only through the `TerminalRenderer` adapter from `@relayterm/terminal-xterm`. No file under `apps/web/` imports `@xterm/xterm` directly.
+- Output decode is centralised in `@relayterm/terminal-core` via `decodeOutputData`; the lab wraps it with `safeDecodeOutput` so a malformed base64 payload collapses to a typed log line WITHOUT echoing the payload. Tests in `apps/web/tests/labLog.test.ts` and `packages/terminal-core/tests/protocol.test.ts` pin the rule.
+- Input redaction: the diagnostic event log NEVER carries raw input bytes. The log line is `input sent <redacted>, bytes=N`, where `N` is the UTF-8 byte length computed via `inputByteLength` (matching what the wire frame would carry — JS string `.length` would disagree on non-ASCII). The redaction helper's signature deliberately does not accept the payload at all.
+- Output redaction: the log line for an inbound `output` frame is `output seq=S, bytes=N` only — the rendered bytes go to the terminal grid (that is the whole point), but the diagnostic log never carries them.
+- Cell-grid validation: cols/rows are clamped to `1..=4096` client-side via `validateCellGrid` before any resize frame is sent; the backend's `invalid_input` rejection is a defense-in-depth.
+- Resize is driven through the renderer: a manual "apply resize" button calls `renderer.resize(cols, rows)`, xterm fires `onResize` synchronously, and the subscriber is the single place that calls `client.sendResize` — no duplicate wire frames.
 
 #### Future work (explicit out-of-scope for this slice)
 

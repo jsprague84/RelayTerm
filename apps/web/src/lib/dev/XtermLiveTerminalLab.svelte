@@ -1,19 +1,28 @@
 <script lang="ts">
   /**
-   * Dev-only lab for the @relayterm/terminal-xterm baseline renderer.
+   * Dev-only lab for exercising a live SSH PTY through the
+   * `@relayterm/terminal-core` client and `@relayterm/terminal-xterm`
+   * renderer. This is NOT the production terminal UI; it exists to prove
+   * the live-PTY data path renders end-to-end so the production UI slice
+   * can be built on top without re-validating the seam.
    *
-   * This is NOT the production terminal UI. It exists to prove the
-   * `TerminalRenderer` interface in `terminal-core` can drive xterm.js
-   * end-to-end — keystrokes flow renderer → core client → backend, and
-   * any backend-supplied `output` bytes flow back into the renderer
-   * via `write`. Everything is scoped behind `import.meta.env.DEV`;
-   * the production bundle drops this file via dead-code elimination.
+   * Gated behind `import.meta.env.DEV`. The production bundle's dead-code
+   * elimination drops the JS branch (terminal-xterm's `sideEffects` field
+   * tree-shakes xterm itself away); the css side-effect import is the
+   * documented compromise — see App.svelte.
    *
-   * Backend PTY streaming is not implemented yet, so the renderer is
-   * primed with a local banner. Inputs reach the backend and come back
-   * as the existing `pty_not_implemented` rejection event — the lab
-   * surfaces that explicitly so nobody mistakes this slice for a live
-   * SSH terminal.
+   * Contracts re-asserted in this file:
+   *  - Renderer-neutral: the lab only touches `XtermRenderer` through the
+   *    `TerminalRenderer` adapter package. No `@xterm/xterm` import here.
+   *  - Output decode is centralised in `@relayterm/terminal-core` via the
+   *    `decodeOutputData` helper, wrapped here by `safeDecodeOutput` so a
+   *    malformed frame collapses to a typed log line, never an exception.
+   *  - Input/output redaction: the diagnostic log NEVER carries raw input
+   *    bytes (renderer-driven keystrokes) or raw output bytes (PTY frames).
+   *    Length is the only payload-correlated value the log records. The
+   *    redaction rule is enforced both here and inside the renderer
+   *    adapter, and pinned by tests in `apps/web/tests/labLog.test.ts`
+   *    and `packages/terminal-xterm/tests/xtermRenderer.test.ts`.
    */
   import { onDestroy } from "svelte";
   import {
@@ -25,6 +34,15 @@
   } from "@relayterm/terminal-core";
   import { XtermRenderer } from "@relayterm/terminal-xterm";
   import "@relayterm/terminal-xterm/styles";
+  import {
+    CELL_GRID_MAX,
+    CELL_GRID_MIN,
+    inputByteLength,
+    outputLogText,
+    redactInputLogText,
+    safeDecodeOutput,
+    validateCellGrid,
+  } from "./labLog";
 
   interface LogLine {
     id: number;
@@ -44,25 +62,16 @@
   let unsubResize: (() => void) | null = null;
   let mountTarget: HTMLDivElement | null = null;
 
-  const BANNER =
-    "RelayTerm xterm baseline attached. PTY streaming is not implemented yet.\r\n" +
-    "Keystrokes here are sent over the protocol but the backend currently rejects them with pty_not_implemented.\r\n";
-
   function append(direction: LogLine["direction"], text: string) {
     log = [...log.slice(-199), { id: nextId++, direction, text }];
   }
 
-  function describeServerMsg(msg: ServerMsg): string {
+  function describeNonOutputServerMsg(msg: Exclude<ServerMsg, { type: "output" }>): string {
     switch (msg.type) {
       case "session_attached":
         return `session_attached (${msg.status}): ${msg.message}`;
       case "ack":
         return `ack ${msg.kind}`;
-      case "output":
-        // Reserved for the future PTY slice. We do NOT format `data`
-        // into the diagnostic log to avoid rendering escape sequences
-        // into HTML; the renderer is the only consumer of those bytes.
-        return `output seq=${msg.seq} (${msg.data.length} bytes)`;
       case "session_detached":
         return `session_detached attachment=${msg.attachment_id}`;
       case "session_closed":
@@ -102,6 +111,11 @@
       append("error", "renderer mount point not yet available");
       return;
     }
+    const initial = validateCellGrid(cols, rows);
+    if (!initial.ok) {
+      append("error", `initial cols/rows invalid: ${initial.reason}`);
+      return;
+    }
 
     const r = new XtermRenderer({
       fontFamily:
@@ -117,7 +131,6 @@
       },
     });
     r.mount(mountTarget);
-    r.write(BANNER);
     r.focus();
     renderer = r;
 
@@ -128,55 +141,69 @@
       append("info", `state → ${s}`);
     });
     next.on("attached", (m) => {
-      append("in", describeServerMsg(m));
-      // Send the renderer's current cell-grid to the backend so the
-      // server-side resize bookkeeping matches what the client sees.
-      // We drive `renderer.resize` only — xterm fires `onResize`
-      // synchronously inside `Terminal.resize`, and the subscriber
-      // below is the single place that calls `client.sendResize`.
-      // Calling `client.sendResize` directly from here would emit a
-      // duplicate frame.
+      append("in", describeNonOutputServerMsg(m));
+      // Drive the renderer to the user-supplied cell grid; xterm fires
+      // `onResize` synchronously inside `Terminal.resize`, and the
+      // subscriber wired below is the single place that calls
+      // `client.sendResize`. Calling `client.sendResize` directly here
+      // would emit a duplicate frame.
       r.resize(cols, rows);
     });
-    next.on("detached", (m) => append("in", describeServerMsg(m)));
-    next.on("closed", (m) => append("in", describeServerMsg(m)));
-    next.on("ack", (m) => append("in", describeServerMsg(m)));
-    next.on("pong", (m) => append("in", describeServerMsg(m)));
+    next.on("detached", (m) => append("in", describeNonOutputServerMsg(m)));
+    next.on("closed", (m) => append("in", describeNonOutputServerMsg(m)));
+    next.on("ack", (m) => append("in", describeNonOutputServerMsg(m)));
+    next.on("pong", (m) => append("in", describeNonOutputServerMsg(m)));
     next.on("output", (m) => {
-      append("in", describeServerMsg(m));
-      // Pipe backend bytes into the renderer once a PTY actually fires.
-      // Today this is unreachable — the backend doesn't emit `output`
-      // — but wiring it up means the future slice doesn't need to
-      // touch this file.
-      r.write(m.data);
+      // Decode base64 → bytes via the centralised helper. A decode
+      // failure must never echo the offending payload — the lab logs a
+      // static error line and drops the frame so a malformed peer can't
+      // crash the renderer.
+      const decoded = safeDecodeOutput(m.data);
+      if (!decoded.ok) {
+        append(
+          "error",
+          `output seq=${m.seq} discarded: ${decoded.reason}`,
+        );
+        return;
+      }
+      append("in", outputLogText(m.seq, decoded.bytes.byteLength));
+      r.write(decoded.bytes);
     });
-    next.on("replay_window_lost", (m) => append("in", describeServerMsg(m)));
+    next.on("replay_window_lost", (m) =>
+      append("in", describeNonOutputServerMsg(m)),
+    );
     next.on("input_rejected_or_stubbed", (rej) =>
       append("info", `${rej.attempted} rejected: ${rej.reason}`),
     );
     next.on("error", (e) => append("error", describeError(e)));
 
-    // Renderer → client. We log only the byte length, never the input
-    // payload — the redaction rule is enforced inside the adapter and
-    // the lab follows it too.
+    // Renderer → client. Length is computed off the payload before we
+    // hand it to `sendInput`; the redacted log line never sees the
+    // bytes themselves. Strings are reported as their UTF-8 byte count
+    // (matching what the wire frame would carry); a future binary
+    // payload would arrive as `Uint8Array` and the length is its
+    // `byteLength`.
     unsubInput = r.onInput((data) => {
-      const len = typeof data === "string" ? data.length : data.byteLength;
-      append("out", `input (${len} bytes)`);
-      next.sendInput(typeof data === "string" ? data : new TextDecoder().decode(data));
+      const bytes = inputByteLength(data);
+      append("out", redactInputLogText(bytes));
+      next.sendInput(
+        typeof data === "string" ? data : new TextDecoder().decode(data),
+      );
     });
-    unsubResize = r.onResize?.((size) => {
-      cols = size.cols;
-      rows = size.rows;
-      next.sendResize(size.cols, size.rows);
-      append("out", `renderer resize cols=${size.cols} rows=${size.rows}`);
-    }) ?? null;
+    unsubResize =
+      r.onResize?.((size) => {
+        cols = size.cols;
+        rows = size.rows;
+        next.sendResize(size.cols, size.rows);
+        append("out", `renderer resize cols=${size.cols} rows=${size.rows}`);
+      }) ?? null;
 
     client = next;
     try {
       await next.attach({
         url: buildWsUrl(sessionId.trim()),
         sessionId: sessionId.trim(),
-        clientId: "xterm-renderer-lab",
+        clientId: "xterm-live-terminal-lab",
       });
       append("out", "attach frame sent");
     } catch (err) {
@@ -211,11 +238,16 @@
   }
 
   function applyResize() {
+    const v = validateCellGrid(cols, rows);
+    if (!v.ok) {
+      append("error", `resize refused: ${v.reason}`);
+      return;
+    }
     // Renderer resize fires xterm's `onResize` synchronously, which the
     // subscriber translates into `client.sendResize`. We don't fire
     // `client.sendResize` here too — that would double the wire frame.
-    // If the renderer isn't mounted yet (no client either), there is
-    // nothing to send.
+    // If the renderer isn't mounted (no client either) there is nothing
+    // to send; the resize button stays disabled in that state.
     renderer?.resize(cols, rows);
     append("out", `manual resize cols=${cols} rows=${rows}`);
   }
@@ -239,18 +271,22 @@
   });
 </script>
 
-<section class="rounded-md border border-zinc-800 p-4 text-sm">
+<section class="rounded-md border border-amber-700/60 bg-amber-950/30 p-4 text-sm">
   <header class="flex items-baseline justify-between">
-    <h2 class="text-base font-semibold">Xterm Renderer Lab</h2>
-    <span class="font-mono text-xs text-zinc-400">
-      diagnostic — baseline renderer
+    <h2 class="text-base font-semibold text-amber-200">
+      Xterm Live Terminal Lab
+    </h2>
+    <span class="font-mono text-xs text-amber-400">
+      dev-only diagnostic — not the product UI
     </span>
   </header>
-  <p class="mt-1 text-xs text-zinc-400">
-    Mounts <code>@relayterm/terminal-xterm</code> behind the
-    <code>TerminalRenderer</code> interface. Backend PTY streaming is not
-    implemented; keystrokes route through the protocol and surface as
-    <code>pty_not_implemented</code>.
+  <p class="mt-1 text-xs text-amber-200/80">
+    Wires <code>@relayterm/terminal-xterm</code> through
+    <code>TerminalSessionClient</code> against a live
+    <code>/api/v1/terminal-sessions/:id/ws</code>. Create a session via the
+    API first; this lab attaches to an existing id. Output is decoded via
+    <code>decodeOutputData</code> from the protocol core; the event log
+    redacts both input and output payloads (length only).
   </p>
 
   <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
@@ -264,21 +300,21 @@
       />
     </label>
     <label class="flex flex-col gap-1">
-      <span class="text-xs text-zinc-400">cols</span>
+      <span class="text-xs text-zinc-400">cols ({CELL_GRID_MIN}–{CELL_GRID_MAX})</span>
       <input
         type="number"
-        min="1"
-        max="4096"
+        min={CELL_GRID_MIN}
+        max={CELL_GRID_MAX}
         class="rounded-sm border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono"
         bind:value={cols}
       />
     </label>
     <label class="flex flex-col gap-1">
-      <span class="text-xs text-zinc-400">rows</span>
+      <span class="text-xs text-zinc-400">rows ({CELL_GRID_MIN}–{CELL_GRID_MAX})</span>
       <input
         type="number"
-        min="1"
-        max="4096"
+        min={CELL_GRID_MIN}
+        max={CELL_GRID_MAX}
         class="rounded-sm border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono"
         bind:value={rows}
       />
@@ -328,8 +364,9 @@
     </button>
     <button
       type="button"
-      class="rounded-sm bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
+      class="rounded-sm bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700 disabled:opacity-50"
       onclick={disconnect}
+      disabled={clientState === "idle"}
     >
       dispose renderer + client
     </button>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import TerminalProtocolLab from "./lib/dev/TerminalProtocolLab.svelte";
-  import XtermRendererLab from "./lib/dev/XtermRendererLab.svelte";
+  import XtermLiveTerminalLab from "./lib/dev/XtermLiveTerminalLab.svelte";
 
   // `import.meta.env.DEV` is statically `true` under `vite dev` / vitest
   // and statically `false` for `vite build` (see vite.config.ts). Vite
@@ -51,7 +51,7 @@
 
   {#if isDev}
     <TerminalProtocolLab />
-    <XtermRendererLab />
+    <XtermLiveTerminalLab />
   {:else}
     <section class="rounded-md border border-zinc-800 p-4 text-sm">
       <h2 class="text-base font-semibold">Terminal</h2>

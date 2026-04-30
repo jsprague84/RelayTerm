@@ -173,4 +173,13 @@ describe("output data codec", () => {
     const expected = new TextEncoder().encode("hello world");
     expect(decoded).toEqual(expected);
   });
+
+  it("throws on malformed base64 input (caller must catch)", () => {
+    // The browser `atob` throws `DOMException("InvalidCharacterError")`
+    // on a non-base64 input; Node's `atob` throws a plain `Error`.
+    // Either way the call must throw — callers (e.g. the live-terminal
+    // lab's `safeDecodeOutput`) wrap this in a try/catch and surface a
+    // typed failure WITHOUT echoing the offending payload.
+    expect(() => decodeOutputData("!!!definitely-not-base64!!!")).toThrow();
+  });
 });
