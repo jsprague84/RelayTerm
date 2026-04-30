@@ -16,6 +16,9 @@ importers:
       '@relayterm/terminal-ghostty-web':
         specifier: workspace:*
         version: link:../../packages/terminal-ghostty-web
+      '@relayterm/terminal-restty':
+        specifier: workspace:*
+        version: link:../../packages/terminal-restty
       '@relayterm/terminal-xterm':
         specifier: workspace:*
         version: link:../../packages/terminal-xterm
@@ -65,6 +68,22 @@ importers:
       ghostty-web:
         specifier: 0.4.0
         version: 0.4.0
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(jiti@2.6.1)(lightningcss@1.32.0)
+
+  packages/terminal-restty:
+    dependencies:
+      '@relayterm/terminal-core':
+        specifier: workspace:*
+        version: link:../terminal-core
+      restty:
+        specifier: 0.1.35
+        version: 0.1.35(typescript@5.9.3)
     devDependencies:
       typescript:
         specifier: ^5.7.0
@@ -819,6 +838,10 @@ packages:
     resolution: {integrity: sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg==}
     engines: {node: '>= 14.18.0'}
 
+  restty@0.1.35:
+    resolution: {integrity: sha512-IUr4NsdYCTErKBxuAd0eu/KdiGZhADBxA0ddSPEEIxAz8np3RT1bLiL9iIH+wglmUeSmHRmJzkPN7hGJJ+E/Yw==}
+    engines: {bun: '>=1.2.0'}
+
   rollup@4.60.2:
     resolution: {integrity: sha512-J9qZyW++QK/09NyN/zeO0dG/1GdGfyp9lV8ajHnRVLfo/uFsbji5mHnDgn/qYdUHyCkM2N+8VyspgZclfAh0eQ==}
     engines: {node: '>=18.0.0', npm: '>=8.0.0'}
@@ -862,6 +885,11 @@ packages:
   tapable@2.3.3:
     resolution: {integrity: sha512-uxc/zpqFg6x7C8vOE7lh6Lbda8eEL9zmVm/PLeTPBRhh1xCgdWaQ+J1CUieGpIfm2HdtsUpRv+HshiasBMcc6A==}
     engines: {node: '>=6'}
+
+  text-shaper@0.1.22:
+    resolution: {integrity: sha512-OYxqPcNEox3tlXilxZVPNub8EU/A6Lxy9vlCAe362fiGI9f3pMav497wL7cecX0CPq1yVtiBn/lii/ZZUUk9bQ==}
+    peerDependencies:
+      typescript: ^5
 
   tinybench@2.9.0:
     resolution: {integrity: sha512-0+DUvqWMValLmha6lr4kD8iAMK1HzV0/aKnCtWb9v9641TnP/MFb7Pc2bxoxQjTXAErryXVgUOfv2YqNllqGeg==}
@@ -1493,6 +1521,12 @@ snapshots:
 
   readdirp@4.1.2: {}
 
+  restty@0.1.35(typescript@5.9.3):
+    dependencies:
+      text-shaper: 0.1.22(typescript@5.9.3)
+    transitivePeerDependencies:
+      - typescript
+
   rollup@4.60.2:
     dependencies:
       '@types/estree': 1.0.8
@@ -1576,6 +1610,10 @@ snapshots:
   tailwindcss@4.2.4: {}
 
   tapable@2.3.3: {}
+
+  text-shaper@0.1.22(typescript@5.9.3):
+    dependencies:
+      typescript: 5.9.3
 
   tinybench@2.9.0: {}
 

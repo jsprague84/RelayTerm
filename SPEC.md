@@ -362,7 +362,59 @@ The production `apps/web` build (`pnpm -r build`) emits a ~28 KB JS bundle. The 
 
 #### Future work (explicit out-of-scope for this slice)
 
-Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; restty and wterm renderer adapters; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real ghostty-web WASM runtime. Each is a separate, deliberate slice.
+Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; wterm renderer adapter; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real ghostty-web WASM runtime. Each is a separate, deliberate slice.
+
+### restty experimental renderer adapter
+
+`@relayterm/terminal-restty` is the third concrete `TerminalRenderer` implementation. It is **experimental** — xterm.js remains the compatibility baseline; `@relayterm/terminal-ghostty-web` remains the libghostty-vt-via-WASM experiment; this adapter wraps `restty` (npm `restty@0.1.x`), a more ambitious modern renderer powered by libghostty-vt (WASM), WebGPU/WebGL2, and TypeScript text shaping. Landing this adapter proves a substantively different renderer experiment can drop in behind the renderer-neutral seam without backend protocol or `terminal-core` changes.
+
+**Scope (load-bearing — this slice).** A successful integration attests ONLY to:
+
+1. The same `TerminalRenderer` interface from `@relayterm/terminal-core` (`mount` / `write` / `focus` / `resize` / `dispose` / `onInput` / `onResize`) bridges restty's `restty/xterm` compatibility shim bidirectionally.
+2. `apps/web`'s dev-only live terminal lab can switch between xterm baseline (default), ghostty-web experimental, and restty experimental at runtime; switching disposes the previous renderer and remounts the new one without tearing down the wire protocol.
+3. The backend protocol, the session client, and `terminal-core` remain unchanged and renderer-neutral.
+
+It does **NOT** yet:
+
+- Replace xterm as the production renderer. The production terminal UI is still not built; the dev lab is the only consumer.
+- Persist a per-renderer preference. The lab defaults to xterm on every page load.
+- Validate restty behavior in jsdom. Vitest exercises the adapter against a mocked `restty/xterm` module — the real WASM/WebGPU runtime is verified only in a browser dev session. The mock pins option mapping, the pre-mount write queue, idempotent dispose, the dispose-during-pending-mount cancellation path, the UTF-8 decode of `Uint8Array` writes, and the input-redaction rule.
+- Honor restty's native pane / plugin / shader-stage surface. The adapter binds to the focused `restty/xterm` compatibility shim, not the full `Restty` class. Promoting any of those surfaces is future work.
+
+#### Package layout
+
+`packages/terminal-restty/` is a workspace package alongside `terminal-core`, `terminal-xterm`, and `terminal-ghostty-web`. Keys:
+
+- `src/ResttyRenderer.ts` — the only file in the repo that imports from `restty`. Implements `TerminalRenderer`. Binds against `restty/xterm`'s `Terminal` class for shape-parity with the existing adapters; restty's WASM/WebGPU runtime initializes lazily inside the underlying `Restty` instance the first time `Terminal.open` is called. `mount` is `async` for parity with the ghostty-web adapter and to give restty room to grow into a future async init step without changing the adapter contract.
+- `src/options.ts` — renderer-neutral `ResttyRendererOptions` mirroring `XtermRendererOptions` and `GhosttyWebRendererOptions` (`fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`, `theme`). The `restty/xterm` shim does not interpret these cosmetic knobs (the underlying `Restty` exposes `setFontSize` / `setLigatures` / `applyTheme` etc. as native APIs); the adapter accepts them on the neutral surface for cross-adapter shape-parity and silently drops them during the option mapping. Honoring them via `Restty`'s native APIs is future work. A `resttyOnly` escape hatch passes raw restty-compat option keys through and is documented as **non-portable**. An optional `cols` / `rows` initial cell grid is accepted on the constructor and forwarded into the restty `Terminal`.
+- `package.json` declares `"sideEffects": false`. restty ships a sizeable WASM/WebGPU payload (~3 MB JS plus an inlined WASM binary); combined with the `sideEffects: false` marker the production `apps/web` bundle tree-shakes both restty and this adapter when the dev lab is dead-code-eliminated. Caveat: restty 0.1.x itself does not declare `sideEffects` in its `package.json`, so if a future code change made the adapter reachable from a non-dev path the WASM payload would land in the prod JS bundle.
+
+#### Adapter contract
+
+- `ResttyRenderer` is the **only** `restty` consumer in the repo. `terminal-core` does not depend on `restty`. `terminal-xterm` and `terminal-ghostty-web` do not depend on `restty`. `apps/web` depends on `@relayterm/terminal-restty` (workspace) — never directly on `restty`.
+- Constructor takes `ResttyRendererCtorOptions` (the neutral options plus optional `cols` / `rows`); the underlying restty `Terminal` instance is private.
+- `mount` is `async`. Calling it more than once on a live renderer rejects with `already mounted`. Calling it after `dispose` rejects with `cannot mount after dispose`. A synchronous `dispose()` issued **during** the awaited microtask cancels the open silently — no `Terminal` is constructed and no DOM is touched after disposal.
+- `write` accepts `string | Uint8Array`. `restty/xterm`'s `Terminal.write(data: string)` accepts strings only; the adapter UTF-8-decodes `Uint8Array` payloads with replacement-on-error before forwarding. UTF-8 is the correct decoding for SSH PTY output; a future binary frame format is out of scope here. `write` before `mount` queues; the queue is flushed on `mount` resolution. `write` after `dispose` is a silent no-op.
+- `dispose` is synchronous and idempotent. It tears down the underlying `Restty` instance via `Terminal.dispose()` (canvas, IME input, render loop, pane manager), the `onData`/`onResize` subscriptions, the pre-mount write queue, and the listener sets. The restty WASM module itself stays loaded for the page.
+- A throwing user listener inside `onInput` is caught and dropped, identical to `XtermRenderer` and `GhosttyWebRenderer` — it MUST NOT interrupt sibling listeners or surface the input bytes through the error envelope. `tests/resttyRenderer.test.ts` pins the redaction rule with the same sentinel-string approach as the sibling adapters.
+
+#### Renderer-neutral rule (re-affirmed)
+
+- `terminal-core` still imports nothing from `restty` (or `@xterm/*` / `ghostty-web`).
+- `ResttyRendererOptions` is shape-compatible with `XtermRendererOptions` and `GhosttyWebRendererOptions` for the portable knobs, so an app can swap renderers by changing only the import. Renderer-only escape-hatch fields (`xtermOnly`, `ghosttyOnly`, `resttyOnly`) are explicitly NOT promised to behave the same across adapters. Cosmetic knobs (font, cursor, theme, scrollback) are accepted by `ResttyRendererOptions` for shape-parity but silently dropped during the mapping — see "Package layout."
+- The wire protocol stays RelayTerm-shaped. A live PTY's `Output` bytes hand identical payloads to all three renderers; `Input` flows back through the same `TerminalSessionClient`.
+
+#### Diagnostic UI
+
+The dev-only live terminal lab — `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` — exposes a `renderer:` radio group switching between xterm baseline (default), ghostty-web experimental, and restty experimental. Switching while attached tears down the current renderer and `TerminalSessionClient` and immediately reconnects with the new renderer; switching while idle records the choice for the next `connect()`. The event log records ONLY the renderer name on switch — no payload bytes. The redaction rules pinned by `apps/web/tests/labLog.test.ts`, `tests/xtermRenderer.test.ts`, `tests/ghosttyWebRenderer.test.ts`, and `tests/resttyRenderer.test.ts` continue to hold across renderer switches.
+
+#### Production bundle behavior
+
+The dev lab is gated behind `import.meta.env.DEV`, which Vite inlines as a constant; Rollup eliminates the dead branch, which makes the `apps/web` imports of `@relayterm/terminal-xterm`, `@relayterm/terminal-ghostty-web`, and `@relayterm/terminal-restty` unreachable. All three adapter packages declare `sideEffects: false` (xterm pins only `./src/styles.ts` and `**/*.css` as side-effectful), so Rollup drops the wrappers, which in turn drops the underlying libraries — xterm.js's parser/renderer, ghostty-web's WASM data URL, and restty's WASM/WebGPU payload. Only the xterm CSS side-effect import remains in the prod CSS bundle; ghostty-web and restty ship no CSS so their adapters contribute nothing to the styles bundle. Caveat: neither ghostty-web 0.4.0 nor restty 0.1.x declares `sideEffects` in its own `package.json`, so if a future code change made either adapter reachable from a non-dev path, the corresponding WASM payload would land in the prod JS bundle.
+
+#### Future work (explicit out-of-scope for this slice)
+
+Production terminal UI; persistent per-renderer preference; renderer benchmarking harness; wterm renderer adapter; mobile/Tauri shell integration of the experimental renderer; jsdom/headless-browser verification of the real restty WASM/WebGPU runtime; honoring the neutral cosmetic knobs (font, cursor, theme, scrollback) via `Restty`'s native APIs; restty pane / plugin / shader-stage surface integration. Each is a separate, deliberate slice.
 
 ### Live SSH PTY bridge contract
 
@@ -638,7 +690,7 @@ TODO — explicit list of features deferred so the agent doesn't "helpfully" imp
 - Multi-user shared sessions / "screen-share."
 - Public-cloud-hosted multi-tenant deployment (v1 is single-tenant Docker Compose).
 - iOS Tauri build (Android first; iOS later).
-- libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) has landed; ghostty-web / restty / wterm are future siblings under `packages/terminal-<name>/`.
+- libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) and the experimental ghostty-web (`@relayterm/terminal-ghostty-web`) and restty (`@relayterm/terminal-restty`) adapters have landed; wterm is a future sibling under `packages/terminal-<name>/`.
 
 ## Open questions
 

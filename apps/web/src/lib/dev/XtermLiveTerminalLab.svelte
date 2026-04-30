@@ -3,25 +3,28 @@
    * Dev-only lab for exercising a live SSH PTY through the
    * `@relayterm/terminal-core` client against any renderer adapter that
    * implements `TerminalRenderer`. The lab can switch between the
-   * baseline `XtermRenderer` (`@relayterm/terminal-xterm`) and the
-   * experimental `GhosttyWebRenderer` (`@relayterm/terminal-ghostty-web`)
+   * baseline `XtermRenderer` (`@relayterm/terminal-xterm`), the
+   * experimental `GhosttyWebRenderer` (`@relayterm/terminal-ghostty-web`),
+   * and the experimental `ResttyRenderer` (`@relayterm/terminal-restty`)
    * at runtime — switching disposes the previous renderer and remounts.
    * This is NOT the production terminal UI; it exists to prove the
    * live-PTY data path renders end-to-end and that the renderer-neutral
    * seam holds across adapter implementations.
    *
    * Gated behind `import.meta.env.DEV`. The production bundle's
-   * dead-code elimination drops the JS branch (terminal-xterm and
-   * terminal-ghostty-web both declare `sideEffects: false`, letting
-   * Rollup tree-shake xterm and ghostty-web's WASM-data-URL bundle
-   * respectively); the xterm css side-effect import is the documented
-   * compromise — see App.svelte. ghostty-web ships no CSS.
+   * dead-code elimination drops the JS branch (terminal-xterm,
+   * terminal-ghostty-web, and terminal-restty all declare
+   * `sideEffects: false`, letting Rollup tree-shake xterm,
+   * ghostty-web's WASM-data-URL bundle, and restty's WASM/WebGPU
+   * payload respectively); the xterm css side-effect import is the
+   * documented compromise — see App.svelte. ghostty-web and restty
+   * ship no CSS.
    *
    * Contracts re-asserted in this file:
-   *  - Renderer-neutral: the lab touches both renderers ONLY through
-   *    the shared `TerminalRenderer` interface. No `@xterm/xterm`
-   *    or `ghostty-web` import here — those are encapsulated by the
-   *    adapter packages.
+   *  - Renderer-neutral: the lab touches every renderer ONLY through
+   *    the shared `TerminalRenderer` interface. No `@xterm/xterm`,
+   *    `ghostty-web`, or `restty` import here — those are encapsulated
+   *    by the adapter packages.
    *  - Output decode is centralised in `@relayterm/terminal-core` via the
    *    `decodeOutputData` helper, wrapped here by `safeDecodeOutput` so a
    *    malformed frame collapses to a typed log line, never an exception.
@@ -49,6 +52,7 @@
   import { XtermRenderer } from "@relayterm/terminal-xterm";
   import "@relayterm/terminal-xterm/styles";
   import { GhosttyWebRenderer } from "@relayterm/terminal-ghostty-web";
+  import { ResttyRenderer } from "@relayterm/terminal-restty";
   import {
     CELL_GRID_MAX,
     CELL_GRID_MIN,
@@ -108,16 +112,21 @@
   /**
    * Stable identifiers for the swappable renderer adapters. xterm
    * remains the compatibility baseline; ghostty-web is an experimental
-   * adapter wrapping libghostty-vt via WASM. The adapter contract
-   * (`TerminalRenderer`) is identical for both — switching only flips
-   * which constructor we call at attach time. The id type and the
-   * operator-facing label both come from `rendererDiagnostics.ts` so
-   * the diagnostics summary and the lab UI never disagree on names.
+   * libghostty-vt-via-WASM adapter; restty is an experimental
+   * libghostty-vt + WebGPU/WebGL2 adapter via its xterm-compat shim.
+   * The adapter contract (`TerminalRenderer`) is identical for all of
+   * them — switching only flips which constructor we call at attach
+   * time. The id type and the operator-facing label both come from
+   * `rendererDiagnostics.ts` so the diagnostics summary and the lab UI
+   * never disagree on names.
    */
   type RendererChoice = RendererId;
   const rendererLabel = diagnosticsRendererLabel;
 
-  function newRenderer(choice: RendererChoice): TerminalRenderer {
+  function newRenderer(
+    choice: RendererChoice,
+    grid: { cols: number; rows: number },
+  ): TerminalRenderer {
     const themed = {
       fontFamily:
         'ui-monospace, "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
@@ -138,6 +147,12 @@
         // ghostty-web has no analogue for `lineHeight`; the adapter
         // accepts it on the neutral surface and silently drops it.
         return new GhosttyWebRenderer(themed);
+      case "restty":
+        // restty's xterm-compat shim accepts cols/rows on construction;
+        // the neutral cosmetic knobs (font/cursor/theme/scrollback) are
+        // documented as silently dropped on this adapter — see
+        // `packages/terminal-restty/src/options.ts`.
+        return new ResttyRenderer({ ...themed, cols: grid.cols, rows: grid.rows });
     }
   }
 
@@ -349,7 +364,7 @@
       opts.resumeFromBookmark && lastSeenSeq > 0 ? lastSeenSeq : undefined;
 
     const choice = rendererChoice;
-    const r = newRenderer(choice);
+    const r = newRenderer(choice, { cols, rows });
     // `mount` may return a Promise for renderers that load WASM
     // (ghostty-web). Awaiting unconditionally is safe — the xterm
     // adapter is sync and resolves immediately. Diagnostics bracket
@@ -894,6 +909,16 @@
         onchange={() => void setRendererChoice("ghostty-web")}
       />
       <span class="font-mono text-amber-300">ghostty-web (experimental)</span>
+    </label>
+    <label class="inline-flex items-center gap-1">
+      <input
+        type="radio"
+        name="renderer"
+        value="restty"
+        checked={rendererChoice === "restty"}
+        onchange={() => void setRendererChoice("restty")}
+      />
+      <span class="font-mono text-amber-300">restty (experimental)</span>
     </label>
     <span class="text-zinc-500">— switching disposes the current renderer and remounts</span>
   </div>

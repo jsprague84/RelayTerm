@@ -80,6 +80,7 @@ describe("rendererLabel", () => {
   it("returns the lab-facing label for each renderer id", () => {
     expect(rendererLabel("xterm")).toBe("xterm baseline");
     expect(rendererLabel("ghostty-web")).toBe("ghostty-web experimental");
+    expect(rendererLabel("restty")).toBe("restty experimental");
   });
 });
 
