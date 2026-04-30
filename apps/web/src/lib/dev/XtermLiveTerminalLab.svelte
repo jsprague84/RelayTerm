@@ -21,8 +21,13 @@
    *    bytes (renderer-driven keystrokes) or raw output bytes (PTY frames).
    *    Length is the only payload-correlated value the log records. The
    *    redaction rule is enforced both here and inside the renderer
-   *    adapter, and pinned by tests in `apps/web/tests/labLog.test.ts`
-   *    and `packages/terminal-xterm/tests/xtermRenderer.test.ts`.
+   *    adapter, and pinned by tests in `apps/web/tests/labLog.test.ts`,
+   *    `apps/web/tests/liveTerminalState.test.ts`, and
+   *    `packages/terminal-xterm/tests/xtermRenderer.test.ts`.
+   *  - State / button enablement / TTL text / replay formatting all flow
+   *    through pure helpers in `liveTerminalState.ts`. The Svelte file
+   *    keeps the imperative glue; anything with a contract worth pinning
+   *    sits in the helper module.
    */
   import { onDestroy, onMount } from "svelte";
   import {
@@ -43,6 +48,18 @@
     safeDecodeOutput,
     validateCellGrid,
   } from "./labLog";
+  import {
+    DETACHED_TTL_MS,
+    computeEnablement,
+    derivePhase,
+    describeTtlWindow,
+    formatReplayEnd,
+    formatReplayStart,
+    formatReplayWindowLost,
+    labelForPhase,
+    toneForPhase,
+    type LabPhase,
+  } from "./liveTerminalState.js";
 
   /**
    * Optional caller-controlled inputs. When `DevTerminalWorkbench`
@@ -88,11 +105,85 @@
    * tracking the bookmark by hand.
    */
   let lastSeenSeq = $state(0);
+  /**
+   * Set on `replay_start`, cleared on `replay_end` or
+   * `replay_window_lost`. Distinguishes "live attached" from "attached
+   * but currently catching up the buffered window" in the lab phase.
+   * Live `output` frames during replay still flow into the renderer —
+   * the orchestrator is the one tagging order, not us.
+   */
+  let replayActive = $state(false);
+  /**
+   * Wall-clock instant when the lab observed a detach (server frame OR
+   * local disconnect-without-close). Drives the local TTL countdown.
+   * Cleared on a fresh `attach`, on explicit `close`, and on `dispose`
+   * so a stale countdown doesn't outlive its trigger. The value is a
+   * LOCAL clock — `describeTtlWindow` is honest that the backend's
+   * exact remaining TTL is not on the wire.
+   */
+  let detachedAtMs = $state<number | null>(null);
+  /**
+   * `nowMs` is ticked once per second whenever a TTL window is active.
+   * Decoupled from `Date.now()` references in the template so the
+   * countdown re-renders on a deterministic cadence; tests don't need
+   * a Svelte runtime to exercise the helper because the helper is
+   * pure and the component just feeds it `nowMs`.
+   */
+  let nowMs = $state(Date.now());
+  /**
+   * Marks the brief window between `teardown()` and the next `attach`
+   * resolving. The lab uses it so the phase shows `reconnecting`
+   * instead of momentarily flashing `idle`.
+   */
+  let reconnectInFlight = $state(false);
   let client: TerminalSessionClient | null = null;
   let renderer: XtermRenderer | null = null;
   let unsubInput: (() => void) | null = null;
   let unsubResize: (() => void) | null = null;
   let mountTarget: HTMLDivElement | null = null;
+
+  const phase = $derived<LabPhase>(
+    derivePhase({
+      clientState,
+      replayActive,
+      detachedAtMs,
+      nowMs,
+      reconnectInFlight,
+    }),
+  );
+
+  const enablement = $derived(
+    computeEnablement({
+      phase,
+      hasSessionId: sessionId.trim().length > 0,
+      lastSeenSeq,
+    }),
+  );
+
+  const ttlText = $derived(describeTtlWindow({ detachedAtMs, nowMs }));
+
+  /**
+   * While a TTL countdown is active, tick `nowMs` once a second so the
+   * `$derived` countdown re-renders. The interval is owned by this
+   * effect — Svelte 5's `$effect` cleanup makes the lifecycle obvious
+   * without us reaching for `onDestroy` for this one timer. The null
+   * branch returns early WITHOUT a cleanup closure: when the previous
+   * run had no interval, there is nothing to tear down; when it did,
+   * the previous run's returned closure already ran before this body
+   * re-fired (Svelte 5 lifecycle rule).
+   */
+  $effect(() => {
+    if (detachedAtMs === null) {
+      return;
+    }
+    nowMs = Date.now();
+    const handle = setInterval(() => {
+      nowMs = Date.now();
+    }, 1_000);
+    return () => {
+      clearInterval(handle);
+    };
+  });
 
   function append(direction: LogLine["direction"], text: string) {
     log = [...log.slice(-199), { id: nextId++, direction, text }];
@@ -109,17 +200,11 @@
       case "session_closed":
         return "session_closed";
       case "replay_start":
-        return `replay_start from_seq=${msg.from_seq} to_seq=${msg.to_seq}`;
+        return formatReplayStart(msg);
       case "replay_end":
-        return `replay_end latest_seq=${msg.latest_seq}`;
+        return formatReplayEnd(msg);
       case "replay_window_lost":
-        // Metadata only — never the missed payload bytes (the lab does
-        // not have them; the server already ate them).
-        return (
-          `replay_window_lost requested_seq=${msg.requested_seq} ` +
-          `oldest_available_seq=${msg.oldest_available_seq ?? "null"} ` +
-          `latest_seq=${msg.latest_seq}`
-        );
+        return formatReplayWindowLost(msg);
       case "error":
         return `error ${msg.code}: ${msg.message}`;
       case "pong":
@@ -183,6 +268,26 @@
     next.on("state_change", (s) => {
       clientState = s;
       append("info", `state → ${s}`);
+      if (s === "attached") {
+        // A fresh attachment owns the TTL clock now; clear any stale
+        // countdown left over from the prior detach. `reconnectInFlight`
+        // is reset in the same hop because the outer `attach()` call
+        // resolved.
+        detachedAtMs = null;
+        replayActive = false;
+        reconnectInFlight = false;
+      } else if (s === "detached" || s === "closed" || s === "error") {
+        replayActive = false;
+      }
+      if (s === "detached" && detachedAtMs === null) {
+        // Server-frame detach starts the TTL clock too. The lab uses
+        // the same clock for "I dropped the socket myself" and "the
+        // server told me you detached."
+        detachedAtMs = Date.now();
+      }
+      if (s === "closed") {
+        detachedAtMs = null;
+      }
     });
     next.on("attached", (m) => {
       append("in", describeNonOutputServerMsg(m));
@@ -219,16 +324,19 @@
         lastSeenSeq = m.seq;
       }
     });
-    next.on("replay_start", (m) =>
-      append("in", describeNonOutputServerMsg(m)),
-    );
+    next.on("replay_start", (m) => {
+      replayActive = true;
+      append("in", describeNonOutputServerMsg(m));
+    });
     next.on("replay_end", (m) => {
+      replayActive = false;
       append("in", describeNonOutputServerMsg(m));
       if (m.latest_seq > lastSeenSeq) {
         lastSeenSeq = m.latest_seq;
       }
     });
     next.on("replay_window_lost", (m) => {
+      replayActive = false;
       append("in", describeNonOutputServerMsg(m));
       if (m.latest_seq > lastSeenSeq) {
         lastSeenSeq = m.latest_seq;
@@ -279,11 +387,20 @@
         "error",
         `attach failed: ${err instanceof Error ? err.message : String(err)}`,
       );
-      teardown();
+      reconnectInFlight = false;
+      teardown({ keepDetachClock: false });
     }
   }
 
-  function teardown() {
+  /**
+   * Tear down the local client + renderer. `keepDetachClock` controls
+   * whether `detachedAtMs` is preserved — `true` for "drop the socket
+   * but keep the TTL countdown ticking" (disconnect-no-close); `false`
+   * for "we're done with this session" (explicit dispose, after
+   * close, after error). The clock is also cleared by the
+   * `state_change` handler when a fresh attach lands.
+   */
+  function teardown(opts: { keepDetachClock?: boolean } = {}) {
     unsubInput?.();
     unsubResize?.();
     unsubInput = null;
@@ -293,11 +410,56 @@
     renderer?.dispose();
     renderer = null;
     clientState = "idle";
+    replayActive = false;
+    if (!opts.keepDetachClock) {
+      detachedAtMs = null;
+    }
   }
 
   function disconnect() {
-    teardown();
+    teardown({ keepDetachClock: false });
     append("info", "client + renderer disposed");
+  }
+
+  /**
+   * Drop the WebSocket without sending `Close`, so the session enters
+   * the bounded detached-TTL window on the backend. The lab then
+   * surfaces the `reconnect with last_seen_seq` button as the resume
+   * affordance — exercising the TTL path the operator can use to
+   * verify replay end-to-end.
+   *
+   * Code-wise this is the same teardown sequence as `disconnect()` —
+   * the wire-side distinction is only that NEITHER button calls
+   * `client.close()` (the wire `Close` frame). The lab labels them
+   * separately so an operator can communicate intent in the event
+   * log; `client.dispose()` closes the underlying socket cleanly,
+   * which the backend treats as a socket-drop (final detach + TTL
+   * scheduled), exactly like a normal browser tab close. To actually
+   * close the session, use the `close` button (wire `Close` frame).
+   *
+   * `keepDetachClock=true` so the local TTL countdown starts from
+   * NOW. The backend's true remaining TTL is not on the wire; the
+   * countdown is labelled `approximate` for that reason.
+   */
+  function disconnectWithoutClose() {
+    if (!client) {
+      append("info", "not connected; nothing to disconnect");
+      return;
+    }
+    const at = Date.now();
+    teardown({ keepDetachClock: true });
+    // Assign AFTER teardown: with `keepDetachClock: true` teardown
+    // preserves the existing `detachedAtMs`, but it does NOT seed a
+    // new one for a fresh disconnect. We seed it here so the local
+    // TTL countdown starts ticking from the moment the operator
+    // clicked the button.
+    detachedAtMs = at;
+    append(
+      "info",
+      `disconnected without close — server enters TTL window (~${Math.round(
+        DETACHED_TTL_MS / 1000,
+      )}s); reconnect via lastSeenSeq within that window`,
+    );
   }
 
   /**
@@ -313,9 +475,25 @@
       append("info", "no last_seen_seq yet — nothing to resume from");
       return;
     }
-    teardown();
+    reconnectInFlight = true;
+    teardown({ keepDetachClock: true });
     append("info", `reconnecting with last_seen_seq=${lastSeenSeq}`);
     await connect({ resumeFromBookmark: true });
+  }
+
+  /**
+   * Reconnect WITHOUT requesting replay. Useful when the operator
+   * deliberately wants a fresh attach (after a `replay_window_lost`,
+   * after a TTL-elapsed local clock, or just to diff a no-replay path
+   * vs the bookmark path). Importantly: this still issues a wire
+   * `attach` frame, but with `last_seen_seq: null` — the server will
+   * NOT dump pre-attach scrollback (that's product policy per SPEC).
+   */
+  async function reconnectWithoutBookmark() {
+    reconnectInFlight = true;
+    teardown({ keepDetachClock: true });
+    append("info", "reconnecting without bookmark (no replay request)");
+    await connect({ resumeFromBookmark: false });
   }
 
   function ping() {
@@ -353,7 +531,7 @@
   }
 
   onDestroy(() => {
-    teardown();
+    teardown({ keepDetachClock: false });
   });
 
   // Workbench-driven auto-connect: when the parent has just created a
@@ -368,6 +546,17 @@
       void connect();
     }
   });
+
+  // Tone -> Tailwind text class. Kept inline so the lab is the only
+  // place that maps the tone enum to a colour; helper module stays
+  // pure and renderer-neutral.
+  const TONE_CLASS: Record<ReturnType<typeof toneForPhase>, string> = {
+    neutral: "text-zinc-200",
+    info: "text-sky-300",
+    ok: "text-emerald-300",
+    warn: "text-amber-300",
+    error: "text-rose-300",
+  };
 </script>
 
 <section class="rounded-md border border-amber-700/60 bg-amber-950/30 p-4 text-sm">
@@ -387,6 +576,32 @@
     <code>decodeOutputData</code> from the protocol core; the event log
     redacts both input and output payloads (length only).
   </p>
+  <ul class="mt-2 list-disc pl-5 text-xs text-amber-200/70">
+    <li>
+      <strong>disconnect (no close)</strong> drops the socket without sending
+      <code>Close</code>; the server keeps the PTY alive in a bounded
+      ~{Math.round(DETACHED_TTL_MS / 1000)}s detached-TTL window.
+    </li>
+    <li>
+      <strong>close</strong> sends the wire <code>Close</code> frame and ends
+      the PTY immediately — TTL is bypassed.
+    </li>
+    <li>
+      <strong>reconnect with last_seen_seq</strong> requests buffered output
+      newer than the last observed <code>seq</code>. A bookmark older than
+      the bounded server-side buffer surfaces as <code>replay_window_lost</code>.
+    </li>
+    <li>
+      <strong>reconnect without bookmark</strong> issues a fresh attach (no
+      replay request); the server resumes live fanout from
+      <code>latest_seq + 1</code>.
+    </li>
+    <li>
+      A backend restart drops every detached PTY and its replay buffer; a
+      reconnect after that always lands on a fresh attach (or a
+      <code>409</code> if the row was closed).
+    </li>
+  </ul>
 
   <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
     <label class="flex flex-col gap-1">
@@ -425,7 +640,7 @@
       type="button"
       class="rounded-sm bg-emerald-700 px-3 py-1 text-xs hover:bg-emerald-600 disabled:opacity-50"
       onclick={() => void connect()}
-      disabled={clientState !== "idle"}
+      disabled={!enablement.connect}
     >
       connect + attach + mount renderer
     </button>
@@ -433,7 +648,7 @@
       type="button"
       class="rounded-sm bg-zinc-700 px-3 py-1 text-xs hover:bg-zinc-600 disabled:opacity-50"
       onclick={ping}
-      disabled={clientState !== "attached"}
+      disabled={!enablement.ping}
     >
       ping
     </button>
@@ -441,7 +656,7 @@
       type="button"
       class="rounded-sm bg-zinc-700 px-3 py-1 text-xs hover:bg-zinc-600 disabled:opacity-50"
       onclick={applyResize}
-      disabled={clientState !== "attached"}
+      disabled={!enablement.applyResize}
     >
       apply resize
     </button>
@@ -449,7 +664,8 @@
       type="button"
       class="rounded-sm bg-amber-700 px-3 py-1 text-xs hover:bg-amber-600 disabled:opacity-50"
       onclick={detach}
-      disabled={clientState !== "attached"}
+      disabled={!enablement.detach}
+      title="send wire `Detach` — server replies SessionDetached and starts the TTL window"
     >
       detach
     </button>
@@ -457,7 +673,8 @@
       type="button"
       class="rounded-sm bg-rose-700 px-3 py-1 text-xs hover:bg-rose-600 disabled:opacity-50"
       onclick={closeSession}
-      disabled={clientState !== "attached"}
+      disabled={!enablement.close}
+      title="send wire `Close` — ends the PTY immediately, no TTL window"
     >
       close
     </button>
@@ -465,17 +682,36 @@
       type="button"
       class="rounded-sm bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700 disabled:opacity-50"
       onclick={disconnect}
-      disabled={clientState === "idle"}
+      disabled={!enablement.dispose}
     >
       dispose renderer + client
     </button>
     <button
       type="button"
+      class="rounded-sm bg-amber-800 px-3 py-1 text-xs hover:bg-amber-700 disabled:opacity-50"
+      onclick={disconnectWithoutClose}
+      disabled={!enablement.disconnectNoClose}
+      title="drop the socket without sending Close — session enters TTL window"
+    >
+      disconnect (no close)
+    </button>
+    <button
+      type="button"
       class="rounded-sm bg-indigo-700 px-3 py-1 text-xs hover:bg-indigo-600 disabled:opacity-50"
       onclick={() => void reconnectWithBookmark()}
-      disabled={lastSeenSeq <= 0}
+      disabled={!enablement.reconnectWithBookmark}
+      title="re-attach with the highest seq seen so far; exercises replay handshake"
     >
       reconnect with last_seen_seq
+    </button>
+    <button
+      type="button"
+      class="rounded-sm bg-indigo-800 px-3 py-1 text-xs hover:bg-indigo-700 disabled:opacity-50"
+      onclick={() => void reconnectWithoutBookmark()}
+      disabled={!enablement.reconnectWithoutBookmark}
+      title="re-attach with last_seen_seq=null (no replay request)"
+    >
+      reconnect without bookmark
     </button>
     <button
       type="button"
@@ -488,11 +724,20 @@
 
   <div class="mt-3 flex flex-wrap items-baseline gap-4 text-xs text-zinc-400">
     <span>
-      state: <span class="font-mono text-zinc-200">{clientState}</span>
+      phase:
+      <span class={`font-mono ${TONE_CLASS[toneForPhase(phase)]}`}>
+        {labelForPhase(phase)}
+      </span>
+    </span>
+    <span>
+      client_state: <span class="font-mono text-zinc-200">{clientState}</span>
     </span>
     <span>
       last_seen_seq: <span class="font-mono text-zinc-200">{lastSeenSeq}</span>
     </span>
+    {#if ttlText}
+      <span class="font-mono text-amber-300">{ttlText.label}</span>
+    {/if}
   </div>
 
   <div
