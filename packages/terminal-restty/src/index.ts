@@ -29,10 +29,18 @@ export type { ResttyRendererCtorOptions } from "./ResttyRenderer.js";
 export {
   type ResttyInitialGrid,
   type ResttyRendererOptions,
+} from "./options.js";
+
+// The shared renderer-neutral types live in `@relayterm/terminal-core`;
+// they are re-exported here so callers consuming this adapter can import
+// the full neutral surface from one place. Do NOT introduce adapter-local
+// duplicates of these types — extend `BaseTerminalRendererOptions` instead.
+export {
+  type BaseTerminalRendererOptions,
   type RendererCursorStyle,
   type RendererTheme,
   type RendererThemeAnsi,
-} from "./options.js";
+} from "@relayterm/terminal-core";
 
 // `toResttyOptions` is intentionally NOT re-exported through the public
 // barrel. It returns a restty-compat-shaped `Record<string, unknown>`

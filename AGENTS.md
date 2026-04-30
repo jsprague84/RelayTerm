@@ -122,7 +122,7 @@ If you're tempted to invent a new directory, propose it here first.
 
 - **Adding a new terminal renderer adapter.** Mirrors the shape established by `@relayterm/terminal-xterm` (baseline), `@relayterm/terminal-ghostty-web`, `@relayterm/terminal-restty`, and `@relayterm/terminal-wterm`. The architectural rule: `terminal-core` stays renderer-agnostic, and the backend protocol stays renderer-neutral — never reshape either to accommodate a renderer. Steps:
   1. Scaffold `packages/terminal-<name>/` (package name `@relayterm/terminal-<name>`); implement `TerminalRenderer` from `@relayterm/terminal-core`.
-  2. Keep exports minimal and renderer-neutral. Renderer-specific knobs go behind a `<renderer>Only` escape hatch on the options object — never on the `TerminalRenderer` surface.
+  2. Keep exports minimal and renderer-neutral. Extend `BaseTerminalRendererOptions` from `@relayterm/terminal-core` (which carries the shared `fontFamily`/`fontSize`/`lineHeight`/`cursorStyle`/`cursorBlink`/`scrollbackLines`/`theme` shape, `RendererTheme`, `RendererThemeAnsi`, and `RendererCursorStyle`) — DO NOT redefine these neutral types in the adapter. Renderer-specific knobs go behind a local `<renderer>Only` escape hatch on the options object — never on the `TerminalRenderer` surface, never on `BaseTerminalRendererOptions`.
   3. Do NOT add the renderer's runtime as a dep of `terminal-core`. Only the adapter package depends on the underlying lib.
   4. Add adapter unit tests (vitest). Mock the underlying terminal when WASM/WebGPU/DOM/jsdom is awkward — see `terminal-ghostty-web`, `terminal-restty`, and `terminal-wterm` tests for the mock pattern.
   5. Add redaction tests covering input, output, log, and error paths. Raw terminal bytes/strings must never appear in console, logs, or thrown error messages.
@@ -181,6 +181,7 @@ If you're tempted to invent a new directory, propose it here first.
 | Put a Tauri shell under `apps/web/src-tauri/` | Desktop shell lives in `apps/desktop/`, mobile shell in `apps/mobile/` |
 | Edit `apps/{desktop,mobile}/src-tauri/gen/**` by hand | Re-generate via `tauri android init` (mobile) or platform init (desktop); configure via capabilities |
 | Use a JWT for browser auth, or trust client-validated input | Server-side session; re-validate inputs at the axum boundary |
+| Redefine `RendererTheme`, `RendererThemeAnsi`, `RendererCursorStyle`, or `BaseTerminalRendererOptions` inside an adapter package | Import them from `@relayterm/terminal-core`; extend `BaseTerminalRendererOptions` for the adapter's option interface |
 
 ## Git workflow
 

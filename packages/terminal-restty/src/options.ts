@@ -1,14 +1,10 @@
 /**
  * Renderer-neutral options for the restty adapter.
  *
- * Mirrors the same surface as `@relayterm/terminal-xterm`'s
- * `XtermRendererOptions` and `@relayterm/terminal-ghostty-web`'s
- * `GhosttyWebRendererOptions` so a future production caller can swap
- * renderers by changing only the import. The neutral fields (`fontFamily`,
- * `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`,
- * `theme`) are the lowest common denominator across renderer adapters;
- * anything restty-only goes behind the `resttyOnly` escape hatch and is
- * explicitly NOT promised to behave the same on a different adapter.
+ * The shared option/theme/cursor types live in
+ * `@relayterm/terminal-core`; this adapter extends
+ * `BaseTerminalRendererOptions` with a local `resttyOnly` escape hatch
+ * for restty-specific knobs that have no portable analogue.
  *
  * restty's xterm-compatibility shim (`restty/xterm`) exposes a `Terminal`
  * with an xterm-style `TerminalOptions` bag — `cols`, `rows`, plus an
@@ -17,77 +13,34 @@
  * xterm-only knobs such as `cursorStyle` / `cursorBlink` / `scrollback` /
  * `fontSize` / `fontFamily` / `theme` through this surface: the restty
  * shim does not interpret them, and pretending it did would lie about
- * cross-renderer parity. The neutral fields are accepted so a single
- * `themed` option object can flow into any adapter, but on this adapter
+ * cross-renderer parity. The neutral fields are accepted (so a single
+ * shared option object can flow into any adapter) but on this adapter
  * they are dropped during the option mapping. Theme application against
  * restty goes through the native `applyTheme` API which is out of scope
  * for this slice.
  */
 
-/** 16-slot ANSI palette, named rather than indexed. */
-export interface RendererThemeAnsi {
-  black?: string;
-  red?: string;
-  green?: string;
-  yellow?: string;
-  blue?: string;
-  magenta?: string;
-  cyan?: string;
-  white?: string;
-  brightBlack?: string;
-  brightRed?: string;
-  brightGreen?: string;
-  brightYellow?: string;
-  brightBlue?: string;
-  brightMagenta?: string;
-  brightCyan?: string;
-  brightWhite?: string;
-}
-
-/** Renderer-neutral theme. Adapter implementations map to their own. */
-export interface RendererTheme extends RendererThemeAnsi {
-  background?: string;
-  foreground?: string;
-  cursor?: string;
-  selectionBackground?: string;
-}
-
-/** Renderer-neutral cursor styles. */
-export type RendererCursorStyle = "block" | "underline" | "bar";
+import type { BaseTerminalRendererOptions } from "@relayterm/terminal-core";
 
 /**
- * Portable option set the restty adapter accepts. Mirrors the xterm and
- * ghostty-web adapters' option shapes so a caller can swap
- * `XtermRenderer` / `GhosttyWebRenderer` for `ResttyRenderer` by changing
- * only the import. The fields below that have no analogue in restty's
- * xterm-compat shim are accepted for shape-compatibility and silently
- * dropped during the option mapping — see file header.
+ * Portable option set the restty adapter accepts. Equals the shared
+ * `BaseTerminalRendererOptions` plus the local restty-only escape
+ * hatch. The shared cosmetic fields are accepted for cross-adapter
+ * shape-compatibility and silently dropped during the option mapping —
+ * see file header.
  */
-export interface ResttyRendererOptions {
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  fontFamily?: string;
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  fontSize?: number;
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  lineHeight?: number;
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  cursorStyle?: RendererCursorStyle;
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  cursorBlink?: boolean;
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  scrollbackLines?: number;
-  /** Accepted for cross-adapter shape-compatibility; not honored by restty. */
-  theme?: RendererTheme;
+export interface ResttyRendererOptions extends BaseTerminalRendererOptions {
   /**
    * Adapter-local escape hatch for restty-only options that have no
    * portable analogue. DO NOT put portable knobs here — extend the
-   * neutral surface instead. Anything set via this hatch is explicitly
-   * NOT promised to behave the same on a different renderer adapter.
+   * shared neutral surface in `terminal-core` instead. Anything set via
+   * this hatch is explicitly NOT promised to behave the same on a
+   * different renderer adapter.
    *
-   * Typed as a loose record because restty's xterm-compat `TerminalOptions`
-   * is itself open-ended (`[key: string]: unknown`); leaking the restty
-   * type here would re-introduce a restty shape into the consumer API
-   * surface, defeating the renderer-neutral rule.
+   * Typed as a loose record because restty's xterm-compat
+   * `TerminalOptions` is itself open-ended (`[key: string]: unknown`);
+   * leaking the restty type here would re-introduce a restty shape into
+   * the consumer API surface, defeating the renderer-neutral rule.
    */
   resttyOnly?: Record<string, unknown>;
 }

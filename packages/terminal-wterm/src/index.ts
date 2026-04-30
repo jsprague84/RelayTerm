@@ -28,13 +28,21 @@
 export { WtermRenderer } from "./WtermRenderer.js";
 export type { WtermRendererCtorOptions } from "./WtermRenderer.js";
 export {
-  type RendererCursorStyle,
-  type RendererTheme,
-  type RendererThemeAnsi,
   type WtermInitialGrid,
   type WtermOnlyOptions,
   type WtermRendererOptions,
 } from "./options.js";
+
+// The shared renderer-neutral types live in `@relayterm/terminal-core`;
+// they are re-exported here so callers consuming this adapter can import
+// the full neutral surface from one place. Do NOT introduce adapter-local
+// duplicates of these types — extend `BaseTerminalRendererOptions` instead.
+export {
+  type BaseTerminalRendererOptions,
+  type RendererCursorStyle,
+  type RendererTheme,
+  type RendererThemeAnsi,
+} from "@relayterm/terminal-core";
 
 // `toWtermOptions` is intentionally NOT re-exported through the public
 // barrel. It returns an internal `MappedWtermOptions` shape that exists

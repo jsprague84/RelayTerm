@@ -1,15 +1,10 @@
 /**
  * Renderer-neutral options for the wterm adapter.
  *
- * Mirrors the same surface as `@relayterm/terminal-xterm`'s
- * `XtermRendererOptions`, `@relayterm/terminal-ghostty-web`'s
- * `GhosttyWebRendererOptions`, and `@relayterm/terminal-restty`'s
- * `ResttyRendererOptions` so a future production caller can swap renderers
- * by changing only the import. The neutral fields (`fontFamily`,
- * `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`,
- * `theme`) are the lowest common denominator; anything wterm-only goes
- * behind the `wtermOnly` escape hatch and is explicitly NOT promised to
- * behave the same on a different adapter.
+ * The shared option/theme/cursor types live in
+ * `@relayterm/terminal-core`; this adapter extends
+ * `BaseTerminalRendererOptions` with a local `wtermOnly` escape hatch
+ * for wterm-specific knobs that have no portable analogue.
  *
  * wterm@0.2.x's `WTermOptions` accepts a small fixed surface — `cols`,
  * `rows`, `wasmUrl`, `autoResize`, `cursorBlink`, `debug`, plus
@@ -18,41 +13,12 @@
  * `theme`) are styled via CSS custom properties on the `.wterm` host
  * element (`--term-font-family`, `--term-font-size`, etc. — see
  * `@wterm/dom/src/terminal.css`) rather than constructor arguments. The
- * adapter therefore accepts the neutral surface for cross-renderer parity
- * and silently drops cosmetic fields during the option mapping; theming
- * goes through CSS, not the WTerm constructor.
+ * adapter therefore accepts the shared neutral surface for cross-renderer
+ * parity and silently drops cosmetic fields during the option mapping;
+ * theming goes through CSS, not the WTerm constructor.
  */
 
-/** 16-slot ANSI palette, named rather than indexed. */
-export interface RendererThemeAnsi {
-  black?: string;
-  red?: string;
-  green?: string;
-  yellow?: string;
-  blue?: string;
-  magenta?: string;
-  cyan?: string;
-  white?: string;
-  brightBlack?: string;
-  brightRed?: string;
-  brightGreen?: string;
-  brightYellow?: string;
-  brightBlue?: string;
-  brightMagenta?: string;
-  brightCyan?: string;
-  brightWhite?: string;
-}
-
-/** Renderer-neutral theme. Adapter implementations map to their own. */
-export interface RendererTheme extends RendererThemeAnsi {
-  background?: string;
-  foreground?: string;
-  cursor?: string;
-  selectionBackground?: string;
-}
-
-/** Renderer-neutral cursor styles. */
-export type RendererCursorStyle = "block" | "underline" | "bar";
+import type { BaseTerminalRendererOptions } from "@relayterm/terminal-core";
 
 /**
  * Adapter-local escape hatch for wterm's non-portable knobs. Kept in a
@@ -88,34 +54,24 @@ export interface WtermOnlyOptions {
 }
 
 /**
- * Portable option set the wterm adapter accepts. Mirrors the xterm,
- * ghostty-web, and restty adapters' option shapes so a caller can swap
- * adapters by changing only the import. The fields below that have no
- * analogue in `WTermOptions` are accepted for shape-compatibility and
- * silently dropped during the option mapping — see file header. Theming
- * for wterm goes through CSS variables on the `.wterm` host, not through
- * constructor arguments.
+ * Portable option set the wterm adapter accepts. Equals the shared
+ * `BaseTerminalRendererOptions` plus the local wterm-only escape
+ * hatch. The shared cosmetic fields without a wterm analogue are
+ * accepted for shape-compatibility and silently dropped during the
+ * option mapping — see file header. Theming for wterm goes through CSS
+ * variables on the `.wterm` host, not through constructor arguments.
+ *
+ * `cursorBlink` IS honoured by wterm — it's the one cosmetic knob
+ * wterm consumes via the constructor (it toggles a CSS class on the
+ * host).
  */
-export interface WtermRendererOptions {
-  /** Accepted for cross-adapter shape-compatibility; not honored by wterm. */
-  fontFamily?: string;
-  /** Accepted for cross-adapter shape-compatibility; not honored by wterm. */
-  fontSize?: number;
-  /** Accepted for cross-adapter shape-compatibility; not honored by wterm. */
-  lineHeight?: number;
-  /** Forwarded to `WTermOptions.cursorBlink`. */
-  cursorBlink?: boolean;
-  /** Accepted for cross-adapter shape-compatibility; not honored by wterm. */
-  cursorStyle?: RendererCursorStyle;
-  /** Accepted for cross-adapter shape-compatibility; not honored by wterm. */
-  scrollbackLines?: number;
-  /** Accepted for cross-adapter shape-compatibility; not honored by wterm. */
-  theme?: RendererTheme;
+export interface WtermRendererOptions extends BaseTerminalRendererOptions {
   /**
    * Adapter-local escape hatch for wterm-only options that have no
    * portable analogue. DO NOT put portable knobs here — extend the
-   * neutral surface instead. Anything set via this hatch is explicitly
-   * NOT promised to behave the same on a different renderer adapter.
+   * shared neutral surface in `terminal-core` instead. Anything set via
+   * this hatch is explicitly NOT promised to behave the same on a
+   * different renderer adapter.
    */
   wtermOnly?: WtermOnlyOptions;
 }

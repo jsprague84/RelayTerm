@@ -73,10 +73,15 @@ export {
 export {
   type RendererInput,
   type RendererOutput,
-  type TerminalPreferences,
   type TerminalRenderer,
-  type TerminalThemePreferences,
 } from "./renderer.js";
+
+export {
+  type BaseTerminalRendererOptions,
+  type RendererCursorStyle,
+  type RendererTheme,
+  type RendererThemeAnsi,
+} from "./rendererOptions.js";
 
 export {
   type AttachOptions,

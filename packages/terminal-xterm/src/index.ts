@@ -14,12 +14,18 @@
  */
 
 export { XtermRenderer } from "./XtermRenderer.js";
+export { type XtermRendererOptions } from "./options.js";
+
+// The shared renderer-neutral types live in `@relayterm/terminal-core`;
+// they are re-exported here so callers consuming this adapter can import
+// the full neutral surface from one place. Do NOT introduce adapter-local
+// duplicates of these types — extend `BaseTerminalRendererOptions` instead.
 export {
+  type BaseTerminalRendererOptions,
   type RendererCursorStyle,
   type RendererTheme,
   type RendererThemeAnsi,
-  type XtermRendererOptions,
-} from "./options.js";
+} from "@relayterm/terminal-core";
 
 // `toXtermOptions` / `toXtermTheme` are deliberately NOT re-exported.
 // They return xterm-shaped types (`ITerminalOptions`, `ITheme`) which would

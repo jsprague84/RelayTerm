@@ -1,13 +1,10 @@
 /**
  * Renderer-neutral options for the ghostty-web adapter.
  *
- * Mirrors the same surface as `@relayterm/terminal-xterm`'s `XtermRendererOptions`
- * so a future production caller can swap renderers by changing the import.
- * The neutral fields (`fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`,
- * `cursorBlink`, `scrollbackLines`, `theme`) are the lowest common
- * denominator across renderer adapters; anything ghostty-web-only goes
- * behind the `ghosttyOnly` escape hatch and is explicitly NOT promised
- * to behave the same on a different adapter.
+ * The shared option/theme/cursor types live in
+ * `@relayterm/terminal-core`; this adapter extends
+ * `BaseTerminalRendererOptions` with a local `ghosttyOnly` escape hatch
+ * for ghostty-web-specific knobs that have no portable analogue.
  *
  * NOTE: ghostty-web exposes an `ITerminalOptions` shape that happens to
  * be near-identical to xterm.js — same `cursorStyle`, `cursorBlink`,
@@ -17,65 +14,29 @@
  * by the same rule that keeps `toXtermOptions` adapter-private.
  *
  * `lineHeight` has no analogue in ghostty-web's `ITerminalOptions`;
- * the field is accepted at the neutral surface and silently dropped
- * when mapping. This is documented behaviour of the experimental
- * adapter, not a regression.
+ * the field is accepted on the shared neutral surface and silently
+ * dropped when mapping. This is documented behaviour of the
+ * experimental adapter, not a regression.
  */
+import type {
+  BaseTerminalRendererOptions,
+  RendererTheme,
+} from "@relayterm/terminal-core";
 import type { ITerminalOptions, ITheme } from "ghostty-web";
 
-/** 16-slot ANSI palette, named rather than indexed. */
-export interface RendererThemeAnsi {
-  black?: string;
-  red?: string;
-  green?: string;
-  yellow?: string;
-  blue?: string;
-  magenta?: string;
-  cyan?: string;
-  white?: string;
-  brightBlack?: string;
-  brightRed?: string;
-  brightGreen?: string;
-  brightYellow?: string;
-  brightBlue?: string;
-  brightMagenta?: string;
-  brightCyan?: string;
-  brightWhite?: string;
-}
-
-/** Renderer-neutral theme. Adapter implementations map to their own. */
-export interface RendererTheme extends RendererThemeAnsi {
-  background?: string;
-  foreground?: string;
-  cursor?: string;
-  selectionBackground?: string;
-}
-
-/** Renderer-neutral cursor styles. */
-export type RendererCursorStyle = "block" | "underline" | "bar";
-
 /**
- * Portable option set the ghostty-web adapter honors. Mirrors the
- * xterm adapter's `XtermRendererOptions` so a caller can swap
- * `XtermRenderer` for `GhosttyWebRenderer` by changing only the
- * import. `lineHeight` is accepted but silently ignored — see file
+ * Portable option set the ghostty-web adapter honours. Equals the shared
+ * `BaseTerminalRendererOptions` plus the local ghostty-only escape
+ * hatch. `lineHeight` is accepted but silently ignored — see file
  * header.
  */
-export interface GhosttyWebRendererOptions {
-  fontFamily?: string;
-  fontSize?: number;
-  /** Accepted for cross-adapter shape-compatibility; not honored by ghostty-web. */
-  lineHeight?: number;
-  cursorStyle?: RendererCursorStyle;
-  cursorBlink?: boolean;
-  /** Visible scrollback in lines; maps to ghostty-web's `scrollback`. */
-  scrollbackLines?: number;
-  theme?: RendererTheme;
+export interface GhosttyWebRendererOptions extends BaseTerminalRendererOptions {
   /**
    * Adapter-local escape hatch for ghostty-web-only options that have
    * no portable analogue. DO NOT put portable knobs here — extend the
-   * neutral surface instead. Anything set via this hatch is explicitly
-   * NOT promised to behave the same on a different renderer adapter.
+   * shared neutral surface in `terminal-core` instead. Anything set via
+   * this hatch is explicitly NOT promised to behave the same on a
+   * different renderer adapter.
    */
   ghosttyOnly?: ITerminalOptions;
 }

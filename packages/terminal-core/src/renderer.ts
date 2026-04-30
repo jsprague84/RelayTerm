@@ -51,29 +51,3 @@ export interface TerminalRenderer {
    */
   onResize?(cb: (size: { cols: number; rows: number }) => void): Unsubscribe;
 }
-
-/**
- * Renderer-neutral preferences. The shape is intentionally lowest-common-
- * denominator: anything xterm-specific (`rendererType`, `allowProposedApi`,
- * `convertEol`) belongs in the xterm adapter, not here.
- *
- * These are placeholders for a future preferences slice; nothing in this
- * file consumes them yet. They live here so adapters don't each invent
- * their own incompatible preference surface.
- */
-export interface TerminalPreferences {
-  fontFamily?: string;
-  fontSize?: number;
-  lineHeight?: number;
-  theme?: TerminalThemePreferences;
-  cursorStyle?: "block" | "underline" | "bar";
-  scrollbackLines?: number;
-}
-
-export interface TerminalThemePreferences {
-  background?: string;
-  foreground?: string;
-  cursor?: string;
-  /** Optional ANSI 16-color palette, in the standard `0..15` order. */
-  ansi?: readonly string[];
-}
