@@ -735,6 +735,33 @@ async fn audit_event_round_trip(pool: PgPool) {
     );
 }
 
+/// The `audit_events_kind_chk` CHECK constraint must accept the
+/// server-profile lifecycle kinds emitted by the disable/enable routes.
+/// A failure here means the migration that extended the constraint did
+/// not land — the API-side audit emission would silently break.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_event_accepts_server_profile_lifecycle_kinds(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgAuditEventRepository::new(pool.clone());
+
+    for kind in [
+        AuditEventKind::ServerProfileCreated,
+        AuditEventKind::ServerProfileDisabled,
+        AuditEventKind::ServerProfileEnabled,
+    ] {
+        let created = repo
+            .create(CreateAuditEvent {
+                actor_id: Some(user.id),
+                kind,
+                payload: json!({ "server_profile_id": uuid::Uuid::new_v4() }),
+                remote_addr: None,
+            })
+            .await
+            .expect("audit_events_kind_chk should accept lifecycle kinds");
+        assert_eq!(created.kind, kind);
+    }
+}
+
 // ----------------------------------------------------------------------
 // TerminalSessionAttachment
 // ----------------------------------------------------------------------

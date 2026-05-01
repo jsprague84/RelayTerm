@@ -27,11 +27,12 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt as _;
 use relayterm_api::{AppState, router};
+use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
-    CreateHost, CreateKnownHostEntry, CreateServerProfile, CreateSshIdentity, CreateUser,
-    HostRepository, KnownHostEntryRepository, ServerProfileRepository, SessionEventRepository,
-    SshIdentityRepository, TerminalSessionRepository, UserRepository,
+    AuditEventRepository, CreateHost, CreateKnownHostEntry, CreateServerProfile, CreateSshIdentity,
+    CreateUser, HostRepository, KnownHostEntryRepository, ServerProfileRepository,
+    SessionEventRepository, SshIdentityRepository, TerminalSessionRepository, UserRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
@@ -40,9 +41,9 @@ use relayterm_core::validation::{
     validate_host_display_name, validate_hostname, validate_ssh_port, validate_ssh_username,
 };
 use relayterm_db::{
-    Db, PgHostRepository, PgKnownHostEntryRepository, PgServerProfileRepository,
-    PgSessionEventRepository, PgSshIdentityRepository, PgTerminalSessionRepository,
-    PgUserRepository,
+    Db, PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
+    PgServerProfileRepository, PgSessionEventRepository, PgSshIdentityRepository,
+    PgTerminalSessionRepository, PgUserRepository,
 };
 use relayterm_ssh::{
     AuthAttemptKind, AuthCheckOutcome, AuthCheckTarget, CapturedHostKey, HostKeyPreflightService,
@@ -6189,5 +6190,323 @@ async fn disable_after_terminal_session_create_does_not_affect_existing_session_
     assert_ne!(
         body["status"], "closed",
         "disable must NOT retroactively close existing sessions, got: {body}",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Server profile lifecycle audit emission
+//
+// Each lifecycle action — create, transition-to-disabled,
+// transition-to-enabled — appends one row to `audit_events` with public
+// metadata only. The payload contract excludes `private_key`,
+// `encrypted_private_key`, PEM bytes, public-key bytes, terminal I/O,
+// raw russh / DB error text, and any vault internal. Idempotent calls
+// (redundant disable / enable) MUST NOT duplicate the event row. See
+// `routes/v1/server_profiles.rs::write_lifecycle_audit` for the contract
+// and SPEC.md "Server profile lifecycle audit" for the rationale.
+// ----------------------------------------------------------------------
+
+/// Forbidden substrings that must never appear in an audit payload's
+/// JSON serialisation. The list mirrors the renderer-redaction sentinels
+/// used by `disable_owned_server_profile_sets_disabled_at` and the
+/// terminal-session create response asserts. New secret-shaped names
+/// belong here so a single test catches every lifecycle audit path.
+///
+/// `remote_addr` and `user_agent` are listed separately rather than as
+/// one hyphenated sentinel — both are real field names that could drift
+/// onto a future audit payload via a one-off route-level capture path,
+/// and a concatenated form would silently never match. Today's lifecycle
+/// payloads carry neither.
+const AUDIT_FORBIDDEN_SUBSTRINGS: &[&str] = &[
+    "encrypted_private_key",
+    "private_key",
+    "BEGIN OPENSSH PRIVATE KEY",
+    "client_info",
+    "remote_addr",
+    "user_agent",
+];
+
+fn assert_audit_payload_redacted(payload: &Value, kind: AuditEventKind) {
+    let raw = payload.to_string();
+    for forbidden in AUDIT_FORBIDDEN_SUBSTRINGS {
+        assert!(
+            !raw.contains(forbidden),
+            "{kind:?} audit payload must not contain `{forbidden}`: {raw}",
+            kind = kind,
+            forbidden = forbidden,
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_server_profile_writes_one_audit_event(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let identity = PgSshIdentityRepository::new(pool.clone())
+        .create(CreateSshIdentity {
+            owner_id: user_id,
+            name: "audit-create".to_owned(),
+            key_type: SshKeyType::Ed25519,
+            public_key: b"ssh-ed25519 AAAA-pub".to_vec(),
+            encrypted_private_key: b"opaque-cipher".to_vec(),
+            fingerprint_sha256: "SHA256:audit-create".to_owned(),
+        })
+        .await
+        .unwrap();
+    let host_resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/hosts",
+            json!({
+                "display_name": "Audit Host",
+                "hostname": "audit-create.example.com",
+                "default_username": "deploy",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(host_resp.status(), StatusCode::CREATED);
+    let host_id = read_body(host_resp).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/server-profiles",
+            json!({
+                "name": "audit-create-profile",
+                "host_id": host_id,
+                "ssh_identity_id": identity.id,
+                "tags": ["audit"],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let profile_id = body["id"].as_str().unwrap().to_owned();
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let created_events: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::ServerProfileCreated)
+        .collect();
+    assert_eq!(
+        created_events.len(),
+        1,
+        "expected exactly one server_profile_created audit row, got: {recent:?}",
+    );
+    let event = created_events[0];
+    assert_eq!(event.actor_id, Some(user_id));
+    let payload = &event.payload;
+    assert_eq!(payload["server_profile_id"].as_str().unwrap(), profile_id);
+    assert_eq!(payload["host_id"].as_str().unwrap(), host_id);
+    assert_eq!(
+        payload["ssh_identity_id"].as_str().unwrap(),
+        identity.id.to_string(),
+    );
+    assert_eq!(payload["name"], "audit-create-profile");
+    assert!(payload["disabled_at"].is_null());
+    assert_audit_payload_redacted(payload, AuditEventKind::ServerProfileCreated);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disable_server_profile_writes_one_audit_event_only_on_transition(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "audit-disable",
+        "audit-disable.example.com",
+    )
+    .await;
+
+    // First disable: enabled -> disabled. One audit row appended.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second disable: already-disabled, idempotent — must NOT append.
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let disabled_events: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::ServerProfileDisabled)
+        .collect();
+    assert_eq!(
+        disabled_events.len(),
+        1,
+        "redundant disable must not duplicate audit rows, got: {recent:?}",
+    );
+    let event = disabled_events[0];
+    assert_eq!(event.actor_id, Some(user_id));
+    let payload = &event.payload;
+    assert_eq!(
+        payload["server_profile_id"].as_str().unwrap(),
+        profile_id.to_string(),
+    );
+    assert!(
+        payload["disabled_at"].is_string(),
+        "disable audit must include a stamped disabled_at: {payload}",
+    );
+    assert!(payload["host_id"].is_string());
+    assert!(payload["ssh_identity_id"].is_string());
+    assert_audit_payload_redacted(payload, AuditEventKind::ServerProfileDisabled);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn enable_server_profile_writes_one_audit_event_only_on_transition(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "audit-enable",
+        "audit-enable.example.com",
+    )
+    .await;
+
+    // Disable first so a real transition exists.
+    let _ = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+
+    // First enable: disabled -> enabled. One audit row appended.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second enable: already-enabled, idempotent — must NOT append.
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let enabled_events: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::ServerProfileEnabled)
+        .collect();
+    assert_eq!(
+        enabled_events.len(),
+        1,
+        "redundant enable must not duplicate audit rows, got: {recent:?}",
+    );
+    let event = enabled_events[0];
+    assert_eq!(event.actor_id, Some(user_id));
+    let payload = &event.payload;
+    assert_eq!(
+        payload["server_profile_id"].as_str().unwrap(),
+        profile_id.to_string(),
+    );
+    assert!(
+        payload["disabled_at"].is_null(),
+        "enable audit captures the post-transition state: {payload}",
+    );
+    assert_audit_payload_redacted(payload, AuditEventKind::ServerProfileEnabled);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn no_audit_events_for_owner_scoped_404_disable(pool: PgPool) {
+    // A 404 (foreign-owned or missing id) MUST NOT leak an audit row.
+    // Otherwise the audit log would expose cross-user existence by id.
+    let (app, _user_id) = setup(pool.clone()).await;
+    let bogus = uuid::Uuid::new_v4();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let lifecycle: Vec<_> = recent
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AuditEventKind::ServerProfileCreated
+                    | AuditEventKind::ServerProfileDisabled
+                    | AuditEventKind::ServerProfileEnabled,
+            )
+        })
+        .collect();
+    assert!(
+        lifecycle.is_empty(),
+        "404 path must not write an audit row, got: {lifecycle:?}",
+    );
+}
+
+/// Symmetric coverage for the enable route. SPEC.md "Server profile
+/// lifecycle audit" pins "401/404 paths write NO audit event" as a
+/// load-bearing invariant on every lifecycle entry point — both routes
+/// must satisfy it, not just disable.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn no_audit_events_for_owner_scoped_404_enable(pool: PgPool) {
+    let (app, _user_id) = setup(pool.clone()).await;
+    let bogus = uuid::Uuid::new_v4();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let lifecycle: Vec<_> = recent
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AuditEventKind::ServerProfileCreated
+                    | AuditEventKind::ServerProfileDisabled
+                    | AuditEventKind::ServerProfileEnabled,
+            )
+        })
+        .collect();
+    assert!(
+        lifecycle.is_empty(),
+        "enable 404 path must not write an audit row, got: {lifecycle:?}",
     );
 }

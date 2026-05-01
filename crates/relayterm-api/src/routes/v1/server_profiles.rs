@@ -4,15 +4,17 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::host::Host;
 use relayterm_core::ids::ServerProfileId;
 use relayterm_core::repository::{
-    CreateKnownHostEntry, HostRepository, KnownHostEntryRepository, ServerProfileRepository,
-    SshIdentityRepository,
+    AuditEventRepository, CreateAuditEvent, CreateKnownHostEntry, HostRepository,
+    KnownHostEntryRepository, ServerProfileRepository, SshIdentityRepository,
 };
 use relayterm_core::server_profile::ServerProfile;
 use relayterm_core::ssh_identity::SshIdentity;
 use relayterm_ssh::{HostKeyPreflightRequest, HostKeyStatus, SshAuthCheckRequest};
+use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::AppState;
@@ -72,6 +74,15 @@ async fn create(
     debug_assert_eq!(identity.id, input.ssh_identity_id);
 
     let profile = state.db.server_profiles().create(input).await?;
+
+    // Lifecycle audit. Public metadata only — no key material, no host
+    // banner, no DB error text. Failure policy: fail-closed. The row has
+    // already been written; surfacing the audit failure to the caller
+    // mirrors the partial-success shape of `create_session` (see the
+    // 2026-04-29 lesson in AGENTS.md). The orphan row is operator-visible
+    // and can be reconciled, the audit gap cannot.
+    write_lifecycle_audit(&state, user, AuditEventKind::ServerProfileCreated, &profile).await?;
+
     Ok((StatusCode::CREATED, Json(profile.into())))
 }
 
@@ -138,10 +149,15 @@ async fn disable(
     // reach `set_disabled_at`. The outcome is benign — the SQL writes
     // unconditionally, the second writer overwrites with a near-identical
     // timestamp, and both callers return a consistent post-update row.
-    // No data is lost. If timestamp-preservation ever becomes load-
-    // bearing for audit, push the guard into SQL via
-    // `WHERE disabled_at IS NULL` and treat zero affected rows as the
-    // "already disabled" case (mirrors `record_trusted`).
+    // No data is lost. In the concurrent case both callers ALSO append
+    // a `server_profile_disabled` audit row, which technically violates
+    // the "idempotent calls write zero rows" contract — duplicate audit
+    // rows in this race are harmless (operator-visible, near-identical
+    // recorded_at), so the slice ships without serialising. If
+    // timestamp-preservation OR strict zero-duplicate audit ever becomes
+    // load-bearing, push the guard into SQL via `WHERE disabled_at IS
+    // NULL` and treat zero affected rows as the "already disabled" case
+    // (mirrors `record_trusted`).
     if current.is_disabled() {
         return Ok(Json(current.into()));
     }
@@ -151,6 +167,19 @@ async fn disable(
         .server_profiles()
         .set_disabled_at(id, user.0, Some(chrono::Utc::now()))
         .await?;
+
+    // Audit only on the enabled -> disabled transition. The early-return
+    // above means we only reach here when `current.is_disabled()` was
+    // false, so a redundant disable does NOT produce a duplicate row.
+    // Fail-closed: see `create` for the rationale.
+    write_lifecycle_audit(
+        &state,
+        user,
+        AuditEventKind::ServerProfileDisabled,
+        &updated,
+    )
+    .await?;
+
     Ok(Json(updated.into()))
 }
 
@@ -182,7 +211,58 @@ async fn enable(
         .server_profiles()
         .set_disabled_at(id, user.0, None)
         .await?;
+
+    // Audit only on the disabled -> enabled transition. Same fail-closed
+    // policy as `create` / `disable`.
+    write_lifecycle_audit(&state, user, AuditEventKind::ServerProfileEnabled, &updated).await?;
+
     Ok(Json(updated.into()))
+}
+
+/// Build the public-metadata-only payload for a server-profile lifecycle
+/// audit event and append it to `audit_events`.
+///
+/// **Payload contract (security-critical):** the JSON object MUST contain
+/// only public metadata: ids, the profile name, and the `disabled_at`
+/// timestamp. It MUST NOT contain `private_key`, `encrypted_private_key`,
+/// PEM bytes, public-key bytes, terminal I/O, replay frames, raw russh
+/// errors, vault internals, or DB error text. Sentinel-style redaction
+/// tests in the API test crate guard this invariant on every lifecycle
+/// path.
+///
+/// **Failure policy:** fail-closed. A failed audit insert surfaces as
+/// `RepositoryError` → `ApiError::Internal` to the caller. The lifecycle
+/// row state is already committed; the orphan-without-audit shape mirrors
+/// the partial-success pattern documented for `create_session` (see the
+/// 2026-04-29 lesson in AGENTS.md). Audit gaps are worse than orphan rows
+/// because they can't be reconstructed after the fact.
+async fn write_lifecycle_audit(
+    state: &AppState,
+    actor: DevUser,
+    kind: AuditEventKind,
+    profile: &ServerProfile,
+) -> Result<(), ApiError> {
+    let payload = json!({
+        "server_profile_id": profile.id,
+        "name": profile.name.as_str(),
+        "host_id": profile.host_id,
+        "ssh_identity_id": profile.ssh_identity_id,
+        "disabled_at": profile.disabled_at,
+    });
+    state
+        .db
+        .audit_events()
+        .create(CreateAuditEvent {
+            actor_id: Some(actor.0),
+            kind,
+            payload,
+            // Client IP / user-agent capture is deferred — see SPEC.md.
+            // Recording `None` here is intentional, not a bug to fix in a
+            // drive-by edit; the column is nullable for exactly this case.
+            remote_addr: None,
+        })
+        .await?;
+    Ok(())
 }
 
 /// 409 conflict shape returned by every route that refuses to operate on

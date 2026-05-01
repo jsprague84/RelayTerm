@@ -27,6 +27,8 @@ pub enum AuditEventKind {
     HostKeyRevoked,
     ServerProfileCreated,
     ServerProfileUpdated,
+    ServerProfileDisabled,
+    ServerProfileEnabled,
     ServerProfileDeleted,
     SshIdentityCreated,
     SshIdentityDeleted,
@@ -49,6 +51,8 @@ impl AuditEventKind {
             Self::HostKeyRevoked => "host_key_revoked",
             Self::ServerProfileCreated => "server_profile_created",
             Self::ServerProfileUpdated => "server_profile_updated",
+            Self::ServerProfileDisabled => "server_profile_disabled",
+            Self::ServerProfileEnabled => "server_profile_enabled",
             Self::ServerProfileDeleted => "server_profile_deleted",
             Self::SshIdentityCreated => "ssh_identity_created",
             Self::SshIdentityDeleted => "ssh_identity_deleted",
@@ -72,6 +76,8 @@ impl AuditEventKind {
             "host_key_revoked" => Self::HostKeyRevoked,
             "server_profile_created" => Self::ServerProfileCreated,
             "server_profile_updated" => Self::ServerProfileUpdated,
+            "server_profile_disabled" => Self::ServerProfileDisabled,
+            "server_profile_enabled" => Self::ServerProfileEnabled,
             "server_profile_deleted" => Self::ServerProfileDeleted,
             "ssh_identity_created" => Self::SshIdentityCreated,
             "ssh_identity_deleted" => Self::SshIdentityDeleted,
@@ -94,4 +100,47 @@ pub struct AuditEvent {
     pub payload: serde_json::Value,
     pub remote_addr: Option<String>,
     pub recorded_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditEventKind;
+
+    /// The wire tags are persisted in `audit_events.kind` and constrained by
+    /// the `audit_events_kind_chk` CHECK in the migrations. Renaming any of
+    /// them is a schema break that requires a follow-up migration. Pin them.
+    #[test]
+    fn server_profile_lifecycle_wire_tags_are_stable() {
+        assert_eq!(
+            AuditEventKind::ServerProfileCreated.as_str(),
+            "server_profile_created",
+        );
+        assert_eq!(
+            AuditEventKind::ServerProfileDisabled.as_str(),
+            "server_profile_disabled",
+        );
+        assert_eq!(
+            AuditEventKind::ServerProfileEnabled.as_str(),
+            "server_profile_enabled",
+        );
+    }
+
+    #[test]
+    fn server_profile_lifecycle_round_trips_through_from_str_tag() {
+        for kind in [
+            AuditEventKind::ServerProfileCreated,
+            AuditEventKind::ServerProfileDisabled,
+            AuditEventKind::ServerProfileEnabled,
+        ] {
+            assert_eq!(AuditEventKind::from_str_tag(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn unknown_tag_remains_none() {
+        assert_eq!(
+            AuditEventKind::from_str_tag("server_profile_obliterated"),
+            None,
+        );
+    }
 }

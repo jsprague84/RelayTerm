@@ -1402,7 +1402,7 @@ This section is normative. It defines the safe lifecycle for every inventory ent
 **Status today (load-bearing — read before adding any destructive surface).** No production route or UI **deletes** or archives any inventory record. The lifecycle moves wired today are:
 
 - `POST /api/v1/terminal-sessions/:id/close` — terminal sessions reach the `closed` terminal state.
-- `POST /api/v1/server-profiles/:id/disable` and `POST /api/v1/server-profiles/:id/enable` — backend-only. Stamp / clear `server_profiles.disabled_at`. Disabled profiles refuse new launches, auth-check, host-key preflight / trust. Existing live sessions are unaffected. Frontend UI is deferred. Audit-event emission is deferred (see "Audit gap" under "Server profile disable / enable backend"). See that section for the full contract.
+- `POST /api/v1/server-profiles/:id/disable` and `POST /api/v1/server-profiles/:id/enable` — backend-only. Stamp / clear `server_profiles.disabled_at`. Disabled profiles refuse new launches, auth-check, host-key preflight / trust. Existing live sessions are unaffected. Each successful create / enabled→disabled / disabled→enabled transition appends one `audit_events` row (`server_profile_created` / `server_profile_disabled` / `server_profile_enabled`). Frontend UI is deferred. See "Server profile disable / enable backend" and "Server profile lifecycle audit" for the full contract.
 - `known_host_entries.revoked_at` — column exists; no route or UI yet writes it. The trust route already refuses to silently re-trust a revoked fingerprint (two-layer guard: route check + `record_trusted` SQL `WHERE revoked_at IS NULL`).
 
 Everything else (`hosts`, `ssh_identities`, `server_profiles` deletion, `terminal_sessions` outside `close`, audit/session events) has no destructive surface. The schema enforces FK `RESTRICT` on the load-bearing references; an attempt to delete a referenced row from the DB layer would already fail. The policy below is what MUST be true *before* any destructive route or UI lands.
@@ -1458,11 +1458,14 @@ Everything else (`hosts`, `ssh_identities`, `server_profiles` deletion, `termina
 
 ### Audit-event expectations
 
-The `audit_events.kind` enum already anticipates `server_profile_created`, `server_profile_updated`, `server_profile_deleted`, `ssh_identity_created`, `ssh_identity_deleted`, `host_key_accepted`, `host_key_mismatch`, and `host_key_revoked`. New destructive routes MUST extend the enum (with a paired migration to the `audit_events_kind_chk` CHECK and the `AuditEventKind` Rust enum) when they introduce a new lifecycle action. The currently-missing kinds are:
+The `audit_events.kind` enum already anticipates `server_profile_created`, `server_profile_updated`, `server_profile_disabled`, `server_profile_enabled`, `server_profile_deleted`, `ssh_identity_created`, `ssh_identity_deleted`, `host_key_accepted`, `host_key_mismatch`, and `host_key_revoked`. New destructive routes MUST extend the enum (with a paired migration to the `audit_events_kind_chk` CHECK and the `AuditEventKind` Rust enum) when they introduce a new lifecycle action.
+
+`server_profile_created`, `server_profile_disabled`, and `server_profile_enabled` are the only kinds wired today. See "Server profile lifecycle audit" below for the payload contract, idempotency rules, and fail-closed failure policy.
+
+The currently-missing kinds are:
 
 - `host_created`, `host_updated` — neither variant exists yet. The host CRUD routes do not write audit events today; that is its own gap. When host create/update lands, add the matching kinds (and corresponding `host_deleted`).
 - `host_deleted` — required when host delete lands.
-- `server_profile_disabled`, `server_profile_enabled` — required when disable/enable land.
 - (`host_key_revoked` already exists; reuse it for the revoke route.)
 
 Rules every destructive lifecycle action MUST follow:
@@ -1512,16 +1515,49 @@ Preflight refuses (rather than allowing a read-only probe) so the disabled state
 
 **WebSocket attach.** `GET /api/v1/terminal-sessions/:id/ws` does **not** re-check the underlying profile's `disabled_at`. An already-created session row is reachable until it closes via the standard lifecycle paths (operator close, remote shell exit, PTY teardown, TTL expiry). Disable is a launch-time gate, not a runtime kill switch; reapplying it across the live wire would surprise an active operator and serve no security purpose (the SSH transport is already pinned to the credentials in flight).
 
-**Audit gap (deferred).** Server profile create / update / delete routes do not emit `audit_events` rows today. Disable / enable inherit this gap rather than introducing a one-off audit path; landing audit emission is its own slice that should cover create / update / disable / enable in one pass. The `AuditEventKind` enum already lists `ServerProfileCreated` / `ServerProfileUpdated` / `ServerProfileDeleted`; the new `ServerProfileDisabled` / `ServerProfileEnabled` kinds are still pending and will be added with a paired migration to `audit_events_kind_chk` when the audit-emission slice lands. Until then the rules in "Audit-event expectations" above (one event per successful destructive action, public metadata only, target id required) still describe the contract that future slice MUST satisfy.
+**Audit emission (landed).** See "Server profile lifecycle audit" below for the full contract. Server profile **create** and the **disable** / **enable** *transitions* each append one row to `audit_events` with public metadata only. The `update` and `delete` routes do not exist yet and therefore do not audit; when they land, they MUST follow the same payload contract and idempotency rules.
 
 **ApiError shape.** `ApiError::Conflict` now carries `entity: &'static str` AND `reason: Option<&'static str>`. The wire envelope still uses `code: "conflict"`; when `reason` is `Some(r)` the message becomes `"{entity} {r}"`. When `reason` is `None` the message keeps the historical `"{entity} conflict"` form so existing clients (and pinned tests for `host_key conflict`, `terminal_session conflict`, etc.) continue to parse byte-identically.
+
+### Server profile lifecycle audit
+
+**Status:** schema, domain, and API emission landed. The kinds emitted today are `server_profile_created`, `server_profile_disabled`, and `server_profile_enabled`. `server_profile_updated` and `server_profile_deleted` remain pending — the routes themselves do not exist yet.
+
+**Schema.** Migration `20260501000012_audit_events_lifecycle_kinds.sql` extends the `audit_events_kind_chk` CHECK with `server_profile_disabled` and `server_profile_enabled` (strict superset; no rows invalidated). The matching variants land on `relayterm_core::audit_event::AuditEventKind` with snake_case wire tags pinned by unit tests in `audit_event.rs`.
+
+**Emission points.**
+
+- `POST /api/v1/server-profiles` — on a successful create, appends one `server_profile_created` row.
+- `POST /api/v1/server-profiles/:id/disable` — appends one `server_profile_disabled` row **only on the enabled → disabled transition**. A redundant disable (already-disabled row) returns the existing row unchanged and writes NO audit event.
+- `POST /api/v1/server-profiles/:id/enable` — appends one `server_profile_enabled` row **only on the disabled → enabled transition**. A redundant enable returns the existing row unchanged and writes NO audit event.
+- 401 / 404 paths (cross-user / missing id) write NO audit event. Otherwise the audit log would expose existence by id.
+
+**Payload contract (security-critical).** The JSON object on every emitted row is built field-by-field from a single helper (`write_lifecycle_audit` in `routes/v1/server_profiles.rs`) and contains only public metadata:
+
+```jsonc
+{
+    "server_profile_id": "<uuid>",
+    "name":              "<profile name>",
+    "host_id":           "<uuid>",
+    "ssh_identity_id":   "<uuid>",
+    "disabled_at":       "<rfc3339 timestamp> | null"
+}
+```
+
+The payload MUST NOT contain: `private_key`, `encrypted_private_key`, plaintext key bytes, public-key bytes, terminal I/O (input keystrokes, output bytes, replay frames), the `client_info` blob from `terminal_session_attachments`, peer banners, raw russh error text, vault internals, or DB error text. Sentinel-string redaction tests in `crates/relayterm-api/tests/api.rs` (the `AUDIT_FORBIDDEN_SUBSTRINGS` helper) pin this on every emission path.
+
+**Failure policy: fail-closed.** If the audit insert fails after the lifecycle row write, the route returns `500 internal_error` to the caller. The wire body is the static `internal error` message; the underlying SQL / driver detail is logged operator-side only and never echoed to the client. The lifecycle row state (the `server_profiles` insert / the `disabled_at` stamp / clear) is already committed by the time the audit insert runs — this matches the partial-success shape documented for `create_session` in AGENTS.md (2026-04-29 lesson). The orphan `server_profiles` row is operator-visible and reconcilable; the audit gap cannot be reconstructed after the fact, so surfacing the failure is preferable to silently dropping it.
+
+**`remote_addr`.** The `audit_events.remote_addr` column is intentionally `NULL` for these rows in this slice. Client IP / user-agent capture across the API surface is its own deferred refactor (see "Out of scope (v1)") — this slice does not introduce a one-off route-level capture path.
+
+**Reasoning.** Lifecycle audit rows are forensic primitives. Their value depends on `(actor, kind, target_id, recorded_at)` being trustworthy and free of secret-shaped fields. The payload deliberately avoids `tags`, `username_override`, host bag-of-fields, and identity public-key bytes — all of which are reachable via standard inventory queries scoped to the `actor_id`. Audit history is not a denormalised inventory snapshot; it is a transition log.
 
 ### Future implementation order
 
 This is the recommended staged plan. Each item is its own slice; do not bundle. Earlier items unblock later items.
 
 1. **~~Add `disabled_at TIMESTAMPTZ NULL` to `server_profiles`~~ (LANDED).** Migration, domain model, DTO, and frontend parser all carry the field. See "Server profile disable / enable backend (landed)" above. The "third state" guidance still applies: graduate to a `status` text column only if a third state (e.g. `archived`) becomes necessary.
-2. **~~Backend route `POST /api/v1/server-profiles/:id/disable` (and paired `:id/enable`)~~ (LANDED).** Idempotent, owner-scoped, dev-auth gated. Audit-event emission is deferred; the new audit kinds (`ServerProfileDisabled`, `ServerProfileEnabled`) are still pending and will land with the audit-emission slice.
+2. **~~Backend route `POST /api/v1/server-profiles/:id/disable` (and paired `:id/enable`)~~ (LANDED).** Idempotent, owner-scoped, dev-auth gated. ~~Audit-event emission is deferred~~ Audit-event emission landed alongside `server_profile_created`; see "Server profile lifecycle audit" above for the kinds, payload contract, idempotency rules, and fail-closed failure policy.
 3. **~~Launch-time guard on `POST /api/v1/terminal-sessions`~~ (LANDED).** Plus parallel guards on `auth-check`, `host-key-preflight`, and `trust-host-key`. Existing live sessions keep running. WebSocket attach is intentionally not gated — disable is a launch-time gate, not a runtime kill switch.
 4. **Frontend disable / enable UI** on the server-profiles list and detail panel. Confirmation dialog, disabled badge, launch button gated, redaction tests for the dialog copy.
 5. **Backend route `DELETE /api/v1/server-profiles/:id`** ONLY after disable is in place. Refuses with `409 conflict { entity: "terminal_session", count: N }` when any session references the profile (any status). Owner-scoped 404 collapses cross-user existence checks. Writes `server_profile_deleted` audit event (kind already exists).
