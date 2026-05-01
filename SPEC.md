@@ -476,7 +476,7 @@ The production-facing web app has a real shell now. The shell is layout, navigat
 4. Dev-lab tools (`TerminalProtocolLab`, `DevTerminalWorkbench`, the per-renderer lab and renderer diagnostics) stay dev-only. They are reachable only via the "Developer tools" section of the shell, which is gated by `import.meta.env.DEV` AND a `devTools` snippet passed from `App.svelte`. Vite's dead-code elimination drops the dev branch — and the dev-lab imports it pulls in — from the production bundle.
 5. The dashboard exposes a one-shot backend health probe (`GET /healthz`) via `lib/api/health.ts`. The probe does NOT poll, does NOT retry, and does NOT surface transport-error detail. Failure collapses to `down`; the underlying error is dropped on the floor (liveness probe, not diagnostic).
 
-**Architecture rule.** Production shell components (`lib/app/`) MUST NOT import anything from `lib/dev/` or any renderer adapter (`@relayterm/terminal-{xterm,ghostty-web,restty,wterm}`). Renderer packages stay dev-lab-only until the production terminal workspace lands. This is enforced by `appShellIsolation.test.ts`.
+**Architecture rule.** Production shell components (`lib/app/`) MUST NOT import anything from `lib/dev/`. The renderer-adapter rule was relaxed once the production terminal workspace landed: `@relayterm/terminal-core` (renderer-neutral) and `@relayterm/terminal-xterm` (the production baseline + its CSS side-effect entry) are allowed in the production shell; the experimental adapters `@relayterm/terminal-{ghostty-web,restty,wterm}` remain banned. This is enforced by `appShellIsolation.test.ts`.
 
 **Package layout.**
 
@@ -509,7 +509,7 @@ Production terminal workspace; production renderer selector; renderer-preference
 
 ### Production inventory read-only views
 
-The Servers and Identities views are display-only inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. Create / edit / delete UI, terminal launch, and SSH identity deletion remain future work. (Host-key trust, auth-check, and SSH identity generation are now wired — see the per-flow sections below.)
+The Servers and Identities views are display-only inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. Create / edit / delete UI and SSH identity deletion remain future work. (Host-key trust, auth-check, SSH identity generation, and terminal launch are now wired — see the per-flow sections below.)
 
 **Scope (load-bearing — this slice).**
 
@@ -692,6 +692,58 @@ After a host key has been pinned and trusted (preceding section), an operator ca
 **Future work (explicit out-of-scope for this slice).**
 
 Terminal session launch from the production shell; changed-host-key override / re-pin UI; revoked-entry recovery UI; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI; mobile/Tauri shell integration; backend VT observer; auth-check history / audit-log surfacing in the UI. Each is a separate slice.
+
+### Production terminal launch UI
+
+After a host key has been pinned and trusted AND auth-check has confirmed credentials, an operator can launch a live terminal session from a server profile. This slice ships the FIRST production terminal workspace; it is intentionally minimal — one session at a time, one renderer (xterm baseline), no multi-tab UI, no durable session list, no renderer selector.
+
+**Scope (load-bearing — this slice).**
+
+1. **Per-profile "Launch terminal" action** lives on each profile row in `ServersView.svelte`. The button is enabled by default; the underlying SSH/host-key/auth preconditions are enforced server-side and surface as a typed launch error if missing. Adjacent operator-facing copy explicitly tells the operator to run host-key trust + auth-check first if launch is refused. Per-row launch state (`submitting`, `error`) is keyed on `profile.id` so a launch on one row does not freeze every other row's button.
+2. **Production terminal workspace** — `apps/web/src/lib/app/views/TerminalView.svelte` + `apps/web/src/lib/app/terminal/ProductionTerminal.svelte`. The view is a thin wrapper that either renders the workspace component (keyed by `sessionId` so a fresh launch tears down the prior renderer + client cleanly) or shows an honest empty state pointing the operator at the Server profiles view.
+3. **Renderer is xterm baseline only.** The production shell imports `@relayterm/terminal-core` and `@relayterm/terminal-xterm` (plus its CSS side-effect via `@relayterm/terminal-xterm/styles`). The experimental adapters — ghostty-web, restty, wterm — remain dev-lab-only; `appShellIsolation.test.ts` is updated to ban only the experimentals (terminal-xterm and terminal-core are explicitly allowed). A production build's tree-shaking confirms zero references to the experimental adapters in the JS bundle.
+4. **Cross-view active-launch state lives on the shell.** `AppShell.svelte` owns `activeLaunch: ActiveLaunch | null`. Pressing "Launch terminal" on a profile row calls `createTerminalSession` and, on success, hands the result back to the shell which switches `selected = "terminal"` and stores the new launch. The Terminal view's "Back to servers" button clears `activeLaunch` and switches back to `selected = "servers"`. There is no router (the shell still uses local view-state).
+5. **Lifecycle behaviour.**
+   - On mount of `ProductionTerminal`: build an `XtermRenderer`, mount it, build a `TerminalSessionClient` over `WebSocketTerminalTransport`, attach via the canonical `wss?://<host>/api/v1/terminal-sessions/:id/ws` URL.
+   - Output frames decode through `decodeOutputData` inside a `try/catch`; malformed frames are dropped silently — `m.data` is NEVER logged or echoed.
+   - Renderer `onInput` forwards directly to `client.sendInput`; renderer `onResize` forwards directly to `client.sendResize`. xterm's `onResize` fires synchronously inside `Terminal.resize`, so the workspace's manual resize entry points (none in this slice) MUST NOT also call `client.sendResize` — the AGENTS.md "Encountered Lessons" double-emit rule still holds.
+   - On unmount: tear down client + renderer without sending a wire `Close` frame. The session enters the bounded detached-TTL window so a re-mount within ~30s can resume from the captured `lastSeenSeq`.
+   - **Detach** sends the wire `Detach` frame (TTL window starts).
+   - **End session** sends the wire `Close` frame (PTY ends immediately, no TTL).
+   - **Reconnect** tears the client down and re-attaches with `last_seen_seq` for replay; disabled until the bookmark is positive.
+   - **Disconnect** tears down the local client + renderer without changing the session row (operator-facing equivalent of closing the browser tab).
+6. **No backend changes.** The existing `POST /api/v1/terminal-sessions` and `GET /api/v1/terminal-sessions/:id/ws` routes already carry the wire shape this slice consumes; the slice is purely a frontend addition.
+
+**Redaction posture (load-bearing).**
+
+- Raw input bytes (renderer keystrokes / paste) flow straight from `XtermRenderer.onInput` to `client.sendInput`. They are NEVER logged, stashed in any error message, or surfaced through the workspace status line. The redaction rule mirrors the dev lab's pin in `packages/terminal-xterm/tests/xtermRenderer.test.ts`.
+- Raw output bytes are decoded only inside the `output` event handler and forwarded to `renderer.write`. The status line shows metadata only — phase, last_seen_seq, and a profile/session label.
+- `describeLaunchError` is a function of `kind` + `status` + `code` ONLY. Sentinel-string tests pin that it never echoes the wire `message` of an HTTP error or the thrown `Error.message` of a transport failure, across every error variant (`validation`, `http`, `transport`, `malformed_response`).
+- `describeWorkspaceError` is a function of `kind` (and `code` for server errors) ONLY. The wire `ServerMsg::Error.message` is intentionally dropped at the formatter boundary; the backend's static `message` field is wire-stable today, but a future widening must not leak through this surface. Sentinel tests pin this against every `TerminalClientError.kind`.
+- Helpers do NOT log raw response bodies, request bodies, or any payload. The workspace component does not `console.*` at all.
+- The `data-testid` selectors carry `sessionId` only on `production-terminal[data-session-id]` (a UUID — operator-visible by design); they NEVER carry input/output bytes, decoded text, or any payload-correlated value beyond `last_seen_seq`.
+
+**Architecture rule update.** The "production shell MUST NOT import any `@relayterm/terminal-*` adapter" rule (`appShellIsolation.test.ts`) is relaxed: `@relayterm/terminal-core` is renderer-neutral and is allowed; `@relayterm/terminal-xterm` is the production baseline and is allowed; `@relayterm/terminal-{ghostty-web,restty,wterm}` remain banned in the production shell. The same rule lives in AGENTS.md "Things to avoid" / "Folder conventions".
+
+**TTL and replay limitations (load-bearing copy).**
+
+- Detached sessions survive only briefly — ~30s — pinned to `relayterm_terminal::DETACHED_LIVE_PTY_TTL`. The workspace copy says "~{`DETACHED_TTL_MS / 1000`}s" and labels the local TTL countdown as `approximate, local clock` (the backend's true remaining TTL is not on the wire).
+- Replay is the bounded in-memory ring buffer on the backend. A bookmark older than the buffer surfaces as `replay_window_lost`; the workspace renders no special UI for this beyond resuming the live stream.
+- A backend restart drops every detached PTY AND its replay buffer. The workspace explicitly does NOT promise resume-across-restart, durable session recording, or backend-side terminal state observation. These are out of scope.
+
+**Stable selectors.** `production-terminal` (root, carries `data-session-id` and `data-phase`), `production-terminal-phase`, `production-terminal-detach`, `production-terminal-close`, `production-terminal-reconnect`, `production-terminal-dispose`, `production-terminal-back`, `production-terminal-ttl-hint`, `production-terminal-closed`, `production-terminal-error`, `production-terminal-viewport`. ServersView gains `profile-launch-terminal` and `profile-launch-error` (with sibling `profile-launch-error-dismiss`) on each profile row.
+
+**UX copy (load-bearing).**
+
+- Workspace status line: `Status <phase>` + `last_seen_seq <n>` only. No raw payload references.
+- Detach hint: "Detached. The remote PTY remains alive only briefly (~30s) — reconnect within that window or the session is reaped. Replay is in-memory and not durable across a backend restart."
+- Closed hint: "Session ended. Return to the server profile to launch a new one."
+- Empty Terminal view: "Launch a terminal from a server profile." plus a 3-bullet honest disclaimer (where to launch from, host-key/auth precondition, TTL/replay limitation).
+- ServersView per-row launch button hint: "Launch is enabled by host-key trust and SSH auth-check — run those above first if the launch is refused."
+
+**Future work (explicit out-of-scope for this slice).**
+
+Multi-tab terminal workspace; durable / polished session list; renderer selector in production; renderer-preference persistence; backend VT observer / `libghostty-vt` snapshot for resume-across-restart; durable session recording UI; mobile/Tauri shell integration; password bootstrap / `ssh-copy-id`; private-key import UI; edit / delete UI for hosts and profiles; URL-driven routes / deep-linking; resume-from-detached on browser tab restore. Each is a separate slice.
 
 ### Live SSH PTY bridge contract
 

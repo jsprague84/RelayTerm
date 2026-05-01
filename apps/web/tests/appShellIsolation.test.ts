@@ -45,15 +45,19 @@ describe("production app shell isolation", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("does not import a renderer adapter package", () => {
-    // Renderer packages stay dev-lab-only for now. Pulling one into the
-    // shell would smuggle a renderer (and its CSS/WASM) into the prod
-    // bundle even with `sideEffects: false`.
-    const rendererImport = /@relayterm\/terminal-(xterm|ghostty-web|restty|wterm)/;
+  it("does not import an experimental renderer adapter package", () => {
+    // Experimental renderer packages stay dev-lab-only. xterm is the
+    // production baseline (per AGENTS.md "Adding a new terminal
+    // renderer adapter") so `@relayterm/terminal-xterm` is allowed in
+    // the production shell; ghostty-web, restty, and wterm are NOT.
+    // `@relayterm/terminal-core` is renderer-neutral by construction
+    // and is also fine.
+    const experimentalImport =
+      /@relayterm\/terminal-(ghostty-web|restty|wterm)/;
     const offenders: string[] = [];
     for (const file of walk(APP_DIR)) {
       const text = readFileSync(file, "utf8");
-      if (rendererImport.test(text)) {
+      if (experimentalImport.test(text)) {
         offenders.push(file);
       }
     }

@@ -1,13 +1,19 @@
 <script lang="ts">
   // Production app shell. This module MUST NOT import anything from
-  // `lib/dev/` — dev-lab code is pulled in only by the dev-only branch in
-  // `App.svelte`, where `import.meta.env.DEV` lets Vite tree-shake the
-  // entire dev surface out of the production bundle.
+  // `lib/dev/` — dev-lab code is pulled in only via the dev-only branch
+  // in `App.svelte`, where `import.meta.env.DEV` lets Vite tree-shake
+  // the entire dev surface out of the production bundle.
+  //
+  // The shell owns the cross-view "active terminal launch" state so
+  // that pressing "Launch terminal" inside the Servers view can switch
+  // to the Terminal view AND hand off the session id without a routing
+  // library.
 
   import SidebarNav from "./SidebarNav.svelte";
   import TopBar from "./TopBar.svelte";
   import DashboardView from "./views/DashboardView.svelte";
   import TerminalView from "./views/TerminalView.svelte";
+  import type { ActiveLaunch } from "./terminal/activeLaunch.js";
   import SessionsView from "./views/SessionsView.svelte";
   import ServersView from "./views/ServersView.svelte";
   import IdentitiesView from "./views/IdentitiesView.svelte";
@@ -33,6 +39,29 @@
   let selected = $state<AppViewId>(DEFAULT_VIEW);
   let devToolsOpen = $state(false);
   let current = $derived(findNavItem(selected));
+  /**
+   * Active terminal launch. `null` until a profile-row "Launch terminal"
+   * action creates a session. Lives at the shell so navigating away
+   * from the Terminal view (without explicitly closing) preserves the
+   * attachment for the brief detached-TTL window — the next visit
+   * remounts `ProductionTerminal`, which re-attaches the WebSocket and
+   * passes its captured `lastSeenSeq` for replay.
+   *
+   * Resetting to `null` on the "Back to servers" exit and on explicit
+   * disposal in the Terminal view is intentional: the shell does not
+   * persist a closed session as if it were still launchable.
+   */
+  let activeLaunch = $state<ActiveLaunch | null>(null);
+
+  function handleLaunch(launch: ActiveLaunch) {
+    activeLaunch = launch;
+    selected = "terminal";
+  }
+
+  function handleTerminalExit() {
+    activeLaunch = null;
+    selected = "servers";
+  }
 </script>
 
 <div class="flex h-full min-h-screen bg-zinc-900 text-zinc-100">
@@ -54,11 +83,11 @@
         {#if selected === "dashboard"}
           <DashboardView />
         {:else if selected === "terminal"}
-          <TerminalView />
+          <TerminalView launch={activeLaunch} onExit={handleTerminalExit} />
         {:else if selected === "sessions"}
           <SessionsView />
         {:else if selected === "servers"}
-          <ServersView />
+          <ServersView onLaunch={handleLaunch} />
         {:else if selected === "identities"}
           <IdentitiesView />
         {:else if selected === "settings"}

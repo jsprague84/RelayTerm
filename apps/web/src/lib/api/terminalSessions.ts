@@ -1,35 +1,41 @@
 /**
  * Frontend helper for `POST /api/v1/terminal-sessions`.
  *
- * Scope: dev-only diagnostic. The production terminal UI is still future
- * work — see SPEC.md "Live SSH PTY bridge contract → Diagnostic UI". This
- * module exists so the dev launcher in `lib/dev/` can issue a typed create
- * request without inlining `fetch` and ad-hoc JSON shapes inside the
- * Svelte component.
+ * Scope: shared by the production terminal launch UI
+ * (`apps/web/src/lib/app/terminal/`, driven from `ServersView.svelte`)
+ * AND the dev launcher in `lib/dev/DevTerminalWorkbench.svelte`. Both
+ * callers issue the same typed create request through this module —
+ * production reaches the result via the AppShell-level active launch
+ * state; the dev workbench hands it to `XtermLiveTerminalLab` for
+ * auto-attach. SPEC.md "Production terminal launch UI" pins the
+ * production contract.
  *
  * Critical contracts re-asserted here:
  *  - Inputs are validated client-side BEFORE the wire round-trip
  *    ({@link validateCreateRequest}). The backend's `invalid_input` is
- *    defense-in-depth; we refuse a typo locally so the dev UI can show a
+ *    defense-in-depth; we refuse a typo locally so the UI can show a
  *    clear message without burning a request.
  *  - The backend is authoritative on every field of the response. The
- *    helper does not synthesize, default, or rename fields. Unknown fields
- *    are ignored; missing required fields collapse to a typed parse error
- *    so the dev launcher can surface "session created but response was
- *    malformed" without panicking.
+ *    helper does not synthesize, default, or rename fields. Unknown
+ *    fields are ignored; missing required fields collapse to a typed
+ *    parse error so the launcher can surface "session created but
+ *    response was malformed" without panicking.
  *  - Error envelopes are mapped to a small, safe public summary
- *    ({@link CreateTerminalSessionError}). Operator-facing detail (raw SQL
- *    fragments, peer banners, vault internals) is NEVER produced by the
- *    backend in 4xx/5xx bodies, but we still strip everything except the
- *    short `code` and the static `message`.
+ *    ({@link CreateTerminalSessionError}). Operator-facing detail (raw
+ *    SQL fragments, peer banners, vault internals) is NEVER produced by
+ *    the backend in 4xx/5xx bodies, but we still strip everything
+ *    except the short `code` and the static `message`. The two
+ *    formatters that reach the UI ({@link describeCreateError} here
+ *    and `describeLaunchError` in the production workspace) are
+ *    functions of `kind`/`status`/`code` only — never the wire body.
  *
  * What this helper does NOT do:
- *  - It does NOT log raw response bodies. A future rev that adds tracing
- *    must keep the same rule — body fields can later carry data we
- *    don't want in the console.
- *  - It does NOT authenticate. The dev-auth shim picks the user up from
- *    `AppState::dev_user_id` server-side; no header or cookie is required
- *    for same-origin requests in development.
+ *  - It does NOT log raw response bodies. A future rev that adds
+ *    tracing must keep the same rule — body fields can later carry
+ *    data we don't want in the console.
+ *  - It does NOT authenticate. Authentication is the AppShell's
+ *    concern (and, today, the dev-auth shim's). Same-origin requests
+ *    pick up cookies; no header threading happens here.
  */
 
 import { CELL_GRID_MAX, CELL_GRID_MIN } from "../terminal/cellGrid.js";

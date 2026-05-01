@@ -55,6 +55,21 @@ update this file in the same change.
 | `[data-testid="auth-check-status-description"]`   | One-line operator-facing description keyed off `status`. |
 | `[data-testid="auth-check-success-footnote"]`     | Static success footnote (only rendered on `authentication_succeeded`; explicitly disclaims terminal launch). |
 | `[data-testid="auth-check-error"]`                | Auth-check error summary (safe formatter only; never echoes wire `message` or transport detail). |
+| `[data-testid="profile-launch-terminal"]`         | Per-profile "Launch terminal" button on the Servers view (creates a session and navigates to the Terminal workspace). |
+| `[data-testid="profile-launch-error"]`            | Per-row launch error summary (safe formatter only — never echoes wire `message` or transport detail). |
+| `[data-testid="profile-launch-error-dismiss"]`    | Dismiss button inside `profile-launch-error`.                 |
+| `[data-testid="production-view-terminal"]`        | Terminal workspace empty state (rendered when there is no active launch). |
+| `[data-testid="production-terminal"]`             | Production terminal workspace root (one per active session; carries `data-session-id` and `data-phase`). |
+| `[data-testid="production-terminal-phase"]`       | Workspace phase label (`creating`/`connecting`/`live`/`replaying`/`detached`/`closed`/`error`). |
+| `[data-testid="production-terminal-detach"]`      | "Detach" button (sends wire `Detach`; PTY enters TTL window).  |
+| `[data-testid="production-terminal-close"]`       | "End session" button (sends wire `Close`; PTY ends immediately). |
+| `[data-testid="production-terminal-reconnect"]`   | "Reconnect" button (re-attaches with `last_seen_seq`; disabled until the bookmark is positive). |
+| `[data-testid="production-terminal-dispose"]`     | "Disconnect" button (tears down the local client + renderer without touching the session row). |
+| `[data-testid="production-terminal-back"]`        | "Back to servers" button (clears the active launch and returns to the Servers view). |
+| `[data-testid="production-terminal-ttl-hint"]`    | Detach TTL hint banner (visible only in the `detached` phase, before explicit close). |
+| `[data-testid="production-terminal-closed"]`      | Closed-state hint banner.                                     |
+| `[data-testid="production-terminal-error"]`       | Workspace error summary (safe formatter only — never echoes wire `message` or transport detail). |
+| `[data-testid="production-terminal-viewport"]`    | xterm renderer host element (terminal output renders inside).  |
 | `[data-testid="production-view-identities"]`      | Identities view (public-key list + generate panel).           |
 | `[data-testid="identities-refresh-button"]`       | Refresh button on the Identities view.                        |
 | `[data-testid="identities-generate-open"]`        | "Generate SSH identity" button (opens the generate panel).    |
@@ -290,7 +305,53 @@ the same MCP browser tools.
    carries the honest empty-state hint. This is the documented contract
    — do not mark it a regression.
 
-5. `browser_console_messages level=error all=true`. As above, the
+5. Verify the production terminal launch surface is reachable in the
+   prod bundle (no live backend is assumed; this step does NOT click
+   "Launch terminal" because that would issue a real `POST` against
+   `/api/v1/terminal-sessions`):
+
+   - With the Servers view still selected, `browser_evaluate`:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       const launchButtons = document.querySelectorAll(
+         '[data-testid="profile-launch-terminal"]',
+       );
+       return {
+         // The button is per-row; if the dev inventory has no profiles
+         // the button is absent and the "no profiles yet" empty state
+         // renders instead. Both are valid prod-bundle states.
+         launchButtonAbsentOrPresent:
+           launchButtons.length === 0 || launchButtons.length >= 1,
+         // The terminal workspace is not visible until a launch
+         // succeeds; the empty-state placeholder lives behind the
+         // Terminal nav item.
+         workspaceEmptyState: false, // populated below
+       };
+     }
+     ```
+
+   - `browser_click [data-testid="nav-terminal"]`
+   - Assert the empty Terminal view renders and the production
+     workspace is NOT yet mounted:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         emptyState: has('[data-testid="production-view-terminal"]'),
+         workspaceAbsent: !has('[data-testid="production-terminal"]'),
+       };
+     }
+     ```
+
+     Expected: both `true`. The workspace selectors
+     (`production-terminal-*`) only become reachable after a successful
+     launch from the Servers view; verifying the post-launch surface
+     requires a live backend and is out of scope for this smoke.
+
+6. `browser_console_messages level=error all=true`. As above, the
    favicon `404` is the only allowed error.
 
 ## What this smoke does NOT cover

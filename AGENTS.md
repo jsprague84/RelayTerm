@@ -185,7 +185,7 @@ If you're tempted to invent a new directory, propose it here first.
 | Edit `apps/{desktop,mobile}/src-tauri/gen/**` by hand | Re-generate via `tauri android init` (mobile) or platform init (desktop); configure via capabilities |
 | Use a JWT for browser auth, or trust client-validated input | Server-side session; re-validate inputs at the axum boundary |
 | Redefine `RendererTheme`, `RendererThemeAnsi`, `RendererCursorStyle`, or `BaseTerminalRendererOptions` inside an adapter package | Import them from `@relayterm/terminal-core`; extend `BaseTerminalRendererOptions` for the adapter's option interface |
-| Import from `lib/dev/` or any `@relayterm/terminal-*` adapter inside `apps/web/src/lib/app/` | Production shell stays dev-free; reach the dev lab via the `devTools` snippet in `App.svelte`, gated by `import.meta.env.DEV` — see `tests/appShellIsolation.test.ts` |
+| Import from `lib/dev/` inside `apps/web/src/lib/app/`, OR import an experimental renderer adapter (`@relayterm/terminal-{ghostty-web,restty,wterm}`) inside `apps/web/src/lib/app/` | Production shell stays dev-free; the production terminal workspace uses `@relayterm/terminal-core` + `@relayterm/terminal-xterm` (the baseline) only. Reach the dev lab via the `devTools` snippet in `App.svelte`, gated by `import.meta.env.DEV` — see `tests/appShellIsolation.test.ts` |
 | Show fake data, mock secret values, or a `private_key`/`encrypted_private_key` field on a placeholder view | Use `PlaceholderView` with honest copy: a one-line summary, a "what currently exists on the backend" bullet list, and a `futureWork` note |
 
 ## Git workflow

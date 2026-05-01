@@ -20,8 +20,37 @@
     type SshIdentity,
   } from "../../api/sshIdentities.js";
   import { describeLoadError } from "../../api/apiErrors.js";
+  import {
+    createTerminalSession,
+  } from "../../api/terminalSessions.js";
+  import { describeLaunchError } from "../terminal/terminalLaunch.js";
+  import type { ActiveLaunch } from "../terminal/activeLaunch.js";
   import HostKeyPanel from "./HostKeyPanel.svelte";
   import AuthCheckPanel from "./AuthCheckPanel.svelte";
+
+  interface Props {
+    /**
+     * Hand a successful launch back to the parent shell. The shell is
+     * responsible for switching to the Terminal view; this component
+     * only owns the create call and the per-row launch state.
+     */
+    onLaunch?: (launch: ActiveLaunch) => void;
+  }
+
+  let { onLaunch }: Props = $props();
+
+  /**
+   * Per-profile launch state. Keyed on `server_profile_id` so each row
+   * tracks its own button state independently — a launch on one profile
+   * must not freeze every other row's button. `idle` is the implicit
+   * default; absence of an entry means "not in flight, no error
+   * pending."
+   */
+  type ProfileLaunchState =
+    | { kind: "submitting" }
+    | { kind: "error"; summary: string };
+
+  let launchStates = $state<Record<string, ProfileLaunchState>>({});
 
   type LoadState =
     | { kind: "idle" }
@@ -283,6 +312,50 @@
       profileHostId.length === 0 ||
       profileIdentityId.length === 0,
   );
+
+  async function launchProfile(profile: ServerProfile) {
+    const existing = launchStates[profile.id];
+    if (existing?.kind === "submitting") return;
+    launchStates = { ...launchStates, [profile.id]: { kind: "submitting" } };
+    // Cols/rows are intentionally omitted: the helper falls through to
+    // the wire-stable 80×24 defaults, and the workspace reads
+    // `result.session.cols/rows` back to seed the renderer. Resize-to-fit
+    // on mount is future work; until then, the row's create dims are the
+    // canonical pair the workspace uses.
+    const result = await createTerminalSession({
+      server_profile_id: profile.id,
+    });
+    if (!result.ok) {
+      launchStates = {
+        ...launchStates,
+        [profile.id]: {
+          kind: "error",
+          summary: describeLaunchError(result.error),
+        },
+      };
+      return;
+    }
+    // Drop the per-row state on success — the Terminal view owns the
+    // attachment from here. Leaving a stale `submitting` would freeze
+    // the button if the operator returns to this view via "Back to
+    // servers" while the session is still alive.
+    const next = { ...launchStates };
+    delete next[profile.id];
+    launchStates = next;
+    onLaunch?.({
+      sessionId: result.session.id,
+      cols: result.session.cols,
+      rows: result.session.rows,
+      profileLabel: profile.name,
+    });
+  }
+
+  function dismissLaunchError(profileId: string) {
+    if (launchStates[profileId]?.kind !== "error") return;
+    const next = { ...launchStates };
+    delete next[profileId];
+    launchStates = next;
+  }
 </script>
 
 <section
@@ -753,6 +826,7 @@
         >
           {#each view.profiles as profile (profile.id)}
             {@const links = resolveProfileLinks(profile, view.hosts)}
+            {@const launchState = launchStates[profile.id]}
             <li
               class="flex flex-col gap-1.5 py-3 first:pt-0 last:pb-0"
               data-testid="profile-row"
@@ -816,6 +890,40 @@
               {/if}
               <HostKeyPanel profileId={profile.id} />
               <AuthCheckPanel profileId={profile.id} />
+              <div class="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  class="rounded-md border border-emerald-700/60 bg-emerald-900/20 px-3 py-1 text-xs text-emerald-100 transition hover:border-emerald-600 hover:bg-emerald-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  onclick={() => void launchProfile(profile)}
+                  disabled={launchState?.kind === "submitting"}
+                  data-testid="profile-launch-terminal"
+                  title="Create a terminal session and open the Terminal workspace. Run host-key trust + auth-check first; the backend will refuse otherwise."
+                >
+                  {launchState?.kind === "submitting"
+                    ? "Launching…"
+                    : "Launch terminal"}
+                </button>
+                <span class="text-[11px] text-zinc-500">
+                  Launch is enabled by host-key trust and SSH auth-check —
+                  run those above first if the launch is refused.
+                </span>
+              </div>
+              {#if launchState?.kind === "error"}
+                <p
+                  class="flex items-center justify-between gap-2 rounded-md border border-rose-900/40 bg-rose-950/20 px-3 py-2 text-xs text-rose-200/80"
+                  data-testid="profile-launch-error"
+                >
+                  <span>{launchState.summary}</span>
+                  <button
+                    type="button"
+                    class="rounded-sm border border-rose-900/60 bg-rose-950/40 px-2 py-0.5 text-[11px] text-rose-100 hover:bg-rose-900/40"
+                    onclick={() => dismissLaunchError(profile.id)}
+                    data-testid="profile-launch-error-dismiss"
+                  >
+                    Dismiss
+                  </button>
+                </p>
+              {/if}
             </li>
           {/each}
         </ul>
@@ -827,9 +935,9 @@
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Edit / delete forms and terminal launch land alongside the
-    production terminal workspace. Host-key preflight, trust, and
-    auth-check are above; auth-check is a credential check only — it
-    does not open a terminal, run commands, or install your public key.
+    Edit / delete forms land in a later slice. Launch starts a live SSH
+    PTY using the xterm baseline renderer; detached sessions survive
+    only briefly (~30s) and replay is in-memory only — not durable
+    across a backend restart.
   </p>
 </section>
