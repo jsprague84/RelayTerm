@@ -49,6 +49,12 @@ update this file in the same change.
 | `[data-testid="host-key-preflight-error"]`        | Preflight error summary (safe formatter only).                |
 | `[data-testid="host-key-trust-error"]`            | Trust error summary (safe formatter only; collapses 409 to a conservative re-run-preflight message). |
 | `[data-testid="host-key-trusted-success"]`        | Trust success card (rendered after a successful trust action). |
+| `[data-testid="auth-check-panel"]`                | Per-profile SSH auth-check panel (one per profile row; carries `data-profile-id`; rendered immediately below the host-key panel). |
+| `[data-testid="auth-check-run-button"]`           | "Run auth-check" / "Re-run auth-check" button inside the panel. |
+| `[data-testid="auth-check-status-badge"]`         | Status badge after auth-check; carries `data-status` (`authentication_succeeded`/`authentication_failed`/`host_key_unknown`/`host_key_changed`/`connection_failed`) and `data-tone` (`ok`/`warn`/`blocked`/`error`). |
+| `[data-testid="auth-check-status-description"]`   | One-line operator-facing description keyed off `status`. |
+| `[data-testid="auth-check-success-footnote"]`     | Static success footnote (only rendered on `authentication_succeeded`; explicitly disclaims terminal launch). |
+| `[data-testid="auth-check-error"]`                | Auth-check error summary (safe formatter only; never echoes wire `message` or transport detail). |
 | `[data-testid="production-view-identities"]`      | Identities view (public-key list + generate panel).           |
 | `[data-testid="identities-refresh-button"]`       | Refresh button on the Identities view.                        |
 | `[data-testid="identities-generate-open"]`        | "Generate SSH identity" button (opens the generate panel).    |

@@ -243,8 +243,9 @@
         class="rounded-md border border-emerald-900/50 bg-emerald-950/30 px-2 py-1.5 text-[11px] text-emerald-100"
         data-testid="host-key-trusted-success"
       >
-        Host key pinned. Re-run preflight to confirm. SSH authentication
-        and terminal launch are still future work.
+        Host key pinned. Re-run preflight to confirm. Run auth-check
+        below to verify the configured SSH identity authenticates;
+        terminal launch is still future work.
       </p>
     {:else if trustGate?.kind === "already_trusted"}
       <p

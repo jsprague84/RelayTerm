@@ -509,7 +509,7 @@ Production terminal workspace; production renderer selector; renderer-preference
 
 ### Production inventory read-only views
 
-The Servers and Identities views are display-only inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. Create / edit / delete UI, host-key trust, auth-check, terminal launch, and SSH identity generation/deletion remain future work.
+The Servers and Identities views are display-only inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. Create / edit / delete UI, terminal launch, and SSH identity deletion remain future work. (Host-key trust, auth-check, and SSH identity generation are now wired — see the per-flow sections below.)
 
 **Scope (load-bearing — this slice).**
 
@@ -535,7 +535,7 @@ The Servers and Identities views are display-only inventories of `hosts`, `serve
 
 **Future work (explicit out-of-scope for this slice).**
 
-CRUD forms (create / edit / delete) for hosts and profiles; SSH identity deletion / rename; private-key import; host-key preflight and trust UI; auth-check UI; terminal session launch from the production shell; per-row "view details" / `get_by_id` panels; password bootstrap / `ssh-copy-id`; durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice.
+CRUD forms (create / edit / delete) for hosts and profiles; SSH identity deletion / rename; private-key import; terminal session launch from the production shell; per-row "view details" / `get_by_id` panels; password bootstrap / `ssh-copy-id`; durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice. (SSH identity generation, host-key preflight + trust UI, and auth-check UI are now wired — see the per-flow sections below.)
 
 ### Production SSH identity generation UI
 
@@ -600,15 +600,15 @@ The next production-safe write flows on the Servers view: an operator can create
 
 **UX copy (load-bearing).**
 
-- Host panel intro: "A host is a metadata-only target definition" and "No SSH connection is attempted. Host-key trust and auth-check are deliberate later slices."
-- Profile panel intro: "A server profile binds a host, a username, and an SSH identity into a single connect target" and "Creating a profile does NOT trust the host key, does NOT verify SSH authentication, and does NOT install the public key on the target server. Run host-key trust and auth-check later (future slices)."
+- Host panel intro: "A host is a metadata-only target definition" and "No SSH connection is attempted. Host-key trust and auth-check happen per-profile (panels appear under each profile row after creation)."
+- Profile panel intro: "A server profile binds a host, a username, and an SSH identity into a single connect target" and "Creating a profile does NOT trust the host key, does NOT verify SSH authentication, and does NOT install the public key on the target server. Run host-key trust and then auth-check on the new profile row after it appears."
 - The view header and footer are updated with the same load-bearing claim: creation here does not imply trust or reachability.
 
 **Stable selectors.** New `data-testid` hooks: `servers-create-host-{open,close,panel,form,display-name,hostname,port,username,submit,error,success}` and `servers-create-profile-{open,close,panel,form,name,host,identity,username-override,tags,submit,error,success,blocked}`.
 
 **Future work (explicit out-of-scope for this slice).**
 
-Edit / delete forms for hosts and profiles; auth-check UI; terminal session launch from the production shell; password bootstrap / `ssh-copy-id`; `username_override` / `tags` editing on existing profiles; per-row "view details" / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice. (Host-key preflight and trust UI is now wired — see "Production host-key preflight & trust UI" below.)
+Edit / delete forms for hosts and profiles; terminal session launch from the production shell; password bootstrap / `ssh-copy-id`; `username_override` / `tags` editing on existing profiles; per-row "view details" / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice. (Host-key preflight + trust UI and auth-check UI are now wired — see "Production host-key preflight & trust UI" and "Production SSH auth-check UI" below.)
 
 ### Production host-key preflight & trust UI
 
@@ -649,7 +649,49 @@ The next production-safe security flow on the Servers view: an operator can run 
 
 **Future work (explicit out-of-scope for this slice).**
 
-SSH auth-check UI; terminal session launch from the production shell; changed-host-key override / re-pin UI; revoked-entry recovery UI; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI; mobile/Tauri shell integration; backend VT observer. Each is a separate slice.
+Terminal session launch from the production shell; changed-host-key override / re-pin UI; revoked-entry recovery UI; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI; mobile/Tauri shell integration; backend VT observer. Each is a separate slice. (SSH auth-check UI is now wired — see "Production SSH auth-check UI" below.)
+
+### Production SSH auth-check UI
+
+After a host key has been pinned and trusted (preceding section), an operator can run an SSH auth-check from the production Servers view to confirm the configured `ssh_identity` actually authenticates against the target. This is NOT a terminal launch, NOT a password bootstrap, NOT a private-key import, and NOT a real auth/user-login UI.
+
+**Scope (load-bearing — this slice).**
+
+1. **Per-profile "Auth-check" panel** is rendered inside each profile row on `ServersView.svelte` via the `AuthCheckPanel.svelte` component, immediately below the existing `HostKeyPanel`. The panel exposes a single "Run auth-check" button, a loading indicator, a status badge keyed off the wire status (`Authenticated` / `Auth rejected` / `Host key not trusted` / `Host key changed` / `Connection failed`), a one-line operator-facing description, the `checked_at` timestamp, and — only on `authentication_succeeded` — a static success footnote that explicitly disclaims terminal launch. The panel holds local Svelte state ONLY (no global stores, no router, no polling, no auto-retry).
+2. **`authCheckServerProfile(profileId, options)`** in `lib/api/serverProfiles.ts` is the single client entry point. It posts an empty JSON body to `POST /api/v1/server-profiles/:id/auth-check`, parses the response with `parseAuthCheckResponse` (a field-by-field DTO guard), and returns either `{ ok: true, check }` or `{ ok: false, error }`. It does NOT throw, does NOT log raw response bodies, and does NOT echo wire / transport detail through any user-facing string.
+3. **Auth-check NEVER opens a PTY, runs a shell, executes a command, persists a terminal session, or installs the public key.** The success copy explicitly disclaims that scope so the operator cannot mistake "credentials work" for "terminal ready". `terminalLaunchWouldBeAllowed(status)` is the single pure helper that names the (currently empty) bridge to a future terminal-launch slice — it returns `true` only on `authentication_succeeded` and is advisory, not a gate.
+4. **Trusted host key is a precondition, surfaced as a diagnostic outcome.** The wire `host_key_unknown` and `host_key_changed` statuses arrive as 200-OK typed `status` values, NOT HTTP errors. The UI renders them as "trust the host key first" / "the host key changed; investigate before continuing" — never as an internal error and never as a generic failure. The host-key panel above continues to be the single deliberate trust-issuance surface; auth-check never auto-runs preflight or auto-trusts.
+5. **No backend changes.** The existing `POST /api/v1/server-profiles/:id/auth-check` route already returns the wire shape the new helper parses; the slice is purely a frontend addition.
+6. **Architecture rule preserved.** No import added under `lib/app/` touches `lib/dev/` or any renderer adapter; `appShellIsolation.test.ts` continues to pass.
+
+**Redaction posture (load-bearing).**
+
+- `parseAuthCheckResponse` builds its DTO field-by-field, so a backend bug or hostile fixture that includes `private_key` / `encrypted_private_key` on a 200 response cannot smuggle them onto the parsed object. Sentinel-string redaction tests in `tests/authCheckApi.test.ts` pin this on the parsed object and on `JSON.stringify` of the parsed object.
+- `describeAuthCheckError` is a function of `kind` + `status` + `code` ONLY. Sentinel-string tests pin that it NEVER echoes the wire `message` of an HTTP error or the thrown `Error.message` of a transport failure, across `401`, `404`, `500`, `503`, and unknown statuses, plus `transport` and `malformed_response`.
+- The helper does NOT log raw response bodies. Tests pin `console.log/warn/error` as untouched across success, HTTP failure, and transport failure.
+- The UI status formatters (`authCheckStatusLabel`, `authCheckStatusDescription`, `authCheckStatusTone`, `terminalLaunchWouldBeAllowed`, `AUTH_CHECK_DISCLAIMER`, `AUTH_CHECK_SUCCESS_FOOTNOTE`) are pure functions of `status` only — no I/O, no Svelte state, no side effects. Tests pin that none of them mention `private_key` / `encrypted_private_key` and that the success copy never implies a PTY, shell, command execution, or terminal/session readiness.
+
+**Wire shape (mirror of `crates/relayterm-api/src/dto/auth_check.rs`).**
+
+- Auth-check request: empty body. Response (`200 OK`): `{ profile_id, host_id, ssh_identity_id, status, message, checked_at }`. `status` ∈ `authentication_succeeded | authentication_failed | host_key_unknown | host_key_changed | connection_failed`. `message` is a static, server-supplied string keyed off `status`; the UI may render it but does not depend on its exact wording (the local `authCheckStatusDescription` helper is the single source of truth for rendered status copy).
+
+**UX copy (load-bearing).**
+
+- Auth-check disclaimer (`AUTH_CHECK_DISCLAIMER`): "Auth-check verifies that the configured SSH identity authenticates against the server. It requires a trusted host key first. It does not open a terminal, does not run commands, and does not install your public key."
+- Success footnote (`AUTH_CHECK_SUCCESS_FOOTNOTE`): "Credentials worked for SSH authentication. Terminal launch is still a separate action and is not yet implemented in the production shell."
+- `authentication_succeeded` description: explicitly disclaims PTY allocation, command execution, and terminal-launch. Phrasing: "SSH public-key authentication succeeded for the configured username. No PTY was allocated and no command was executed. Terminal launch is a separate, deliberate action."
+- `authentication_failed` description: names the wrong-key / wrong-user / `authorized_keys`-not-installed diagnostic without surfacing peer banner detail.
+- `host_key_unknown` description: surfaces the trust-host-key precondition explicitly ("Run host-key preflight and trust the captured fingerprint above before re-running auth-check") and never implies authentication was attempted.
+- `host_key_changed` description: warns about server reinstallation, key rotation, or man-in-the-middle, and explicitly states auth was not attempted.
+- `connection_failed` description: names the SSH-transport-layer cause (refused, timeout, unreachable) without leaking peer detail.
+- The host-key panel's `trusted` description and `trusted` success message now point operators to the auth-check panel below: "Run auth-check below to confirm the configured SSH identity authenticates. Terminal launch is still future work."
+- The Servers view header and the bottom "future work" footer are updated in lockstep so neither still claims auth-check is future work.
+
+**Stable selectors.** New `data-testid` hooks on `AuthCheckPanel.svelte`: `auth-check-panel` (root, also carries `data-profile-id`), `auth-check-run-button`, `auth-check-idle`, `auth-check-checking`, `auth-check-error`, `auth-check-status-badge` (with `data-status` and `data-tone` attributes), `auth-check-checked-at`, `auth-check-status-description`, `auth-check-success-footnote`.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Terminal session launch from the production shell; changed-host-key override / re-pin UI; revoked-entry recovery UI; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI; mobile/Tauri shell integration; backend VT observer; auth-check history / audit-log surfacing in the UI. Each is a separate slice.
 
 ### Live SSH PTY bridge contract
 

@@ -21,6 +21,7 @@
   } from "../../api/sshIdentities.js";
   import { describeLoadError } from "../../api/apiErrors.js";
   import HostKeyPanel from "./HostKeyPanel.svelte";
+  import AuthCheckPanel from "./AuthCheckPanel.svelte";
 
   type LoadState =
     | { kind: "idle" }
@@ -295,9 +296,11 @@
     <p class="text-sm text-zinc-400">
       Hosts are reachable target definitions. Server profiles bind a
       host to an SSH identity. Run host-key preflight per profile to
-      capture and explicitly trust the server's host key. SSH auth-check
-      and terminal launch are future work — creating or trusting here
-      does NOT verify SSH authentication or install the public key.
+      capture and explicitly trust the server's host key, then run
+      auth-check to confirm the configured SSH identity authenticates.
+      Terminal launch is future work — creating, trusting, or running
+      auth-check here does NOT open a terminal, run commands, or install
+      the public key on the target.
     </p>
   </header>
 
@@ -367,7 +370,8 @@
         </li>
         <li>
           No SSH connection is attempted. Host-key trust and
-          auth-check are deliberate later slices.
+          auth-check happen per-profile (panels appear under each
+          profile row after creation).
         </li>
       </ul>
 
@@ -519,8 +523,8 @@
         <li>
           Creating a profile does NOT trust the host key, does NOT
           verify SSH authentication, and does NOT install the public
-          key on the target server. Run host-key trust and auth-check
-          later (future slices).
+          key on the target server. Run host-key trust and then
+          auth-check on the new profile row after it appears.
         </li>
       </ul>
 
@@ -811,6 +815,7 @@
                 </ul>
               {/if}
               <HostKeyPanel profileId={profile.id} />
+              <AuthCheckPanel profileId={profile.id} />
             </li>
           {/each}
         </ul>
@@ -822,8 +827,9 @@
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Edit / delete forms, auth-check, and terminal launch land alongside
-    the production terminal workspace. Host-key preflight and trust
-    are above; SSH authentication has not been verified by either.
+    Edit / delete forms and terminal launch land alongside the
+    production terminal workspace. Host-key preflight, trust, and
+    auth-check are above; auth-check is a credential check only — it
+    does not open a terminal, run commands, or install your public key.
   </p>
 </section>

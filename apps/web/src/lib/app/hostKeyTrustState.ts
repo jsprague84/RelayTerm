@@ -46,7 +46,7 @@ export function hostKeyStatusDescription(status: HostKeyStatus): string {
     case "unknown":
       return "Host key was captured during SSH key exchange, but no pinned entry matches it. Verify the fingerprint matches what you expect for this server before trusting it.";
     case "trusted":
-      return "Host key matches an active pinned entry. SSH authentication and terminal launch are still future work.";
+      return "Host key matches an active pinned entry. Run auth-check below to confirm the configured SSH identity authenticates. Terminal launch is still future work.";
     case "changed":
       return "Host key differs from the pinned entry for this host. RelayTerm will not overwrite a pinned key automatically. This may indicate server reinstallation, key rotation, or a possible man-in-the-middle.";
   }

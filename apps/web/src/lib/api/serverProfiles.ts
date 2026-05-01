@@ -811,3 +811,194 @@ export function describeTrustHostKeyError(err: TrustHostKeyError): string {
       return "Trust refused: malformed response";
   }
 }
+
+// ---------------------------------------------------------------------------
+// SSH auth-check helpers
+// ---------------------------------------------------------------------------
+//
+// Wire shape mirrors `crates/relayterm-api/src/dto/auth_check.rs`. The route
+// returns `200 OK` with a typed `status` enum for diagnostic outcomes
+// (auth failure, host-key mismatch, connection failure are NOT HTTP errors
+// — they are operator-facing diagnostic answers). HTTP errors are reserved
+// for "the request couldn't be processed" cases (missing profile, vault
+// disabled, internal data-integrity bug, concurrency cap saturated).
+//
+// Redaction posture: the wire response carries ONLY public diagnostic
+// fields — no host key, fingerprint, peer banner, decrypted PEM, encrypted
+// blob, or russh error text. The DTO declared here mirrors that surface
+// 1:1; the parser builds it field-by-field so a stray `private_key` /
+// `encrypted_private_key` smuggled onto the wire body cannot reach the
+// returned object. The error formatter is a function of `kind` + `status`
+// + `code` only — wire `message` and transport `Error.message` never
+// reach the UI.
+
+/**
+ * Wire-stable auth-check status returned by `POST /:id/auth-check`.
+ *
+ * - `authentication_succeeded` — host key matched a trusted pin AND
+ *   public-key authentication succeeded for the configured username.
+ *   The auth-check route did NOT open a PTY, run a shell, or execute a
+ *   command. Terminal launch remains a separate, deliberate action.
+ * - `authentication_failed` — host key matched a trusted pin, but the
+ *   server rejected the configured identity for the configured username
+ *   (wrong key, wrong user, or `authorized_keys` not yet in place).
+ * - `host_key_unknown` — no active, trusted, non-revoked pin matches
+ *   the captured host key. Auth was NOT attempted. Trust the host key
+ *   first via the host-key panel.
+ * - `host_key_changed` — an active, non-revoked pin exists for the
+ *   same key type with a DIFFERENT fingerprint. Auth was NOT attempted.
+ *   Investigate before continuing — server reinstallation, key rotation,
+ *   or man-in-the-middle are all possible.
+ * - `connection_failed` — the SSH transport failed before authentication
+ *   could complete (TCP refused, timeout, malformed peer, outer auth-
+ *   check timeout). Auth was NOT attempted.
+ */
+export type AuthCheckStatus =
+  | "authentication_succeeded"
+  | "authentication_failed"
+  | "host_key_unknown"
+  | "host_key_changed"
+  | "connection_failed";
+
+const AUTH_CHECK_STATUSES: ReadonlySet<AuthCheckStatus> = new Set([
+  "authentication_succeeded",
+  "authentication_failed",
+  "host_key_unknown",
+  "host_key_changed",
+  "connection_failed",
+]);
+
+/**
+ * Parsed shape of `POST /api/v1/server-profiles/:id/auth-check`.
+ *
+ * Carries ONLY public diagnostic fields. No private-key field is declared
+ * here — the parser builds the DTO field-by-field, so any stray
+ * `private_key` / `encrypted_private_key` smuggled onto the wire body
+ * cannot reach the returned object. See the redaction-sentinel tests in
+ * `tests/authCheckApi.test.ts`.
+ */
+export interface AuthCheckResponse {
+  profile_id: string;
+  host_id: string;
+  ssh_identity_id: string;
+  status: AuthCheckStatus;
+  /** Static, server-supplied human-facing message keyed off `status`.
+   * The backend wires this from a fixed string per status — no operator
+   * detail is interpolated. The UI is free to use it but does not depend
+   * on its exact wording; the local `authCheckStatusDescription` helper
+   * (in `lib/app/authCheckState.ts`) is the single source of truth for
+   * rendered status copy. */
+  message: string;
+  /** RFC 3339 timestamp. */
+  checked_at: string;
+}
+
+export function parseAuthCheckResponse(
+  raw: unknown,
+): AuthCheckResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.profile_id !== "string" ||
+    typeof r.host_id !== "string" ||
+    typeof r.ssh_identity_id !== "string" ||
+    typeof r.status !== "string" ||
+    typeof r.message !== "string" ||
+    typeof r.checked_at !== "string"
+  ) {
+    return null;
+  }
+  if (!AUTH_CHECK_STATUSES.has(r.status as AuthCheckStatus)) {
+    return null;
+  }
+  // Construct field-by-field. A stray `encrypted_private_key` /
+  // `private_key` on `r` cannot reach the returned object because no
+  // path here copies it.
+  return {
+    profile_id: r.profile_id,
+    host_id: r.host_id,
+    ssh_identity_id: r.ssh_identity_id,
+    status: r.status as AuthCheckStatus,
+    message: r.message,
+    checked_at: r.checked_at,
+  };
+}
+
+export interface AuthCheckOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/server-profiles/:id/auth-check`. */
+  endpoint?: string;
+}
+
+export type AuthCheckError = WireError;
+
+export type AuthCheckResult =
+  | { ok: true; check: AuthCheckResponse }
+  | { ok: false; error: AuthCheckError };
+
+/**
+ * POST an auth-check request and parse the typed response.
+ *
+ * The route attempts SSH public-key authentication WITHOUT requesting a
+ * PTY, opening a channel, or executing a command. Auth failure, host-key
+ * mismatch, and connection failure are returned as 200-OK typed `status`
+ * outcomes; only "request couldn't be processed" cases (missing profile,
+ * vault disabled, vault-row corrupt, semaphore saturated, dev-auth
+ * disabled) reach the {@link AuthCheckError} envelope.
+ *
+ * The helper does NOT throw, does NOT log raw response bodies, and does
+ * NOT echo wire / transport detail through any user-facing string.
+ */
+export async function authCheckServerProfile(
+  profileId: string,
+  options: AuthCheckOptions = {},
+): Promise<AuthCheckResult> {
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/server-profiles/${encodeURIComponent(profileId)}/auth-check`;
+  const result = await postJsonItem<AuthCheckResponse>(
+    endpoint,
+    {},
+    parseAuthCheckResponse,
+    options,
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, check: result.data };
+}
+
+/**
+ * Format an auth-check error as a one-line UI summary. Stays a function
+ * of `kind` + `status` + `code` ONLY — never echoes the wire `message`
+ * of an HTTP error or the thrown `Error.message` of a transport failure.
+ *
+ * Per-status copy mirrors the backend's failure shapes:
+ *  - `503 service_unavailable` — vault disabled OR auth-check concurrency
+ *    cap saturated. The wire body is the static `service unavailable`
+ *    string in either case; the UI cannot distinguish them.
+ *  - `500 internal_error` — vault row decrypted to a malformed PEM. Data-
+ *    integrity bug; operator-facing copy is generic.
+ *  - `404 not_found` — profile is missing or foreign-owned.
+ *  - `401 unauthorized` — dev-auth disabled.
+ */
+export function describeAuthCheckError(err: AuthCheckError): string {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 503 && err.code === "service_unavailable") {
+        return "Auth-check unavailable: backend vault is not configured or the auth-check concurrency cap is saturated — try again shortly";
+      }
+      if (err.status === 500 && err.code === "internal_error") {
+        return "Auth-check failed: backend could not decrypt the SSH identity (vault data-integrity issue)";
+      }
+      if (err.status === 404 && err.code === "not_found") {
+        return "Auth-check failed: server profile not found";
+      }
+      if (err.status === 401) {
+        return "Auth-check failed: not authenticated";
+      }
+      return `Auth-check failed: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Auth-check failed: transport error";
+    case "malformed_response":
+      return "Auth-check failed: malformed response";
+  }
+}
