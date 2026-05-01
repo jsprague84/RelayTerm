@@ -4,14 +4,18 @@ import {
   CELL_GRID_MIN,
   closeTerminalSession,
   describeCloseSessionError,
+  describeSessionGetError,
   describeSessionLoadError,
   type CreateTerminalSessionResponse,
   createTerminalSession,
   describeCreateError,
+  getTerminalSession,
+  isSessionReconnectable,
   listTerminalSessions,
   parseTerminalSession,
   type TerminalSession,
   validateCreateRequest,
+  validateSavedSession,
 } from "../src/lib/api/terminalSessions.js";
 
 /**
@@ -623,5 +627,331 @@ describe("describeCloseSessionError", () => {
         message: "unauthorized",
       }),
     ).toBe("Could not close session: not authenticated");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Get-by-id + saved-session validation
+// ---------------------------------------------------------------------------
+
+describe("getTerminalSession", () => {
+  it("encodes path-unsafe ids and hits the canonical endpoint", async () => {
+    let captured: { url: string; init: RequestInit | undefined } | null = null;
+    const fetchImpl = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      captured = { url: String(input), init };
+      return new Response(JSON.stringify(LIST_SESSION), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    await getTerminalSession("a/b c", { fetchImpl });
+    expect(captured).not.toBeNull();
+    expect(captured!.url).toBe("/api/v1/terminal-sessions/a%2Fb%20c");
+    // GET request — no method override, no body
+    expect(captured!.init?.method).toBeUndefined();
+    expect(captured!.init?.body).toBeUndefined();
+  });
+
+  it("returns the parsed session on a 2xx body", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify(LIST_SESSION), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const result = await getTerminalSession(LIST_SESSION.id, { fetchImpl });
+    expect(result).toEqual({ ok: true, session: LIST_SESSION });
+  });
+
+  it("collapses 404 to a typed error without leaking operator detail", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "not_found",
+            message: "not found",
+            operator_detail: SENTINEL,
+          },
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const result = await getTerminalSession(LIST_SESSION.id, { fetchImpl });
+    expect(result.ok).toBe(false);
+    if (!result.ok && result.error.kind === "http") {
+      expect(result.error.status).toBe(404);
+      expect(result.error.code).toBe("not_found");
+      expect(JSON.stringify(result.error)).not.toContain(SENTINEL);
+    } else {
+      expect.fail("expected http error");
+    }
+  });
+
+  it("returns malformed_response when the body cannot be parsed", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ id: 42 /* wrong type */ }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const result = await getTerminalSession(LIST_SESSION.id, { fetchImpl });
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "malformed_response" },
+    });
+  });
+
+  it("returns transport when fetch throws", async () => {
+    const fetchImpl = (async () => {
+      throw new Error(`boom ${SENTINEL}`);
+    }) as unknown as typeof fetch;
+    const result = await getTerminalSession(LIST_SESSION.id, { fetchImpl });
+    expect(result.ok).toBe(false);
+    if (!result.ok && result.error.kind === "transport") {
+      // Programmatic callers may branch on `message`; the formatter is
+      // the surface that strips it for the UI.
+      expect(result.error.message).toContain("boom");
+    } else {
+      expect.fail("expected transport error");
+    }
+  });
+});
+
+describe("isSessionReconnectable", () => {
+  it("is true for active and detached", () => {
+    expect(isSessionReconnectable({ status: "active" })).toBe(true);
+    expect(isSessionReconnectable({ status: "detached" })).toBe(true);
+  });
+  it("is false for starting and closed", () => {
+    expect(isSessionReconnectable({ status: "starting" })).toBe(false);
+    expect(isSessionReconnectable({ status: "closed" })).toBe(false);
+  });
+});
+
+describe("describeSessionGetError", () => {
+  it("formats every kind without echoing operator detail", () => {
+    expect(
+      describeSessionGetError({
+        kind: "http",
+        status: 404,
+        code: "not_found",
+        message: SENTINEL,
+      }),
+    ).toBe("Saved session is no longer available.");
+    expect(
+      describeSessionGetError({
+        kind: "http",
+        status: 401,
+        code: "unauthorized",
+        message: SENTINEL,
+      }),
+    ).toBe("Could not check saved session: not authenticated.");
+    expect(
+      describeSessionGetError({
+        kind: "http",
+        status: 500,
+        code: "internal_error",
+        message: SENTINEL,
+      }),
+    ).toBe("Could not check saved session: HTTP 500 internal_error");
+    expect(
+      describeSessionGetError({
+        kind: "transport",
+        message: `request to https://example.com ${SENTINEL}`,
+      }),
+    ).toBe("Could not check saved session: backend unavailable.");
+    expect(
+      describeSessionGetError({ kind: "malformed_response" }),
+    ).toBe("Could not check saved session: malformed response.");
+  });
+
+  it("never echoes the wire message of an http error", () => {
+    const summary = describeSessionGetError({
+      kind: "http",
+      status: 502,
+      code: "bad_gateway",
+      message: SENTINEL,
+    });
+    expect(summary).not.toContain(SENTINEL);
+  });
+
+  it("never echoes the thrown message of a transport error", () => {
+    const summary = describeSessionGetError({
+      kind: "transport",
+      message: `request to https://example.com/path ${SENTINEL}`,
+    });
+    expect(summary).not.toContain(SENTINEL);
+    expect(summary).not.toContain("https://");
+  });
+
+  it("collapses any 404 to 'no longer available' (consistent with validateSavedSession)", () => {
+    // The backend uses one canonical 404 code today, but the formatter
+    // must stay consistent with the validator — both treat any 404 as
+    // the canonical "row is gone or owned by someone else" surface.
+    // A non-canonical code on a 404 must not surface as a confusingly
+    // technical HTTP-404-<code> string.
+    expect(
+      describeSessionGetError({
+        kind: "http",
+        status: 404,
+        code: "different_404_code",
+        message: SENTINEL,
+      }),
+    ).toBe("Saved session is no longer available.");
+  });
+});
+
+describe("validateSavedSession", () => {
+  function fetchImplFor(
+    body: unknown,
+    init: { status?: number } = {},
+  ): typeof fetch {
+    return (async () =>
+      new Response(JSON.stringify(body), {
+        status: init.status ?? 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+  }
+
+  it("classifies active and detached as reconnectable and carries the session", async () => {
+    for (const status of ["active", "detached"] as const) {
+      const result = await validateSavedSession(LIST_SESSION.id, {
+        fetchImpl: fetchImplFor({ ...LIST_SESSION, status }),
+      });
+      expect(result.kind).toBe("reconnectable");
+      if (result.kind === "reconnectable") {
+        expect(result.session.status).toBe(status);
+      }
+    }
+  });
+
+  it("does not leak operator detail on the reconnectable path either (parser is the boundary)", async () => {
+    // Companion to the stale-* sentinel checks. The reconnectable variant
+    // surfaces `result.session`, which is built by `parseTerminalSession`
+    // — itself field-by-field. A future diff that adds metadata to the
+    // reconnectable branch (or stops going through the parser) would
+    // trip this canary.
+    const result = await validateSavedSession(LIST_SESSION.id, {
+      fetchImpl: fetchImplFor({
+        ...LIST_SESSION,
+        status: "active",
+        operator_detail: SENTINEL,
+        private_key: SENTINEL,
+        encrypted_private_key: SENTINEL,
+      }),
+    });
+    expect(result.kind).toBe("reconnectable");
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
+
+  it("classifies a closed row as stale (closed) without leaking the body", async () => {
+    const result = await validateSavedSession(LIST_SESSION.id, {
+      fetchImpl: fetchImplFor({
+        ...LIST_SESSION,
+        status: "closed",
+        closed_at: "2026-04-30T01:00:00Z",
+        // Sentinel field — the parser drops it; the validation must
+        // never surface it.
+        operator_detail: SENTINEL,
+      }),
+    });
+    expect(result.kind).toBe("stale");
+    if (result.kind === "stale") {
+      expect(result.reason).toBe("closed");
+      expect(result.summary).toBe("Saved session is no longer available.");
+      expect(JSON.stringify(result)).not.toContain(SENTINEL);
+    }
+  });
+
+  it("classifies a 404 as stale (not_found) — the canonical 'session is gone' surface", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "not_found",
+            message: "not found",
+            operator_detail: SENTINEL,
+          },
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const result = await validateSavedSession(LIST_SESSION.id, { fetchImpl });
+    expect(result.kind).toBe("stale");
+    if (result.kind === "stale") {
+      expect(result.reason).toBe("not_found");
+      expect(result.summary).toBe("Saved session is no longer available.");
+      expect(JSON.stringify(result)).not.toContain(SENTINEL);
+    }
+  });
+
+  it("classifies a starting row as uncertain (starting) — keep the pointer, don't claim reconnectable", async () => {
+    const result = await validateSavedSession(LIST_SESSION.id, {
+      fetchImpl: fetchImplFor({ ...LIST_SESSION, status: "starting" }),
+    });
+    expect(result.kind).toBe("uncertain");
+    if (result.kind === "uncertain") {
+      expect(result.reason).toBe("starting");
+      expect(result.summary).toContain("starting");
+    }
+  });
+
+  it("classifies a transport failure as uncertain (transport) — pointer must be preserved", async () => {
+    const fetchImpl = (async () => {
+      throw new Error(`boom ${SENTINEL}`);
+    }) as unknown as typeof fetch;
+    const result = await validateSavedSession(LIST_SESSION.id, { fetchImpl });
+    expect(result.kind).toBe("uncertain");
+    if (result.kind === "uncertain") {
+      expect(result.reason).toBe("transport");
+      // The summary MUST NOT echo the thrown `Error.message`. Tripwire
+      // for a future "be helpful" regression that would otherwise leak
+      // request URLs or fetch internals through this surface.
+      expect(result.summary).not.toContain(SENTINEL);
+      expect(result.summary).not.toContain("https://");
+    }
+  });
+
+  it("classifies a 500 as uncertain (http) so a flaky backend doesn't drop the pointer", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "internal_error",
+            message: "internal error",
+            operator_detail: SENTINEL,
+          },
+        }),
+        { status: 500, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const result = await validateSavedSession(LIST_SESSION.id, { fetchImpl });
+    expect(result.kind).toBe("uncertain");
+    if (result.kind === "uncertain") {
+      expect(result.reason).toBe("http");
+      expect(result.summary).not.toContain(SENTINEL);
+    }
+  });
+
+  it("classifies a malformed body as uncertain (malformed)", async () => {
+    const result = await validateSavedSession(LIST_SESSION.id, {
+      fetchImpl: fetchImplFor({ id: "wrong-shape" }),
+    });
+    expect(result.kind).toBe("uncertain");
+    if (result.kind === "uncertain") {
+      expect(result.reason).toBe("malformed");
+    }
+  });
+
+  it("encodes path-unsafe ids when constructing the request", async () => {
+    let captured: string | null = null;
+    const fetchImpl = (async (input: string | URL | Request) => {
+      captured = String(input);
+      return new Response(JSON.stringify(LIST_SESSION), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    await validateSavedSession("a/b c", { fetchImpl });
+    expect(captured).toBe("/api/v1/terminal-sessions/a%2Fb%20c");
   });
 });

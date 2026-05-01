@@ -22,6 +22,7 @@
     describeCloseSessionError,
     describeSessionLoadError,
     listTerminalSessions,
+    validateSavedSession,
     type TerminalSession,
   } from "../../api/terminalSessions.js";
   import {
@@ -67,8 +68,21 @@
     | { kind: "submitting" }
     | { kind: "error"; summary: string };
 
+  type OpenState =
+    | { kind: "verifying" }
+    | { kind: "error"; summary: string };
+
   let view = $state<LoadState>({ kind: "idle" });
   let closing = $state<Record<string, CloseState>>({});
+  /**
+   * Per-row state for the Open/Reconnect action. Independent of `closing`
+   * so a row may be in mid-verify while another is mid-close. The
+   * `verifying` state is short-lived (one HTTP round-trip via
+   * {@link validateSavedSession}); the `error` state is dismissable and
+   * never echoes wire-side detail (the formatter is a function of
+   * `kind`+`status`+`code` ONLY).
+   */
+  let opening = $state<Record<string, OpenState>>({});
 
   async function load() {
     view = { kind: "loading" };
@@ -112,14 +126,71 @@
     return id.slice(0, 8);
   }
 
-  function reconnectClicked(session: TerminalSession, profileName: string) {
+  async function reconnectClicked(session: TerminalSession, profileName: string) {
     if (!canReconnect(session.status)) return;
-    onReconnect?.({
-      sessionId: session.id,
-      cols: session.cols,
-      rows: session.rows,
-      profileLabel: profileName,
-    });
+    // Pre-handoff validation: a row's local status can be stale (the
+    // backend may have closed the session since the last load — explicit
+    // close from another tab, PTY exit, TTL elapsed). Verify against the
+    // backend BEFORE the handoff so the operator does not watch a
+    // WebSocket attach fail seconds later. The check is one cheap HTTP
+    // round-trip; the operator sees a brief "Verifying…" state.
+    opening = { ...opening, [session.id]: { kind: "verifying" } };
+    const validation = await validateSavedSession(session.id);
+
+    if (validation.kind === "reconnectable") {
+      // Refresh the row in place so any operator who navigates back to
+      // the list sees the freshest status the verify call observed.
+      const fresh = validation.session;
+      if (view.kind === "ready") {
+        view = {
+          kind: "ready",
+          sessions: view.sessions.map((s) => (s.id === fresh.id ? fresh : s)),
+          profiles: view.profiles,
+        };
+      }
+      const next = { ...opening };
+      delete next[session.id];
+      opening = next;
+      onReconnect?.({
+        sessionId: fresh.id,
+        cols: fresh.cols,
+        rows: fresh.rows,
+        profileLabel: profileName,
+      });
+      return;
+    }
+
+    if (validation.kind === "uncertain" && validation.reason !== "starting") {
+      // Transport / surprising HTTP / malformed response: don't punish
+      // the operator for a network blip. Proceed with the handoff and
+      // let the WebSocket attach surface its own failure if applicable.
+      const next = { ...opening };
+      delete next[session.id];
+      opening = next;
+      onReconnect?.({
+        sessionId: session.id,
+        cols: session.cols,
+        rows: session.rows,
+        profileLabel: profileName,
+      });
+      return;
+    }
+
+    // Stale (closed / not_found) OR uncertain "starting": refuse the
+    // handoff, surface the reason inline, and refresh the whole list so
+    // every row re-syncs against the backend.
+    opening = {
+      ...opening,
+      [session.id]: { kind: "error", summary: validation.summary },
+    };
+    void load();
+  }
+
+  function dismissOpenError(sessionId: string) {
+    if (opening[sessionId]?.kind !== "error") return;
+    const next = { ...opening };
+    delete next[sessionId];
+    opening = next;
   }
 
   async function closeClicked(session: TerminalSession) {
@@ -194,7 +265,7 @@
     </p>
   </header>
 
-  <div class="flex items-center gap-2">
+  <div class="flex flex-wrap items-center gap-3">
     <button
       type="button"
       class="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50"
@@ -204,6 +275,14 @@
     >
       {view.kind === "loading" ? "Loading…" : "Refresh"}
     </button>
+    <p
+      class="text-xs text-zinc-500"
+      data-testid="sessions-refresh-note"
+    >
+      Refresh re-fetches the current backend state. There is no
+      auto-refresh or live update yet — closed sessions cannot be
+      recovered from this view.
+    </p>
   </div>
 
   {#if view.kind === "idle" || view.kind === "loading"}
@@ -242,7 +321,9 @@
           view.profiles,
         )}
         {@const closingState = closing[session.id]}
+        {@const openingState = opening[session.id]}
         {@const isActive = activeSessionId === session.id}
+        {@const isVerifying = openingState?.kind === "verifying"}
         <li
           class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-4"
           data-testid="sessions-row"
@@ -335,15 +416,21 @@
               type="button"
               class="rounded-md border border-indigo-800/60 bg-indigo-900/20 px-3 py-1 text-xs text-indigo-100 transition hover:border-indigo-700 hover:bg-indigo-900/40 disabled:cursor-not-allowed disabled:opacity-50"
               onclick={() => reconnectClicked(session, profileName)}
-              disabled={!canReconnect(session.status) || isActive}
+              disabled={!canReconnect(session.status) || isActive || isVerifying}
               data-testid="sessions-row-reconnect"
               title={canReconnect(session.status)
                 ? isActive
                   ? "Already attached in the Terminal view"
-                  : "Open the session in the Terminal workspace"
+                  : "Verifies the session is reachable, then opens it in the Terminal workspace"
                 : "Closed sessions cannot be reconnected"}
             >
-              {isActive ? "Attached" : "Open"}
+              {#if isVerifying}
+                Verifying…
+              {:else if isActive}
+                Attached
+              {:else}
+                Open
+              {/if}
             </button>
             <button
               type="button"
@@ -370,6 +457,22 @@
                 type="button"
                 class="ml-auto rounded-md border border-rose-800 bg-rose-900/40 px-2 py-0.5 text-[11px] text-rose-100 transition hover:bg-rose-900/60"
                 onclick={() => dismissCloseError(session.id)}
+              >
+                Dismiss
+              </button>
+            </p>
+          {/if}
+
+          {#if openingState?.kind === "error"}
+            <p
+              class="flex flex-wrap items-center gap-2 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+              data-testid="sessions-row-open-error"
+            >
+              <span>{openingState.summary}</span>
+              <button
+                type="button"
+                class="ml-auto rounded-md border border-amber-800 bg-amber-900/40 px-2 py-0.5 text-[11px] text-amber-100 transition hover:bg-amber-900/60"
+                onclick={() => dismissOpenError(session.id)}
               >
                 Dismiss
               </button>

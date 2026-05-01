@@ -27,6 +27,10 @@
     type ActiveSessionRecord,
   } from "../terminal/activeSessionStore.js";
   import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
+  import {
+    validateSavedSession,
+    type SavedSessionValidation,
+  } from "../../api/terminalSessions.js";
 
   interface Props {
     launch: ActiveLaunch | null;
@@ -72,6 +76,89 @@
    */
   let saved = $state<ActiveSessionRecord | null>(loadActiveSession());
 
+  /**
+   * Outcome of the optional saved-session validation pass against the
+   * backend. Drives whether the affordance is offered, gated, or
+   * suppressed. Variants:
+   *   - `idle`        → no pointer to validate.
+   *   - `checking`    → request in flight; UI shows "Checking…" and
+   *                     hides the Reconnect button.
+   *   - `reconnectable` → backend confirmed alive + reconnectable.
+   *                     UI offers the affordance with no caveat.
+   *   - `stale`       → backend says the row is gone or closed. The
+   *                     local pointer is cleared (the shell handler
+   *                     drops localStorage); the UI shows safe copy
+   *                     and no Reconnect button.
+   *   - `uncertain`   → transport blip / surprising HTTP / backend
+   *                     malformed / row is `starting`. The pointer is
+   *                     PRESERVED — operators can still try a manual
+   *                     reconnect; the WebSocket will surface its own
+   *                     failure if applicable.
+   */
+  type ValidationState =
+    | { kind: "idle" }
+    | { kind: "checking" }
+    | { kind: "reconnectable" }
+    | { kind: "stale"; summary: string }
+    | { kind: "uncertain"; summary: string };
+
+  let validation = $state<ValidationState>({ kind: "idle" });
+
+  /**
+   * Validate the saved pointer against the backend at most once per mount.
+   * Runs in the background; the affordance renders progressively as the
+   * state transitions. NEVER auto-connects (the reconnect attempt is
+   * always gated by the explicit button).
+   *
+   * Failure modes are deliberately split:
+   *   - `stale` clears the local pointer (the shell drops localStorage
+   *     via `onForgetLastSession`).
+   *   - `uncertain` LEAVES the pointer alone — a network blip should
+   *     not cost the operator their saved record.
+   *
+   * Re-run discipline: the effect tracks `saved` because the async branch
+   * reads `saved.session_id` synchronously. In practice `saved` only ever
+   * transitions `non-null → null` (forget click, stale outcome), never
+   * `non-null → different non-null` — this view does not own the saved
+   * record's identity, the AppShell does, and the AppShell unmounts and
+   * remounts this view across launch transitions. If a future revision
+   * starts mutating `saved` in place to a different session id, the
+   * effect would re-fire and a second validation would race the first;
+   * the cancellation flag below would let the second one win cleanly.
+   */
+  $effect(() => {
+    if (saved === null) {
+      validation = { kind: "idle" };
+      return;
+    }
+    let cancelled = false;
+    validation = { kind: "checking" };
+    void (async () => {
+      const result: SavedSessionValidation = await validateSavedSession(
+        saved.session_id,
+      );
+      if (cancelled) return;
+      if (result.kind === "reconnectable") {
+        validation = { kind: "reconnectable" };
+        return;
+      }
+      if (result.kind === "stale") {
+        validation = { kind: "stale", summary: result.summary };
+        // Drop the persisted pointer — the row is gone on the backend.
+        // We KEEP `saved` in memory for one render so the stale notice
+        // can show the dropped record's profile/id; the next mount of
+        // this view will read `null` from storage and render nothing.
+        onForgetLastSession?.();
+        return;
+      }
+      // uncertain: keep the pointer, surface a cautious message.
+      validation = { kind: "uncertain", summary: result.summary };
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
   function reconnectLastClicked() {
     if (saved === null) return;
     onReconnectLastSession?.(buildReconnectAttempt(saved));
@@ -80,6 +167,7 @@
   function forgetLastClicked() {
     onForgetLastSession?.();
     saved = null;
+    validation = { kind: "idle" };
   }
 </script>
 
@@ -133,11 +221,39 @@
       </li>
     </ul>
 
-    {#if shouldOfferReconnect(saved, null) && saved}
+    {#if validation.kind === "stale" && saved}
+      <div
+        class="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-3 text-xs text-zinc-300"
+        data-testid="terminal-empty-saved-stale"
+        data-saved-session-id={saved.session_id}
+      >
+        <p class="text-zinc-300">
+          <strong class="font-semibold text-zinc-200">{validation.summary}</strong>
+          The local pointer at your most recent terminal session was
+          dropped because the backend reports it as gone or already
+          closed. Launch a new session from the Server profiles view.
+        </p>
+        {#if saved.profile_label}
+          <p class="text-[11px] text-zinc-500">
+            <span class="font-medium">Profile:</span>
+            {saved.profile_label}
+          </p>
+        {/if}
+        <p class="text-[11px] text-zinc-500">
+          <span class="font-medium">Session:</span>
+          <span class="font-mono" title={saved.session_id}>
+            {saved.session_id.length > 8
+              ? saved.session_id.slice(0, 8)
+              : saved.session_id}
+          </span>
+        </p>
+      </div>
+    {:else if shouldOfferReconnect(saved, null) && saved}
       <div
         class="flex flex-col gap-2 rounded-md border border-indigo-900/40 bg-indigo-950/20 px-3 py-3 text-xs text-indigo-100/90"
         data-testid="terminal-empty-saved"
         data-saved-session-id={saved.session_id}
+        data-validation={validation.kind}
       >
         <p class="text-indigo-100/90">
           <strong class="font-semibold">Reconnect last session.</strong>
@@ -160,11 +276,28 @@
               : saved.session_id}
           </span>
         </p>
+        {#if validation.kind === "checking"}
+          <p
+            class="rounded-md border border-indigo-900/30 bg-indigo-950/40 px-2.5 py-1.5 text-[11px] text-indigo-200/80"
+            data-testid="terminal-empty-saved-checking"
+          >
+            Checking saved session against the backend…
+          </p>
+        {:else if validation.kind === "uncertain"}
+          <p
+            class="rounded-md border border-amber-900/40 bg-amber-950/20 px-2.5 py-1.5 text-[11px] text-amber-200/80"
+            data-testid="terminal-empty-saved-uncertain"
+          >
+            {validation.summary} You can still try the reconnect — the
+            saved pointer was kept because the failure may be transient.
+          </p>
+        {/if}
         <div class="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            class="rounded-md border border-indigo-700 bg-indigo-900/40 px-3 py-1 text-xs text-indigo-100 transition hover:border-indigo-600 hover:bg-indigo-900/60"
+            class="rounded-md border border-indigo-700 bg-indigo-900/40 px-3 py-1 text-xs text-indigo-100 transition hover:border-indigo-600 hover:bg-indigo-900/60 disabled:cursor-not-allowed disabled:opacity-50"
             onclick={reconnectLastClicked}
+            disabled={validation.kind === "checking"}
             data-testid="terminal-empty-reconnect-last"
             title="Re-attach the WebSocket to the saved session id; succeeds only while the backend runtime is still alive"
           >

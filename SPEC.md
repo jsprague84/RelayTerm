@@ -932,6 +932,60 @@ This is **not** multi-tab workspace, **not** durable recording, **not** backend-
 
 Multi-tab workspace; durable session recording UI; backend VT observer / `libghostty-vt` snapshot for backend-restart recovery; cross-device sync of the saved pointer; per-profile recovery hints; auto-reconnect on page load; smarter stale-detection (poll the Sessions list before offering recovery); a local "saved sessions history" beyond the most-recent one. Each is a separate slice.
 
+### Production session status refresh and stale-session handling
+
+Polish slice that layers honest manual-refresh + stale-detection behavior onto the production Terminal Sessions list AND the empty-state Terminal view's "Reconnect last session" affordance. No backend changes, no new wire messages, no polling, no auto-refresh, no live list updates. The slice exists because two failure modes were silently misleading the operator:
+
+1. The Sessions list could show an `active` / `detached` row that the backend had since closed (e.g. PTY exited; close from another tab; TTL elapsed). Clicking Open would hand off to the Terminal view, which would attach a WebSocket, which would fail seconds later with a `closed` lifecycle.
+2. The empty-state Terminal view always offered the "Reconnect last session" affordance whenever a saved local pointer existed. The pointer is local; the backend may have dropped the runtime hours ago. Clicking Reconnect would attach to a stale id and fail.
+
+This slice catches both BEFORE the WebSocket hand-off, using the existing `GET /api/v1/terminal-sessions/:id` route. It is explicit, single-shot, user-triggered (Sessions list) or once-per-mount (Terminal view); it never polls.
+
+**Scope (load-bearing — this slice).**
+
+1. **API helpers** — `apps/web/src/lib/api/terminalSessions.ts` gains:
+   - `getTerminalSession(sessionId, options?)` — typed GET wrapper around `/api/v1/terminal-sessions/:id`. Reuses the existing `parseTerminalSession` (the GET route emits the same `TerminalSessionResponse` shape as the list route), so a future smuggled `private_key` / `encrypted_private_key` cannot reach the parsed object via this surface either. Path-unsafe ids are URL-encoded (test pin: `a/b c → /api/v1/terminal-sessions/a%2Fb%20c`).
+   - `isSessionReconnectable(session)` — convenience predicate over a `Pick<TerminalSession, "status">`; mirrors `sessionStatus.canReconnect(status)` for callers that already hold a DTO.
+   - `validateSavedSession(sessionId, options?)` — composes the GET + the predicate into a typed `SavedSessionValidation` decision: `reconnectable | stale (closed | not_found) | uncertain (starting | transport | http | malformed)`. Each variant carries a pre-formatted `summary` so the UI does not need a second formatter.
+   - `describeSessionGetError(err)` — one-line UI summary for the GET error envelope. Same redaction posture as `describeSessionLoadError` / `describeCloseSessionError`: a function of `kind` + `status` + `code` ONLY.
+2. **Sessions list pre-handoff verification** — `SessionsView.svelte` now validates the row against the backend BEFORE handing off to the Terminal view. The Open button transitions through a brief `Verifying…` state while `validateSavedSession` runs. Outcome:
+   - `reconnectable` → refresh the row in place from the verify response (so the post-handoff scroll-back into the list shows fresh status), then call `onReconnect`.
+   - `uncertain (transport | http | malformed)` → proceed with handoff. Don't punish the operator for a network blip; the WebSocket attach will surface its own failure if applicable.
+   - `uncertain (starting)` → refuse handoff, surface the reason inline, and trigger a full list reload (`load()`) so every row re-syncs against the backend.
+   - `stale (closed | not_found)` → refuse handoff, surface the safe summary (`"Saved session is no longer available."`) inline, and trigger a full list reload.
+3. **Sessions list "honesty note"** — the Refresh affordance now sits next to a static `data-testid="sessions-refresh-note"` line stating that "Refresh re-fetches the current backend state. There is no auto-refresh or live update yet — closed sessions cannot be recovered from this view." The note is not a bug surface; it is a TTL/limitation reminder.
+4. **Terminal view saved-session validation** — `TerminalView.svelte` runs `validateSavedSession(saved.session_id)` once per mount via `$effect` (cancellation flag pins the unmount race). The empty-state affordance now has four progressive states:
+   - `idle` — no saved record; nothing rendered (existing behavior).
+   - `checking` — request in flight; the existing affordance renders with a `Checking saved session against the backend…` line and the Reconnect button disabled.
+   - `reconnectable` — the existing affordance renders with no caveat.
+   - `uncertain` — the existing affordance renders with a cautious message: "{summary} You can still try the reconnect — the saved pointer was kept because the failure may be transient." The Reconnect button is enabled.
+   - `stale` — the affordance is REPLACED by a small notice block (selector `terminal-empty-saved-stale`) that names the dropped session and tells the operator to launch a new session. The local pointer is dropped via `onForgetLastSession` (the shell clears localStorage); the in-memory `saved` is intentionally NOT nulled until next mount so the notice can show the dropped record's metadata.
+5. **No backend changes.** The slice is purely a frontend reliability slice. No new routes, no schema, no new wire messages, no protocol changes. The pre-handoff verify uses the existing `GET /api/v1/terminal-sessions/:id` route.
+
+**Honesty rules (load-bearing).**
+
+- **No polling, no auto-refresh, no live list updates.** Refresh in the Sessions view is explicit; the Terminal view's mount-time validation is a single shot. Both views document the limitation in their copy.
+- **Refresh does not recover closed sessions.** The honesty note next to the Refresh button says so; the underlying GET / list endpoints surface the backend's authoritative state, which never re-promotes a closed row.
+- **Transport failure does not drop the saved pointer.** A backend blip is exactly the time when the operator most wants the pointer to survive. `validateSavedSession` returns `uncertain (transport)` and the UI keeps the Reconnect button + shows a cautious message. Test pin: `validateSavedSession transport` test asserts `kind: "uncertain"`, `reason: "transport"`, and that the formatter does NOT echo the thrown `Error.message`.
+- **A 404 IS a stale signal.** The backend treats "doesn't exist" and "not yours" as the same 404 (the right redaction). The validator collapses both to `stale (not_found)` and the UI clears the pointer.
+- **A 200 + closed status IS a stale signal.** The runtime is gone and cannot be reconnected. The validator collapses this to `stale (closed)` and the UI clears the pointer with the same operator-facing copy.
+- **Saved-pointer copy never echoes wire detail.** `describeSessionGetError`, the `summary` strings on `SavedSessionValidation`, and the inline notice copy are all functions of `kind` + `status` + `code` ONLY. Sentinel-string tests pin this in `terminalSessionsApi.test.ts` against a URL-bearing transport message and operator-detail-bearing wire envelopes.
+
+**Redaction posture (load-bearing).**
+
+- `getTerminalSession` reuses `parseTerminalSession`. The DTO is built field-by-field; a stray `private_key` / `encrypted_private_key` / `peer_banner` smuggled onto the wire body cannot reach the parsed object. Sentinel test `parseTerminalSession does NOT carry private_key or encrypted_private_key onto the parsed DTO` already pins the parser; the new `validateSavedSession` tests additionally pin that `JSON.stringify(result)` does not contain the operator-detail sentinel after a stale-by-closed or stale-by-404 outcome.
+- `SavedSessionValidation` summaries and `describeSessionGetError` are functions of `kind` + `status` + `code` ONLY. The wire `message` field of an HTTP error and the thrown `Error.message` of a transport failure are NEVER echoed in any user-facing string. Tests pin both.
+- The new SessionsView "open error" inline message uses the same `summary` strings; no new redaction surface was introduced.
+- The Terminal view validation effect does NOT log the validation result and does NOT log the dropped pointer. A console-noise regression would trip the existing redaction posture for the active-session store.
+
+**Stable selectors (additions only).** `sessions-refresh-note`, `sessions-row-open-error`, `terminal-empty-saved-stale`, `terminal-empty-saved-checking`, `terminal-empty-saved-uncertain`. The pre-existing `sessions-*` and `terminal-empty-*` selectors are unchanged. The `terminal-empty-saved` block now also carries a `data-validation` attribute (one of `idle`/`checking`/`reconnectable`/`uncertain`) for smoke-test targeting.
+
+**Architecture rule preserved.** The new helpers live in `lib/api/terminalSessions.ts`; the new view wiring lives in `lib/app/views/`. No imports from `lib/dev/` and no imports from any `@relayterm/terminal-*` adapter package. `appShellIsolation.test.ts` continues to enforce both bans; no rule change.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Background polling / auto-refresh; WebSocket-driven live list updates; multi-tab workspace; URL-driven routes / deep-linking; durable session recording UI / replay player; backend VT observer / `libghostty-vt` snapshot for backend-restart recovery; production renderer selector; mobile / Tauri shell integration; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI; auto-reconnect on page load. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.

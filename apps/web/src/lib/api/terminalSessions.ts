@@ -522,3 +522,243 @@ export function describeCloseSessionError(
       return "Could not close session: malformed response";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Get-by-id + saved-session validation (Terminal view recovery affordance)
+// ---------------------------------------------------------------------------
+//
+// Mirrors backend `GET /api/v1/terminal-sessions/:id`. The handler returns
+// the same `TerminalSessionResponse` shape the list endpoint emits, so
+// {@link parseTerminalSession} is reused — no second parser, no second
+// redaction pin to maintain.
+//
+// Used by the empty-state Terminal view to validate the local active-session
+// pointer BEFORE offering the "Reconnect last session" affordance. The
+// validator returns a typed decision so the view can:
+//   - reconnectable → keep + offer
+//   - stale         → clear the local pointer
+//   - uncertain     → keep + show a cautious message (e.g. transport
+//     unavailable; we don't punish a user with a dropped pointer over a
+//     network blip)
+
+export interface GetTerminalSessionOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/terminal-sessions/:id`. */
+  endpoint?: string;
+}
+
+export type GetTerminalSessionError = WireError;
+
+export type GetTerminalSessionResponse =
+  | { ok: true; session: TerminalSession }
+  | { ok: false; error: GetTerminalSessionError };
+
+/**
+ * GET a single terminal session by id.
+ *
+ * Returns `{ ok: true, session }` on a 2xx with a parseable body. 404 is
+ * the canonical "row is gone or owned by someone else" surface — the
+ * caller treats it as a stale pointer (the backend never differentiates
+ * "not yours" from "doesn't exist", which is the right redaction).
+ *
+ * Same posture as the rest of this module: does NOT throw, does NOT log
+ * raw bodies, does NOT echo wire / transport detail through the
+ * formatter.
+ */
+export async function getTerminalSession(
+  sessionId: string,
+  options: GetTerminalSessionOptions = {},
+): Promise<GetTerminalSessionResponse> {
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/terminal-sessions/${encodeURIComponent(sessionId)}`;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      headers: { accept: "application/json" },
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const parsed = parseTerminalSession(body);
+  if (parsed === null) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, session: parsed };
+}
+
+/**
+ * Whether a session row's status admits a reconnect attempt.
+ *
+ * Mirrors {@link sessionStatus.canReconnect} — `active` and `detached` are
+ * reconnectable; `starting` and `closed` are not. Lives here too so an
+ * API-layer caller can branch on the wire DTO without importing the
+ * status-helpers module.
+ */
+export function isSessionReconnectable(
+  session: Pick<TerminalSession, "status">,
+): boolean {
+  return session.status === "active" || session.status === "detached";
+}
+
+/**
+ * Outcome of a saved-session validation pass.
+ *
+ *  - `reconnectable` → the row is alive and reconnect is allowed; offer
+ *    the affordance and pass `session` along for any local UI hint.
+ *  - `stale` → the row is gone or terminal; clear the local pointer.
+ *  - `uncertain` → we couldn't decide (transport blip, surprising HTTP
+ *    error, or the row is `starting` and not yet reconnectable). The
+ *    caller MUST NOT clear the pointer; show a cautious message instead.
+ *
+ * `stale` and `uncertain` carry a pre-formatted `summary` string so the
+ * UI does not need a second formatter. Strings are functions of `kind`
+ * + `code` + `status` ONLY (same redaction posture as the rest of this
+ * module). The `reconnectable` variant intentionally omits `summary` —
+ * the affordance renders the same copy whether a verify ran or not.
+ */
+export type SavedSessionValidation =
+  | { kind: "reconnectable"; session: TerminalSession }
+  | {
+      kind: "stale";
+      reason: "closed" | "not_found";
+      summary: string;
+    }
+  | {
+      kind: "uncertain";
+      reason: "starting" | "transport" | "http" | "malformed";
+      summary: string;
+    };
+
+/**
+ * Validate a saved active-session pointer against the backend.
+ *
+ * Wraps {@link getTerminalSession} and {@link isSessionReconnectable} into
+ * a typed decision the empty-state Terminal view consumes directly. The
+ * function never throws and never logs.
+ *
+ * Decision table:
+ *  - 200 + `active`/`detached` → `reconnectable`
+ *  - 200 + `closed`            → `stale (closed)`
+ *  - 200 + `starting`          → `uncertain (starting)`
+ *  - 404                       → `stale (not_found)`
+ *  - other HTTP                → `uncertain (http)`
+ *  - transport failure         → `uncertain (transport)`
+ *  - malformed response        → `uncertain (malformed)`
+ */
+export async function validateSavedSession(
+  sessionId: string,
+  options: GetTerminalSessionOptions = {},
+): Promise<SavedSessionValidation> {
+  const result = await getTerminalSession(sessionId, options);
+  if (result.ok) {
+    if (isSessionReconnectable(result.session)) {
+      return { kind: "reconnectable", session: result.session };
+    }
+    if (result.session.status === "closed") {
+      return {
+        kind: "stale",
+        reason: "closed",
+        summary: "Saved session is no longer available.",
+      };
+    }
+    return {
+      kind: "uncertain",
+      reason: "starting",
+      summary: "Saved session is still starting; reconnect is not yet ready.",
+    };
+  }
+  return classifyValidationError(result.error);
+}
+
+function classifyValidationError(
+  err: GetTerminalSessionError,
+): SavedSessionValidation {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 404) {
+        return {
+          kind: "stale",
+          reason: "not_found",
+          summary: "Saved session is no longer available.",
+        };
+      }
+      return {
+        kind: "uncertain",
+        reason: "http",
+        summary: `Could not check saved session: HTTP ${err.status} ${err.code}`,
+      };
+    case "transport":
+      return {
+        kind: "uncertain",
+        reason: "transport",
+        summary: "Could not check saved session: backend unavailable.",
+      };
+    case "malformed_response":
+      return {
+        kind: "uncertain",
+        reason: "malformed",
+        summary: "Could not check saved session: malformed response.",
+      };
+  }
+}
+
+/**
+ * Format a get-session error for surfaces that don't want the full
+ * {@link SavedSessionValidation} structure (e.g. a manual "check saved
+ * session" button outside the validate flow). Same redaction posture as
+ * {@link describeSessionLoadError}.
+ */
+export function describeSessionGetError(
+  err: GetTerminalSessionError,
+): string {
+  switch (err.kind) {
+    case "http":
+      // Match `classifyValidationError`'s 404 handling: any 404 — regardless
+      // of the wire `code` — is the canonical "row is gone or owned by
+      // someone else" surface. The backend collapses both into the same
+      // status (the right redaction); we keep the formatter consistent
+      // with the validator so a non-canonical code on a 404 doesn't
+      // surface as a confusingly technical "HTTP 404 <code>" string.
+      if (err.status === 404) {
+        return "Saved session is no longer available.";
+      }
+      if (err.status === 401) {
+        return "Could not check saved session: not authenticated.";
+      }
+      return `Could not check saved session: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Could not check saved session: backend unavailable.";
+    case "malformed_response":
+      return "Could not check saved session: malformed response.";
+  }
+}
