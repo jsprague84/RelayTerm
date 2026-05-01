@@ -30,6 +30,8 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create).get(list))
         .route("/{id}", get(get_by_id))
+        .route("/{id}/disable", post(disable))
+        .route("/{id}/enable", post(enable))
         .route("/{id}/host-key-preflight", post(host_key_preflight))
         .route("/{id}/trust-host-key", post(trust_host_key))
         .route("/{id}/auth-check", post(auth_check))
@@ -101,6 +103,99 @@ async fn get_by_id(
     Ok(Json(profile.into()))
 }
 
+/// `POST /api/v1/server-profiles/:id/disable`.
+///
+/// Stamps `disabled_at` on a profile owned by the caller. Idempotent: a
+/// second disable preserves the original timestamp (the SQL only writes
+/// when `disabled_at IS NULL`). Foreign-owned or missing ids collapse to
+/// the same 404 a regular get_by_id would return — cross-user existence
+/// is never leaked.
+///
+/// Disabled profiles are blocked from new launches, auth-check, host-key
+/// preflight, and host-key trust. Existing live `terminal_sessions` are
+/// unaffected — disable is a launch-time gate, not a runtime kill switch.
+/// See SPEC.md "Inventory lifecycle and destructive-action policy".
+async fn disable(
+    State(state): State<AppState>,
+    user: DevUser,
+    Path(id): Path<ServerProfileId>,
+) -> Result<Json<ServerProfileResponse>, ApiError> {
+    // Owner-scoped read first so the conflict / current-state check
+    // collapses cross-user existence to 404 BEFORE the UPDATE runs.
+    let current = state
+        .db
+        .server_profiles()
+        .get(id)
+        .await?
+        .filter(|p| p.owner_id == user.0)
+        .ok_or(ApiError::NotFound { entity: ENTITY })?;
+
+    // Idempotency: if already disabled, return the existing row unchanged
+    // — preserving the original `disabled_at` is the audit-correct shape.
+    // Bumping `updated_at` on a redundant disable would be misleading.
+    //
+    // TOCTOU: two concurrent callers can both pass this guard and both
+    // reach `set_disabled_at`. The outcome is benign — the SQL writes
+    // unconditionally, the second writer overwrites with a near-identical
+    // timestamp, and both callers return a consistent post-update row.
+    // No data is lost. If timestamp-preservation ever becomes load-
+    // bearing for audit, push the guard into SQL via
+    // `WHERE disabled_at IS NULL` and treat zero affected rows as the
+    // "already disabled" case (mirrors `record_trusted`).
+    if current.is_disabled() {
+        return Ok(Json(current.into()));
+    }
+
+    let updated = state
+        .db
+        .server_profiles()
+        .set_disabled_at(id, user.0, Some(chrono::Utc::now()))
+        .await?;
+    Ok(Json(updated.into()))
+}
+
+/// `POST /api/v1/server-profiles/:id/enable`.
+///
+/// Clears `disabled_at` on a profile owned by the caller. Idempotent: a
+/// second enable on an already-enabled row is a no-op and returns the
+/// row unchanged. Foreign-owned or missing ids collapse to the same 404
+/// as the rest of the route surface.
+async fn enable(
+    State(state): State<AppState>,
+    user: DevUser,
+    Path(id): Path<ServerProfileId>,
+) -> Result<Json<ServerProfileResponse>, ApiError> {
+    let current = state
+        .db
+        .server_profiles()
+        .get(id)
+        .await?
+        .filter(|p| p.owner_id == user.0)
+        .ok_or(ApiError::NotFound { entity: ENTITY })?;
+
+    if !current.is_disabled() {
+        return Ok(Json(current.into()));
+    }
+
+    let updated = state
+        .db
+        .server_profiles()
+        .set_disabled_at(id, user.0, None)
+        .await?;
+    Ok(Json(updated.into()))
+}
+
+/// 409 conflict shape returned by every route that refuses to operate on
+/// a disabled profile (auth-check, host-key preflight/trust, terminal
+/// launch). The message reads `"server_profile disabled"`; the wire
+/// `code` stays `conflict` so clients keep parsing.
+fn server_profile_disabled_conflict() -> ApiError {
+    ApiError::Conflict {
+        entity: ENTITY,
+        reason: Some("disabled"),
+    }
+}
+
 /// Resolve the (profile, host, identity) trio for a preflight-style request.
 ///
 /// All three lookups are scoped to the authenticated user; any miss — by
@@ -163,6 +258,13 @@ async fn host_key_preflight(
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<HostKeyPreflightResponse>, ApiError> {
     let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    // Disabled profiles cannot be probed. Re-enabling is the documented
+    // path back to a live setup surface — keeping preflight refuse-only
+    // for now matches the launch / trust / auth-check guards and keeps
+    // semantics simple. See SPEC.md "Inventory lifecycle..." for why.
+    if profile.is_disabled() {
+        return Err(server_profile_disabled_conflict());
+    }
     let pem = decrypt_identity(&state, &identity)?;
 
     // Username override falls back to the host default. Validation already
@@ -209,6 +311,11 @@ async fn trust_host_key(
     let expected = req.validated_expected_fingerprint()?.to_owned();
 
     let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    // Disabled profiles cannot be trusted. The enable route is the
+    // explicit return path; trust must not be a sneaky bypass.
+    if profile.is_disabled() {
+        return Err(server_profile_disabled_conflict());
+    }
     let pem = decrypt_identity(&state, &identity)?;
 
     // Mirror the username fallback used in `host_key_preflight` so both
@@ -240,7 +347,10 @@ async fn trust_host_key(
     //    must match the captured one. Otherwise the host's key changed
     //    between preflight and trust, or the caller posted a stale value.
     if result.status == HostKeyStatus::Changed || result.captured.fingerprint_sha256 != expected {
-        return Err(ApiError::Conflict { entity: "host_key" });
+        return Err(ApiError::Conflict {
+            entity: "host_key",
+            reason: None,
+        });
     }
 
     // Refuse to re-trust a fingerprint that was explicitly revoked. The
@@ -257,7 +367,10 @@ async fn trust_host_key(
             && e.fingerprint_sha256 == result.captured.fingerprint_sha256
             && e.revoked_at.is_some()
     }) {
-        return Err(ApiError::Conflict { entity: "host_key" });
+        return Err(ApiError::Conflict {
+            entity: "host_key",
+            reason: None,
+        });
     }
 
     let entry = state
@@ -304,6 +417,10 @@ async fn auth_check(
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<AuthCheckResponse>, ApiError> {
     let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    // Disabled profiles cannot be auth-checked. Re-enable first.
+    if profile.is_disabled() {
+        return Err(server_profile_disabled_conflict());
+    }
     let pem = decrypt_identity(&state, &identity)?;
 
     let username = profile

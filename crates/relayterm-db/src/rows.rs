@@ -145,6 +145,7 @@ pub(crate) struct ServerProfileRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_connected_at: Option<DateTime<Utc>>,
+    pub disabled_at: Option<DateTime<Utc>>,
 }
 
 impl ServerProfileRow {
@@ -160,6 +161,7 @@ impl ServerProfileRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             last_connected_at: self.last_connected_at,
+            disabled_at: self.disabled_at,
         }
     }
 }

@@ -64,6 +64,7 @@ const PROFILE_FIXTURE: ServerProfile = {
   created_at: "2026-04-29T00:00:00Z",
   updated_at: "2026-04-29T00:00:00Z",
   last_connected_at: null,
+  disabled_at: null,
 };
 
 const IDENTITY_FIXTURE: SshIdentity = {
@@ -327,6 +328,51 @@ describe("parseServerProfile", () => {
         future_safe_field: SENTINEL_OPERATOR,
       }),
     ).toEqual(PROFILE_FIXTURE);
+  });
+
+  it("accepts a disabled_at timestamp and surfaces it on the parsed object", () => {
+    const raw = { ...PROFILE_FIXTURE, disabled_at: "2026-05-01T12:34:56Z" };
+    const parsed = parseServerProfile(raw);
+    expect(parsed?.disabled_at).toBe("2026-05-01T12:34:56Z");
+  });
+
+  it("collapses a missing disabled_at to null for forward compatibility", () => {
+    // The API always emits the field today, but a future server build that
+    // momentarily omits it (e.g. an older deploy during a rolling upgrade)
+    // must not crash the parser. Older builds also predate the field
+    // entirely; both shapes collapse to "enabled" at the parser level.
+    const raw: Record<string, unknown> = { ...PROFILE_FIXTURE };
+    delete raw.disabled_at;
+    expect(parseServerProfile(raw)?.disabled_at).toBeNull();
+  });
+
+  it("rejects a wrong-shape disabled_at (e.g. boolean) to prevent silent drift", () => {
+    expect(
+      parseServerProfile({ ...PROFILE_FIXTURE, disabled_at: true }),
+    ).toBeNull();
+  });
+
+  it("never copies private_key / encrypted_private_key onto the parsed profile", () => {
+    // Defence-in-depth sentinel: the server must never put key material on
+    // a server_profile response. If a future server bug sneaks one in, the
+    // field-by-field parser pattern silently drops it. Asserting absence
+    // here pins the contract so a future refactor that copies `r` whole
+    // would surface as a clear test failure, not a silent leak.
+    const REDACT = "REDACT-MARKER-FE-DISABLED-AT-9F2B";
+    const raw = {
+      ...PROFILE_FIXTURE,
+      private_key: REDACT,
+      encrypted_private_key: REDACT,
+    };
+    const parsed = parseServerProfile(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed as unknown as Record<string, unknown>).not.toHaveProperty(
+      "private_key",
+    );
+    expect(parsed as unknown as Record<string, unknown>).not.toHaveProperty(
+      "encrypted_private_key",
+    );
+    expect(JSON.stringify(parsed)).not.toContain(REDACT);
   });
 });
 

@@ -40,6 +40,16 @@ export interface ServerProfile {
   updated_at: string;
   /** RFC 3339 timestamp; absent when the profile has never connected. */
   last_connected_at: string | null;
+  /**
+   * RFC 3339 timestamp set when the operator has disabled the profile;
+   * `null` when the profile is currently enabled. Disabled profiles
+   * cannot launch new terminal sessions, run auth-check, or run host-key
+   * preflight/trust on the backend — see SPEC.md "Inventory lifecycle
+   * and destructive-action policy". The disable/enable UI is future
+   * work; this field is exposed today so the parser doesn't silently
+   * drop it.
+   */
+  disabled_at: string | null;
 }
 
 export interface ListServerProfilesOptions extends LoadOptions {
@@ -82,6 +92,20 @@ export function parseServerProfile(raw: unknown): ServerProfile | null {
   if (!Array.isArray(r.tags) || !r.tags.every((t) => typeof t === "string")) {
     return null;
   }
+  // `disabled_at` is `Option<DateTime<Utc>>` on the wire — accept null,
+  // accept string. Anything else (`true`, an object, a number) is a
+  // type-shape error from the server and the whole row gets rejected,
+  // matching the existing pattern for `last_connected_at`.
+  // `undefined` is tolerated for forward compatibility with older server
+  // builds that haven't shipped the disable migration yet — collapse to
+  // `null` (enabled).
+  if (
+    r.disabled_at !== null &&
+    r.disabled_at !== undefined &&
+    typeof r.disabled_at !== "string"
+  ) {
+    return null;
+  }
   return {
     id: r.id,
     name: r.name,
@@ -92,6 +116,7 @@ export function parseServerProfile(raw: unknown): ServerProfile | null {
     created_at: r.created_at,
     updated_at: r.updated_at,
     last_connected_at: r.last_connected_at,
+    disabled_at: (r.disabled_at as string | null | undefined) ?? null,
   };
 }
 

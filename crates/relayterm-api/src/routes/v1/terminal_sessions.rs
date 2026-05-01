@@ -106,6 +106,16 @@ async fn create(
         .await?
         .filter(|p| p.owner_id == user.0)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
+    // Disabled profiles refuse new launches. Existing live sessions
+    // continue running — disable is a launch-time gate, not a runtime
+    // kill switch. The wire shape (`409 conflict { entity:
+    // "server_profile", reason: "disabled" }`) is pinned in SPEC.md.
+    if profile.is_disabled() {
+        return Err(ApiError::Conflict {
+            entity: "server_profile",
+            reason: Some("disabled"),
+        });
+    }
     let host = state
         .db
         .hosts()
@@ -133,7 +143,10 @@ async fn create(
         .map(|e| (e.key_type, e.fingerprint_sha256.clone()))
         .collect();
     if accept_pins.is_empty() {
-        return Err(ApiError::Conflict { entity: "host_key" });
+        return Err(ApiError::Conflict {
+            entity: "host_key",
+            reason: None,
+        });
     }
 
     // Decrypt the identity. Vault disabled → 503 (matches the rest of
@@ -224,11 +237,17 @@ fn map_pty_start_error(err: &SshPtyError) -> (ApiError, &'static str) {
             "transport",
         ),
         SshPtyError::HostKeyNotTrusted => (
-            ApiError::Conflict { entity: "host_key" },
+            ApiError::Conflict {
+                entity: "host_key",
+                reason: None,
+            },
             "host_key_not_trusted",
         ),
         SshPtyError::AuthenticationFailed => (
-            ApiError::Conflict { entity: "ssh_auth" },
+            ApiError::Conflict {
+                entity: "ssh_auth",
+                reason: None,
+            },
             "authentication_failed",
         ),
         SshPtyError::PtyStartFailed => (
@@ -321,7 +340,10 @@ async fn ws_attach(
         .filter(|s| s.owner_id == user.0)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     if session.status == TerminalSessionStatus::Closed {
-        return Err(ApiError::Conflict { entity: ENTITY });
+        return Err(ApiError::Conflict {
+            entity: ENTITY,
+            reason: None,
+        });
     }
 
     // Capture audit-only client metadata at the boundary. Header lookup is

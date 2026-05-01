@@ -1399,12 +1399,13 @@ It does **NOT** mean a PTY can be allocated, a shell can be spawned, a command c
 
 This section is normative. It defines the safe lifecycle for every inventory entity and the rules a future destructive surface (delete, disable, archive, revoke) MUST follow. Drift from these rules is a spec bug, not an implementation freedom.
 
-**Status today (load-bearing — read before adding any destructive surface).** No production route or UI deletes, disables, or archives any inventory record. The only destructive lifecycle moves wired today are:
+**Status today (load-bearing — read before adding any destructive surface).** No production route or UI **deletes** or archives any inventory record. The lifecycle moves wired today are:
 
 - `POST /api/v1/terminal-sessions/:id/close` — terminal sessions reach the `closed` terminal state.
+- `POST /api/v1/server-profiles/:id/disable` and `POST /api/v1/server-profiles/:id/enable` — backend-only. Stamp / clear `server_profiles.disabled_at`. Disabled profiles refuse new launches, auth-check, host-key preflight / trust. Existing live sessions are unaffected. Frontend UI is deferred. Audit-event emission is deferred (see "Audit gap" under "Server profile disable / enable backend"). See that section for the full contract.
 - `known_host_entries.revoked_at` — column exists; no route or UI yet writes it. The trust route already refuses to silently re-trust a revoked fingerprint (two-layer guard: route check + `record_trusted` SQL `WHERE revoked_at IS NULL`).
 
-Everything else (`hosts`, `ssh_identities`, `server_profiles`, `terminal_sessions` outside `close`, audit/session events) has no destructive surface. The schema enforces FK `RESTRICT` on the load-bearing references; an attempt to delete a referenced row from the DB layer would already fail. The policy below is what MUST be true *before* any destructive route or UI lands.
+Everything else (`hosts`, `ssh_identities`, `server_profiles` deletion, `terminal_sessions` outside `close`, audit/session events) has no destructive surface. The schema enforces FK `RESTRICT` on the load-bearing references; an attempt to delete a referenced row from the DB layer would already fail. The policy below is what MUST be true *before* any destructive route or UI lands.
 
 ### Per-entity lifecycle states
 
@@ -1413,7 +1414,7 @@ Everything else (`hosts`, `ssh_identities`, `server_profiles`, `terminal_session
 | `users` | `active` (no other state) | none planned in v1 | none | `hosts` (CASCADE), `ssh_identities` (CASCADE), `server_profiles` (CASCADE), `terminal_sessions` (CASCADE), `audit_events.actor_id` (SET NULL) |
 | `hosts` | `active` (no flag column) | `active` only — delete-when-zero-references | none | `server_profiles.host_id` (RESTRICT), `known_host_entries.host_id` (CASCADE) |
 | `ssh_identities` | `active` (no flag column) | `active` only — delete-when-zero-references | none | `server_profiles.ssh_identity_id` (RESTRICT) |
-| `server_profiles` | `active` (no flag column) | `active` \| `disabled` (preferred); delete only after disable AND zero session references | none | `terminal_sessions.server_profile_id` (RESTRICT) |
+| `server_profiles` | `active` \| `disabled` (`disabled_at` column) | unchanged; delete only after disable AND zero session references | `POST /:id/disable`, `POST /:id/enable` (backend-only today; no UI) | `terminal_sessions.server_profile_id` (RESTRICT) |
 | `known_host_entries` | `unknown` (no `trusted_at`), `trusted` (`trusted_at` set, `revoked_at IS NULL`), `revoked` (`revoked_at` set) | unchanged; explicit operator-only unrevoke much later | column-level `revoked_at` only — no route yet | none |
 | `terminal_sessions` | `starting`, `active`, `detached`, `closed` (CHECK constraint) | unchanged | `POST /:id/close` — idempotent, terminal | `terminal_session_attachments.session_id` (CASCADE), `session_events.session_id` (CASCADE) |
 | `terminal_session_attachments` | open (`detached_at IS NULL`), detached (`detached_at` set) | unchanged | row update on detach (manager-internal); never deleted via UI | none |
@@ -1484,13 +1485,44 @@ Rules every destructive lifecycle action MUST follow:
 - Closed terminal sessions remain visible and read-only in the sessions list. The list MUST handle a session whose `server_profile_id` no longer resolves (post-delete) without crashing — render a stable session id, status, timestamps, and a "(profile removed)" placeholder.
 - A session whose underlying profile is `disabled` (but still resolvable) renders the profile name with a `(disabled)` suffix in the sessions list and detail panel. The session itself is unaffected by disable — `active`/`detached` sessions keep streaming and the operator may still close them — so the UI signals the disabled-profile context without implying the session has stopped. Re-enabling the profile clears the suffix on the next refresh.
 
+### Server profile disable / enable backend (landed)
+
+**Status:** schema, repository, API, and launch / setup-action guards are wired. Audit-event emission is intentionally deferred — see "Audit gap (deferred)" below. Frontend disable / enable UI remains future work and is unchanged today; the production shell still renders inventory read-only.
+
+**Schema.** `server_profiles.disabled_at TIMESTAMPTZ NULL`, no default (migration `20260501000011_server_profiles_disabled_at.sql`). Existing rows are enabled (NULL). Column is **not** indexed in this slice — list filtering by `disabled_at` is not yet a hot path.
+
+**Domain + DTO.** `relayterm_core::server_profile::ServerProfile.disabled_at: Option<DateTime<Utc>>` plus `is_disabled() -> bool`. `ServerProfileResponse.disabled_at` is **always serialised** (`null` when absent) so clients can rely on the field's presence. Frontend `parseServerProfile` accepts a string or `null`, treats a missing field as `null` for forward compatibility, and rejects wrong-shape values to prevent silent drift.
+
+**Endpoints.**
+
+- `POST /api/v1/server-profiles/:id/disable` — stamps `disabled_at = NOW()`. Owner-scoped; foreign / missing ids return a byte-identical 404. Idempotent: a redundant disable returns the existing row unchanged (the original `disabled_at` is preserved — bumping it on a no-op call would be misleading).
+- `POST /api/v1/server-profiles/:id/enable` — clears `disabled_at`. Same ownership / idempotency contract.
+- Both routes return the updated `ServerProfileResponse` body. Neither route accepts a request body in this slice.
+
+**Failure modes.** `401 unauthorized` when dev-auth is disabled (extractor 401 short-circuits). `404 not_found` for a missing or foreign-owned profile (cross-user 404 is byte-identical to a genuine 404). `500 internal_error` for repository / database failures (static body, never echoes SQL).
+
+**Setup-action and launch-time guards.** A profile with `disabled_at IS NOT NULL` refuses these dependent actions with `409 conflict` and the wire message `"server_profile disabled"` (the `code` stays `conflict`):
+
+- `POST /api/v1/terminal-sessions` (launch). The wire `entity` reads `server_profile`; `reason` reads `disabled`. Existing live sessions are unaffected — see "Active session at the moment of profile disable" in the policy section above.
+- `POST /api/v1/server-profiles/:id/auth-check`.
+- `POST /api/v1/server-profiles/:id/host-key-preflight`.
+- `POST /api/v1/server-profiles/:id/trust-host-key`.
+
+Preflight refuses (rather than allowing a read-only probe) so the disabled state is uniformly closed across every dependent action; re-enabling the profile is the explicit return path. The trust route additionally guards against a sneaky bypass where a disabled profile is "re-blessed" without an explicit enable.
+
+**WebSocket attach.** `GET /api/v1/terminal-sessions/:id/ws` does **not** re-check the underlying profile's `disabled_at`. An already-created session row is reachable until it closes via the standard lifecycle paths (operator close, remote shell exit, PTY teardown, TTL expiry). Disable is a launch-time gate, not a runtime kill switch; reapplying it across the live wire would surprise an active operator and serve no security purpose (the SSH transport is already pinned to the credentials in flight).
+
+**Audit gap (deferred).** Server profile create / update / delete routes do not emit `audit_events` rows today. Disable / enable inherit this gap rather than introducing a one-off audit path; landing audit emission is its own slice that should cover create / update / disable / enable in one pass. The `AuditEventKind` enum already lists `ServerProfileCreated` / `ServerProfileUpdated` / `ServerProfileDeleted`; the new `ServerProfileDisabled` / `ServerProfileEnabled` kinds are still pending and will be added with a paired migration to `audit_events_kind_chk` when the audit-emission slice lands. Until then the rules in "Audit-event expectations" above (one event per successful destructive action, public metadata only, target id required) still describe the contract that future slice MUST satisfy.
+
+**ApiError shape.** `ApiError::Conflict` now carries `entity: &'static str` AND `reason: Option<&'static str>`. The wire envelope still uses `code: "conflict"`; when `reason` is `Some(r)` the message becomes `"{entity} {r}"`. When `reason` is `None` the message keeps the historical `"{entity} conflict"` form so existing clients (and pinned tests for `host_key conflict`, `terminal_session conflict`, etc.) continue to parse byte-identically.
+
 ### Future implementation order
 
 This is the recommended staged plan. Each item is its own slice; do not bundle. Earlier items unblock later items.
 
-1. **Add `disabled_at TIMESTAMPTZ NULL` to `server_profiles`** via a new sqlx migration. Update `relayterm-core::ServerProfile`, `CreateServerProfile`/repository contract, the DTO, and the parsers in `apps/web/src/lib/api/`. Read paths gain a derived `status: "active" | "disabled"` field. The `disabled_at` timestamp form mirrors `known_host_entries.revoked_at` and is the v1 shape. If a third state (e.g. `archived`) ever becomes necessary, that's the moment to graduate to a `status` text column — not before.
-2. **Backend route `POST /api/v1/server-profiles/:id/disable` (and paired `:id/enable`).** Idempotent, owner-scoped, dev-auth gated. Writes `server_profile_disabled` / `server_profile_enabled` audit events. Add the new audit kinds via a paired migration to `audit_events_kind_chk` and the `AuditEventKind` Rust enum.
-3. **Launch-time guard on `POST /api/v1/terminal-sessions`** — refuse with `409 conflict { entity: "server_profile", reason: "disabled" }` when the resolved profile has `disabled_at IS NOT NULL`. Existing live sessions keep running.
+1. **~~Add `disabled_at TIMESTAMPTZ NULL` to `server_profiles`~~ (LANDED).** Migration, domain model, DTO, and frontend parser all carry the field. See "Server profile disable / enable backend (landed)" above. The "third state" guidance still applies: graduate to a `status` text column only if a third state (e.g. `archived`) becomes necessary.
+2. **~~Backend route `POST /api/v1/server-profiles/:id/disable` (and paired `:id/enable`)~~ (LANDED).** Idempotent, owner-scoped, dev-auth gated. Audit-event emission is deferred; the new audit kinds (`ServerProfileDisabled`, `ServerProfileEnabled`) are still pending and will land with the audit-emission slice.
+3. **~~Launch-time guard on `POST /api/v1/terminal-sessions`~~ (LANDED).** Plus parallel guards on `auth-check`, `host-key-preflight`, and `trust-host-key`. Existing live sessions keep running. WebSocket attach is intentionally not gated — disable is a launch-time gate, not a runtime kill switch.
 4. **Frontend disable / enable UI** on the server-profiles list and detail panel. Confirmation dialog, disabled badge, launch button gated, redaction tests for the dialog copy.
 5. **Backend route `DELETE /api/v1/server-profiles/:id`** ONLY after disable is in place. Refuses with `409 conflict { entity: "terminal_session", count: N }` when any session references the profile (any status). Owner-scoped 404 collapses cross-user existence checks. Writes `server_profile_deleted` audit event (kind already exists).
 6. **Backend route `DELETE /api/v1/hosts/:id`.** Refuses with `409 conflict { entity: "server_profile", count: N }` when any profile references the host. Cascade-deletes `known_host_entries` (already enforced by schema). Writes `host_deleted` audit event (NEW kind — paired migration required).

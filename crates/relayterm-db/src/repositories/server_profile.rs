@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use relayterm_core::ids::{ServerProfileId, UserId};
 use relayterm_core::repository::{CreateServerProfile, RepositoryError, ServerProfileRepository};
 use relayterm_core::server_profile::ServerProfile;
@@ -41,7 +42,7 @@ impl ServerProfileRepository for PgServerProfileRepository {
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, owner_id, name, host_id, ssh_identity_id,
                       username_override, tags, created_at, updated_at,
-                      last_connected_at
+                      last_connected_at, disabled_at
             "#,
         )
         .bind(id)
@@ -63,7 +64,7 @@ impl ServerProfileRepository for PgServerProfileRepository {
             r#"
             SELECT id, owner_id, name, host_id, ssh_identity_id,
                    username_override, tags, created_at, updated_at,
-                   last_connected_at
+                   last_connected_at, disabled_at
             FROM server_profiles
             WHERE id = $1
             "#,
@@ -81,7 +82,7 @@ impl ServerProfileRepository for PgServerProfileRepository {
             r#"
             SELECT id, owner_id, name, host_id, ssh_identity_id,
                    username_override, tags, created_at, updated_at,
-                   last_connected_at
+                   last_connected_at, disabled_at
             FROM server_profiles
             WHERE owner_id = $1
             ORDER BY name ASC
@@ -96,5 +97,39 @@ impl ServerProfileRepository for PgServerProfileRepository {
             .into_iter()
             .map(ServerProfileRow::into_domain)
             .collect())
+    }
+
+    async fn set_disabled_at(
+        &self,
+        id: ServerProfileId,
+        owner_id: UserId,
+        disabled_at: Option<DateTime<Utc>>,
+    ) -> Result<ServerProfile, RepositoryError> {
+        // Ownership is enforced inside the SQL: an unowned-but-existing row
+        // returns zero rows here, indistinguishable from a missing id, and
+        // the route layer collapses both into the same 404. The SQL writes
+        // the column AND bumps `updated_at` unconditionally; idempotency
+        // (preserving the original `disabled_at` on a redundant operator
+        // action) lives in the disable / enable handlers, not here.
+        let row: Option<ServerProfileRow> = sqlx::query_as(
+            r#"
+            UPDATE server_profiles
+            SET disabled_at = $3,
+                updated_at  = NOW()
+            WHERE id = $1 AND owner_id = $2
+            RETURNING id, owner_id, name, host_id, ssh_identity_id,
+                      username_override, tags, created_at, updated_at,
+                      last_connected_at, disabled_at
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(owner_id.into_uuid())
+        .bind(disabled_at)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        row.map(ServerProfileRow::into_domain)
+            .ok_or(RepositoryError::NotFound { entity: ENTITY })
     }
 }

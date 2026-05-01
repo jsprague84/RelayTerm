@@ -200,6 +200,28 @@ pub trait ServerProfileRepository: Send + Sync {
     async fn create(&self, input: CreateServerProfile) -> Result<ServerProfile, RepositoryError>;
     async fn get(&self, id: ServerProfileId) -> Result<Option<ServerProfile>, RepositoryError>;
     async fn list_for_user(&self, owner_id: UserId) -> Result<Vec<ServerProfile>, RepositoryError>;
+    /// Set or clear `disabled_at` on a profile owned by `owner_id`.
+    ///
+    /// Behavior:
+    /// - `disabled_at = Some(t)` writes the timestamp; `None` clears it.
+    /// - The update is scoped to `(id, owner_id)`. A row not owned by the
+    ///   caller, or absent, returns [`RepositoryError::NotFound`] — the
+    ///   route layer maps that to a single 404 so cross-user existence
+    ///   isn't leaked.
+    /// - The implementation writes the column unconditionally and bumps
+    ///   `updated_at = NOW()`. Idempotency is enforced one layer up:
+    ///   the disable / enable routes early-return when the requested
+    ///   state already holds, so a redundant operator action does not
+    ///   reach this method at all. Callers that genuinely want to write
+    ///   the same state again (e.g. an admin "re-stamp" workflow that
+    ///   doesn't exist today) get the bump.
+    /// - Returns the post-update [`ServerProfile`] row.
+    async fn set_disabled_at(
+        &self,
+        id: ServerProfileId,
+        owner_id: UserId,
+        disabled_at: Option<DateTime<Utc>>,
+    ) -> Result<ServerProfile, RepositoryError>;
 }
 
 #[async_trait]

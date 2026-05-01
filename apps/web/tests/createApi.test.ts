@@ -60,6 +60,7 @@ const PROFILE_FIXTURE: ServerProfile = {
   created_at: "2026-04-30T00:00:00Z",
   updated_at: "2026-04-30T00:00:00Z",
   last_connected_at: null,
+  disabled_at: null,
 };
 
 describe("validateCreateHostRequest", () => {

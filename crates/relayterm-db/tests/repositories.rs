@@ -324,6 +324,99 @@ async fn server_profile_round_trip(pool: PgPool) {
 
     let listed = repo.list_for_user(user.id).await.unwrap();
     assert_eq!(listed.len(), 1);
+    // Newly-created profiles are enabled by default. Pinned here so a
+    // future migration that defaults the column to `NOW()` would surface
+    // as a clear test failure, not silent semantic drift.
+    assert!(listed[0].disabled_at.is_none());
+    assert!(!listed[0].is_disabled());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn server_profile_set_disabled_at_round_trip(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let repo = PgServerProfileRepository::new(pool.clone());
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+
+    // Disable: a fresh profile transitions to disabled with `Some(t)`.
+    let now = Utc::now();
+    let disabled = repo
+        .set_disabled_at(profile.id, user.id, Some(now))
+        .await
+        .expect("disable owned profile");
+    assert!(disabled.is_disabled());
+    assert!(disabled.disabled_at.is_some());
+
+    // Idempotent on repeated disable: the SQL writes unconditionally so a
+    // second call still succeeds, but `is_disabled()` stays true. The
+    // route layer wraps this with a get-then-skip so the original
+    // `disabled_at` survives a redundant call.
+    let again_disabled = repo
+        .set_disabled_at(profile.id, user.id, Some(Utc::now()))
+        .await
+        .expect("idempotent disable");
+    assert!(again_disabled.is_disabled());
+
+    // Enable: clears the timestamp.
+    let enabled = repo
+        .set_disabled_at(profile.id, user.id, None)
+        .await
+        .expect("enable owned profile");
+    assert!(!enabled.is_disabled());
+    assert!(enabled.disabled_at.is_none());
+
+    // Idempotent on repeated enable.
+    let again_enabled = repo
+        .set_disabled_at(profile.id, user.id, None)
+        .await
+        .expect("idempotent enable");
+    assert!(!again_enabled.is_disabled());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn server_profile_set_disabled_at_unknown_returns_not_found(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgServerProfileRepository::new(pool.clone());
+    let bogus = relayterm_core::ids::ServerProfileId::from_uuid(uuid::Uuid::new_v4());
+
+    let err = repo
+        .set_disabled_at(bogus, user.id, Some(Utc::now()))
+        .await
+        .expect_err("unknown id should be NotFound");
+    assert!(matches!(
+        err,
+        RepositoryError::NotFound {
+            entity: "server_profile"
+        }
+    ));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn server_profile_set_disabled_at_foreign_returns_not_found(pool: PgPool) {
+    // Cross-user existence must be indistinguishable from "no such row" at
+    // the repository layer. The route relies on this collapsing into a
+    // single 404 — see AGENTS.md "Encountered Lessons" 2026-04-28.
+    let owner = make_user(&pool).await;
+    let host = make_host(&pool, &owner).await;
+    let identity = make_identity(&pool, &owner).await;
+    let stranger = make_user(&pool).await;
+    let repo = PgServerProfileRepository::new(pool.clone());
+    let profile = make_profile(&pool, &owner, &host, &identity).await;
+
+    let err = repo
+        .set_disabled_at(profile.id, stranger.id, Some(Utc::now()))
+        .await
+        .expect_err("foreign owner_id should be NotFound");
+    assert!(matches!(
+        err,
+        RepositoryError::NotFound {
+            entity: "server_profile"
+        }
+    ));
+    // And the original row was not mutated.
+    let untouched = repo.get(profile.id).await.unwrap().unwrap();
+    assert!(!untouched.is_disabled());
 }
 
 // ----------------------------------------------------------------------

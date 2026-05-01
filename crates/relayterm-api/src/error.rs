@@ -70,8 +70,18 @@ pub enum ApiError {
     NotFound { entity: &'static str },
 
     /// 409 — uniqueness or referential constraint violated.
-    #[error("{entity} conflict")]
-    Conflict { entity: &'static str },
+    ///
+    /// `reason` is an optional short stable discriminator (`"disabled"`,
+    /// `"closed"`, etc.) included when the route wants the wire message to
+    /// distinguish *why* the conflict fired — e.g. a disabled
+    /// `server_profile` vs. a profile-name-uniqueness clash. The wire
+    /// envelope still uses the static `code = "conflict"`; the variant
+    /// rides in the message string so existing clients keep parsing.
+    #[error("{entity} {}", reason.unwrap_or("conflict"))]
+    Conflict {
+        entity: &'static str,
+        reason: Option<&'static str>,
+    },
 
     /// 502 — an upstream system the request depends on (e.g. an SSH peer
     /// during preflight) failed in a way that's not the client's fault.
@@ -111,10 +121,13 @@ impl ApiError {
                 ErrorCode::NotFound,
                 format!("{entity} not found"),
             ),
-            Self::Conflict { entity } => (
+            Self::Conflict { entity, reason } => (
                 StatusCode::CONFLICT,
                 ErrorCode::Conflict,
-                format!("{entity} conflict"),
+                match reason {
+                    Some(r) => format!("{entity} {r}"),
+                    None => format!("{entity} conflict"),
+                },
             ),
             Self::BadGateway(_) => (
                 StatusCode::BAD_GATEWAY,
@@ -181,7 +194,10 @@ impl From<RepositoryError> for ApiError {
     fn from(err: RepositoryError) -> Self {
         match err {
             RepositoryError::NotFound { entity } => Self::NotFound { entity },
-            RepositoryError::Conflict { entity, .. } => Self::Conflict { entity },
+            RepositoryError::Conflict { entity, .. } => Self::Conflict {
+                entity,
+                reason: None,
+            },
             // A row read/written by the persistence layer that failed domain
             // validation is a data-integrity bug; treat it as internal.
             RepositoryError::Validation { field, message } => {
@@ -249,6 +265,7 @@ impl From<TerminalSessionManagerError> for ApiError {
             // operator UI can tell "no such session" from "session is gone."
             TerminalSessionManagerError::SessionClosed => Self::Conflict {
                 entity: "terminal_session",
+                reason: None,
             },
             // The session row exists but its live PTY runtime is gone
             // (start failed, shell exited, or never bound). Surface as
@@ -256,6 +273,7 @@ impl From<TerminalSessionManagerError> for ApiError {
             // (404) from "row present, runtime gone" (409).
             TerminalSessionManagerError::PtyNotLive => Self::Conflict {
                 entity: "pty_runtime",
+                reason: None,
             },
             // PTY-startup errors only reach the API layer if a route
             // forwards one without prior translation. The terminal-

@@ -5698,3 +5698,496 @@ async fn ws_explicit_close_during_ttl_closes_immediately(pool: PgPool) {
         .unwrap();
     assert_eq!(row.status, TerminalSessionStatus::Closed);
 }
+
+// ----------------------------------------------------------------------
+// Server profile disable / enable
+//
+// Backend foundation for the inventory-lifecycle disable surface. The
+// route is owner-scoped; foreign-owned and missing ids collapse to a
+// byte-identical 404. Disable is idempotent (preserves the original
+// `disabled_at` on a redundant call); enable is idempotent. Existing
+// live `terminal_sessions` are unaffected by disable — see SPEC.md
+// "Inventory lifecycle and destructive-action policy".
+// ----------------------------------------------------------------------
+
+/// `disable` on an owned profile sets `disabled_at` and returns the
+/// updated row. The response carries the new timestamp and never any
+/// secret material.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disable_owned_server_profile_sets_disabled_at(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "disable-me",
+        "disable.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["id"].as_str().unwrap(), profile_id.to_string());
+    assert!(
+        body["disabled_at"].is_string(),
+        "disabled_at must be set on the response, got: {body}",
+    );
+    // Redaction: response must never carry private-key material under any
+    // shape, even though the route never touches the vault. Sentinel-style
+    // assertion; mirrors the pattern in `create_terminal_session_returns_active_*`.
+    let raw = body.to_string();
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "disable response must not contain `{forbidden}`: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disable_is_idempotent_and_preserves_original_timestamp(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "idempotent",
+        "idempotent.example.com",
+    )
+    .await;
+
+    let resp1 = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let first = read_body(resp1).await["disabled_at"].clone();
+    assert!(first.is_string());
+
+    let resp2 = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let second = read_body(resp2).await["disabled_at"].clone();
+    assert_eq!(
+        first, second,
+        "redundant disable must preserve the original disabled_at timestamp",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn enable_clears_disabled_at_and_is_idempotent(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "enable-me",
+        "enable.example.com",
+    )
+    .await;
+
+    let _ = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert!(
+        body["disabled_at"].is_null(),
+        "enable must clear disabled_at, got: {body}",
+    );
+
+    // Idempotent on already-enabled.
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert!(body["disabled_at"].is_null());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
+    let (app, _user_id) = setup(pool.clone()).await;
+    let bogus = uuid::Uuid::new_v4();
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bogus_body = read_body(resp).await;
+    assert_eq!(bogus_body["error"]["code"], "not_found");
+
+    // Foreign-owned id MUST produce a byte-identical body.
+    let other_user = create_user(&pool, "stranger").await;
+    let foreign_id = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-disable",
+        "foreign-disable.example.com",
+    )
+    .await;
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{foreign_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let foreign_body = read_body(resp).await;
+    assert_eq!(
+        foreign_body, bogus_body,
+        "cross-user disable 404 must match a genuine 404",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn enable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
+    let (app, _user_id) = setup(pool.clone()).await;
+    let bogus = uuid::Uuid::new_v4();
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bogus_body = read_body(resp).await;
+
+    let other_user = create_user(&pool, "stranger-enable").await;
+    let foreign_id = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-enable",
+        "foreign-enable.example.com",
+    )
+    .await;
+    // Disable as the owner so a real "needs enabling" target exists.
+    PgServerProfileRepository::new(pool.clone())
+        .set_disabled_at(foreign_id, other_user, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{foreign_id}/enable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let foreign_body = read_body(resp).await;
+    assert_eq!(
+        foreign_body, bogus_body,
+        "cross-user enable 404 must match a genuine 404",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_and_get_server_profiles_include_disabled_at(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "list-disabled",
+        "list.example.com",
+    )
+    .await;
+
+    // Fresh profile: disabled_at present and null.
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/server-profiles/{profile_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert!(
+        body.as_object().unwrap().contains_key("disabled_at"),
+        "GET /server-profiles/:id must always include disabled_at: {body}",
+    );
+    assert!(body["disabled_at"].is_null());
+
+    // After disable, list view reflects the timestamp.
+    let _ = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let resp = app.oneshot(get("/api/v1/server-profiles")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body.as_array().expect("list returns array");
+    let row = arr
+        .iter()
+        .find(|r| r["id"].as_str() == Some(&profile_id.to_string()))
+        .unwrap();
+    assert!(
+        row["disabled_at"].is_string(),
+        "list response must echo disabled_at after disable: {row}",
+    );
+}
+
+// ----- Disabled-profile guards on dependent setup actions -----
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disabled_profile_blocks_terminal_session_create_with_safe_409(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    // A trusted profile would normally launch successfully; disable AFTER
+    // pinning so the launch path's only failure cause is `disabled_at`.
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "blocked-launch",
+        "blocked.example.com",
+        "SHA256:blocked-launch",
+    )
+    .await;
+    PgServerProfileRepository::new(pool.clone())
+        .set_disabled_at(profile_id, user_id, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("server_profile") && msg.contains("disabled"),
+        "disabled-launch 409 must name server_profile + disabled, got: {msg}",
+    );
+    // No bytes from any inner SSH layer, no peer banners, no secrets.
+    let raw = body.to_string();
+    for forbidden in ["BEGIN OPENSSH PRIVATE KEY", "private_key"] {
+        assert!(!raw.contains(forbidden), "wire body leaked `{forbidden}`");
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disabled_profile_blocks_auth_check(pool: PgPool) {
+    let captured_fp = "SHA256:auth-blocked";
+    let (app, user_id, _checker) = setup_with_fake_auth_checker(
+        pool.clone(),
+        captured_for_test(captured_fp),
+        AuthAttemptKind::Authenticated,
+    )
+    .await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "auth-blocked",
+        "auth-blocked.example.com",
+        captured_fp,
+    )
+    .await;
+    PgServerProfileRepository::new(pool.clone())
+        .set_disabled_at(profile_id, user_id, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("server_profile") && msg.contains("disabled"),
+        "auth-check 409 on disabled profile must name server_profile disabled, got: {msg}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disabled_profile_blocks_host_key_preflight(pool: PgPool) {
+    let (app, user_id, _probe) =
+        setup_with_fake_probe(pool.clone(), "SHA256:preflight-blocked").await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "preflight-blocked",
+        "preflight-blocked.example.com",
+    )
+    .await;
+    PgServerProfileRepository::new(pool.clone())
+        .set_disabled_at(profile_id, user_id, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("server_profile") && msg.contains("disabled"),
+        "preflight 409 on disabled profile must name server_profile disabled, got: {msg}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disabled_profile_blocks_trust_host_key(pool: PgPool) {
+    let fp = "SHA256:trust-blocked";
+    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "trust-blocked",
+        "trust-blocked.example.com",
+    )
+    .await;
+    PgServerProfileRepository::new(pool.clone())
+        .set_disabled_at(profile_id, user_id, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": fp }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("server_profile") && msg.contains("disabled"),
+        "trust-host-key 409 on disabled profile must name server_profile disabled, got: {msg}",
+    );
+
+    // Defence in depth: no host-key entry was pinned despite the route
+    // running with a successful fake probe.
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(profile.host_id)
+        .await
+        .unwrap();
+    assert!(
+        entries.is_empty(),
+        "trust on a disabled profile must NOT pin: got {entries:?}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disable_after_terminal_session_create_does_not_affect_existing_session_metadata(
+    pool: PgPool,
+) {
+    // Existing live sessions continue when their profile is disabled.
+    // This slice doesn't run the live PTY in the test (would require the
+    // attach surface), but we can assert the session metadata row stays
+    // intact and is still readable post-disable. The runtime guarantee
+    // that the WS attach is unaffected is pinned at the route layer
+    // (the ws_attach upgrade gate does NOT re-check `disabled_at`).
+    let (app, user_id) = setup(pool.clone()).await;
+    let profile_id = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "post-launch-disable",
+        "post-launch-disable.example.com",
+        "SHA256:post-launch",
+    )
+    .await;
+    let session_id = create_session_via_api(&app, profile_id).await;
+
+    // Disable AFTER launch — must not retroactively close the session.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Session row is still readable and not closed.
+    let resp = app
+        .oneshot(get(&format!("/api/v1/terminal-sessions/{session_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_ne!(
+        body["status"], "closed",
+        "disable must NOT retroactively close existing sessions, got: {body}",
+    );
+}

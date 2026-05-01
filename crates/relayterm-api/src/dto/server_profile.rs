@@ -50,6 +50,10 @@ pub(crate) struct ServerProfileResponse {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_connected_at: Option<DateTime<Utc>>,
+    /// `Some(t)` when the operator has disabled the profile; `None` when
+    /// it is currently enabled. Always serialised (as `null` when absent)
+    /// so clients can rely on the field's presence.
+    pub disabled_at: Option<DateTime<Utc>>,
 }
 
 impl From<ServerProfile> for ServerProfileResponse {
@@ -64,6 +68,7 @@ impl From<ServerProfile> for ServerProfileResponse {
             created_at: p.created_at,
             updated_at: p.updated_at,
             last_connected_at: p.last_connected_at,
+            disabled_at: p.disabled_at,
         }
     }
 }
