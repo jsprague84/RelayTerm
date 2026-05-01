@@ -875,7 +875,7 @@ The first production-safe local preferences UI for the terminal workspace. An op
 - `fontFamily`: stripped of ASCII control characters and trimmed; falls back to the default if empty after stripping; clipped to 256 chars.
 - `themePresetId`: must match an entry in `TERMINAL_THEME_PRESETS`; unknown ids collapse to `relayterm-dark`.
 
-**Stable selectors.** `production-view-settings` (root), `settings-terminal-appearance`, `settings-font-family`, `settings-font-size`, `settings-line-height`, `settings-scrollback-lines`, `settings-cursor-style`, `settings-cursor-blink`, `settings-theme-preset`, `settings-preview`, `settings-apply`, `settings-reset`, `settings-status-saved`, `settings-status-failed`.
+**Stable selectors.** `production-view-settings` (root), `settings-terminal-appearance`, `settings-font-family`, `settings-font-size`, `settings-line-height`, `settings-scrollback-lines`, `settings-cursor-style`, `settings-cursor-blink`, `settings-theme-preset`, `settings-preview`, `settings-apply`, `settings-reset`, `settings-status-saved`, `settings-status-failed`. The settings view also hosts the recent-audit panel — see "Current-user audit events read API (landed)" below for `settings-recent-activity*` selectors.
 
 **UX copy (load-bearing).**
 
@@ -1551,6 +1551,54 @@ The payload MUST NOT contain: `private_key`, `encrypted_private_key`, plaintext 
 **`remote_addr`.** The `audit_events.remote_addr` column is intentionally `NULL` for these rows in this slice. Client IP / user-agent capture across the API surface is its own deferred refactor (see "Out of scope (v1)") — this slice does not introduce a one-off route-level capture path.
 
 **Reasoning.** Lifecycle audit rows are forensic primitives. Their value depends on `(actor, kind, target_id, recorded_at)` being trustworthy and free of secret-shaped fields. The payload deliberately avoids `tags`, `username_override`, host bag-of-fields, and identity public-key bytes — all of which are reachable via standard inventory queries scoped to the `actor_id`. Audit history is not a denormalised inventory snapshot; it is a transition log.
+
+### Current-user audit events read API (landed)
+
+**Status:** read-only `GET /api/v1/audit-events/recent` route plus a small "Recent activity" panel on the production Settings view. This slice is deliberately **not** an admin / cross-user audit viewer; admin tooling, search, filtering, export, retention, and payload-detail expansion remain future work.
+
+**Scope (load-bearing).**
+
+- **Current-user only.** Rows are filtered at the SQL layer by `actor_id = caller` via `AuditEventRepository::recent_for_actor`. There is no `actor_id` query parameter, no admin route, no aggregation surface.
+- **NULL-actor exclusion.** Pre-auth events with `actor_id IS NULL` (failed-login attempts, unauthenticated probes) are NOT visible on this route. An admin surface that wants those uses `AuditEventRepository::recent` directly when it lands; this route MUST NOT relax the SQL filter.
+- **Limit clamping.** `?limit=N` is clamped to `1..=100`; default is `20`. Out-of-range values are clamped silently rather than 400'd — the limit is a UI hint, not load-bearing input. The clamp is in `routes/v1/audit_events::clamp_limit` with a unit-test table.
+- **No raw payload.** Responses go through `AuditEventResponse::from_event` (`crates/relayterm-api/src/dto/audit_event.rs`), which maps each known `AuditEventKind` onto a closed allow-list of safe public fields. Unknown kinds collapse to a generic summary that carries no payload data at all.
+- **`actor_id` and `remote_addr` are dropped from the wire.** The caller IS the actor; re-emitting `actor_id` would invite a future drift where a cross-user row leaks via copy-paste. `remote_addr` exposure is a separate slice (client IP / user-agent capture across the API surface).
+
+**Wire shape.** `AuditEventResponse`:
+
+```jsonc
+{
+    "id":          "<uuid>",
+    "kind":        "<snake_case AuditEventKind tag>",
+    "recorded_at": "<rfc3339 timestamp>",
+    "summary": {
+        "kind": "server_profile_lifecycle",
+        "server_profile_id": "<uuid> | null",
+        "name":              "<string> | null",
+        "host_id":           "<uuid> | null",
+        "ssh_identity_id":   "<uuid> | null",
+        "disabled_at":       "<rfc3339> | null"
+    }
+}
+```
+
+For audit kinds without an explicit sanitizer arm, `summary` collapses to `{ "kind": "generic" }` with no other fields. Per-kind sanitizer arms are added explicitly: each new kind that grows a public surface must (1) extend `AuditPayloadSummary`, (2) wire it in `sanitize_payload`, and (3) add a redaction-sentinel test that constructs an event whose payload contains every name in `AUDIT_FORBIDDEN_SUBSTRINGS` and asserts the serialised DTO contains none of them.
+
+**Redaction contract (security-critical).** The DTO MUST NOT carry `private_key`, `encrypted_private_key`, plaintext PEM bytes, public-key bytes, terminal I/O, replay frames, peer banners, raw russh / transport / SQL error text, vault internals, `client_info` blobs, `remote_addr`, `user_agent`, or any payload field not explicitly allow-listed. Sentinel-string tests at three layers pin this:
+
+1. `crates/relayterm-api/src/dto/audit_event.rs` — sanitizer-level tests serialise the DTO and assert no forbidden substring appears.
+2. `crates/relayterm-api/tests/api.rs::audit_events_recent_redacts_secret_shaped_payload_fields` — route-level test that constructs an audit row whose payload smuggles every forbidden name and asserts the response body strips them.
+3. `apps/web/tests/auditApi.test.ts` — frontend `parseAuditEvent` drops top-level smuggled fields, falls back to a `generic` summary on unknown summary variants (forward-compatibility for a backend that ships a new sanitizer arm before the frontend updates), and rejects malformed top-level shape.
+
+**Unauthorized.** When `dev_auth.enabled = false` (the dev-auth shim is off and real auth has not landed yet), the `DevUser` extractor 401s before the route runs. Pinned by `audit_events_recent_unauthorized_when_dev_user_disabled`.
+
+**Empty list semantics.** A user with no audit history sees `200 []` (not `404`). Empty is the steady state for a fresh account.
+
+**Frontend surface.** `apps/web/src/lib/api/auditEvents.ts` exposes `listRecentAuditEvents({ limit? })`, `parseAuditEvent`, `describeAuditEventKind`, and `summarizeAuditEvent`. The "Recent activity" panel (`apps/web/src/lib/app/views/RecentActivityPanel.svelte`) renders inside `SettingsView` with explicit loading / empty / error / ready states and a manual `Refresh` button. There is no polling, no auto-retry, and no payload-expansion affordance. Errors collapse through `describeLoadError("audit events", err)` so transport / operator detail cannot leak into the rendered string.
+
+**Stable selectors (additions only).** `settings-recent-activity` (root article), `settings-recent-activity-refresh` (manual refresh button), `settings-recent-activity-loading`, `settings-recent-activity-error`, `settings-recent-activity-empty`, `settings-recent-activity-list` (the `<ul>` once events have loaded), `settings-recent-activity-row` (each `<li>`). Each row also carries a `data-kind` attribute set to the wire `kind` tag for smoke targeting; the value is a public taxonomy label and contains no operator data.
+
+**Out of scope for this slice.** Admin / cross-user audit view, audit search, audit filtering, audit export, retention / sweeper, raw JSON payload expansion, client IP / user-agent capture refactor, payload sanitizers for kinds beyond the server-profile lifecycle trio.
 
 ### Server profile disable / enable UI (landed)
 

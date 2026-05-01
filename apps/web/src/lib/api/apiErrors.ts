@@ -30,7 +30,11 @@
  * resource lands (e.g. "terminal sessions"), extend the union AND the
  * caller in lockstep — never `as` the cast away.
  */
-export type ResourceLabel = "hosts" | "server profiles" | "SSH identities";
+export type ResourceLabel =
+  | "hosts"
+  | "server profiles"
+  | "SSH identities"
+  | "audit events";
 
 export type LoadError =
   | { kind: "http"; status: number; code: string; message: string }

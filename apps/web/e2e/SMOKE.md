@@ -213,6 +213,13 @@ update this file in the same change.
 | `[data-testid="settings-status-failed"]`          | Save-failure status text (rendered when localStorage write throws). |
 | `[data-testid="settings-apply-note"]`             | Settings view inline copy mirroring `production-terminal-settings-note` (sourced from `TERMINAL_UX_COPY`). |
 | `[data-testid="settings-copy-paste-note"]`        | Settings view inline copy mirroring `production-terminal-copy-paste-note` (sourced from `TERMINAL_UX_COPY`). |
+| `[data-testid="settings-recent-activity"]`        | Recent-audit panel root inside the Settings view (current-user audit feed; read-only; not an admin view). |
+| `[data-testid="settings-recent-activity-refresh"]` | Manual refresh button inside the recent-audit panel (no auto-refresh, no polling). |
+| `[data-testid="settings-recent-activity-loading"]` | Recent-audit loading state. |
+| `[data-testid="settings-recent-activity-error"]`  | Recent-audit error summary (safe formatter only — never echoes wire `message` or transport detail). |
+| `[data-testid="settings-recent-activity-empty"]`  | Recent-audit empty state ("No audit events yet."). |
+| `[data-testid="settings-recent-activity-list"]`   | Recent-audit list container (one row per event). |
+| `[data-testid="settings-recent-activity-row"]`    | One row in the recent-audit list (carries `data-kind` set to the wire `AuditEventKind` tag). |
 | `[data-testid="dev-mode-badge"]`                  | "dev build" badge in top bar (only visible under `vite dev`). |
 | `[data-testid="nav-devtools-toggle"]`             | Sidebar dev-tools toggle (only visible under `vite dev`).     |
 | `[data-testid="dev-tools-panel"]`                 | Dev tools panel rendered when toggle is open (dev only).      |
@@ -332,6 +339,34 @@ the same MCP browser tools.
    - `browser_navigate http://localhost:5173/nope`
    - Re-run the snippet. Expected: `{ path: "/dashboard", view: "dashboard" }`
      (unknown paths replaceState-canonicalize to the dashboard).
+
+5a. Recent-audit panel — navigate to the Settings view and confirm the
+    current-user audit feed surface is reachable in the dev bundle. The
+    panel issues one `GET /api/v1/audit-events/recent` on mount; without
+    a live backend the request fails and the panel renders the error
+    state. Both the loading-and-then-error path AND the
+    loading-and-then-empty / -ready path are valid prod-bundle states —
+    the smoke only asserts the panel root + Refresh button are present:
+
+    - `browser_click [data-testid="nav-settings"]`
+    - `browser_evaluate`:
+
+      ```js
+      () => {
+        const has = (sel) => !!document.querySelector(sel);
+        return {
+          settingsView: has('[data-testid="production-view-settings"]'),
+          recentAudit: has('[data-testid="settings-recent-activity"]'),
+          recentAuditRefresh: has(
+            '[data-testid="settings-recent-activity-refresh"]',
+          ),
+        };
+      }
+      ```
+
+      Expected: every field `true`. Whether the panel currently shows
+      `loading`, `error`, `empty`, or `list` depends on whether the
+      backend is up — the smoke does NOT assert a specific state.
 
 6. For each of `ghostty-web`, `restty`, `wterm`, `xterm` (in that
    order):

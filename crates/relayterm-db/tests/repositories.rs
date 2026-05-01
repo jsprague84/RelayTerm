@@ -735,6 +735,92 @@ async fn audit_event_round_trip(pool: PgPool) {
     );
 }
 
+/// `recent_for_actor` must scope to the actor and exclude `actor_id IS
+/// NULL` rows. The current-user audit read route relies on this — a
+/// regression here would either leak cross-user events or surface
+/// pre-auth failed-login rows to a normal user.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_event_recent_for_actor_scopes_to_actor_and_excludes_null(pool: PgPool) {
+    let repo = PgAuditEventRepository::new(pool.clone());
+    let alice = make_user(&pool).await;
+    let bob = make_user(&pool).await;
+
+    // Alice's row.
+    let a = repo
+        .create(CreateAuditEvent {
+            actor_id: Some(alice.id),
+            kind: AuditEventKind::ServerProfileCreated,
+            payload: json!({ "server_profile_id": uuid::Uuid::new_v4(), "name": "alice-prof" }),
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+    // Bob's row.
+    let b = repo
+        .create(CreateAuditEvent {
+            actor_id: Some(bob.id),
+            kind: AuditEventKind::ServerProfileCreated,
+            payload: json!({ "server_profile_id": uuid::Uuid::new_v4(), "name": "bob-prof" }),
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+    // Pre-auth row (NULL actor) — must not appear in either feed.
+    let _anon = repo
+        .create(CreateAuditEvent {
+            actor_id: None,
+            kind: AuditEventKind::LoginFailed,
+            payload: json!({ "reason": "bad_password" }),
+            remote_addr: Some("203.0.113.7".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    let alice_feed = repo.recent_for_actor(alice.id, 50).await.unwrap();
+    assert_eq!(alice_feed.len(), 1);
+    assert_eq!(alice_feed[0].id, a.id);
+
+    let bob_feed = repo.recent_for_actor(bob.id, 50).await.unwrap();
+    assert_eq!(bob_feed.len(), 1);
+    assert_eq!(bob_feed[0].id, b.id);
+
+    // The shared `recent` admin-shape query still sees all three.
+    assert_eq!(repo.recent(50).await.unwrap().len(), 3);
+}
+
+/// `recent_for_actor` must order newest-first and clamp the row count
+/// at the SQL `LIMIT`. The route's clamp covers user input; this is
+/// the SQL-level guarantee.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_event_recent_for_actor_orders_and_limits(pool: PgPool) {
+    let repo = PgAuditEventRepository::new(pool.clone());
+    let user = make_user(&pool).await;
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let row = repo
+            .create(CreateAuditEvent {
+                actor_id: Some(user.id),
+                kind: AuditEventKind::ServerProfileCreated,
+                payload: json!({
+                    "server_profile_id": uuid::Uuid::new_v4(),
+                    "name": format!("p-{i}"),
+                }),
+                remote_addr: None,
+            })
+            .await
+            .unwrap();
+        ids.push(row.id);
+    }
+
+    // Page of 3 must take the most recently inserted three, in
+    // reverse-insertion order (recorded_at DESC, id DESC).
+    let page = repo.recent_for_actor(user.id, 3).await.unwrap();
+    assert_eq!(page.len(), 3);
+    let observed: Vec<_> = page.iter().map(|e| e.id).collect();
+    let expected: Vec<_> = ids.iter().rev().take(3).copied().collect();
+    assert_eq!(observed, expected);
+}
+
 /// The `audit_events_kind_chk` CHECK constraint must accept the
 /// server-profile lifecycle kinds emitted by the disable/enable routes.
 /// A failure here means the migration that extended the constraint did

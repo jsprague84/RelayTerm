@@ -64,6 +64,35 @@ impl AuditEventRepository for PgAuditEventRepository {
             .collect()
     }
 
+    async fn recent_for_actor(
+        &self,
+        actor_id: relayterm_core::ids::UserId,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, RepositoryError> {
+        // `actor_id = $1` (not `IS NOT DISTINCT FROM`) is intentional —
+        // pre-auth events with NULL `actor_id` MUST NOT be visible to a
+        // current-user audit read. An admin surface that wants those
+        // calls `recent` instead.
+        let rows: Vec<AuditEventRow> = sqlx::query_as(
+            r#"
+            SELECT id, actor_id, kind, payload, remote_addr, recorded_at
+            FROM audit_events
+            WHERE actor_id = $1
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(actor_id.into_uuid())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        rows.into_iter()
+            .map(AuditEventRow::try_into_domain)
+            .collect()
+    }
+
     async fn get(&self, id: AuditEventId) -> Result<Option<AuditEvent>, RepositoryError> {
         let row: Option<AuditEventRow> = sqlx::query_as(
             r#"

@@ -321,5 +321,17 @@ pub trait SessionEventRepository: Send + Sync {
 pub trait AuditEventRepository: Send + Sync {
     async fn create(&self, input: CreateAuditEvent) -> Result<AuditEvent, RepositoryError>;
     async fn recent(&self, limit: u32) -> Result<Vec<AuditEvent>, RepositoryError>;
+    /// Most-recent-first audit events scoped to a single actor.
+    ///
+    /// The current-user audit read route uses this so a request from
+    /// user A never observes user B's events. Rows with `actor_id IS
+    /// NULL` (pre-auth events, e.g. failed login attempts where the
+    /// actor isn't known) are NOT returned by this method; an admin
+    /// surface that wants those uses [`Self::recent`] directly.
+    async fn recent_for_actor(
+        &self,
+        actor_id: UserId,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, RepositoryError>;
     async fn get(&self, id: AuditEventId) -> Result<Option<AuditEvent>, RepositoryError>;
 }

@@ -30,9 +30,10 @@ use relayterm_api::{AppState, router};
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
-    AuditEventRepository, CreateHost, CreateKnownHostEntry, CreateServerProfile, CreateSshIdentity,
-    CreateUser, HostRepository, KnownHostEntryRepository, ServerProfileRepository,
-    SessionEventRepository, SshIdentityRepository, TerminalSessionRepository, UserRepository,
+    AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry, CreateServerProfile,
+    CreateSshIdentity, CreateUser, HostRepository, KnownHostEntryRepository,
+    ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
+    TerminalSessionRepository, UserRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
@@ -6509,4 +6510,303 @@ async fn no_audit_events_for_owner_scoped_404_enable(pool: PgPool) {
         lifecycle.is_empty(),
         "enable 404 path must not write an audit row, got: {lifecycle:?}",
     );
+}
+
+// ----------------------------------------------------------------------
+// GET /api/v1/audit-events/recent
+//
+// Read-only current-user audit feed. The route filters at the SQL layer
+// via `AuditEventRepository::recent_for_actor` — a foreign-actor row
+// MUST NOT reach the wire. Limit is clamped to `1..=100`. Payload is
+// sanitised through `AuditEventResponse::from_event`; raw payload
+// fields with secret-shaped names MUST NOT appear in the response body.
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_returns_current_user_lifecycle_events(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    // Create + disable a profile so we have two lifecycle audit rows
+    // for the current user.
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "audit-feed",
+        "audit-feed.example.com",
+    )
+    .await;
+    // The profile inserted via repo above does NOT route through
+    // `write_lifecycle_audit`, so write the create-event manually for
+    // a faithful feed shape. Use the same payload contract the route
+    // emits.
+    let audit = PgAuditEventRepository::new(pool.clone());
+    audit
+        .create(CreateAuditEvent {
+            actor_id: Some(user_id),
+            kind: AuditEventKind::ServerProfileCreated,
+            payload: json!({
+                "server_profile_id": profile_id,
+                "name": "audit-feed",
+                "host_id": uuid::Uuid::new_v4(),
+                "ssh_identity_id": uuid::Uuid::new_v4(),
+                "disabled_at": null,
+            }),
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body.as_array().expect("expected JSON array");
+    assert!(!arr.is_empty(), "current user should see their own row");
+
+    let first = &arr[0];
+    assert_eq!(first["kind"], "server_profile_created");
+    assert!(first["id"].is_string());
+    assert!(first["recorded_at"].is_string());
+    let summary = &first["summary"];
+    assert_eq!(summary["kind"], "server_profile_lifecycle");
+    assert_eq!(
+        summary["server_profile_id"].as_str().unwrap(),
+        profile_id.to_string(),
+    );
+    assert_eq!(summary["name"], "audit-feed");
+
+    // The DTO must drop actor_id and remote_addr.
+    assert!(first.get("actor_id").is_none(), "DTO must omit actor_id");
+    assert!(
+        first.get("remote_addr").is_none(),
+        "DTO must omit remote_addr",
+    );
+    assert!(
+        first.get("payload").is_none(),
+        "DTO must not echo raw payload",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
+    // Set up a router whose dev_user is `caller`. Insert an audit row
+    // for `other` directly. The feed for `caller` must NOT see it.
+    let caller = create_user(&pool, "caller").await;
+    let other = create_user(&pool, "other").await;
+
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: Some(caller),
+    };
+    let app = router(state);
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    audit
+        .create(CreateAuditEvent {
+            actor_id: Some(other),
+            kind: AuditEventKind::ServerProfileCreated,
+            payload: json!({
+                "server_profile_id": uuid::Uuid::new_v4(),
+                "name": "other-prof",
+            }),
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+    // Pre-auth row (NULL actor) — must also be invisible.
+    audit
+        .create(CreateAuditEvent {
+            actor_id: None,
+            kind: AuditEventKind::LoginFailed,
+            payload: json!({ "reason": "bad_password" }),
+            remote_addr: Some("203.0.113.7".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body.as_array().unwrap();
+    assert!(
+        arr.is_empty(),
+        "current-user feed must hide foreign-actor and NULL-actor rows: {body}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_clamps_limit(pool: PgPool) {
+    // Insert 12 lifecycle events for the current user, then ask for
+    // limit=5: the response MUST contain at most 5. A limit much larger
+    // than `MAX_LIMIT` (10000) clamps silently to 100.
+    let (app, user_id) = setup(pool.clone()).await;
+    let audit = PgAuditEventRepository::new(pool.clone());
+    for i in 0..12 {
+        audit
+            .create(CreateAuditEvent {
+                actor_id: Some(user_id),
+                kind: AuditEventKind::ServerProfileCreated,
+                payload: json!({
+                    "server_profile_id": uuid::Uuid::new_v4(),
+                    "name": format!("p-{i}"),
+                }),
+                remote_addr: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/audit-events/recent?limit=5"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 5);
+
+    // Out-of-range limit is silently clamped to MAX_LIMIT.
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent?limit=10000"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body.as_array().unwrap();
+    assert!(arr.len() <= 100, "MAX_LIMIT must cap the response");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_empty_list_for_quiet_user(pool: PgPool) {
+    let (app, _user_id) = setup(pool.clone()).await;
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body.as_array().expect("expected an array");
+    assert!(arr.is_empty(), "fresh user should see an empty feed");
+}
+
+/// Sentinel-style redaction guarantee for the audit-events feed. A
+/// payload row crafted with every name in `AUDIT_FORBIDDEN_SUBSTRINGS`
+/// MUST NOT see any of them survive into the wire response. The
+/// sanitizer is the redaction backstop; this test is the "if the
+/// sanitizer drifts, the route still strips it" assertion.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_redacts_secret_shaped_payload_fields(pool: PgPool) {
+    let (app, user_id) = setup(pool.clone()).await;
+    let audit = PgAuditEventRepository::new(pool.clone());
+    audit
+        .create(CreateAuditEvent {
+            actor_id: Some(user_id),
+            kind: AuditEventKind::ServerProfileCreated,
+            payload: json!({
+                "server_profile_id": uuid::Uuid::new_v4(),
+                "name": "redact-me",
+                "host_id": uuid::Uuid::new_v4(),
+                "ssh_identity_id": uuid::Uuid::new_v4(),
+                "disabled_at": null,
+                // Forbidden names smuggled into the payload — must not
+                // appear in the response.
+                "encrypted_private_key": "BEGIN OPENSSH PRIVATE KEY...",
+                "private_key": "PEM bytes",
+                "client_info": "Mozilla/5.0",
+                "remote_addr": "203.0.113.7",
+                "user_agent": "tauri/2",
+            }),
+            // remote_addr field is also a sentinel — make sure DTO doesn't
+            // surface the column either.
+            remote_addr: Some("203.0.113.7".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw =
+        String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+    for forbidden in AUDIT_FORBIDDEN_SUBSTRINGS {
+        assert!(
+            !raw.contains(forbidden),
+            "audit feed response must not contain `{forbidden}`: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_unknown_kind_collapses_to_generic_summary(pool: PgPool) {
+    // A row whose kind doesn't have an explicit sanitizer (e.g.
+    // `Other`) must surface as `summary.kind = "generic"` and MUST NOT
+    // echo any of the row's payload fields.
+    let (app, user_id) = setup(pool.clone()).await;
+    let audit = PgAuditEventRepository::new(pool.clone());
+    audit
+        .create(CreateAuditEvent {
+            actor_id: Some(user_id),
+            kind: AuditEventKind::Other,
+            payload: json!({
+                "raw_error": "russh internal: handshake failed",
+                "private_key": "leak-me",
+            }),
+            remote_addr: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let entry = &body.as_array().unwrap()[0];
+    assert_eq!(entry["kind"], "other");
+    assert_eq!(entry["summary"]["kind"], "generic");
+    let raw = entry.to_string();
+    assert!(!raw.contains("raw_error"));
+    assert!(!raw.contains("private_key"));
+    assert!(!raw.contains("russh"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn audit_events_recent_unauthorized_when_dev_user_disabled(pool: PgPool) {
+    // When `dev_user_id = None` (and no real auth backend is wired
+    // yet), the DevUser extractor returns 401. The audit-events route
+    // MUST go through that gate.
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(get("/api/v1/audit-events/recent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

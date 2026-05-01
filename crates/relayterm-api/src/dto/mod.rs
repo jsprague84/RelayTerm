@@ -9,6 +9,7 @@
 //! 2. Filter the wire shape — no internal-only fields (e.g. `owner_id`),
 //!    and **never** the encrypted private key on `SshIdentity`.
 
+pub(crate) mod audit_event;
 pub(crate) mod auth_check;
 pub(crate) mod host;
 pub(crate) mod preflight;

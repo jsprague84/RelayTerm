@@ -38,6 +38,7 @@
     findThemePreset,
   } from "../settings/themePresets.js";
   import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
+  import RecentActivityPanel from "./RecentActivityPanel.svelte";
 
   type SaveState =
     | { kind: "idle" }
@@ -378,4 +379,6 @@ Last login: Mon May  1 14:02:51
     mobile/Tauri settings are deliberate later slices. Today's settings
     are stored locally in this browser only.
   </p>
+
+  <RecentActivityPanel />
 </section>
