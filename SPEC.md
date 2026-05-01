@@ -1395,6 +1395,112 @@ It does **NOT** mean a PTY can be allocated, a shell can be spawned, a command c
 - **Host-key change**: on `check_server_key` mismatch, the backend rejects the connection, logs an `audit_event`, and surfaces the mismatch to the user; it does NOT silently update the known_hosts entry. The preflight + trust-host-key endpoints (see "SSH preflight + known-host trust contract") implement this for the pre-session probe; the same rule applies to live sessions once they land.
 - **Key vault access**: the encrypted private key is decrypted only inside the SSH session task. Decrypted bytes never cross a boundary (no log, no IPC payload, no DB write).
 
+## Inventory lifecycle and destructive-action policy
+
+This section is normative. It defines the safe lifecycle for every inventory entity and the rules a future destructive surface (delete, disable, archive, revoke) MUST follow. Drift from these rules is a spec bug, not an implementation freedom.
+
+**Status today (load-bearing — read before adding any destructive surface).** No production route or UI deletes, disables, or archives any inventory record. The only destructive lifecycle moves wired today are:
+
+- `POST /api/v1/terminal-sessions/:id/close` — terminal sessions reach the `closed` terminal state.
+- `known_host_entries.revoked_at` — column exists; no route or UI yet writes it. The trust route already refuses to silently re-trust a revoked fingerprint (two-layer guard: route check + `record_trusted` SQL `WHERE revoked_at IS NULL`).
+
+Everything else (`hosts`, `ssh_identities`, `server_profiles`, `terminal_sessions` outside `close`, audit/session events) has no destructive surface. The schema enforces FK `RESTRICT` on the load-bearing references; an attempt to delete a referenced row from the DB layer would already fail. The policy below is what MUST be true *before* any destructive route or UI lands.
+
+### Per-entity lifecycle states
+
+| Entity | States today | Future states | Destructive surface today | FK to children |
+|---|---|---|---|---|
+| `users` | `active` (no other state) | none planned in v1 | none | `hosts` (CASCADE), `ssh_identities` (CASCADE), `server_profiles` (CASCADE), `terminal_sessions` (CASCADE), `audit_events.actor_id` (SET NULL) |
+| `hosts` | `active` (no flag column) | `active` only — delete-when-zero-references | none | `server_profiles.host_id` (RESTRICT), `known_host_entries.host_id` (CASCADE) |
+| `ssh_identities` | `active` (no flag column) | `active` only — delete-when-zero-references | none | `server_profiles.ssh_identity_id` (RESTRICT) |
+| `server_profiles` | `active` (no flag column) | `active` \| `disabled` (preferred); delete only after disable AND zero session references | none | `terminal_sessions.server_profile_id` (RESTRICT) |
+| `known_host_entries` | `unknown` (no `trusted_at`), `trusted` (`trusted_at` set, `revoked_at IS NULL`), `revoked` (`revoked_at` set) | unchanged; explicit operator-only unrevoke much later | column-level `revoked_at` only — no route yet | none |
+| `terminal_sessions` | `starting`, `active`, `detached`, `closed` (CHECK constraint) | unchanged | `POST /:id/close` — idempotent, terminal | `terminal_session_attachments.session_id` (CASCADE), `session_events.session_id` (CASCADE) |
+| `terminal_session_attachments` | open (`detached_at IS NULL`), detached (`detached_at` set) | unchanged | row update on detach (manager-internal); never deleted via UI | none |
+| `session_events`, `audit_events` | append-only | unchanged | none — immutable | none |
+
+`users` deletion is intentionally out of scope for v1. The `ON DELETE CASCADE` shape exists for operator/test use only; no API surface accepts a user delete.
+
+### Delete vs disable / archive policy
+
+1. **Default user-facing destructive action for `server_profiles` is `disable`, not delete.** Disable blocks NEW launches; existing live sessions keep running until they close on their own (operator close, remote shell exit, or PTY teardown). A re-enable returns the profile to launchable.
+2. **`hosts` and `ssh_identities` are deletable only when zero `server_profiles` reference them.** This matches the schema's FK `RESTRICT`. The route MUST classify the refusal at the application layer — a clean 409 BEFORE attempting the DELETE — so the client gets a typed error (`409 conflict { entity: "server_profile", count: N }`) instead of a generic constraint violation. Production UI MUST surface "remove the N referencing profiles first" rather than "try again."
+3. **`server_profiles` are deletable only when zero `terminal_sessions` reference them, AND the profile was already `disabled`** (preferred). Closed sessions count toward the reference total — closed-session metadata is historical and protective. If hard-delete on a referenced profile is ever needed, it is admin-only, not a user-facing action.
+4. **`terminal_sessions` are NEVER deleted from the user UI.** Once `closed`, they are historical metadata. The user lists, views, and audits them. Any cascade or sweep that drops session rows is admin-only, future-only, and explicit. Inventory deletion (host/identity/profile) MUST NOT cascade-delete sessions — `RESTRICT` is the policy and the schema agrees.
+5. **`known_host_entries` are revoked, never hard-deleted from user UI.** Hard delete is admin-only future work. Revoke is non-recoverable from the user surface; an explicit operator unrevoke flow may land later as a separate, deliberate slice (see "Encountered Lessons" 2026-04-29 in AGENTS.md).
+6. **`session_events` and `audit_events` are never deleted from any surface.** They are append-only forensic logs; an admin retention sweep is future work and out of scope for v1.
+
+### Reference / integrity policy
+
+- **Host delete**: requires `0` `server_profiles` referencing the host. Cascade-deletes `known_host_entries` for the host (DB-level `ON DELETE CASCADE`). This is intentional — pins live with the host and a deleted host's pins have no meaning.
+- **SSH identity delete**: requires `0` `server_profiles` referencing the identity. The encrypted private-key bytes are wiped at the DB layer when the row is removed; no copy of `encrypted_private_key` exists outside the row (vault decrypts only into ephemeral memory in the SSH session / preflight task and zeroizes on drop).
+- **Server profile disable**: no reference check needed. Existing live `terminal_sessions` are unaffected. The launch route refuses to start a new session against a disabled profile with `409 conflict { entity: "server_profile", reason: "disabled" }`.
+- **Server profile delete**: requires `disabled` AND `0` `terminal_sessions` referencing the profile (any status). Two-layer policy: the route emits a clean 409 BEFORE attempting DELETE; the schema's `RESTRICT` is the second-line backstop.
+- **Typed-409 entity field convention**: the wire `entity` value on a `409 conflict` envelope uses the singular table-row form (`server_profile`, `terminal_session`, `host_key`). This matches the existing `409 conflict { entity: "host_key" }` and `409 conflict { entity: "terminal_session" }` shapes in the host-key-trust and terminal-session-create contracts. New destructive routes MUST follow this form so client error handling stays uniform.
+- **Active session at the moment of profile disable**: the live session continues. Disable is a launch-time gate, not a runtime kill switch. Operator-driven session kill remains `POST /api/v1/terminal-sessions/:id/close`.
+- **`audit_events.actor_id` orphans to `NULL`** when a user is deleted (schema `ON DELETE SET NULL`). Audit history survives user deletion, with the actor anonymised. This is the only inventory action that nullifies a reference; everything else uses `RESTRICT` or `CASCADE` deliberately.
+
+### Session-history policy
+
+- A `closed` `terminal_session` row is a permanent historical record. Users can list and view it but cannot delete it.
+- The row's `server_profile_id` and `owner_id` references must remain stable for the row's lifetime. This is why the schema uses `RESTRICT` on `server_profile_id` and `CASCADE` on `owner_id` — the row dies only with its owner.
+- When a profile is disabled or deleted, historical session rows that reference it stay readable. The list UI MUST handle a session whose underlying profile is gone (post-delete) without crashing — render a stable session id, status, timestamps, and a "(profile removed)" placeholder for the profile name.
+- `terminal_session_attachments` and `session_events` cascade-delete with their session row. This is correct: they are per-session telemetry and have no meaning detached from the session. They are NOT exposed as their own deletable surface.
+
+### Known-host revocation policy
+
+- The state machine is `unknown → trusted → revoked` (with `unknown` returning to itself if the operator never confirms). `revoked` is reachable only via a deliberate operator action; the production UI does NOT surface revoke today.
+- A revoked entry is **never silently re-trusted**. The trust route enforces this with two layers (route guard + `record_trusted` SQL), and the classifier filters revoked rows out of the `trusted` / `changed` classification (a revoked-and-reappearing key surfaces as `unknown`, not `trusted`). See AGENTS.md "Encountered Lessons" 2026-04-29 for the original incident analysis.
+- Recovery from `revoked` is an explicit operator workflow that does NOT exist in v1. A future "unrevoke" route MUST be admin-only, audit-logged, and require an explicit fingerprint match — no convenience UX that lets an operator click through revocation.
+- `known_host_entries` cascade-delete with their host (schema `ON DELETE CASCADE`). This is correct: pins are scoped to the host and have no meaning after the host is gone.
+- Hard delete of a known-host entry without deleting its host is admin-only future work.
+
+### Audit-event expectations
+
+The `audit_events.kind` enum already anticipates `server_profile_created`, `server_profile_updated`, `server_profile_deleted`, `ssh_identity_created`, `ssh_identity_deleted`, `host_key_accepted`, `host_key_mismatch`, and `host_key_revoked`. New destructive routes MUST extend the enum (with a paired migration to the `audit_events_kind_chk` CHECK and the `AuditEventKind` Rust enum) when they introduce a new lifecycle action. The currently-missing kinds are:
+
+- `host_created`, `host_updated` — neither variant exists yet. The host CRUD routes do not write audit events today; that is its own gap. When host create/update lands, add the matching kinds (and corresponding `host_deleted`).
+- `host_deleted` — required when host delete lands.
+- `server_profile_disabled`, `server_profile_enabled` — required when disable/enable land.
+- (`host_key_revoked` already exists; reuse it for the revoke route.)
+
+Rules every destructive lifecycle action MUST follow:
+
+1. **Successful destructive action writes exactly one audit event** with `actor_id = caller`, an appropriate `kind`, and a payload containing the target id and target kind. The `target_id` field on the payload is required so cross-entity audit queries are tractable.
+2. **Failed destructive attempts that are security-relevant SHOULD audit.** A revoke-then-trust attempt, a cross-user delete (which already collapses to a 404 to avoid existence leak), and a delete refused for FK reasons in a context that suggests probing (large burst, repeated unknowns) are candidates. Routine 409s (delete blocked by visible references in the caller's own inventory) MAY skip audit to keep the log signal-rich.
+3. **Audit payloads contain public metadata only.** Allowed: target id, target kind, caller id, fingerprints (public), `key_type`, `name`, timestamps, reference counts (e.g. `referencing_profile_count`), reason codes. **Forbidden:** `encrypted_private_key`, plaintext private-key bytes, raw russh error text, peer banners, vault internals (master key, nonce, version byte), terminal I/O (input keystrokes, output bytes), full URLs with query strings that could carry secrets, the `client_info` blob from `terminal_session_attachments` (operator-supplied User-Agent — reference attachments by `id` only).
+4. **For `ssh_identity_deleted`** the payload MAY retain `name`, `key_type`, `fingerprint_sha256`, and `created_at` so the audit row remains readable after the underlying identity row is gone. The `encrypted_private_key` bytes are NEVER copied into audit.
+5. **For `host_deleted`** the payload MAY retain `display_name`, `hostname`, `port`, `default_username`, and a count of cascaded `known_host_entries` so audit history records the operation precisely.
+6. **For `server_profile_disabled` / `server_profile_enabled`** the payload includes `target_id` and the new state. No reason field is required in v1; an optional operator-supplied note is future work.
+7. **`session_events` are not a substitute for `audit_events`.** Session events are per-session lifecycle telemetry and stay scoped to that session row. Audit events span the system and survive cascade-delete of session telemetry.
+
+### UI implications
+
+- No edit / delete / disable / archive / close UI exists today outside the terminal-session close path. The production app shell renders read-only inventory detail panels by design.
+- Future destructive UI MUST be **explicit, confirmable, and auditable**. A confirmation dialog is required for every destructive action; the confirmation MUST name the target (display name + id suffix), the action verb, and the consequence ("this profile will stop accepting new launches; existing live sessions are unaffected").
+- Confirmation dialogs and audit views render **public metadata only**. The redaction rule from `lib/api/` parsers extends here — no `private_key` / `encrypted_private_key` field appears in any DOM string, formatted preview, or copy string. The existing sentinel-string redaction tests in the SSH-identity views are the pattern to follow.
+- Routing rule (already established): no secret material, terminal data, or session payloads in URLs. This applies to confirmation dialog hashes too — destructive confirmation goes through component state, not URL params.
+- Disabled `server_profiles` render with a clear `disabled` badge in the inventory list and detail panel. The Launch button is rendered disabled with an honest tooltip ("this profile is disabled; enable it to launch a new terminal"). The dashboard checklist's `launch-terminal` row stays count-inferable — disabled profiles do NOT change the count semantics.
+- Closed terminal sessions remain visible and read-only in the sessions list. The list MUST handle a session whose `server_profile_id` no longer resolves (post-delete) without crashing — render a stable session id, status, timestamps, and a "(profile removed)" placeholder.
+- A session whose underlying profile is `disabled` (but still resolvable) renders the profile name with a `(disabled)` suffix in the sessions list and detail panel. The session itself is unaffected by disable — `active`/`detached` sessions keep streaming and the operator may still close them — so the UI signals the disabled-profile context without implying the session has stopped. Re-enabling the profile clears the suffix on the next refresh.
+
+### Future implementation order
+
+This is the recommended staged plan. Each item is its own slice; do not bundle. Earlier items unblock later items.
+
+1. **Add `disabled_at TIMESTAMPTZ NULL` to `server_profiles`** via a new sqlx migration. Update `relayterm-core::ServerProfile`, `CreateServerProfile`/repository contract, the DTO, and the parsers in `apps/web/src/lib/api/`. Read paths gain a derived `status: "active" | "disabled"` field. The `disabled_at` timestamp form mirrors `known_host_entries.revoked_at` and is the v1 shape. If a third state (e.g. `archived`) ever becomes necessary, that's the moment to graduate to a `status` text column — not before.
+2. **Backend route `POST /api/v1/server-profiles/:id/disable` (and paired `:id/enable`).** Idempotent, owner-scoped, dev-auth gated. Writes `server_profile_disabled` / `server_profile_enabled` audit events. Add the new audit kinds via a paired migration to `audit_events_kind_chk` and the `AuditEventKind` Rust enum.
+3. **Launch-time guard on `POST /api/v1/terminal-sessions`** — refuse with `409 conflict { entity: "server_profile", reason: "disabled" }` when the resolved profile has `disabled_at IS NOT NULL`. Existing live sessions keep running.
+4. **Frontend disable / enable UI** on the server-profiles list and detail panel. Confirmation dialog, disabled badge, launch button gated, redaction tests for the dialog copy.
+5. **Backend route `DELETE /api/v1/server-profiles/:id`** ONLY after disable is in place. Refuses with `409 conflict { entity: "terminal_session", count: N }` when any session references the profile (any status). Owner-scoped 404 collapses cross-user existence checks. Writes `server_profile_deleted` audit event (kind already exists).
+6. **Backend route `DELETE /api/v1/hosts/:id`.** Refuses with `409 conflict { entity: "server_profile", count: N }` when any profile references the host. Cascade-deletes `known_host_entries` (already enforced by schema). Writes `host_deleted` audit event (NEW kind — paired migration required).
+7. **Backend route `DELETE /api/v1/ssh-identities/:id`.** Refuses with `409 conflict { entity: "server_profile", count: N }` when any profile references the identity. Writes `ssh_identity_deleted` audit event (kind already exists). The encrypted private-key bytes go away with the row; no separate wipe step is needed.
+8. **Backend known-host revoke route** (e.g. `POST /api/v1/hosts/:id/known-hosts/:entry_id/revoke`). Stamps `revoked_at`. Writes `host_key_revoked` audit event (kind already exists). Owner-scoped via the host's `owner_id`.
+9. **Stale-row sweepers and admin tooling** — operator surface for `starting` rows that survived a backend restart, orphaned attachments, and very-old closed sessions. Explicit, audit-logged, never silent. Out of scope for v1.
+10. **Operator unrevoke and admin hard-delete** of `known_host_entries` / closed `terminal_sessions` — admin-only, audit-logged, deliberately later.
+
+Each step's "definition of done" inherits the standard checklist (tests, sqlx prepare on schema change, audit event reachable, owner-scoping, redaction posture). When the first destructive route lands, append an "Encountered Lessons" entry in AGENTS.md if any non-obvious gotcha emerged (FK ordering, audit-payload surface, dialog redaction).
+
 ## Integration points
 
 - **PostgreSQL** — primary store for users, sessions, audit log, key vault. sqlx connection pool; `runtime-tokio-rustls`.

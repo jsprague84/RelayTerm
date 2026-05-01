@@ -187,6 +187,7 @@ If you're tempted to invent a new directory, propose it here first.
 | Redefine `RendererTheme`, `RendererThemeAnsi`, `RendererCursorStyle`, or `BaseTerminalRendererOptions` inside an adapter package | Import them from `@relayterm/terminal-core`; extend `BaseTerminalRendererOptions` for the adapter's option interface |
 | Import from `lib/dev/` inside `apps/web/src/lib/app/`, OR import an experimental renderer adapter (`@relayterm/terminal-{ghostty-web,restty,wterm}`) inside `apps/web/src/lib/app/` | Production shell stays dev-free; the production terminal workspace uses `@relayterm/terminal-core` + `@relayterm/terminal-xterm` (the baseline) only. Reach the dev lab via the `devTools` snippet in `App.svelte`, gated by `import.meta.env.DEV` — see `tests/appShellIsolation.test.ts` |
 | Show fake data, mock secret values, or a `private_key`/`encrypted_private_key` field on a placeholder view | Use `PlaceholderView` with honest copy: a one-line summary, a "what currently exists on the backend" bullet list, and a `futureWork` note |
+| Add a delete / disable / archive / hard-revoke route or UI without consulting the lifecycle policy | Read `SPEC.md` "Inventory lifecycle and destructive-action policy" first. Default user-facing destructive action for `server_profiles` is disable (not delete). `hosts`/`ssh_identities` delete is blocked while a `server_profile` references them. `terminal_sessions` are never deleted from the user UI. Every destructive action writes one audit event with public metadata only |
 
 ## Git workflow
 
