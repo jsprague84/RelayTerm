@@ -231,7 +231,22 @@ the same MCP browser tools.
    every renderer option is `present: true`; `xterm` is the only one
    with `checked: true`.
 
-5. For each of `ghostty-web`, `restty`, `wterm`, `xterm` (in that
+5. URL routing — assert each top-level nav click drives `pushState`
+   (no full page reload, URL mirrors the selected view) and back/forward
+   step through in-app history:
+
+   - `browser_navigate http://localhost:5173/servers`
+   - `browser_evaluate (() => ({ path: window.location.pathname, view: document.querySelector('[data-testid="app-shell-main"]')?.dataset.view }))`
+   - Expected: `{ path: "/servers", view: "servers" }`.
+   - `browser_click [data-testid="nav-identities"]`
+   - Re-run the snippet. Expected: `{ path: "/identities", view: "identities" }`.
+   - `browser_navigate_back`
+   - Re-run the snippet. Expected: `{ path: "/servers", view: "servers" }`.
+   - `browser_navigate http://localhost:5173/nope`
+   - Re-run the snippet. Expected: `{ path: "/dashboard", view: "dashboard" }`
+     (unknown paths replaceState-canonicalize to the dashboard).
+
+6. For each of `ghostty-web`, `restty`, `wterm`, `xterm` (in that
    order):
 
    - `browser_click [data-testid="renderer-option-<id>"]`
@@ -246,7 +261,7 @@ the same MCP browser tools.
    `xterm` as the final click — confirm `renderer-option-xterm` is
    checked before closing the browser.
 
-6. `browser_console_messages level=error all=true`. The only allowed
+7. `browser_console_messages level=error all=true`. The only allowed
    error is the favicon `404` (`GET /favicon.ico 404`) — anything else
    fails the smoke.
 
@@ -395,7 +410,26 @@ the same MCP browser tools.
      launch from the Servers view; verifying the post-launch surface
      requires a live backend and is out of scope for this smoke.
 
-6. `browser_console_messages level=error all=true`. As above, the
+6. URL routing — production-build parity check. The deployment must
+   serve `index.html` for every app route; this step asserts the
+   preview server's SPA fallback covers the route table:
+
+   - `browser_navigate http://localhost:4173/sessions`
+   - `browser_evaluate (() => ({ path: window.location.pathname, view: document.querySelector('[data-testid="app-shell-main"]')?.dataset.view }))`
+   - Expected: `{ path: "/sessions", view: "sessions" }`.
+   - `browser_navigate http://localhost:4173/settings`
+   - Re-run the snippet. Expected: `{ path: "/settings", view: "settings" }`.
+   - `browser_navigate http://localhost:4173/nope`
+   - Re-run the snippet. Expected: `{ path: "/dashboard", view: "dashboard" }`
+     (unknown paths replaceState-canonicalize to the dashboard).
+   - `browser_click [data-testid="nav-servers"]` then `browser_navigate_back`
+   - Re-run the snippet. Expected: `{ path: "/dashboard", view: "dashboard" }`.
+
+   If any direct load returns a 404 / blank page, the deploy host is
+   missing its SPA fallback — see SPEC.md "URL-driven production view
+   routing" for the requirement.
+
+7. `browser_console_messages level=error all=true`. As above, the
    favicon `404` is the only allowed error.
 
 ## What this smoke does NOT cover

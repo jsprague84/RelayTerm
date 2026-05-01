@@ -25,10 +25,14 @@
   import IdentitiesView from "./views/IdentitiesView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
   import {
-    DEFAULT_VIEW,
     findNavItem,
     type AppViewId,
   } from "./navigation.js";
+  import {
+    isKnownAppPath,
+    pathForView,
+    viewForPath,
+  } from "./routing.js";
   import type { Snippet } from "svelte";
 
   interface Props {
@@ -42,9 +46,50 @@
 
   let { devMode = false, devTools }: Props = $props();
 
-  let selected = $state<AppViewId>(DEFAULT_VIEW);
+  // Initial view comes from the URL, with unknown paths collapsing to
+  // the default. Production deployments must serve `index.html` for
+  // every app route — see SPEC.md "URL-driven production view routing".
+  // A reactive shell-state read of `window.location` only happens here
+  // (initial mount) and inside the `popstate` listener wired below;
+  // mid-life URL state is mirrored from `selected` via `pushState`.
+  function initialView(): AppViewId {
+    if (typeof window === "undefined") return "dashboard";
+    return viewForPath(window.location.pathname);
+  }
+  let selected = $state<AppViewId>(initialView());
   let devToolsOpen = $state(false);
   let current = $derived(findNavItem(selected));
+
+  $effect(() => {
+    // Wire popstate + canonicalize the initial URL. The effect tracks
+    // `selected` (read inside `pathForView(selected)`) and re-runs on
+    // every `navigate()`, but the canonicalize branch is gated by
+    // `isKnownAppPath(window.location.pathname)`: after `navigate()`
+    // pushState's a canonical path, the gate evaluates true and the
+    // replaceState is skipped. Net effect: replaceState fires only when
+    // the live URL is genuinely unknown (initial mount on a stale link).
+    if (typeof window === "undefined") return;
+    const onPopState = () => {
+      selected = viewForPath(window.location.pathname);
+    };
+    if (!isKnownAppPath(window.location.pathname)) {
+      window.history.replaceState(null, "", pathForView(selected));
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  });
+
+  function navigate(id: AppViewId) {
+    if (id === selected) return;
+    selected = id;
+    if (typeof window === "undefined") return;
+    const next = pathForView(id);
+    if (window.location.pathname !== next) {
+      // pushState lets browser back/forward step through the in-app
+      // history without a full page reload.
+      window.history.pushState(null, "", next);
+    }
+  }
   /**
    * Active terminal launch. `null` until a profile-row "Launch terminal"
    * action creates a session. Lives at the shell so navigating away
@@ -61,7 +106,7 @@
 
   function handleLaunch(launch: ActiveLaunch) {
     activeLaunch = launch;
-    selected = "terminal";
+    navigate("terminal");
     // Persist a local pointer at the just-launched session so a
     // navigation-away / reload during the bounded detached-TTL window
     // can offer an explicit "Reconnect last session" affordance. The
@@ -76,7 +121,7 @@
     // production terminal has already disposed the local client; the
     // backend keeps the PTY alive briefly per its bounded TTL.
     activeLaunch = null;
-    selected = "servers";
+    navigate("servers");
   }
 
   function handleSessionClosed() {
@@ -113,7 +158,7 @@
 <div class="flex h-full min-h-screen bg-zinc-900 text-zinc-100">
   <SidebarNav
     {selected}
-    onselect={(id) => (selected = id)}
+    onselect={(id) => navigate(id)}
     showDevTools={devMode && devTools !== undefined}
     devToolsOpen={devToolsOpen}
     onToggleDevTools={() => (devToolsOpen = !devToolsOpen)}
