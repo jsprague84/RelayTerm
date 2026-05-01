@@ -15,6 +15,10 @@
     safeDisplayValue,
     shortId,
   } from "../inventory/inventoryDetails.js";
+  import {
+    countFilteredResults,
+    filterIdentities,
+  } from "../inventory/inventoryFilters.js";
 
   type LoadState =
     | { kind: "idle" }
@@ -108,6 +112,67 @@
     if (view.kind !== "ready" || selectedIdentityId === null) return null;
     return view.identities.find((i) => i.id === selectedIdentityId) ?? null;
   });
+
+  // ----------------------------------------------------------------
+  // Client-side search & filter state.
+  //
+  // In-memory only over `view.identities` already loaded by `load()`.
+  // No backend search, no URL/localStorage persistence — a refresh
+  // resets the filters. The OpenSSH `public_key` body is deliberately
+  // NOT a searchable field; a search string can only match on name,
+  // fingerprint, and key type (per the helper's haystack).
+  //
+  // The key-type select is only rendered when more than one key type
+  // is present in the loaded list — there is no useful "filter to the
+  // only key type" affordance for a single-type inventory.
+  // ----------------------------------------------------------------
+
+  let identitySearch = $state("");
+  let keyTypeFilter = $state<SshKeyType | "">("");
+
+  let availableKeyTypes = $derived.by<SshKeyType[]>(() => {
+    if (view.kind !== "ready") return [];
+    const seen = new Set<SshKeyType>();
+    for (const identity of view.identities) seen.add(identity.key_type);
+    return Array.from(seen).sort();
+  });
+
+  // Drop a stale key-type filter if the only identity bearing it
+  // disappears from the loaded list (defends against a future delete
+  // flow without changing the helper contract).
+  $effect(() => {
+    if (
+      keyTypeFilter !== "" &&
+      view.kind === "ready" &&
+      !availableKeyTypes.includes(keyTypeFilter)
+    ) {
+      keyTypeFilter = "";
+    }
+  });
+
+  let filteredIdentities = $derived.by<SshIdentity[]>(() => {
+    if (view.kind !== "ready") return [];
+    return filterIdentities(view.identities, {
+      query: identitySearch,
+      keyType: keyTypeFilter === "" ? null : keyTypeFilter,
+    });
+  });
+
+  let identitiesAreFiltered = $derived(
+    view.kind === "ready" &&
+      (identitySearch.trim().length > 0 || keyTypeFilter !== ""),
+  );
+
+  let selectedIdentityHidden = $derived(
+    selectedIdentity !== null &&
+      identitiesAreFiltered &&
+      !filteredIdentities.some((i) => i.id === selectedIdentity?.id),
+  );
+
+  function clearIdentityFilters() {
+    identitySearch = "";
+    keyTypeFilter = "";
+  }
 
   function openPanel() {
     panelOpen = true;
@@ -380,6 +445,62 @@
     </p>
   {:else}
     <article
+      class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-4"
+      data-testid="identities-filter-toolbar"
+    >
+      <header class="flex items-baseline justify-between gap-2">
+        <h3 class="text-sm font-semibold text-zinc-100">Filter identities</h3>
+        <span class="text-xs text-zinc-500">
+          In-memory only · public metadata only
+        </span>
+      </header>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <label class="flex flex-col gap-1 text-xs text-zinc-300">
+          <span class="uppercase tracking-wide text-zinc-500">
+            Search identities
+          </span>
+          <input
+            type="search"
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-700 focus:outline-none"
+            bind:value={identitySearch}
+            placeholder="name, fingerprint, key type"
+            autocomplete="off"
+            spellcheck="false"
+            data-testid="identities-search"
+          />
+        </label>
+        {#if availableKeyTypes.length > 1}
+          <label class="flex flex-col gap-1 text-xs text-zinc-300">
+            <span class="uppercase tracking-wide text-zinc-500">
+              Key type
+            </span>
+            <select
+              class="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 focus:border-emerald-700 focus:outline-none"
+              bind:value={keyTypeFilter}
+              data-testid="identities-key-type-filter"
+            >
+              <option value="">All key types</option>
+              {#each availableKeyTypes as kt (kt)}
+                <option value={kt}>{kt}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+      </div>
+      <div class="flex flex-wrap items-center justify-end gap-2 text-xs text-zinc-400">
+        <button
+          type="button"
+          class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+          onclick={clearIdentityFilters}
+          disabled={!identitiesAreFiltered}
+          data-testid="identities-clear-filters"
+        >
+          Clear filters
+        </button>
+      </div>
+    </article>
+
+    <article
       class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-6"
     >
       <header class="flex items-baseline justify-between gap-2">
@@ -388,8 +509,12 @@
           class="text-xs text-zinc-500"
           data-testid="identities-count"
         >
-          {view.identities.length}
-          {view.identities.length === 1 ? "identity" : "identities"}
+          {countFilteredResults(
+            filteredIdentities.length,
+            view.identities.length,
+            "identity",
+            "identities",
+          )}
         </span>
       </header>
       {#if view.identities.length === 0}
@@ -397,12 +522,19 @@
           No SSH identities yet. Use “Generate SSH identity” above to
           create one.
         </p>
+      {:else if filteredIdentities.length === 0}
+        <p
+          class="text-sm text-zinc-400"
+          data-testid="identities-filter-empty"
+        >
+          No identities match this filter.
+        </p>
       {:else}
         <ul
           class="flex flex-col divide-y divide-zinc-800/60"
           data-testid="identities-list"
         >
-          {#each view.identities as identity (identity.id)}
+          {#each filteredIdentities as identity (identity.id)}
             {@const isSelected = selectedIdentityId === identity.id}
             <li
               class="flex flex-col py-3 first:pt-0 last:pb-0"
@@ -509,6 +641,17 @@
             Close
           </button>
         </header>
+
+        {#if selectedIdentityHidden}
+          <p
+            class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+            data-testid="identity-detail-hidden-by-filter"
+          >
+            This identity is currently hidden by your filters. Clear
+            the search or key-type filter to bring it back into the
+            list.
+          </p>
+        {/if}
 
         <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
           <dt class="text-xs uppercase tracking-wide text-zinc-500">Name</dt>

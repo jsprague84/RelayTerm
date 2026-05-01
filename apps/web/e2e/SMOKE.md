@@ -55,6 +55,15 @@ update this file in the same change.
 | `[data-testid="auth-check-status-description"]`   | One-line operator-facing description keyed off `status`. |
 | `[data-testid="auth-check-success-footnote"]`     | Static success footnote (only rendered on `authentication_succeeded`; explicitly disclaims terminal launch). |
 | `[data-testid="auth-check-error"]`                | Auth-check error summary (safe formatter only; never echoes wire `message` or transport detail). |
+| `[data-testid="servers-filter-toolbar"]`          | Servers view filter toolbar above the Hosts/Profiles sections (in-memory client-side search + filters; no backend search; no pagination; no URL/local-storage persistence). |
+| `[data-testid="servers-host-search"]`             | Hosts free-text search input (matches display name, hostname, port-as-decimal, default username). |
+| `[data-testid="servers-profile-search"]`          | Profiles free-text search input (matches profile name, tags, username override, effective username, linked-host display + hostname, linked-identity name + fingerprint + key type — never the OpenSSH public key body). |
+| `[data-testid="servers-profile-tag-filter"]`      | Profile tag select; pre-populated with the unique tags currently in use; auto-resets to "All tags" when the active tag disappears from the loaded inventory. |
+| `[data-testid="servers-clear-filters"]`           | "Clear filters" button on the Servers view; enabled only while at least one Servers filter is active. |
+| `[data-testid="hosts-count"]`                     | Hosts result-count badge; flips to "Showing X of Y hosts" form when the host search is active. |
+| `[data-testid="hosts-filter-empty"]`              | Hosts empty-filter state ("No hosts match this filter."); distinct from `hosts-empty` (zero rows loaded). |
+| `[data-testid="profiles-count"]`                  | Profiles result-count badge; flips to "Showing X of Y profiles" form when a profile filter is active. |
+| `[data-testid="profiles-filter-empty"]`           | Profiles empty-filter state ("No profiles match this filter."); distinct from `profiles-empty` (zero rows loaded). |
 | `[data-testid="host-row-select"]`                 | Per-host selectable button on the Servers view (opens the host detail panel; toggles closed when re-clicked; carries `aria-expanded`). |
 | `[data-testid="host-detail-panel"]`               | Host detail panel container (read-only; fields, related-profiles list, honesty note). |
 | `[data-testid="host-detail-close"]`               | Close button inside the host detail panel.                    |
@@ -69,6 +78,7 @@ update this file in the same change.
 | `[data-testid="host-detail-profiles-list"]`       | Related-profile summary list inside the host detail panel.    |
 | `[data-testid="host-detail-profiles-empty"]`      | Empty-state line inside the host detail panel when no profiles reference the host. |
 | `[data-testid="host-detail-honesty"]`             | Static honesty note: host details do not prove reachability. |
+| `[data-testid="host-detail-hidden-by-filter"]`    | Host detail panel banner rendered when the selected host is currently hidden by the Servers filter (the panel stays open; the banner names the active filter to clear). |
 | `[data-testid="profile-row-select"]`              | Per-profile selectable button on the Servers view (opens the profile detail panel; toggles closed when re-clicked; carries `aria-expanded`). |
 | `[data-testid="profile-detail-panel"]`            | Server-profile detail panel container (read-only; fields, linked-host + linked-identity summaries, readiness advisory). |
 | `[data-testid="profile-detail-close"]`            | Close button inside the profile detail panel.                 |
@@ -83,6 +93,7 @@ update this file in the same change.
 | `[data-testid="profile-detail-updated-at"]`       | Profile updated-at field inside the detail panel.             |
 | `[data-testid="profile-detail-id"]`               | Truncated profile id (UUID prefix) inside the detail panel.   |
 | `[data-testid="profile-detail-readiness"]`        | Advisory readiness line inside the profile detail panel; never claims "ready", "trusted", "verified", or "passed" — names host-key trust + auth-check as still-required steps. |
+| `[data-testid="profile-detail-hidden-by-filter"]` | Profile detail panel banner rendered when the selected profile is currently hidden by the Servers filter. |
 | `[data-testid="profile-launch-terminal"]`         | Per-profile "Launch terminal" button on the Servers view (creates a session and navigates to the Terminal workspace). |
 | `[data-testid="profile-launch-error"]`            | Per-row launch error summary (safe formatter only — never echoes wire `message` or transport detail). |
 | `[data-testid="profile-launch-error-dismiss"]`    | Dismiss button inside `profile-launch-error`.                 |
@@ -128,6 +139,12 @@ update this file in the same change.
 | `[data-testid="sessions-row-open-error"]`         | Per-row open-error summary (rendered when the pre-handoff backend verify reports the row is stale or still `starting`; safe formatter only — never echoes wire `message` or transport detail; dismissable). |
 | `[data-testid="production-view-identities"]`      | Identities view (public-key list + generate panel).           |
 | `[data-testid="identities-refresh-button"]`       | Refresh button on the Identities view.                        |
+| `[data-testid="identities-filter-toolbar"]`       | Identities view filter toolbar above the list (in-memory client-side search + filters; no backend search; no pagination; no URL/local-storage persistence). |
+| `[data-testid="identities-search"]`               | Identities free-text search input (matches name, fingerprint, key type — never the OpenSSH public key body). |
+| `[data-testid="identities-key-type-filter"]`      | Identities key-type select; rendered ONLY when more than one key type appears in the loaded list. |
+| `[data-testid="identities-clear-filters"]`        | "Clear filters" button on the Identities view; enabled only while at least one identity filter is active. |
+| `[data-testid="identities-count"]`                | Identities result-count badge; flips to "Showing X of Y identities" form when an identity filter is active. |
+| `[data-testid="identities-filter-empty"]`         | Identities empty-filter state ("No identities match this filter."); distinct from `identities-empty` (zero rows loaded). |
 | `[data-testid="identities-generate-open"]`        | "Generate SSH identity" button (opens the generate panel).    |
 | `[data-testid="identities-generate-panel"]`       | Generate panel container (visible after open).                |
 | `[data-testid="identities-generate-form"]`        | Generate panel form root.                                     |
@@ -150,6 +167,7 @@ update this file in the same change.
 | `[data-testid="identity-detail-public-key"]`      | Full OpenSSH public key rendered in a `<pre>` block inside the detail panel — the single deliberate path for the full key on this surface. |
 | `[data-testid="identity-detail-copy-public-key"]` | "Copy public key" button inside the detail panel (copies `identity.public_key` only — never any private material; failure collapses to a static `Copy failed` label). |
 | `[data-testid="identity-detail-honesty"]`         | Static honesty note: private key never reaches the browser; no UI exists to export, recover, or reveal private material. |
+| `[data-testid="identity-detail-hidden-by-filter"]` | Identity detail panel banner rendered when the selected identity is currently hidden by the Identities filter. |
 | `[data-testid="dashboard-refresh"]`               | Dashboard manual-refresh button (drives both health probe and inventory loads in parallel; no polling). |
 | `[data-testid="dashboard-summary-cards"]`         | Dashboard summary card grid (health + hosts/profiles/identities/sessions counts). |
 | `[data-testid="dashboard-card-health"]`           | Dashboard backend-health card (one-shot `/healthz` probe + per-card "Check now" button). |

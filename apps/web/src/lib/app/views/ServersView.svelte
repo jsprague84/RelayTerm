@@ -35,6 +35,12 @@
     safeDisplayValue,
     shortId,
   } from "../inventory/inventoryDetails.js";
+  import {
+    collectProfileTags,
+    countFilteredResults,
+    filterHosts,
+    filterProfiles,
+  } from "../inventory/inventoryFilters.js";
 
   interface Props {
     /**
@@ -400,6 +406,86 @@
     if (view.kind !== "ready" || selectedProfileId === null) return null;
     return view.profiles.find((p) => p.id === selectedProfileId) ?? null;
   });
+
+  // ----------------------------------------------------------------
+  // Client-side search & filter state.
+  //
+  // In-memory only: the helpers below operate over `view.hosts` /
+  // `view.profiles` already loaded by `load()`. There is no backend
+  // search and no URL/localStorage persistence — a refresh resets the
+  // filters to "all rows visible". Per AGENTS.md the filter helpers
+  // never mutate the loaded data.
+  //
+  // Selection vs. filter: the row click toggles `selectedHostId` /
+  // `selectedProfileId` directly, so a row that is currently filtered
+  // out of the visible list still keeps its detail panel open. The
+  // panel renders a "currently hidden by filters" notice in that case
+  // so the operator is not confused about why the row no longer shows
+  // in the list above.
+  // ----------------------------------------------------------------
+
+  let hostSearch = $state("");
+  let profileSearch = $state("");
+  let profileTagFilter = $state("");
+
+  let availableTags = $derived.by<string[]>(() => {
+    if (view.kind !== "ready") return [];
+    return collectProfileTags(view.profiles);
+  });
+
+  // If the active tag is no longer present (e.g. the only profile
+  // bearing it was deleted via a future flow, or the load returned a
+  // narrower set), drop the filter so the dropdown does not display
+  // an orphan selection.
+  $effect(() => {
+    if (
+      profileTagFilter.length > 0 &&
+      view.kind === "ready" &&
+      !availableTags.includes(profileTagFilter)
+    ) {
+      profileTagFilter = "";
+    }
+  });
+
+  let filteredHosts = $derived.by<Host[]>(() => {
+    if (view.kind !== "ready") return [];
+    return filterHosts(view.hosts, hostSearch);
+  });
+
+  let filteredProfiles = $derived.by<ServerProfile[]>(() => {
+    if (view.kind !== "ready") return [];
+    return filterProfiles(view.profiles, view.hosts, view.identities, {
+      query: profileSearch,
+      tag: profileTagFilter,
+    });
+  });
+
+  let hostsAreFiltered = $derived(
+    view.kind === "ready" && hostSearch.trim().length > 0,
+  );
+  let profilesAreFiltered = $derived(
+    view.kind === "ready" &&
+      (profileSearch.trim().length > 0 || profileTagFilter.length > 0),
+  );
+
+  let anyFilterActive = $derived(hostsAreFiltered || profilesAreFiltered);
+
+  let selectedHostHidden = $derived(
+    selectedHost !== null &&
+      hostsAreFiltered &&
+      !filteredHosts.some((h) => h.id === selectedHost?.id),
+  );
+  let selectedProfileHidden = $derived(
+    selectedProfile !== null &&
+      profilesAreFiltered &&
+      !filteredProfiles.some((p) => p.id === selectedProfile?.id),
+  );
+
+  function clearFilters() {
+    hostSearch = "";
+    profileSearch = "";
+    profileTagFilter = "";
+  }
 </script>
 
 <section
@@ -804,25 +890,105 @@
     </p>
   {:else}
     <article
+      class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-4"
+      data-testid="servers-filter-toolbar"
+    >
+      <header class="flex items-baseline justify-between gap-2">
+        <h3 class="text-sm font-semibold text-zinc-100">Filter inventory</h3>
+        <span class="text-xs text-zinc-500">
+          In-memory only · no backend search
+        </span>
+      </header>
+      <div class="grid gap-3 sm:grid-cols-3">
+        <label class="flex flex-col gap-1 text-xs text-zinc-300">
+          <span class="uppercase tracking-wide text-zinc-500">
+            Search hosts
+          </span>
+          <input
+            type="search"
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-700 focus:outline-none"
+            bind:value={hostSearch}
+            placeholder="display name, hostname, port, user"
+            autocomplete="off"
+            spellcheck="false"
+            data-testid="servers-host-search"
+          />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-zinc-300">
+          <span class="uppercase tracking-wide text-zinc-500">
+            Search profiles
+          </span>
+          <input
+            type="search"
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-700 focus:outline-none"
+            bind:value={profileSearch}
+            placeholder="name, tag, user, host, identity"
+            autocomplete="off"
+            spellcheck="false"
+            data-testid="servers-profile-search"
+          />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-zinc-300">
+          <span class="uppercase tracking-wide text-zinc-500">
+            Profile tag
+          </span>
+          <select
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 focus:border-emerald-700 focus:outline-none disabled:opacity-60"
+            bind:value={profileTagFilter}
+            disabled={availableTags.length === 0}
+            data-testid="servers-profile-tag-filter"
+          >
+            <option value="">All tags</option>
+            {#each availableTags as tag (tag)}
+              <option value={tag}>{tag}</option>
+            {/each}
+          </select>
+        </label>
+      </div>
+      <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-400">
+        <span>
+          {availableTags.length === 0
+            ? "No profile tags in current inventory."
+            : `${availableTags.length} tag${availableTags.length === 1 ? "" : "s"} in current inventory.`}
+        </span>
+        <button
+          type="button"
+          class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+          onclick={clearFilters}
+          disabled={!anyFilterActive}
+          data-testid="servers-clear-filters"
+        >
+          Clear filters
+        </button>
+      </div>
+    </article>
+
+    <article
       class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-6"
     >
       <header class="flex items-baseline justify-between gap-2">
         <h3 class="text-sm font-semibold text-zinc-100">Hosts</h3>
         <span class="text-xs text-zinc-500" data-testid="hosts-count">
-          {view.hosts.length}
-          {view.hosts.length === 1 ? "host" : "hosts"}
+          {countFilteredResults(filteredHosts.length, view.hosts.length, "host")}
         </span>
       </header>
       {#if view.hosts.length === 0}
         <p class="text-sm text-zinc-400" data-testid="hosts-empty">
           No hosts yet. Use “Create host” above to add one.
         </p>
+      {:else if filteredHosts.length === 0}
+        <p
+          class="text-sm text-zinc-400"
+          data-testid="hosts-filter-empty"
+        >
+          No hosts match this filter.
+        </p>
       {:else}
         <ul
           class="flex flex-col divide-y divide-zinc-800/60"
           data-testid="hosts-list"
         >
-          {#each view.hosts as host (host.id)}
+          {#each filteredHosts as host (host.id)}
             {@const isSelected = selectedHostId === host.id}
             <li
               class="flex flex-col py-3 first:pt-0 last:pb-0"
@@ -881,6 +1047,16 @@
             Close
           </button>
         </header>
+
+        {#if selectedHostHidden}
+          <p
+            class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+            data-testid="host-detail-hidden-by-filter"
+          >
+            This host is currently hidden by your filters. Clear the
+            host search to bring it back into the list.
+          </p>
+        {/if}
 
         <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
           <dt class="text-xs uppercase tracking-wide text-zinc-500">
@@ -986,8 +1162,11 @@
       <header class="flex items-baseline justify-between gap-2">
         <h3 class="text-sm font-semibold text-zinc-100">Profiles</h3>
         <span class="text-xs text-zinc-500" data-testid="profiles-count">
-          {view.profiles.length}
-          {view.profiles.length === 1 ? "profile" : "profiles"}
+          {countFilteredResults(
+            filteredProfiles.length,
+            view.profiles.length,
+            "profile",
+          )}
         </span>
       </header>
       {#if view.profiles.length === 0}
@@ -996,12 +1175,19 @@
           add one — at least one host AND one SSH identity must exist
           first.
         </p>
+      {:else if filteredProfiles.length === 0}
+        <p
+          class="text-sm text-zinc-400"
+          data-testid="profiles-filter-empty"
+        >
+          No profiles match this filter.
+        </p>
       {:else}
         <ul
           class="flex flex-col divide-y divide-zinc-800/60"
           data-testid="profiles-list"
         >
-          {#each view.profiles as profile (profile.id)}
+          {#each filteredProfiles as profile (profile.id)}
             {@const links = resolveProfileLinks(profile, view.hosts)}
             {@const launchState = launchStates[profile.id]}
             {@const isProfileSelected = selectedProfileId === profile.id}
@@ -1143,6 +1329,16 @@
             Close
           </button>
         </header>
+
+        {#if selectedProfileHidden}
+          <p
+            class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+            data-testid="profile-detail-hidden-by-filter"
+          >
+            This profile is currently hidden by your filters. Clear the
+            profile search or tag filter to bring it back into the list.
+          </p>
+        {/if}
 
         <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
           <dt class="text-xs uppercase tracking-wide text-zinc-500">Name</dt>
