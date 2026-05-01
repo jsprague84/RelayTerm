@@ -41,9 +41,16 @@
 
   interface Props {
     profileId: string;
+    /**
+     * When true, the panel renders a disabled-profile notice instead of
+     * the auth-check controls. Mirrors the backend's launch-time gate —
+     * disabled profiles refuse auth-check with `409 conflict`. Defaults
+     * to `false`.
+     */
+    disabled?: boolean;
   }
 
-  let { profileId }: Props = $props();
+  let { profileId, disabled = false }: Props = $props();
 
   let panelState = $state<State>({ kind: "idle" });
 
@@ -87,6 +94,7 @@
   class="flex flex-col gap-2 rounded-md border border-zinc-800/80 bg-zinc-950/30 p-3"
   data-testid="auth-check-panel"
   data-profile-id={profileId}
+  data-profile-disabled={disabled ? "true" : "false"}
 >
   <header class="flex items-center justify-between gap-2">
     <h4 class="text-xs font-semibold uppercase tracking-wide text-zinc-300">
@@ -96,16 +104,31 @@
       type="button"
       class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
       onclick={runAuthCheck}
-      disabled={panelState.kind === "checking"}
+      disabled={disabled || panelState.kind === "checking"}
       data-testid="auth-check-run-button"
+      title={disabled
+        ? "This profile is disabled — re-enable to run auth-check."
+        : undefined}
     >
       {buttonLabel}
     </button>
   </header>
 
-  <p class="text-[11px] text-zinc-500">{AUTH_CHECK_DISCLAIMER}</p>
+  {#if disabled}
+    <p
+      class="rounded-md border border-amber-900/40 bg-amber-950/20 px-2 py-1.5 text-[11px] text-amber-200/80"
+      data-testid="auth-check-profile-disabled"
+    >
+      Profile is disabled. Auth-check is blocked until the profile is re-enabled.
+    </p>
+  {:else}
+    <p class="text-[11px] text-zinc-500">{AUTH_CHECK_DISCLAIMER}</p>
+  {/if}
 
-  {#if panelState.kind === "idle"}
+  {#if disabled}
+    <!-- Disabled-profile branch: nothing else to render. The header
+         disables the button and the inline notice above names the gate. -->
+  {:else if panelState.kind === "idle"}
     <p
       class="text-[11px] text-zinc-500"
       data-testid="auth-check-idle"

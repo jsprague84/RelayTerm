@@ -10,11 +10,25 @@
     canSubmitServerProfile,
     createServerProfile,
     describeCreateServerProfileError,
+    describeLifecycleError,
+    disableServerProfile,
+    enableServerProfile,
     listServerProfiles,
     parseTagsInput,
     resolveProfileLinks,
     type ServerProfile,
   } from "../../api/serverProfiles.js";
+  import {
+    canLaunchProfile,
+    canRunProfileSetupActions,
+    DISABLE_CONFIRMATION_COPY,
+    ENABLE_CONFIRMATION_COPY,
+    describeDisabledProfile,
+    disableConfirmationMatches,
+    isServerProfileDisabled,
+    profileLifecycleLabel,
+    profileLifecycleTone,
+  } from "../inventory/profileLifecycle.js";
   import {
     listSshIdentities,
     type SshIdentity,
@@ -65,6 +79,28 @@
     | { kind: "error"; summary: string };
 
   let launchStates = $state<Record<string, ProfileLaunchState>>({});
+
+  /**
+   * Per-profile lifecycle (disable / enable) state. Keyed on
+   * `server_profile_id` so each row tracks its own action independently.
+   *
+   * - `confirming` is the deliberate-confirmation step for disable: the
+   *   operator must echo the profile name verbatim before the request
+   *   fires. It carries the typed value so the input stays bound while
+   *   the operator types.
+   * - `submitting` is set while the disable / enable request is in
+   *   flight.
+   * - `error` carries a safe formatted summary (function-of-kind+status
+   *   +code only — never echoes wire `message` or transport detail).
+   *
+   * Absence of an entry means "no action in flight or pending."
+   */
+  type ProfileLifecycleState =
+    | { kind: "confirming"; typed: string }
+    | { kind: "submitting"; action: "disable" | "enable" }
+    | { kind: "error"; action: "disable" | "enable"; summary: string };
+
+  let lifecycleStates = $state<Record<string, ProfileLifecycleState>>({});
 
   type LoadState =
     | { kind: "idle" }
@@ -335,7 +371,102 @@
       profileIdentityId.length === 0,
   );
 
+  function replaceProfileInView(updated: ServerProfile) {
+    if (view.kind !== "ready") return;
+    const next = view.profiles.map((p) => (p.id === updated.id ? updated : p));
+    view = {
+      kind: "ready",
+      hosts: view.hosts,
+      profiles: next,
+      identities: view.identities,
+    };
+  }
+
+  function openDisableConfirmation(profileId: string) {
+    const existing = lifecycleStates[profileId];
+    if (existing?.kind === "submitting") return;
+    lifecycleStates = {
+      ...lifecycleStates,
+      [profileId]: { kind: "confirming", typed: "" },
+    };
+  }
+
+  function cancelDisableConfirmation(profileId: string) {
+    if (lifecycleStates[profileId]?.kind !== "confirming") return;
+    const next = { ...lifecycleStates };
+    delete next[profileId];
+    lifecycleStates = next;
+  }
+
+  function setDisableConfirmationInput(profileId: string, value: string) {
+    const existing = lifecycleStates[profileId];
+    if (existing?.kind !== "confirming") return;
+    lifecycleStates = {
+      ...lifecycleStates,
+      [profileId]: { kind: "confirming", typed: value },
+    };
+  }
+
+  async function submitDisable(profile: ServerProfile) {
+    const existing = lifecycleStates[profile.id];
+    if (existing?.kind !== "confirming") return;
+    if (!disableConfirmationMatches(profile, existing.typed)) return;
+    lifecycleStates = {
+      ...lifecycleStates,
+      [profile.id]: { kind: "submitting", action: "disable" },
+    };
+    const result = await disableServerProfile(profile.id);
+    if (!result.ok) {
+      lifecycleStates = {
+        ...lifecycleStates,
+        [profile.id]: {
+          kind: "error",
+          action: "disable",
+          summary: describeLifecycleError("disable", result.error),
+        },
+      };
+      return;
+    }
+    replaceProfileInView(result.profile);
+    const next = { ...lifecycleStates };
+    delete next[profile.id];
+    lifecycleStates = next;
+  }
+
+  async function submitEnable(profile: ServerProfile) {
+    const existing = lifecycleStates[profile.id];
+    if (existing?.kind === "submitting") return;
+    lifecycleStates = {
+      ...lifecycleStates,
+      [profile.id]: { kind: "submitting", action: "enable" },
+    };
+    const result = await enableServerProfile(profile.id);
+    if (!result.ok) {
+      lifecycleStates = {
+        ...lifecycleStates,
+        [profile.id]: {
+          kind: "error",
+          action: "enable",
+          summary: describeLifecycleError("enable", result.error),
+        },
+      };
+      return;
+    }
+    replaceProfileInView(result.profile);
+    const next = { ...lifecycleStates };
+    delete next[profile.id];
+    lifecycleStates = next;
+  }
+
+  function dismissLifecycleError(profileId: string) {
+    if (lifecycleStates[profileId]?.kind !== "error") return;
+    const next = { ...lifecycleStates };
+    delete next[profileId];
+    lifecycleStates = next;
+  }
+
   async function launchProfile(profile: ServerProfile) {
+    if (!canLaunchProfile(profile)) return;
     const existing = launchStates[profile.id];
     if (existing?.kind === "submitting") return;
     launchStates = { ...launchStates, [profile.id]: { kind: "submitting" } };
@@ -1190,10 +1321,15 @@
           {#each filteredProfiles as profile (profile.id)}
             {@const links = resolveProfileLinks(profile, view.hosts)}
             {@const launchState = launchStates[profile.id]}
+            {@const lifecycleState = lifecycleStates[profile.id]}
+            {@const profileDisabled = isServerProfileDisabled(profile)}
+            {@const lifecycleLabel = profileLifecycleLabel(profile)}
+            {@const lifecycleTone = profileLifecycleTone(profile)}
             {@const isProfileSelected = selectedProfileId === profile.id}
             <li
               class="flex flex-col gap-1.5 py-3 first:pt-0 last:pb-0"
               data-testid="profile-row"
+              data-profile-disabled={profileDisabled ? "true" : "false"}
             >
               <button
                 type="button"
@@ -1204,8 +1340,21 @@
                 aria-expanded={isProfileSelected}
                 data-testid="profile-row-select"
               >
-                <span class="text-sm font-medium text-zinc-100">
-                  {profile.name}
+                <span class="flex items-baseline gap-2">
+                  <span class="text-sm font-medium text-zinc-100">
+                    {profile.name}
+                  </span>
+                  {#if profileDisabled}
+                    <span
+                      class="rounded border px-1.5 py-0.5 text-[11px] font-medium {lifecycleTone === 'muted'
+                        ? 'border-amber-900/60 bg-amber-950/40 text-amber-200'
+                        : 'border-emerald-800/60 bg-emerald-900/30 text-emerald-200'}"
+                      data-testid="profile-lifecycle-badge"
+                      data-lifecycle={lifecycleLabel}
+                    >
+                      {lifecycleLabel}
+                    </span>
+                  {/if}
                 </span>
                 {#if links.host}
                   <span class="font-mono text-xs text-zinc-500">
@@ -1260,25 +1409,165 @@
                   {/each}
                 </ul>
               {/if}
-              <HostKeyPanel profileId={profile.id} />
-              <AuthCheckPanel profileId={profile.id} />
+              {#if profileDisabled}
+                <p
+                  class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+                  data-testid="profile-disabled-notice"
+                >
+                  {describeDisabledProfile(profile)}
+                </p>
+              {/if}
+              <HostKeyPanel
+                profileId={profile.id}
+                disabled={!canRunProfileSetupActions(profile)}
+              />
+              <AuthCheckPanel
+                profileId={profile.id}
+                disabled={!canRunProfileSetupActions(profile)}
+              />
               <div class="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   class="rounded-md border border-emerald-700/60 bg-emerald-900/20 px-3 py-1 text-xs text-emerald-100 transition hover:border-emerald-600 hover:bg-emerald-900/40 disabled:cursor-not-allowed disabled:opacity-50"
                   onclick={() => void launchProfile(profile)}
-                  disabled={launchState?.kind === "submitting"}
+                  disabled={profileDisabled || launchState?.kind === "submitting"}
                   data-testid="profile-launch-terminal"
-                  title="Create a terminal session and open the Terminal workspace. Run host-key trust + auth-check first; the backend will refuse otherwise."
+                  title={profileDisabled
+                    ? "This profile is disabled — re-enable to launch a new terminal session."
+                    : "Create a terminal session and open the Terminal workspace. Run host-key trust + auth-check first; the backend will refuse otherwise."}
                 >
                   {launchState?.kind === "submitting"
                     ? "Launching…"
                     : "Launch terminal"}
                 </button>
                 <span class="text-[11px] text-zinc-500">
-                  Launch is enabled by host-key trust and SSH auth-check —
-                  run those above first if the launch is refused.
+                  {profileDisabled
+                    ? "Re-enable this profile to start a new terminal session."
+                    : "Launch is enabled by host-key trust and SSH auth-check — run those above first if the launch is refused."}
                 </span>
+              </div>
+
+              <!-- Lifecycle controls. Disable requires the operator to
+                   echo the profile name verbatim before the request fires;
+                   enable is a single deliberate click with explicit copy.
+                   Both update local list state from the backend response. -->
+              <div
+                class="flex flex-col gap-2 rounded-md border border-zinc-800/80 bg-zinc-950/30 p-3"
+                data-testid="profile-lifecycle-controls"
+              >
+                {#if !profileDisabled}
+                  {#if lifecycleState?.kind === "confirming"}
+                    {@const typedMatches = disableConfirmationMatches(
+                      profile,
+                      lifecycleState.typed,
+                    )}
+                    <p
+                      class="text-[11px] text-amber-200/80"
+                      data-testid="profile-disable-confirm-copy"
+                    >
+                      {DISABLE_CONFIRMATION_COPY}
+                    </p>
+                    <label class="flex flex-col gap-1 text-[11px] text-zinc-300">
+                      <span class="uppercase tracking-wide text-zinc-500">
+                        Type the profile name to confirm
+                      </span>
+                      <input
+                        type="text"
+                        class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-[11px] text-zinc-100 placeholder:text-zinc-600 focus:border-amber-700 focus:outline-none"
+                        value={lifecycleState.typed}
+                        oninput={(e) =>
+                          setDisableConfirmationInput(
+                            profile.id,
+                            (e.currentTarget as HTMLInputElement).value,
+                          )}
+                        placeholder={profile.name}
+                        autocomplete="off"
+                        spellcheck="false"
+                        data-testid="profile-disable-confirm-input"
+                      />
+                      {#if lifecycleState.typed.length > 0 && !typedMatches}
+                        <span
+                          class="text-[11px] text-amber-300/80"
+                          data-testid="profile-disable-confirm-mismatch"
+                        >
+                          Confirmation does not match the profile name.
+                        </span>
+                      {/if}
+                    </label>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        class="rounded-md border border-amber-700 bg-amber-800 px-3 py-1 text-xs text-amber-50 transition hover:border-amber-600 hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        onclick={() => void submitDisable(profile)}
+                        disabled={!typedMatches}
+                        data-testid="profile-disable-submit"
+                      >
+                        Disable profile
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+                        onclick={() => cancelDisableConfirmation(profile.id)}
+                        data-testid="profile-disable-cancel"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  {:else if lifecycleState?.kind === "submitting" && lifecycleState.action === "disable"}
+                    <button
+                      type="button"
+                      class="self-start rounded-md border border-amber-700 bg-amber-800 px-3 py-1 text-xs text-amber-50 disabled:opacity-50"
+                      disabled
+                      data-testid="profile-disable-submitting"
+                    >
+                      Disabling…
+                    </button>
+                  {:else}
+                    <button
+                      type="button"
+                      class="self-start rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-1 text-xs text-amber-100 transition hover:border-amber-800 hover:bg-amber-900/40"
+                      onclick={() => openDisableConfirmation(profile.id)}
+                      data-testid="profile-disable-open"
+                    >
+                      Disable profile
+                    </button>
+                  {/if}
+                {:else}
+                  <p
+                    class="text-[11px] text-zinc-400"
+                    data-testid="profile-enable-copy"
+                  >
+                    {ENABLE_CONFIRMATION_COPY}
+                  </p>
+                  <button
+                    type="button"
+                    class="self-start rounded-md border border-emerald-700 bg-emerald-800 px-3 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    onclick={() => void submitEnable(profile)}
+                    disabled={lifecycleState?.kind === "submitting"}
+                    data-testid="profile-enable-submit"
+                  >
+                    {lifecycleState?.kind === "submitting" &&
+                    lifecycleState.action === "enable"
+                      ? "Enabling…"
+                      : "Enable profile"}
+                  </button>
+                {/if}
+                {#if lifecycleState?.kind === "error"}
+                  <p
+                    class="flex items-center justify-between gap-2 rounded-md border border-rose-900/40 bg-rose-950/20 px-3 py-2 text-xs text-rose-200/80"
+                    data-testid="profile-lifecycle-error"
+                  >
+                    <span>{lifecycleState.summary}</span>
+                    <button
+                      type="button"
+                      class="rounded-sm border border-rose-900/60 bg-rose-950/40 px-2 py-0.5 text-[11px] text-rose-100 hover:bg-rose-900/40"
+                      onclick={() => dismissLifecycleError(profile.id)}
+                      data-testid="profile-lifecycle-error-dismiss"
+                    >
+                      Dismiss
+                    </button>
+                  </p>
+                {/if}
               </div>
               {#if launchState?.kind === "error"}
                 <p
@@ -1309,9 +1598,11 @@
         view.identities,
       )}
       {@const readiness = describeReadinessFromKnownState(detail)}
+      {@const detailDisabled = isServerProfileDisabled(detail.profile)}
       <article
         class="flex flex-col gap-3 rounded-lg border border-emerald-900/40 bg-emerald-950/10 p-6"
         data-testid="profile-detail-panel"
+        data-profile-disabled={detailDisabled ? "true" : "false"}
       >
         <header class="flex items-baseline justify-between gap-2">
           <h3 class="text-sm font-semibold text-zinc-100">
@@ -1445,6 +1736,29 @@
           >
             {safeDisplayValue(detail.profile.updated_at)}
           </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Lifecycle
+          </dt>
+          <dd data-testid="profile-detail-lifecycle">
+            {#if detailDisabled}
+              <span
+                class="rounded border border-amber-900/60 bg-amber-950/40 px-1.5 py-0.5 text-[11px] font-medium text-amber-200"
+                data-testid="profile-detail-lifecycle-badge"
+              >
+                disabled
+              </span>
+              <span class="ml-2 font-mono text-xs text-zinc-300">
+                since {safeDisplayValue(detail.profile.disabled_at)}
+              </span>
+            {:else}
+              <span
+                class="rounded border border-emerald-800/60 bg-emerald-900/30 px-1.5 py-0.5 text-[11px] font-medium text-emerald-200"
+                data-testid="profile-detail-lifecycle-badge"
+              >
+                enabled
+              </span>
+            {/if}
+          </dd>
           <dt class="text-xs uppercase tracking-wide text-zinc-500">Id</dt>
           <dd
             class="font-mono text-xs text-zinc-500"
@@ -1453,6 +1767,15 @@
             {shortId(detail.profile.id)}
           </dd>
         </dl>
+
+        {#if detailDisabled}
+          <p
+            class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+            data-testid="profile-detail-disabled-note"
+          >
+            {describeDisabledProfile(detail.profile)}
+          </p>
+        {/if}
 
         <p
           class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"

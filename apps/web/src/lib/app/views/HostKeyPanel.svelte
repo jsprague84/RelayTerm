@@ -60,9 +60,17 @@
 
   interface Props {
     profileId: string;
+    /**
+     * When true, the panel renders a disabled-profile notice instead of
+     * the preflight / trust controls. Mirrors the backend's launch-time
+     * gate — disabled profiles refuse preflight and trust with `409
+     * conflict`. Defaulting to `false` keeps the existing call sites
+     * (older tests, dev surfaces) green.
+     */
+    disabled?: boolean;
   }
 
-  let { profileId }: Props = $props();
+  let { profileId, disabled = false }: Props = $props();
 
   let panelState = $state<State>({ kind: "idle" });
   let confirmInput = $state("");
@@ -168,6 +176,7 @@
   class="flex flex-col gap-2 rounded-md border border-zinc-800/80 bg-zinc-950/30 p-3"
   data-testid="host-key-panel"
   data-profile-id={profileId}
+  data-profile-disabled={disabled ? "true" : "false"}
 >
   <header class="flex items-center justify-between gap-2">
     <h4 class="text-xs font-semibold uppercase tracking-wide text-zinc-300">
@@ -177,16 +186,32 @@
       type="button"
       class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
       onclick={runPreflight}
-      disabled={panelState.kind === "preflighting" || panelState.kind === "trusting"}
+      disabled={disabled || panelState.kind === "preflighting" || panelState.kind === "trusting"}
       data-testid="host-key-preflight-button"
+      title={disabled
+        ? "This profile is disabled — re-enable to run host-key preflight."
+        : undefined}
     >
       {preflightButtonLabel}
     </button>
   </header>
 
-  <p class="text-[11px] text-zinc-500">{PREFLIGHT_DISCLAIMER}</p>
+  {#if disabled}
+    <p
+      class="rounded-md border border-amber-900/40 bg-amber-950/20 px-2 py-1.5 text-[11px] text-amber-200/80"
+      data-testid="host-key-profile-disabled"
+    >
+      Profile is disabled. Host-key preflight and trust are blocked until the profile is re-enabled.
+    </p>
+  {:else}
+    <p class="text-[11px] text-zinc-500">{PREFLIGHT_DISCLAIMER}</p>
+  {/if}
 
-  {#if panelState.kind === "idle"}
+  {#if disabled}
+    <!-- Disabled-profile branch: nothing else to render. The header
+         already emits the gated affordance and the inline notice above
+         names the gate. -->
+  {:else if panelState.kind === "idle"}
     <p
       class="text-[11px] text-zinc-500"
       data-testid="host-key-idle"

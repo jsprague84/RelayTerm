@@ -1402,7 +1402,7 @@ This section is normative. It defines the safe lifecycle for every inventory ent
 **Status today (load-bearing — read before adding any destructive surface).** No production route or UI **deletes** or archives any inventory record. The lifecycle moves wired today are:
 
 - `POST /api/v1/terminal-sessions/:id/close` — terminal sessions reach the `closed` terminal state.
-- `POST /api/v1/server-profiles/:id/disable` and `POST /api/v1/server-profiles/:id/enable` — backend-only. Stamp / clear `server_profiles.disabled_at`. Disabled profiles refuse new launches, auth-check, host-key preflight / trust. Existing live sessions are unaffected. Each successful create / enabled→disabled / disabled→enabled transition appends one `audit_events` row (`server_profile_created` / `server_profile_disabled` / `server_profile_enabled`). Frontend UI is deferred. See "Server profile disable / enable backend" and "Server profile lifecycle audit" for the full contract.
+- `POST /api/v1/server-profiles/:id/disable` and `POST /api/v1/server-profiles/:id/enable` — Stamp / clear `server_profiles.disabled_at`. Disabled profiles refuse new launches, auth-check, host-key preflight / trust. Existing live sessions are unaffected. Each successful create / enabled→disabled / disabled→enabled transition appends one `audit_events` row (`server_profile_created` / `server_profile_disabled` / `server_profile_enabled`). Frontend UI for disable / enable has landed; see "Server profile disable / enable UI (landed)". An audit viewer remains future work. See "Server profile disable / enable backend" and "Server profile lifecycle audit" for the full backend contract.
 - `known_host_entries.revoked_at` — column exists; no route or UI yet writes it. The trust route already refuses to silently re-trust a revoked fingerprint (two-layer guard: route check + `record_trusted` SQL `WHERE revoked_at IS NULL`).
 
 Everything else (`hosts`, `ssh_identities`, `server_profiles` deletion, `terminal_sessions` outside `close`, audit/session events) has no destructive surface. The schema enforces FK `RESTRICT` on the load-bearing references; an attempt to delete a referenced row from the DB layer would already fail. The policy below is what MUST be true *before* any destructive route or UI lands.
@@ -1480,7 +1480,7 @@ Rules every destructive lifecycle action MUST follow:
 
 ### UI implications
 
-- No edit / delete / disable / archive / close UI exists today outside the terminal-session close path. The production app shell renders read-only inventory detail panels by design.
+- No edit / delete / archive UI exists today outside the terminal-session close path. The production app shell renders read-only inventory detail panels by design except for the server-profile disable / enable controls described in "Server profile disable / enable UI (landed)" below.
 - Future destructive UI MUST be **explicit, confirmable, and auditable**. A confirmation dialog is required for every destructive action; the confirmation MUST name the target (display name + id suffix), the action verb, and the consequence ("this profile will stop accepting new launches; existing live sessions are unaffected").
 - Confirmation dialogs and audit views render **public metadata only**. The redaction rule from `lib/api/` parsers extends here — no `private_key` / `encrypted_private_key` field appears in any DOM string, formatted preview, or copy string. The existing sentinel-string redaction tests in the SSH-identity views are the pattern to follow.
 - Routing rule (already established): no secret material, terminal data, or session payloads in URLs. This applies to confirmation dialog hashes too — destructive confirmation goes through component state, not URL params.
@@ -1552,6 +1552,41 @@ The payload MUST NOT contain: `private_key`, `encrypted_private_key`, plaintext 
 
 **Reasoning.** Lifecycle audit rows are forensic primitives. Their value depends on `(actor, kind, target_id, recorded_at)` being trustworthy and free of secret-shaped fields. The payload deliberately avoids `tags`, `username_override`, host bag-of-fields, and identity public-key bytes — all of which are reachable via standard inventory queries scoped to the `actor_id`. Audit history is not a denormalised inventory snapshot; it is a transition log.
 
+### Server profile disable / enable UI (landed)
+
+**Status:** wired in `apps/web/src/lib/app/views/ServersView.svelte`. The disable / enable surface is the first user-driven destructive-side action in the production shell; the rest of the inventory (hosts, SSH identities, known-hosts) remains read-only with no destructive UI.
+
+**Scope.** Disable an enabled `server_profile` AND re-enable a disabled one. NOT in scope for this slice: delete UI for any inventory entity, host disable/delete UI, SSH identity disable/delete UI, known-host revoke UI, an audit viewer, admin tooling, multi-tab workspace, or any backend behavior change.
+
+**API surface.** `disableServerProfile(profileId)` and `enableServerProfile(profileId)` in `apps/web/src/lib/api/serverProfiles.ts` POST to the existing backend routes. Both reuse `parseServerProfile` so `disabled_at` parsing stays centralised. Errors are formatted via `describeLifecycleError(action, err)` — a function of `kind` + `status` + `code` only; never echoes wire `message` or transport `Error.message`. Redaction-sentinel tests in `tests/profileLifecycle.test.ts` pin that a 200 response carrying a `private_key` / `encrypted_private_key` field cannot reach the parsed `ServerProfile` object.
+
+**List badge + detail panel.** Each row in the Servers profile list emits a `data-profile-disabled` attribute and a small `disabled` badge next to the name when `disabled_at` is non-null. The detail panel renders a `Lifecycle` row carrying an `enabled` / `disabled` badge plus the `disabled_at` timestamp on disabled profiles, AND an inline disabled-profile note that names the gate ("New terminal launches, host-key preflight / trust, and auth-check are blocked. Existing live sessions are unaffected."). Disabled profiles are NOT hidden by default; the existing client-side search and tag filters continue to include them.
+
+**Disable controls.** An enabled profile renders a `Disable profile` button in its row. Clicking opens a confirmation panel that:
+
+- States the gate explicitly (new launches blocked, host-key preflight / trust / auth-check blocked, existing live sessions unaffected).
+- Requires the operator to type the profile name verbatim before the disable submit becomes enabled (`disableConfirmationMatches` from `lib/app/inventory/profileLifecycle.ts`). The comparison is strict — case- and whitespace-sensitive — so the confirmation is deliberate but lightweight.
+- Carries a `Cancel` button so the operator can back out without firing a request.
+- Submits via `disableServerProfile` and replaces the matching row in the in-memory list from the parsed response. No automatic refetch is required; the backend response is the canonical post-disable shape.
+
+The confirmation copy is static and never interpolates profile-specific data, so a hostile profile name cannot reach the rendered paragraph; sentinel-string tests pin this.
+
+**Enable controls.** A disabled profile renders an `Enable profile` button gated only by an explicit click and a static reminder ("Enabling permits setup and launch attempts again. It does NOT prove host-key trust or auth readiness — re-run preflight, trust the host key, and re-run auth-check before launching."). On submit, the row is replaced in-memory from the parsed response and the disabled badge clears.
+
+**Setup-action gating in UI.** While a profile is disabled:
+
+- The `Launch terminal` button is rendered disabled with an honest tooltip and the inline copy switches to "Re-enable this profile to start a new terminal session." This mirrors the backend's `409 conflict { entity: "server_profile", reason: "disabled" }` and prevents the operator from racing into a rejected POST.
+- `HostKeyPanel` accepts a `disabled` prop, renders an inline `Profile is disabled. Host-key preflight and trust are blocked until the profile is re-enabled.` notice, AND keeps the preflight button disabled. The same pattern applies to `AuthCheckPanel`.
+- These guards are local to the UI and not relied on for security — the backend remains authoritative. The UI mirror exists so a disabled profile never offers an action the backend will refuse.
+
+**Existing live sessions.** Disabling a profile does NOT close, kill, or otherwise touch its existing `terminal_sessions`. The UI copy names this guarantee in the disable confirmation, the row notice, and the detail panel note. The Sessions view continues to render live sessions whose underlying profile has been disabled (see "Sessions view list & per-row state").
+
+**Idempotency.** A redundant disable on an already-disabled row (or enable on an already-enabled row) returns the same row from the backend; the UI replaces it in place and clears the lifecycle state. Concurrent UI clicks are guarded by the per-row `submitting` lifecycle state.
+
+**Errors.** `describeLifecycleError` collapses 404 to `"server profile not found"`, 401 to `"not authenticated"`, transport failures to `"transport error"`, and parse failures to `"malformed response"`. The error banner is dismissable via a per-row `Dismiss` button so the operator can retry from a clean state without reloading.
+
+**Future work this slice does NOT do.** No delete UI, no host or SSH identity lifecycle UI, no known-host revoke UI, no audit viewer, no terminal-session kill on profile disable, no admin tooling. Those remain as separate slices per the policy section above.
+
 ### Future implementation order
 
 This is the recommended staged plan. Each item is its own slice; do not bundle. Earlier items unblock later items.
@@ -1559,7 +1594,7 @@ This is the recommended staged plan. Each item is its own slice; do not bundle. 
 1. **~~Add `disabled_at TIMESTAMPTZ NULL` to `server_profiles`~~ (LANDED).** Migration, domain model, DTO, and frontend parser all carry the field. See "Server profile disable / enable backend (landed)" above. The "third state" guidance still applies: graduate to a `status` text column only if a third state (e.g. `archived`) becomes necessary.
 2. **~~Backend route `POST /api/v1/server-profiles/:id/disable` (and paired `:id/enable`)~~ (LANDED).** Idempotent, owner-scoped, dev-auth gated. ~~Audit-event emission is deferred~~ Audit-event emission landed alongside `server_profile_created`; see "Server profile lifecycle audit" above for the kinds, payload contract, idempotency rules, and fail-closed failure policy.
 3. **~~Launch-time guard on `POST /api/v1/terminal-sessions`~~ (LANDED).** Plus parallel guards on `auth-check`, `host-key-preflight`, and `trust-host-key`. Existing live sessions keep running. WebSocket attach is intentionally not gated — disable is a launch-time gate, not a runtime kill switch.
-4. **Frontend disable / enable UI** on the server-profiles list and detail panel. Confirmation dialog, disabled badge, launch button gated, redaction tests for the dialog copy.
+4. **~~Frontend disable / enable UI~~ (LANDED).** Server-profile lifecycle controls live on the Servers view: per-row `Disable profile` / `Enable profile` actions, name-echo confirmation for disable, inline disabled badge on row + detail panel, gated launch / preflight / trust / auth-check affordances, safe error formatter, and redaction-sentinel tests on the API path AND the static confirmation copy. See "Server profile disable / enable UI (landed)" above. An audit viewer remains future work — the backend already emits the rows, but no read surface exists.
 5. **Backend route `DELETE /api/v1/server-profiles/:id`** ONLY after disable is in place. Refuses with `409 conflict { entity: "terminal_session", count: N }` when any session references the profile (any status). Owner-scoped 404 collapses cross-user existence checks. Writes `server_profile_deleted` audit event (kind already exists).
 6. **Backend route `DELETE /api/v1/hosts/:id`.** Refuses with `409 conflict { entity: "server_profile", count: N }` when any profile references the host. Cascade-deletes `known_host_entries` (already enforced by schema). Writes `host_deleted` audit event (NEW kind — paired migration required).
 7. **Backend route `DELETE /api/v1/ssh-identities/:id`.** Refuses with `409 conflict { entity: "server_profile", count: N }` when any profile references the identity. Writes `ssh_identity_deleted` audit event (kind already exists). The encrypted private-key bytes go away with the row; no separate wipe step is needed.

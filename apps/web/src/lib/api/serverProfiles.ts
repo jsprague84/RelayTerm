@@ -471,6 +471,118 @@ export function resolveProfileLinks(
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle helpers — disable / enable
+// ---------------------------------------------------------------------------
+//
+// Wire shape mirrors `crates/relayterm-api/src/routes/v1/server_profiles.rs`.
+// Both routes return a full `ServerProfileResponse` on success — the route
+// is owner-scoped, idempotent, and never echoes operator detail.
+//
+// Redaction posture: same as the rest of the server-profile surface. The
+// parser builds the DTO field-by-field; a stray `private_key` /
+// `encrypted_private_key` smuggled onto the wire body cannot reach the
+// returned object. The error formatter is a function of `kind` + `status`
+// + `code` only.
+
+export interface LifecycleOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to the canonical `:id/disable` or
+   * `:id/enable` route under `/api/v1/server-profiles/`. */
+  endpoint?: string;
+}
+
+export type LifecycleError = WireError;
+
+export type LifecycleResult =
+  | { ok: true; profile: ServerProfile }
+  | { ok: false; error: LifecycleError };
+
+/**
+ * POST a `disable` request for a server profile and parse the response.
+ *
+ * The route stamps `disabled_at = NOW()` and returns the updated row. It
+ * is idempotent: a redundant disable returns the existing row unchanged.
+ * Disable is a launch-time gate, NOT a runtime kill switch — existing
+ * live `terminal_sessions` are unaffected.
+ *
+ * The helper does NOT throw, does NOT log raw response bodies, and does
+ * NOT echo wire / transport detail through any user-facing string.
+ */
+export async function disableServerProfile(
+  profileId: string,
+  options: LifecycleOptions = {},
+): Promise<LifecycleResult> {
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/server-profiles/${encodeURIComponent(profileId)}/disable`;
+  const result = await postJsonItem<ServerProfile>(
+    endpoint,
+    {},
+    parseServerProfile,
+    options,
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, profile: result.data };
+}
+
+/**
+ * POST an `enable` request for a server profile and parse the response.
+ *
+ * The route clears `disabled_at` and returns the updated row. It is
+ * idempotent: a redundant enable returns the existing row unchanged.
+ * Enabling permits setup / launch attempts again — it does NOT prove
+ * host-key trust or auth readiness.
+ *
+ * The helper does NOT throw, does NOT log raw response bodies, and does
+ * NOT echo wire / transport detail through any user-facing string.
+ */
+export async function enableServerProfile(
+  profileId: string,
+  options: LifecycleOptions = {},
+): Promise<LifecycleResult> {
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/server-profiles/${encodeURIComponent(profileId)}/enable`;
+  const result = await postJsonItem<ServerProfile>(
+    endpoint,
+    {},
+    parseServerProfile,
+    options,
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, profile: result.data };
+}
+
+/**
+ * Format a {@link LifecycleError} as a one-line UI summary. Stays a
+ * function of `kind` + `status` + `code` ONLY — never echoes the wire
+ * `message` of an HTTP error or the thrown `Error.message` of a
+ * transport failure.
+ *
+ * `action` is the verb shown in the rendered string. The two routes
+ * share an error envelope shape, so a single formatter covers both
+ * paths.
+ */
+export function describeLifecycleError(
+  action: "disable" | "enable",
+  err: LifecycleError,
+): string {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 404 && err.code === "not_found") {
+        return `Failed to ${action} server profile: server profile not found`;
+      }
+      if (err.status === 401) {
+        return `Failed to ${action} server profile: not authenticated`;
+      }
+      return `Failed to ${action} server profile: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return `Failed to ${action} server profile: transport error`;
+    case "malformed_response":
+      return `Failed to ${action} server profile: malformed response`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Host-key preflight + trust helpers
 // ---------------------------------------------------------------------------
 //
