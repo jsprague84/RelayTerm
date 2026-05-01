@@ -9,6 +9,12 @@
     type SshKeyType,
   } from "../../api/sshIdentities.js";
   import { describeLoadError } from "../../api/apiErrors.js";
+  import {
+    identityPublicDetail,
+    publicKeyCopyValue,
+    safeDisplayValue,
+    shortId,
+  } from "../inventory/inventoryDetails.js";
 
   type LoadState =
     | { kind: "idle" }
@@ -26,6 +32,13 @@
 
   let view = $state<LoadState>({ kind: "idle" });
   let copy = $state<Record<string, CopyState>>({});
+
+  /**
+   * Currently-selected identity row. A re-click on the same row closes
+   * the panel; selecting a different row swaps the panel content. The
+   * generation panel is independent — selection does not close it.
+   */
+  let selectedIdentityId = $state<string | null>(null);
 
   let panelOpen = $state(false);
   let formName = $state("");
@@ -82,6 +95,19 @@
     if (s === "failed") return "Copy failed";
     return "Copy public key";
   }
+
+  function selectIdentity(id: string) {
+    selectedIdentityId = selectedIdentityId === id ? null : id;
+  }
+
+  function closeIdentityDetail() {
+    selectedIdentityId = null;
+  }
+
+  let selectedIdentity = $derived.by<SshIdentity | null>(() => {
+    if (view.kind !== "ready" || selectedIdentityId === null) return null;
+    return view.identities.find((i) => i.id === selectedIdentityId) ?? null;
+  });
 
   function openPanel() {
     panelOpen = true;
@@ -377,70 +403,203 @@
           data-testid="identities-list"
         >
           {#each view.identities as identity (identity.id)}
+            {@const isSelected = selectedIdentityId === identity.id}
             <li
-              class="flex flex-col gap-1.5 py-3 first:pt-0 last:pb-0"
+              class="flex flex-col py-3 first:pt-0 last:pb-0"
               data-testid="identity-row"
             >
-              <div class="flex items-baseline justify-between gap-3">
-                <span class="text-sm font-medium text-zinc-100">
-                  {identity.name}
+              <div
+                class="flex flex-col gap-1.5 rounded-md px-2 py-1 transition {isSelected
+                  ? 'bg-emerald-950/30 ring-1 ring-emerald-800/60'
+                  : ''}"
+              >
+                <div class="flex items-baseline justify-between gap-3">
+                  <span class="text-sm font-medium text-zinc-100">
+                    {identity.name}
+                  </span>
+                  <span
+                    class="font-mono text-xs uppercase tracking-wide text-zinc-500"
+                  >
+                    {identity.key_type}
+                  </span>
+                </div>
+                <span
+                  class="font-mono text-xs text-zinc-300"
+                  data-testid="identity-fingerprint"
+                >
+                  {identity.fingerprint_sha256}
                 </span>
                 <span
-                  class="font-mono text-xs uppercase tracking-wide text-zinc-500"
+                  class="truncate font-mono text-[11px] text-zinc-500"
+                  data-testid="identity-public-key-preview"
                 >
-                  {identity.key_type}
+                  {publicKeyPreview(identity.public_key)}
                 </span>
-              </div>
-              <span
-                class="font-mono text-xs text-zinc-300"
-                data-testid="identity-fingerprint"
-              >
-                {identity.fingerprint_sha256}
-              </span>
-              <span
-                class="truncate font-mono text-[11px] text-zinc-500"
-                data-testid="identity-public-key-preview"
-              >
-                {publicKeyPreview(identity.public_key)}
-              </span>
-              <div
-                class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-400"
-              >
-                <span>
-                  Created
-                  <time class="font-mono text-zinc-300"
-                    >{identity.created_at}</time
-                  >
-                </span>
-                {#if identity.last_used_at}
+                <div
+                  class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-400"
+                >
                   <span>
-                    Last used
+                    Created
                     <time class="font-mono text-zinc-300"
-                      >{identity.last_used_at}</time
+                      >{identity.created_at}</time
                     >
                   </span>
-                {:else}
-                  <span class="text-zinc-500">Never used</span>
-                {/if}
-              </div>
-              <div class="flex items-center gap-2">
-                <button
-                  type="button"
-                  class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700"
-                  onclick={() => copyPublicKey(identity)}
-                  data-testid="identity-copy-public-key"
-                >
-                  {copyLabel(copy[identity.id])}
-                </button>
-                <span class="text-[11px] text-zinc-500">
-                  Copies the OpenSSH public key only.
-                </span>
+                  {#if identity.last_used_at}
+                    <span>
+                      Last used
+                      <time class="font-mono text-zinc-300"
+                        >{identity.last_used_at}</time
+                      >
+                    </span>
+                  {:else}
+                    <span class="text-zinc-500">Never used</span>
+                  {/if}
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    class="rounded-md border px-2.5 py-1 text-xs transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700/60 {isSelected
+                      ? 'border-emerald-700 bg-emerald-900/40 text-emerald-100 hover:border-emerald-600 hover:bg-emerald-900/60'
+                      : 'border-zinc-700 bg-zinc-800 text-zinc-200 hover:border-zinc-600 hover:bg-zinc-700'}"
+                    onclick={() => selectIdentity(identity.id)}
+                    aria-expanded={isSelected}
+                    data-testid="identity-row-select"
+                  >
+                    {isSelected ? "Hide details" : "View details"}
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700"
+                    onclick={() => copyPublicKey(identity)}
+                    data-testid="identity-copy-public-key"
+                  >
+                    {copyLabel(copy[identity.id])}
+                  </button>
+                  <span class="text-[11px] text-zinc-500">
+                    Copies the OpenSSH public key only.
+                  </span>
+                </div>
               </div>
             </li>
           {/each}
         </ul>
       {/if}
     </article>
+
+    {#if selectedIdentity}
+      {@const detail = identityPublicDetail(selectedIdentity, publicKeyPreview)}
+      {@const fullKey = publicKeyCopyValue(selectedIdentity)}
+      <article
+        class="flex flex-col gap-3 rounded-lg border border-emerald-900/40 bg-emerald-950/10 p-6"
+        data-testid="identity-detail-panel"
+      >
+        <header class="flex items-baseline justify-between gap-2">
+          <h3 class="text-sm font-semibold text-zinc-100">
+            SSH identity detail
+            <span class="ml-2 text-xs font-normal text-zinc-500">
+              read-only
+            </span>
+          </h3>
+          <button
+            type="button"
+            class="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+            onclick={closeIdentityDetail}
+            data-testid="identity-detail-close"
+          >
+            Close
+          </button>
+        </header>
+
+        <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Name</dt>
+          <dd class="text-zinc-100" data-testid="identity-detail-name">
+            {detail.name}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Key type
+          </dt>
+          <dd
+            class="font-mono uppercase tracking-wide text-zinc-100"
+            data-testid="identity-detail-key-type"
+          >
+            {detail.key_type}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Fingerprint
+          </dt>
+          <dd
+            class="font-mono text-zinc-100"
+            data-testid="identity-detail-fingerprint"
+          >
+            {detail.fingerprint_sha256}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Public key preview
+          </dt>
+          <dd
+            class="truncate font-mono text-xs text-zinc-300"
+            data-testid="identity-detail-public-key-preview"
+          >
+            {detail.publicKeyPreview}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Created</dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="identity-detail-created-at"
+          >
+            {safeDisplayValue(detail.created_at)}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Last used
+          </dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="identity-detail-last-used-at"
+          >
+            {safeDisplayValue(detail.last_used_at, "never")}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Id</dt>
+          <dd
+            class="font-mono text-xs text-zinc-500"
+            data-testid="identity-detail-id"
+          >
+            {shortId(detail.id)}
+          </dd>
+        </dl>
+
+        <div class="flex flex-col gap-1">
+          <span class="text-xs uppercase tracking-wide text-zinc-500">
+            Public key
+          </span>
+          <pre
+            class="overflow-x-auto rounded-md border border-emerald-900/40 bg-zinc-950/60 p-3 font-mono text-[11px] text-zinc-200"
+            data-testid="identity-detail-public-key"><code>{fullKey}</code></pre>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700"
+              onclick={() => copyPublicKey(selectedIdentity)}
+              data-testid="identity-detail-copy-public-key"
+            >
+              {copyLabel(copy[selectedIdentity.id])}
+            </button>
+            <span class="text-[11px] text-zinc-500">
+              Copies the OpenSSH public key only — never any private
+              material.
+            </span>
+          </div>
+        </div>
+
+        <p
+          class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+          data-testid="identity-detail-honesty"
+        >
+          The private key is encrypted at rest in the backend vault and
+          never reaches the browser. There is no UI to export, recover,
+          or otherwise reveal private material.
+        </p>
+      </article>
+    {/if}
   {/if}
 
   <p

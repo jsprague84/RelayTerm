@@ -27,6 +27,14 @@
   import type { ActiveLaunch } from "../terminal/activeLaunch.js";
   import HostKeyPanel from "./HostKeyPanel.svelte";
   import AuthCheckPanel from "./AuthCheckPanel.svelte";
+  import {
+    describeReadinessFromKnownState,
+    hostProfileCount,
+    relatedProfilesForHost,
+    resolveProfileDetail,
+    safeDisplayValue,
+    shortId,
+  } from "../inventory/inventoryDetails.js";
 
   interface Props {
     /**
@@ -79,6 +87,14 @@
 
   let view = $state<LoadState>({ kind: "idle" });
   let panel = $state<Panel>("none");
+
+  /**
+   * Currently-selected detail target. Selection is mutually exclusive
+   * across host vs. profile so the operator only sees one detail panel
+   * at a time. A re-click on the same row closes the panel.
+   */
+  let selectedHostId = $state<string | null>(null);
+  let selectedProfileId = $state<string | null>(null);
 
   // Host create form state
   let hostName = $state("");
@@ -356,6 +372,34 @@
     delete next[profileId];
     launchStates = next;
   }
+
+  function selectHost(id: string) {
+    selectedHostId = selectedHostId === id ? null : id;
+    selectedProfileId = null;
+  }
+
+  function selectProfile(id: string) {
+    selectedProfileId = selectedProfileId === id ? null : id;
+    selectedHostId = null;
+  }
+
+  function closeHostDetail() {
+    selectedHostId = null;
+  }
+
+  function closeProfileDetail() {
+    selectedProfileId = null;
+  }
+
+  let selectedHost = $derived.by<Host | null>(() => {
+    if (view.kind !== "ready" || selectedHostId === null) return null;
+    return view.hosts.find((h) => h.id === selectedHostId) ?? null;
+  });
+
+  let selectedProfile = $derived.by<ServerProfile | null>(() => {
+    if (view.kind !== "ready" || selectedProfileId === null) return null;
+    return view.profiles.find((p) => p.id === selectedProfileId) ?? null;
+  });
 </script>
 
 <section
@@ -779,29 +823,162 @@
           data-testid="hosts-list"
         >
           {#each view.hosts as host (host.id)}
+            {@const isSelected = selectedHostId === host.id}
             <li
-              class="flex flex-col gap-1 py-3 first:pt-0 last:pb-0"
+              class="flex flex-col py-3 first:pt-0 last:pb-0"
               data-testid="host-row"
             >
-              <div class="flex items-baseline justify-between gap-3">
-                <span class="text-sm font-medium text-zinc-100">
-                  {host.display_name}
+              <button
+                type="button"
+                class="flex flex-col gap-1 rounded-md px-2 py-1 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700/60 {isSelected
+                  ? 'bg-emerald-950/30 ring-1 ring-emerald-800/60'
+                  : 'hover:bg-zinc-900/40'}"
+                onclick={() => selectHost(host.id)}
+                aria-expanded={isSelected}
+                data-testid="host-row-select"
+              >
+                <span class="flex items-baseline justify-between gap-3">
+                  <span class="text-sm font-medium text-zinc-100">
+                    {host.display_name}
+                  </span>
+                  <span class="font-mono text-xs text-zinc-500">
+                    {host.hostname}:{formatPort(host.port)}
+                  </span>
                 </span>
-                <span class="font-mono text-xs text-zinc-500">
-                  {host.hostname}:{formatPort(host.port)}
+                <span class="text-xs text-zinc-400">
+                  Default user
+                  <span class="font-mono text-zinc-300"
+                    >{host.default_username}</span
+                  >
                 </span>
-              </div>
-              <span class="text-xs text-zinc-400">
-                Default user
-                <span class="font-mono text-zinc-300"
-                  >{host.default_username}</span
-                >
-              </span>
+              </button>
             </li>
           {/each}
         </ul>
       {/if}
     </article>
+
+    {#if selectedHost}
+      {@const host = selectedHost}
+      {@const linkedProfiles = relatedProfilesForHost(host, view.profiles)}
+      <article
+        class="flex flex-col gap-3 rounded-lg border border-emerald-900/40 bg-emerald-950/10 p-6"
+        data-testid="host-detail-panel"
+      >
+        <header class="flex items-baseline justify-between gap-2">
+          <h3 class="text-sm font-semibold text-zinc-100">
+            Host detail
+            <span class="ml-2 text-xs font-normal text-zinc-500">
+              read-only
+            </span>
+          </h3>
+          <button
+            type="button"
+            class="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+            onclick={closeHostDetail}
+            data-testid="host-detail-close"
+          >
+            Close
+          </button>
+        </header>
+
+        <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Display name
+          </dt>
+          <dd class="text-zinc-100" data-testid="host-detail-display-name">
+            {host.display_name}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Hostname
+          </dt>
+          <dd
+            class="font-mono text-zinc-100"
+            data-testid="host-detail-hostname"
+          >
+            {host.hostname}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Port</dt>
+          <dd class="font-mono text-zinc-100" data-testid="host-detail-port">
+            {formatPort(host.port)}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Default user
+          </dt>
+          <dd
+            class="font-mono text-zinc-100"
+            data-testid="host-detail-username"
+          >
+            {host.default_username}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Created</dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="host-detail-created-at"
+          >
+            {safeDisplayValue(host.created_at)}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Updated</dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="host-detail-updated-at"
+          >
+            {safeDisplayValue(host.updated_at)}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Id</dt>
+          <dd class="font-mono text-xs text-zinc-500" data-testid="host-detail-id">
+            {shortId(host.id)}
+          </dd>
+        </dl>
+
+        <section class="flex flex-col gap-2">
+          <header class="flex items-baseline justify-between gap-2">
+            <h4 class="text-xs uppercase tracking-wide text-zinc-400">
+              Server profiles using this host
+            </h4>
+            <span
+              class="text-xs text-zinc-500"
+              data-testid="host-detail-profile-count"
+            >
+              {hostProfileCount(host, view.profiles)}
+            </span>
+          </header>
+          {#if linkedProfiles.length === 0}
+            <p
+              class="text-xs text-zinc-500"
+              data-testid="host-detail-profiles-empty"
+            >
+              No profiles reference this host yet.
+            </p>
+          {:else}
+            <ul
+              class="flex flex-col gap-1"
+              data-testid="host-detail-profiles-list"
+            >
+              {#each linkedProfiles as p (p.id)}
+                <li
+                  class="flex items-baseline justify-between gap-3 rounded-sm border border-zinc-800/60 bg-zinc-950/60 px-2 py-1.5 text-xs"
+                >
+                  <span class="text-zinc-200">{p.name}</span>
+                  <span class="font-mono text-zinc-500">
+                    {safeDisplayValue(p.username_override, "(host default)")}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
+
+        <p
+          class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+          data-testid="host-detail-honesty"
+        >
+          Host details do not prove reachability. Connection readiness
+          depends on a server profile, host-key trust, and an SSH
+          auth-check — run those from the profile's row.
+        </p>
+      </article>
+    {/if}
 
     <article
       class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-6"
@@ -827,11 +1004,20 @@
           {#each view.profiles as profile (profile.id)}
             {@const links = resolveProfileLinks(profile, view.hosts)}
             {@const launchState = launchStates[profile.id]}
+            {@const isProfileSelected = selectedProfileId === profile.id}
             <li
               class="flex flex-col gap-1.5 py-3 first:pt-0 last:pb-0"
               data-testid="profile-row"
             >
-              <div class="flex items-baseline justify-between gap-3">
+              <button
+                type="button"
+                class="flex items-baseline justify-between gap-3 rounded-md px-2 py-1 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700/60 {isProfileSelected
+                  ? 'bg-emerald-950/30 ring-1 ring-emerald-800/60'
+                  : 'hover:bg-zinc-900/40'}"
+                onclick={() => selectProfile(profile.id)}
+                aria-expanded={isProfileSelected}
+                data-testid="profile-row-select"
+              >
                 <span class="text-sm font-medium text-zinc-100">
                   {profile.name}
                 </span>
@@ -847,7 +1033,7 @@
                     host not in your inventory
                   </span>
                 {/if}
-              </div>
+              </button>
               <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-400">
                 {#if links.effectiveUsername !== null}
                   <span>
@@ -929,6 +1115,157 @@
         </ul>
       {/if}
     </article>
+
+    {#if selectedProfile}
+      {@const detail = resolveProfileDetail(
+        selectedProfile,
+        view.hosts,
+        view.identities,
+      )}
+      {@const readiness = describeReadinessFromKnownState(detail)}
+      <article
+        class="flex flex-col gap-3 rounded-lg border border-emerald-900/40 bg-emerald-950/10 p-6"
+        data-testid="profile-detail-panel"
+      >
+        <header class="flex items-baseline justify-between gap-2">
+          <h3 class="text-sm font-semibold text-zinc-100">
+            Server profile detail
+            <span class="ml-2 text-xs font-normal text-zinc-500">
+              read-only
+            </span>
+          </h3>
+          <button
+            type="button"
+            class="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+            onclick={closeProfileDetail}
+            data-testid="profile-detail-close"
+          >
+            Close
+          </button>
+        </header>
+
+        <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Name</dt>
+          <dd class="text-zinc-100" data-testid="profile-detail-name">
+            {detail.profile.name}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Host</dt>
+          <dd data-testid="profile-detail-host">
+            {#if detail.links.host}
+              <span class="font-mono text-zinc-100">
+                {detail.links.host.display_name} —
+                {detail.links.host.hostname}:{formatPort(
+                  detail.links.host.port,
+                )}
+              </span>
+            {:else}
+              <span
+                class="text-amber-300/80"
+                data-testid="profile-detail-host-missing"
+              >
+                host not in your inventory
+              </span>
+            {/if}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">User</dt>
+          <dd data-testid="profile-detail-username">
+            {#if detail.links.effectiveUsername !== null}
+              <span class="font-mono text-zinc-100">
+                {detail.links.effectiveUsername}
+              </span>
+              {#if detail.links.inheritedFromHost}
+                <span class="text-xs text-zinc-500">(host default)</span>
+              {:else}
+                <span class="text-xs text-zinc-500">(override)</span>
+              {/if}
+            {:else}
+              <span class="text-amber-300/80">
+                Username unavailable (host link unresolved)
+              </span>
+            {/if}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            SSH identity
+          </dt>
+          <dd data-testid="profile-detail-identity">
+            {#if detail.identity}
+              <div class="flex flex-col gap-0.5">
+                <span class="text-zinc-100">
+                  {detail.identity.name}
+                  <span
+                    class="ml-1 font-mono text-xs uppercase tracking-wide text-zinc-500"
+                  >
+                    {detail.identity.key_type}
+                  </span>
+                </span>
+                <span class="font-mono text-xs text-zinc-400">
+                  {detail.identity.fingerprint_sha256}
+                </span>
+              </div>
+            {:else}
+              <span class="text-zinc-400">
+                Identity not in your inventory — metadata available in
+                the SSH Identities view.
+              </span>
+            {/if}
+          </dd>
+          {#if detail.profile.tags.length > 0}
+            <dt class="text-xs uppercase tracking-wide text-zinc-500">Tags</dt>
+            <dd>
+              <ul
+                class="flex flex-wrap gap-1.5"
+                data-testid="profile-detail-tags"
+              >
+                {#each detail.profile.tags as tag (tag)}
+                  <li
+                    class="rounded border border-zinc-700/80 bg-zinc-900/60 px-1.5 py-0.5 font-mono text-[11px] text-zinc-300"
+                  >
+                    {tag}
+                  </li>
+                {/each}
+              </ul>
+            </dd>
+          {/if}
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">
+            Last connected
+          </dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="profile-detail-last-connected"
+          >
+            {safeDisplayValue(detail.profile.last_connected_at, "never")}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Created</dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="profile-detail-created-at"
+          >
+            {safeDisplayValue(detail.profile.created_at)}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Updated</dt>
+          <dd
+            class="font-mono text-zinc-300"
+            data-testid="profile-detail-updated-at"
+          >
+            {safeDisplayValue(detail.profile.updated_at)}
+          </dd>
+          <dt class="text-xs uppercase tracking-wide text-zinc-500">Id</dt>
+          <dd
+            class="font-mono text-xs text-zinc-500"
+            data-testid="profile-detail-id"
+          >
+            {shortId(detail.profile.id)}
+          </dd>
+        </dl>
+
+        <p
+          class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+          data-testid="profile-detail-readiness"
+        >
+          {readiness.advisory}
+        </p>
+      </article>
+    {/if}
   {/if}
 
   <p
