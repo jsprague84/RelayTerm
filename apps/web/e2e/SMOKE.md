@@ -35,7 +35,11 @@ update this file in the same change.
 | `[data-testid="nav-identities"]`                  | Sidebar nav button — SSH identities placeholder.              |
 | `[data-testid="nav-settings"]`                    | Sidebar nav button — Settings placeholder.                    |
 | `[data-testid="production-view-dashboard"]`       | Dashboard view (selected by default).                         |
-| `[data-testid="production-view-servers"]`         | Servers view (read-only inventory of hosts + profiles).       |
+| `[data-testid="production-view-servers"]`         | Servers view (inventory of hosts + profiles, with create panels). |
+| `[data-testid="servers-create-host-open"]`        | "Create host" button on the Servers view.                     |
+| `[data-testid="servers-create-profile-open"]`     | "Create server profile" button on the Servers view (disabled when there are no hosts OR no SSH identities). |
+| `[data-testid="servers-create-host-panel"]`       | Create-host panel container (visible after open).             |
+| `[data-testid="servers-create-profile-panel"]`    | Create-server-profile panel container (visible after open).   |
 | `[data-testid="production-view-identities"]`      | Identities view (public-key list + generate panel).           |
 | `[data-testid="identities-refresh-button"]`       | Refresh button on the Identities view.                        |
 | `[data-testid="identities-generate-open"]`        | "Generate SSH identity" button (opens the generate panel).    |
@@ -227,7 +231,51 @@ the same MCP browser tools.
    `devToolsToggle`, `devToolsPanel`, `workbench`, `lab`, `selector`,
    `diagnostics` all `false`. `rendererOptionsAbsent` is `true`.
 
-4. `browser_console_messages level=error all=true`. As above, the
+4. Navigate to the Servers view and assert the create panels render.
+   Hosts and profile creation are production-safe write flows; this
+   step does NOT submit the forms (no live backend is assumed by the
+   smoke), only verifies they are reachable in the prod bundle:
+
+   - `browser_click [data-testid="nav-servers"]`
+   - `browser_evaluate`:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         serversView: has('[data-testid="production-view-servers"]'),
+         createHostOpen: has('[data-testid="servers-create-host-open"]'),
+         createProfileOpen: has(
+           '[data-testid="servers-create-profile-open"]',
+         ),
+         // Panels are not opened yet — the open buttons are present but
+         // the panel containers should be absent until clicked.
+         createHostPanelClosed: !has(
+           '[data-testid="servers-create-host-panel"]',
+         ),
+         createProfilePanelClosed: !has(
+           '[data-testid="servers-create-profile-panel"]',
+         ),
+       };
+     }
+     ```
+
+     Expected: every field `true`.
+
+   - Click the "Create host" button and verify the panel renders:
+     - `browser_click [data-testid="servers-create-host-open"]`
+     - Assert `has('[data-testid="servers-create-host-panel"]')` is
+       `true` and `has('[data-testid="servers-create-host-form"]')` is
+       `true`.
+     - Click the panel's close button to leave the page tidy:
+       `browser_click [data-testid="servers-create-host-close"]`.
+
+   The create-server-profile button may be disabled when the dev
+   inventory is empty; in that case `servers-create-profile-blocked`
+   carries the honest empty-state hint. This is the documented contract
+   — do not mark it a regression.
+
+5. `browser_console_messages level=error all=true`. As above, the
    favicon `404` is the only allowed error.
 
 ## What this smoke does NOT cover

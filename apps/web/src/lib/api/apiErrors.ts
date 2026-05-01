@@ -105,6 +105,87 @@ export async function readErrorEnvelope(
 }
 
 /**
+ * Subset of {@link LoadError} the shared POST helper can produce.
+ * Validation lives at the resource layer; the wire helper only sees
+ * transport / HTTP / parse outcomes. Shaped so a resource-level
+ * `CreateXError` union can directly include this variant set.
+ */
+export type WireError =
+  | { kind: "http"; status: number; code: string; message: string }
+  | { kind: "transport"; message: string }
+  | { kind: "malformed_response" };
+
+export type WireResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: WireError };
+
+/**
+ * POST a JSON body to a typed-create endpoint and parse the response
+ * with the supplied parser. The parser MUST return `null` if it cannot
+ * validate the response; that collapses to `malformed_response`.
+ *
+ * The function does not throw. It does not log. It does not echo the
+ * thrown message of a transport failure or the wire `message` of an
+ * HTTP error in any user-facing field — the typed error preserves both
+ * for programmatic callers, but the resource-level formatter is the
+ * single point that reaches the UI.
+ */
+export async function postJsonItem<T>(
+  endpoint: string,
+  body: unknown,
+  parseItem: (raw: unknown) => T | null,
+  options: LoadOptions = {},
+): Promise<WireResult<T>> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const item = parseItem(parsed);
+  if (item === null) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, data: item };
+}
+
+/**
  * GET a JSON list endpoint and parse each item with the supplied
  * parser. The parser MUST return `null` for any item it cannot
  * validate; a single `null` collapses the whole response to

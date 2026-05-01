@@ -573,6 +573,43 @@ The first production-safe write flow on the Identities view: an operator can ask
 
 Identity deletion and rename; private-key import (BYOK); editing the name after creation; password bootstrap and `ssh-copy-id` to automate `authorized_keys` install; per-identity audit log surface; multi-vault key rotation. Each is a separate slice.
 
+### Production host & server-profile creation UI
+
+The next production-safe write flows on the Servers view: an operator can create a `host` (a reachable target definition) and a `server_profile` (a binding of a host to an SSH identity). Both flows are metadata-only — they do NOT trust a host key, do NOT verify SSH authentication, and do NOT confirm the public key is installed on the target.
+
+**Scope (load-bearing — this slice).**
+
+1. **"Create host" panel** lives on `ServersView.svelte`, opened by a button in the view header. The form has `display_name` (≤ 128 chars, no surrounding whitespace, no control chars), `hostname` (≤ 253 chars, no whitespace, no control chars, only ASCII alphanumerics + `-`, `.`, `:`, `[`, `]`, `_`), `port` (integer 1..=65535, defaults to 22), and `default_username` (≤ 64 chars, leading letter/`_`, ASCII alphanumerics + `-`, `_`, `.` thereafter). Submit is disabled while a request is in flight or while any required text field is empty after trim.
+2. **"Create server profile" panel** lives on the same view. The form has `name` (≤ 64 chars, no surrounding whitespace, no control chars), a `host` select (from the caller's existing hosts), an `ssh_identity` select (from the caller's existing identities), an optional `username_override` (same shape as host username), and an optional `tags` input parsed from a comma-separated string (≤ 32 tags, each ≤ 32 chars, ASCII alphanumerics + `-`/`_`, no duplicates). The "Create server profile" button is **disabled at the toolbar** when the caller has zero hosts OR zero identities — `canSubmitServerProfile(hostCount, identityCount)` returns a typed reason (`no_hosts | no_identities | no_hosts_or_identities | ok`) and the UI renders an honest empty-state hint without ever opening the form.
+3. **`createHost(request, options)` and `createServerProfile(request, options)`** in `lib/api/hosts.ts` and `lib/api/serverProfiles.ts` are the single client entry points. Each client-side-validates the request (mirrors the backend's validators in `crates/relayterm-core/src/validation.rs`), POSTs to the relevant endpoint via the shared `postJsonItem` helper in `apiErrors.ts`, parses the response with the existing `parseHost` / `parseServerProfile`, and returns a typed result. Neither helper throws, logs raw response bodies, or echoes wire / transport detail through any user-facing string.
+4. **Success UI** for hosts shows the new display name, `hostname:port`, and default user, with an explicit "Reachability and host-key trust are not verified by this action." disclaimer. Success UI for profiles shows the new name and an explicit "The host key is not yet trusted and SSH authentication has not been verified for this profile." disclaimer. The newly-created row is also prepended to the inventory list (or a refresh is triggered if the list was loading/errored).
+5. **Error UI** renders one line from `describeCreateHostError` / `describeCreateServerProfileError` and nothing else. Both formatters stay a function of `kind` + `status` + `code` (and the validation `reason` enum) only — never the wire `message`, never the transport `Error.message`. The server-profile formatter collapses `404 not_found` to a friendly "linked host or SSH identity not found" hint so a stale-reference race shows an actionable message.
+6. **No backend changes.** The existing `POST /api/v1/hosts` and `POST /api/v1/server-profiles` routes already accept the wire shapes the new helpers send; the slice is purely a frontend addition.
+7. **Architecture rule preserved.** No import added under `lib/app/` touches `lib/dev/` or any renderer adapter; `appShellIsolation.test.ts` continues to pass.
+
+**Redaction posture (load-bearing).**
+
+- Both formatters never echo wire / transport detail. Sentinel-string tests in `tests/createApi.test.ts` pin this for `http`, `transport`, and `validation` kinds across both helpers, including the `404 not_found` collapse on profile create.
+- `parseServerProfile` already constructs the DTO field-by-field, so a backend bug or hostile fixture that includes `private_key` / `encrypted_private_key` on a 201 response cannot smuggle them onto the parsed object. A redaction-sentinel test pins this for the `createServerProfile` happy path.
+- Helpers do NOT log raw response bodies. Tests pin `console.log/warn/error` as untouched across success, HTTP failure, and transport failure for both `createHost` and `createServerProfile`.
+
+**Wire shapes (mirror of `crates/relayterm-api/src/dto/`).**
+
+- Host create request: `{ display_name, hostname, port?, default_username }`. The validator normalizes `port` to `DEFAULT_SSH_PORT` (22) when omitted before sending so the wire body is always explicit. Response (`201 Created`): the same `Host` shape used by `listHosts`.
+- Server-profile create request: `{ name, host_id, ssh_identity_id, username_override?, tags? }`. `username_override` is included on the wire ONLY when non-null and non-empty (matches the existing integration-test shape so the backend's "omitted == null" behavior is exercised). `tags` is always sent (defaulting to `[]`). Response (`201 Created`): the same `ServerProfile` shape used by `listServerProfiles`.
+
+**UX copy (load-bearing).**
+
+- Host panel intro: "A host is a metadata-only target definition" and "No SSH connection is attempted. Host-key trust and auth-check are deliberate later slices."
+- Profile panel intro: "A server profile binds a host, a username, and an SSH identity into a single connect target" and "Creating a profile does NOT trust the host key, does NOT verify SSH authentication, and does NOT install the public key on the target server. Run host-key trust and auth-check later (future slices)."
+- The view header and footer are updated with the same load-bearing claim: creation here does not imply trust or reachability.
+
+**Stable selectors.** New `data-testid` hooks: `servers-create-host-{open,close,panel,form,display-name,hostname,port,username,submit,error,success}` and `servers-create-profile-{open,close,panel,form,name,host,identity,username-override,tags,submit,error,success,blocked}`.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Edit / delete forms for hosts and profiles; host-key preflight and trust UI; auth-check UI; terminal session launch from the production shell; password bootstrap / `ssh-copy-id`; `username_override` / `tags` editing on existing profiles; per-row "view details" / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.
