@@ -516,7 +516,7 @@ The Servers and Identities views are display-only inventories of `hosts`, `serve
 
 1. **Servers view** (`apps/web/src/lib/app/views/ServersView.svelte`) renders two grouped sections: a Hosts list (display name, hostname, port, default username) and a Profiles list (name, linked host summary if resolvable from the fetched hosts, effective username with explicit "(host default)" / "(override)" attribution, tags, and last-connected timestamp). Hosts and profiles are fetched in parallel via `Promise.all`; either failure collapses the whole view to a single safe error summary keyed off the first failed resource.
 2. **Identities view** (`apps/web/src/lib/app/views/IdentitiesView.svelte`) renders one row per identity with name, key type, full SHA-256 fingerprint, a one-line public-key preview (`publicKeyPreview` truncates the base64 body to keep tables tight), created-at, last-used-at, and a "Copy public key" button. The button copies ONLY `identity.public_key` — never the fingerprint, never any other field. Clipboard failures collapse to a static `Copy failed` label without echoing origin/permission detail.
-3. **Dashboard counts** (`DashboardView.svelte`) shows `hosts` / `profiles` / `identities` cardinality using the same helpers. The counts are nice-to-have: any failure collapses to an unobtrusive `—` placeholder so the per-view error surface stays the canonical triage path. No polling.
+3. **Dashboard counts** (`DashboardView.svelte`) shows `hosts` / `profiles` / `identities` / `sessions` cardinality using the same helpers (the dashboard surface is described in full under "Production dashboard summary"). The counts are nice-to-have: any failure collapses to an unobtrusive `—` placeholder so the per-view error surface stays the canonical triage path. No polling.
 4. **No secret material is rendered.** `SshIdentity` (TypeScript DTO) does not declare an `encrypted_private_key` or `private_key` field. The runtime parser in `parseSshIdentity` builds the DTO field-by-field, so a backend bug or hostile fixture that includes those keys cannot smuggle them onto the parsed object. `tests/inventoryApi.test.ts` pins this with sentinel strings asserted absent from the parsed object, the serialized JSON, and the formatted preview.
 5. **Loading / empty / error states are honest.** Loading states render an unobtrusive "Loading…" placeholder. Empty states say "CRUD UI is not implemented yet — created through the backend API today." Error states render the formatted summary and nothing else (no retry-storm, no auto-reload).
 6. **Architecture rule preserved.** The new helpers and views live entirely under `lib/app/` and `lib/api/`; no import touches `lib/dev/` or any renderer adapter. `appShellIsolation.test.ts` continues to pass.
@@ -1025,6 +1025,49 @@ The production host MUST serve `index.html` for every app route (`/`, `/dashboar
 **Future work (explicit out-of-scope for this slice).**
 
 Route parameters / detail pages (`/servers/:id`, `/identities/:id`); auth routes (`/login`, passkey enrollment, session list); deep-link terminal-session launch; route-based data preloading; nested routes; multi-tab workspace; URL-driven renderer selection; URL-driven settings deep-links; shareable URLs that include any backend identifier. Each is a separate slice.
+
+### Production dashboard summary
+
+The Dashboard view is now a real read-only summary instead of a single health badge. It composes existing API helpers — `checkHealth`, `listHosts`, `listServerProfiles`, `listSshIdentities`, and `listTerminalSessions` — into summary cards, a session-status breakdown, a connection-flow checklist, and a fixed set of internal navigation buttons. No new backend route, no new wire shape, no analytics, no polling.
+
+**Scope (load-bearing — this slice).**
+
+1. **Summary cards** render backend health, hosts count, server-profile count, SSH-identity count, and terminal-session count. Each card load is independent — one failure collapses to the card's `unavailable` state, but it does NOT poison the other cards. Counts that are still loading render as a `—` placeholder; failed loads ALSO render as `—` plus an honest "Unavailable" badge so a zero count is never confused with a failure.
+2. **Sessions-by-status breakdown** sums the existing list-endpoint rows by `TerminalSessionStatus` (`active`, `detached`, `starting`, `closed`). The breakdown is reused list data — no new endpoint, no extra round-trip. A list failure collapses the breakdown to a single `Unavailable` line; an empty list renders all-zeros.
+3. **Connection-flow checklist** renders seven steps in a stable order:
+   1. Generate an SSH identity
+   2. Install the public key on the target server
+   3. Create a host
+   4. Create a server profile
+   5. Run host-key preflight and trust the result
+   6. Run the auth-check
+   7. Launch a terminal
+
+   Steps that the inventory counts can prove (`generate-identity`, `create-host`, `create-profile`, `launch-terminal`) flip to `complete` when their underlying count is `> 0`; otherwise they stay `incomplete`. The remaining three steps — `install-public-key`, `host-key-trust`, `auth-check` — are explicitly `manual`. The dashboard does NOT have per-row state to prove a key was installed, a host key was trusted, or an auth-check passed; the checklist row tells the operator to verify from the per-resource view rather than pretending to know.
+4. **Manual refresh only.** A single `Refresh` button drives both the health probe and the four inventory loads in parallel. There is no polling, no auto-refresh, no exponential backoff. The dashboard is a snapshot — operator triage stays on the per-resource views.
+5. **Quick-action navigation.** A small fixed table of in-app navigation buttons (Manage servers, Manage SSH identities, Open terminal, View sessions, Configure terminal) routes through the existing AppShell `navigate(id)` helper — pure pushState, no full page reload, no route parameters. The view targets are pinned against `routing.ts` in `dashboardSummary.test.ts` so dashboard CTAs and the production route table cannot drift out of sync.
+6. **No backend changes.** No new HTTP route, no new WebSocket frame, no new DTO. The slice is purely a frontend addition on top of the existing inventory + health surface.
+
+**Architecture rule preserved.** The new helper module lives at `apps/web/src/lib/app/dashboard/dashboardSummary.ts`; the view stays at `apps/web/src/lib/app/views/DashboardView.svelte`. No imports from `lib/dev/` and no imports from any `@relayterm/terminal-*` adapter package. `appShellIsolation.test.ts` continues to enforce both bans.
+
+**Redaction posture (load-bearing).**
+
+- The helper consumes already-typed DTOs (`Host`, `ServerProfile`, `SshIdentity`, `TerminalSession`) — never raw wire bodies. The DTO parsers in `lib/api/` already drop `private_key` / `encrypted_private_key` / unknown fields; the dashboard helper cannot reintroduce them because nothing copies fields off `unknown`.
+- The dashboard does NOT echo the wire `message` of an HTTP error or the thrown `Error.message` of a transport failure. Per-card failure surfaces as a static `Unavailable` label only.
+- The helper does NOT log raw response bodies. The `Refresh` button is the single user-visible signal that a load happened.
+- The checklist's manual-row copy is asserted in `dashboardSummary.test.ts` against banned phrases ("host-key trusted", "auth-check passed", "key installed", "ready to launch") so a future copy edit cannot smuggle an implication that the dashboard cannot prove.
+
+**Stable selectors (additions only).** `dashboard-refresh`, `dashboard-summary-cards`, `dashboard-card-{health,hosts,profiles,identities,sessions}`, `dashboard-card-{...}-status`, `dashboard-card-{...}-cta`, `dashboard-count-{hosts,profiles,identities,sessions}`, `dashboard-health-probe`, `dashboard-session-breakdown`, `dashboard-session-status-{active,detached,starting,closed}`, `dashboard-session-loading`, `dashboard-session-unavailable`, `dashboard-sessions-cta`, `dashboard-setup-checklist`, `dashboard-checklist-{generate-identity,install-public-key,create-host,create-profile,host-key-trust,auth-check,launch-terminal}`, `dashboard-checklist-{...}-status`, `dashboard-checklist-{...}-cta`, `dashboard-nav-actions`, `dashboard-nav-{manage-servers,manage-identities,open-terminal,view-sessions,configure-terminal}`. The pre-existing `dashboard-inventory-counts` / `dashboard-counts-refresh` / `dashboard-counts-error` selectors are removed by this slice — the new card grid replaces the legacy three-column inventory tile.
+
+**Checklist limitations (load-bearing — operators read this).**
+
+- A `complete` mark on the count-inferable rows proves only that the corresponding row exists in your inventory. It does NOT prove that the host is reachable, that the SSH identity matches the target, or that the next terminal launch will succeed.
+- The `manual` rows do NOT reflect any state the dashboard can observe today. The dashboard cannot tell whether a public key was installed, whether a host-key fingerprint is trusted, or whether the most recent auth-check passed. Future API surfaces may expose that state — at which point the relevant row would graduate from `manual` to count- or flag-inferable; this slice does not anticipate the schema.
+- A `launch-terminal` mark of `complete` means a terminal session has been launched at least once. It is NOT a readiness signal for a new launch.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Backend exposure of host-key trust state and last-auth-check outcome on the profile DTO; a checklist that promotes those rows from `manual` to inferable; charts / time-series widgets; admin / cross-user reporting; auto-refresh / polling; mobile-specific dashboard layout; setup-wizard UX (step-by-step flow); terminal launch directly from dashboard; host-key trust / auth-check directly from dashboard; URL-driven dashboard parameters. Each is a separate slice.
 
 ### Live SSH PTY bridge contract
 

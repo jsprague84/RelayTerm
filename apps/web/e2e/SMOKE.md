@@ -109,7 +109,16 @@ update this file in the same change.
 | `[data-testid="identities-generate-close"]`       | Generate panel close button.                                  |
 | `[data-testid="identities-generate-error"]`       | Generate panel error summary (safe formatter only).           |
 | `[data-testid="identities-generate-success"]`     | Generate panel success card (public-key + copy action).       |
-| `[data-testid="dashboard-inventory-counts"]`      | Dashboard inventory counts card (hosts/profiles/identities).  |
+| `[data-testid="dashboard-refresh"]`               | Dashboard manual-refresh button (drives both health probe and inventory loads in parallel; no polling). |
+| `[data-testid="dashboard-summary-cards"]`         | Dashboard summary card grid (health + hosts/profiles/identities/sessions counts). |
+| `[data-testid="dashboard-card-health"]`           | Dashboard backend-health card (one-shot `/healthz` probe + per-card "Check now" button). |
+| `[data-testid="dashboard-card-hosts"]`            | Dashboard hosts count card.                                   |
+| `[data-testid="dashboard-card-profiles"]`         | Dashboard server-profiles count card.                         |
+| `[data-testid="dashboard-card-identities"]`       | Dashboard SSH-identities count card.                          |
+| `[data-testid="dashboard-card-sessions"]`         | Dashboard terminal-sessions count card.                       |
+| `[data-testid="dashboard-session-breakdown"]`     | Dashboard sessions-by-status card (active/detached/starting/closed). |
+| `[data-testid="dashboard-setup-checklist"]`       | Dashboard connection-flow checklist (count-inferable + manual rows). |
+| `[data-testid="dashboard-nav-actions"]`           | Dashboard quick-action navigation buttons (Manage servers / Manage SSH identities / Open terminal / View sessions / Configure terminal). |
 | `[data-testid="production-view-settings"]`        | Settings view root (local terminal preferences).              |
 | `[data-testid="settings-terminal-appearance"]`    | Terminal appearance card (font / cursor / scrollback / theme controls). |
 | `[data-testid="settings-font-family"]`            | Font-family text input.                                       |

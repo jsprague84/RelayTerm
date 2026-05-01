@@ -172,7 +172,7 @@
     >
       <div class="mx-auto flex max-w-4xl flex-col gap-6">
         {#if selected === "dashboard"}
-          <DashboardView />
+          <DashboardView onNavigate={(id) => navigate(id)} />
         {:else if selected === "terminal"}
           <TerminalView
             launch={activeLaunch}
