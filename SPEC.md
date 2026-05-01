@@ -500,7 +500,7 @@ apps/web/src/lib/api/
 ├─ health.ts                   # checkHealth() helper
 ├─ hosts.ts                    # listHosts() + parseHost()
 ├─ serverProfiles.ts           # listServerProfiles() + parseServerProfile() + resolveProfileLinks()
-└─ sshIdentities.ts            # listSshIdentities() + parseSshIdentity() + publicKeyPreview()
+└─ sshIdentities.ts            # listSshIdentities() + parseSshIdentity() + publicKeyPreview() + createSshIdentity()
 ```
 
 **Future work (explicit out-of-scope for this slice).**
@@ -535,7 +535,43 @@ The Servers and Identities views are display-only inventories of `hosts`, `serve
 
 **Future work (explicit out-of-scope for this slice).**
 
-CRUD forms (create / edit / delete) for hosts, profiles, and identities; SSH identity generation UI; private-key import; host-key preflight and trust UI; auth-check UI; terminal session launch from the production shell; per-row "view details" / `get_by_id` panels; password bootstrap / `ssh-copy-id`; durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice.
+CRUD forms (create / edit / delete) for hosts and profiles; SSH identity deletion / rename; private-key import; host-key preflight and trust UI; auth-check UI; terminal session launch from the production shell; per-row "view details" / `get_by_id` panels; password bootstrap / `ssh-copy-id`; durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice.
+
+### Production SSH identity generation UI
+
+The first production-safe write flow on the Identities view: an operator can ask the backend to generate a fresh keypair, see only the public metadata, and copy the OpenSSH public key for manual installation on the target server. No private material is ever rendered, copied, logged, or returned over the wire.
+
+**Scope (load-bearing — this slice).**
+
+1. **"Generate SSH identity" panel** lives on `IdentitiesView.svelte`, opened by a button in the view header. The form has a name input (≤ {`MAX_IDENTITY_NAME_LEN` = 64} characters, no surrounding whitespace, no control characters) and a key-type select bound to `SUPPORTED_GENERATION_KEY_TYPES`. The submit button is disabled while a request is in flight or while the trimmed name is empty. The "Close" button is disabled while submitting so an in-flight request cannot be orphaned.
+2. **`createSshIdentity(request, options)`** in `lib/api/sshIdentities.ts` is the single client entry point. It client-side-validates the request (mirrors the backend's `CreateSshIdentityRequest::validate` rules), POSTs `{ name, key_type }` to `/api/v1/ssh-identities`, parses the response with `parseSshIdentity` (which already drops `private_key`/`encrypted_private_key`), and returns a typed `CreateSshIdentityResult`. It does not throw, does not log raw response bodies, and does not echo wire / transport detail through any user-facing string.
+3. **Supported key types** are gated by `SUPPORTED_GENERATION_KEY_TYPES` — currently `["ed25519"]`, the deliberate intersection of the wire-stable `SshKeyType` union (which has to decode legacy rows) and what the backend vault can actually generate today. A test pins this against drift.
+4. **Success UI** renders name, key type, SHA-256 fingerprint, created-at, the full OpenSSH public key in a `<pre>`, and a "Copy public key" button (re-uses the existing `copyPublicKey` helper). The success card stays visible until the user closes the panel; the new identity is also prepended to the inventory list (or a refresh is triggered if the list was loading/errored).
+5. **Error UI** renders one line from `describeCreateSshIdentityError` and nothing else. The summary is a function of `kind` + `status` + `code` (and the validation `reason` enum) only — never the wire `message`, never the transport `Error.message`. A 503 `service_unavailable` is collapsed to a friendly "backend vault is not configured" hint so an operator running without a master key sees an actionable message; every other HTTP error keeps the raw `HTTP <status> <code>` form.
+6. **No backend changes.** The existing `POST /api/v1/ssh-identities` route already returns the wire shape the inventory parser consumes; the slice is purely a frontend addition.
+7. **Architecture rule preserved.** No import added under `lib/app/` touches `lib/dev/` or any renderer adapter; `appShellIsolation.test.ts` continues to pass.
+
+**Redaction posture (load-bearing).**
+
+- The `SshIdentity` TypeScript DTO does not declare `encrypted_private_key` or `private_key`. `parseSshIdentity` constructs the DTO field-by-field, so a backend bug or hostile fixture that includes those keys on a 201 response cannot smuggle them onto the returned object. Sentinel tests in `tests/inventoryApi.test.ts` pin this for both the parser and the `createSshIdentity` happy path.
+- `describeCreateSshIdentityError` is the only formatter that reaches the UI. It never echoes the wire `message` or transport `Error.message`. Sentinel tests pin this against future regressions for `http`, `transport`, and `service_unavailable` kinds.
+- The success card surfaces the OpenSSH public key in exactly two places: a `<pre>` for inspection and the "Copy public key" button (which copies `identity.public_key` only). The key never appears in `title=` / `aria-*` tooltips, console output, or any data attribute.
+- Generation surface mirrors the existing list/copy redaction discipline: helpers do NOT log raw response bodies; tests pin `console.log/warn/error` as untouched across success, HTTP failure, and transport failure.
+
+**Wire shapes (mirror of `crates/relayterm-api/src/dto/ssh_identity.rs`).**
+
+- Request: `{ name: string, key_type?: "ed25519" }`. The backend accepts the broader `SshKeyType` union as a string but the client gates it to `SUPPORTED_GENERATION_KEY_TYPES` so a UI typo cannot reach the boundary.
+- Response (`201 Created`): the same `SshIdentity` shape used by `listSshIdentities` — `{ id, name, key_type, public_key, fingerprint_sha256, created_at, last_used_at }`. No private-key field exists on the wire.
+
+**UX copy (load-bearing).**
+
+- The panel intro states that RelayTerm generated the keypair on the backend, the private key is encrypted at rest with the master key and never reaches the browser, and that copy/install on `~/.ssh/authorized_keys` is currently manual.
+- The success card explicitly tells the operator to append the public key to the target server. It does NOT imply the key is already installed, that the identity can already authenticate against any host, or that the private key can be recovered from the UI.
+- The footer note carries the future-work list: deletion, rename, private-key import, password bootstrap, and `ssh-copy-id` automation are deliberate later slices.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Identity deletion and rename; private-key import (BYOK); editing the name after creation; password bootstrap and `ssh-copy-id` to automate `authorized_keys` install; per-identity audit log surface; multi-vault key rotation. Each is a separate slice.
 
 ### Live SSH PTY bridge contract
 

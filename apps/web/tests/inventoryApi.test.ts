@@ -13,9 +13,14 @@ import {
   type ServerProfile,
 } from "../src/lib/api/serverProfiles.js";
 import {
+  createSshIdentity,
+  describeCreateSshIdentityError,
   listSshIdentities,
+  MAX_IDENTITY_NAME_LEN,
   parseSshIdentity,
   publicKeyPreview,
+  SUPPORTED_GENERATION_KEY_TYPES,
+  validateCreateSshIdentityRequest,
   type SshIdentity,
 } from "../src/lib/api/sshIdentities.js";
 
@@ -442,6 +447,310 @@ describe("listSshIdentities", () => {
     if (result.ok) {
       expect(JSON.stringify(result.data)).not.toContain(SENTINEL_PRIVATE_KEY);
     }
+  });
+});
+
+describe("validateCreateSshIdentityRequest", () => {
+  it("accepts a well-formed request with a default key type", () => {
+    const result = validateCreateSshIdentityRequest({ name: "primary" });
+    expect(result).toEqual({
+      ok: true,
+      body: { name: "primary", key_type: "ed25519" },
+    });
+  });
+
+  it("accepts an explicit ed25519 key type", () => {
+    const result = validateCreateSshIdentityRequest({
+      name: "primary",
+      key_type: "ed25519",
+    });
+    expect(result).toEqual({
+      ok: true,
+      body: { name: "primary", key_type: "ed25519" },
+    });
+  });
+
+  it("rejects an empty or whitespace-only name", () => {
+    expect(validateCreateSshIdentityRequest({ name: "" })).toEqual({
+      ok: false,
+      reason: "missing_name",
+    });
+    expect(validateCreateSshIdentityRequest({ name: "    " })).toEqual({
+      ok: false,
+      reason: "missing_name",
+    });
+  });
+
+  it("rejects surrounding whitespace (mirrors the backend's rule)", () => {
+    expect(validateCreateSshIdentityRequest({ name: " primary" })).toEqual({
+      ok: false,
+      reason: "name_has_surrounding_whitespace",
+    });
+    expect(validateCreateSshIdentityRequest({ name: "primary " })).toEqual({
+      ok: false,
+      reason: "name_has_surrounding_whitespace",
+    });
+  });
+
+  it("rejects names longer than MAX_IDENTITY_NAME_LEN", () => {
+    expect(
+      validateCreateSshIdentityRequest({
+        name: "a".repeat(MAX_IDENTITY_NAME_LEN + 1),
+      }),
+    ).toEqual({ ok: false, reason: "name_too_long" });
+  });
+
+  it("rejects control characters", () => {
+    // C0 (U+0000, U+001F) and C1 (U+007F DEL, U+0085 NEL).
+    for (const ch of ["\u0000", "\u001F", "\u007F", "\u0085"]) {
+      expect(
+        validateCreateSshIdentityRequest({ name: `bad${ch}name` }),
+      ).toEqual({ ok: false, reason: "name_has_control_chars" });
+    }
+  });
+
+  it("rejects key types outside SUPPORTED_GENERATION_KEY_TYPES", () => {
+    // Wire-stable types that the vault cannot generate today must not
+    // smuggle through the client validator. The backend would 400 with
+    // `unsupported key_type` — we refuse locally so the UI can show a
+    // clean message without burning a request.
+    for (const tag of ["rsa", "ecdsa_p256", "ecdsa_p384", "ecdsa_p521"] as const) {
+      expect(
+        validateCreateSshIdentityRequest({ name: "p", key_type: tag }),
+      ).toEqual({ ok: false, reason: "unsupported_key_type" });
+    }
+  });
+
+  it("SUPPORTED_GENERATION_KEY_TYPES contains exactly ed25519 today", () => {
+    // Pinning the intersection: surface a compile/test break the moment
+    // a UI option drifts ahead of (or behind) the vault's generators.
+    expect(SUPPORTED_GENERATION_KEY_TYPES).toEqual(["ed25519"]);
+  });
+});
+
+describe("describeCreateSshIdentityError", () => {
+  it("describes each kind without echoing wire / transport detail", () => {
+    expect(
+      describeCreateSshIdentityError({
+        kind: "validation",
+        reason: "missing_name",
+      }),
+    ).toBe("Cannot generate SSH identity: name is required");
+    expect(
+      describeCreateSshIdentityError({
+        kind: "validation",
+        reason: "name_too_long",
+      }),
+    ).toContain(`${MAX_IDENTITY_NAME_LEN} characters`);
+    expect(
+      describeCreateSshIdentityError({
+        kind: "http",
+        status: 400,
+        code: "invalid_input",
+        message: SENTINEL_OPERATOR,
+      }),
+    ).toBe("Failed to generate SSH identity: HTTP 400 invalid_input");
+    expect(
+      describeCreateSshIdentityError({
+        kind: "transport",
+        message: `boom ${SENTINEL_OPERATOR}`,
+      }),
+    ).toBe("Failed to generate SSH identity: transport error");
+    expect(
+      describeCreateSshIdentityError({ kind: "malformed_response" }),
+    ).toBe("Failed to generate SSH identity: malformed response");
+  });
+
+  it("collapses 503 service_unavailable to a vault-not-configured hint", () => {
+    expect(
+      describeCreateSshIdentityError({
+        kind: "http",
+        status: 503,
+        code: "service_unavailable",
+        message: SENTINEL_OPERATOR,
+      }),
+    ).toBe("Cannot generate SSH identity: backend vault is not configured");
+  });
+
+  it("never echoes operator detail in any output", () => {
+    const cases = [
+      describeCreateSshIdentityError({
+        kind: "http",
+        status: 502,
+        code: "bad_gateway",
+        message: SENTINEL_OPERATOR,
+      }),
+      describeCreateSshIdentityError({
+        kind: "transport",
+        message: `request to https://example.com/${SENTINEL_OPERATOR}`,
+      }),
+      describeCreateSshIdentityError({
+        kind: "http",
+        status: 503,
+        code: "service_unavailable",
+        message: SENTINEL_OPERATOR,
+      }),
+    ];
+    for (const summary of cases) {
+      expect(summary).not.toContain(SENTINEL_OPERATOR);
+      expect(summary).not.toContain("https://");
+    }
+  });
+});
+
+describe("createSshIdentity", () => {
+  it("targets POST /api/v1/ssh-identities with the validated body", async () => {
+    const captured: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchImpl = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      captured.push({ url: String(input), init });
+      return jsonResponse(201, IDENTITY_FIXTURE);
+    }) as unknown as typeof fetch;
+    const result = await createSshIdentity(
+      { name: "primary", key_type: "ed25519" },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].url).toBe("/api/v1/ssh-identities");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(JSON.parse(String(captured[0].init?.body))).toEqual({
+      name: "primary",
+      key_type: "ed25519",
+    });
+  });
+
+  it("refuses an invalid request before issuing a wire round-trip", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(201, IDENTITY_FIXTURE);
+    }) as unknown as typeof fetch;
+    const result = await createSshIdentity({ name: "  " }, { fetchImpl });
+    expect(result.ok).toBe(false);
+    expect(calls).toBe(0);
+    if (!result.ok && result.error.kind === "validation") {
+      expect(result.error.reason).toBe("missing_name");
+    } else {
+      expect.fail("expected validation error");
+    }
+  });
+
+  it("redaction sentinel: a 201 response with private-key fields parses without leaking", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(201, {
+        ...IDENTITY_FIXTURE,
+        encrypted_private_key: SENTINEL_PRIVATE_KEY,
+        private_key: SENTINEL_PRIVATE_KEY,
+      })) as unknown as typeof fetch;
+    const result = await createSshIdentity(
+      { name: "primary" },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(JSON.stringify(result.identity)).not.toContain(
+        SENTINEL_PRIVATE_KEY,
+      );
+      expect(
+        Object.prototype.hasOwnProperty.call(
+          result.identity,
+          "encrypted_private_key",
+        ),
+      ).toBe(false);
+      expect(
+        Object.prototype.hasOwnProperty.call(result.identity, "private_key"),
+      ).toBe(false);
+    }
+  });
+
+  it("maps a 4xx envelope to a typed http error (operator detail dropped)", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(400, {
+        error: {
+          code: "invalid_input",
+          message: "name must not be empty",
+          operator_detail: SENTINEL_OPERATOR,
+        },
+      })) as unknown as typeof fetch;
+    const result = await createSshIdentity(
+      { name: "primary" },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok && result.error.kind === "http") {
+      expect(result.error.status).toBe(400);
+      expect(result.error.code).toBe("invalid_input");
+      expect(JSON.stringify(result.error)).not.toContain(SENTINEL_OPERATOR);
+      // The formatter never echoes the wire `message`.
+      expect(describeCreateSshIdentityError(result.error)).not.toContain(
+        SENTINEL_OPERATOR,
+      );
+    } else {
+      expect.fail("expected http error");
+    }
+  });
+
+  it("maps a transport rejection to a typed transport error (formatter redacts)", async () => {
+    const fetchImpl = (async () => {
+      throw new Error(`network ${SENTINEL_OPERATOR}`);
+    }) as unknown as typeof fetch;
+    const result = await createSshIdentity(
+      { name: "primary" },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok && result.error.kind === "transport") {
+      expect(describeCreateSshIdentityError(result.error)).not.toContain(
+        SENTINEL_OPERATOR,
+      );
+    } else {
+      expect.fail("expected transport error");
+    }
+  });
+
+  it("collapses an unparseable 2xx body to malformed_response", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(201, {
+        id: "broken" /* missing required fields */,
+      })) as unknown as typeof fetch;
+    const result = await createSshIdentity(
+      { name: "primary" },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual({ kind: "malformed_response" });
+    }
+  });
+
+  it("does not log raw response bodies on success or failure", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const successFetch = (async () =>
+      jsonResponse(201, IDENTITY_FIXTURE)) as unknown as typeof fetch;
+    await createSshIdentity({ name: "primary" }, { fetchImpl: successFetch });
+    const httpFetch = (async () =>
+      jsonResponse(503, {
+        error: { code: "service_unavailable", message: "service unavailable" },
+      })) as unknown as typeof fetch;
+    await createSshIdentity({ name: "primary" }, { fetchImpl: httpFetch });
+    const transportFetch = (async () => {
+      throw new Error("boom");
+    }) as unknown as typeof fetch;
+    await createSshIdentity(
+      { name: "primary" },
+      { fetchImpl: transportFetch },
+    );
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(logSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
   });
 });
 

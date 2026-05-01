@@ -1,8 +1,12 @@
 <script lang="ts">
   import {
+    createSshIdentity,
+    describeCreateSshIdentityError,
     listSshIdentities,
     publicKeyPreview,
+    SUPPORTED_GENERATION_KEY_TYPES,
     type SshIdentity,
+    type SshKeyType,
   } from "../../api/sshIdentities.js";
   import { describeLoadError } from "../../api/apiErrors.js";
 
@@ -14,8 +18,19 @@
 
   type CopyState = "idle" | "copied" | "failed";
 
+  type GenerateState =
+    | { kind: "idle" }
+    | { kind: "submitting" }
+    | { kind: "success"; identity: SshIdentity }
+    | { kind: "error"; summary: string };
+
   let view = $state<LoadState>({ kind: "idle" });
   let copy = $state<Record<string, CopyState>>({});
+
+  let panelOpen = $state(false);
+  let formName = $state("");
+  let formKeyType = $state<SshKeyType>(SUPPORTED_GENERATION_KEY_TYPES[0]);
+  let generate = $state<GenerateState>({ kind: "idle" });
 
   async function load() {
     view = { kind: "loading" };
@@ -67,6 +82,56 @@
     if (s === "failed") return "Copy failed";
     return "Copy public key";
   }
+
+  function openPanel() {
+    panelOpen = true;
+    if (generate.kind !== "submitting") {
+      generate = { kind: "idle" };
+    }
+  }
+
+  function closePanel() {
+    if (generate.kind === "submitting") return;
+    panelOpen = false;
+    formName = "";
+    formKeyType = SUPPORTED_GENERATION_KEY_TYPES[0];
+    generate = { kind: "idle" };
+  }
+
+  async function submitGenerate(event: Event) {
+    event.preventDefault();
+    if (generate.kind === "submitting") return;
+    generate = { kind: "submitting" };
+    const result = await createSshIdentity({
+      name: formName,
+      key_type: formKeyType,
+    });
+    if (!result.ok) {
+      // describeCreateSshIdentityError is the only redaction-safe
+      // formatter — never echo `result.error.message` directly.
+      generate = {
+        kind: "error",
+        summary: describeCreateSshIdentityError(result.error),
+      };
+      return;
+    }
+    // The parser already dropped any private_key / encrypted_private_key
+    // field that might have been on the wire. Appending the parsed DTO
+    // directly is safe and avoids a second list round-trip.
+    if (view.kind === "ready") {
+      const exists = view.identities.some((i) => i.id === result.identity.id);
+      view = exists
+        ? view
+        : { kind: "ready", identities: [result.identity, ...view.identities] };
+    } else {
+      // List was loading or errored — refetch so the list catches up.
+      void load();
+    }
+    generate = { kind: "success", identity: result.identity };
+    formName = "";
+    // Leave the panel open so the success card (with the public-key copy
+    // action) is visible. The user closes it deliberately.
+  }
 </script>
 
 <section
@@ -78,9 +143,9 @@
       SSH identities
     </h2>
     <p class="text-sm text-zinc-400">
-      Read-only inventory of vault-managed SSH keypairs. Public material
-      only — the encrypted private key never leaves the backend and is
-      never rendered, copied, or logged on the client.
+      Vault-managed SSH keypairs. The private key is generated and
+      encrypted on the backend and is never rendered, copied, or logged
+      on the client. Public material only.
     </p>
   </header>
 
@@ -94,7 +159,184 @@
     >
       {view.kind === "loading" ? "Loading…" : "Refresh"}
     </button>
+    {#if !panelOpen}
+      <button
+        type="button"
+        class="rounded-md border border-emerald-800/60 bg-emerald-900/20 px-3 py-1.5 text-sm text-emerald-100 transition hover:border-emerald-700 hover:bg-emerald-900/40"
+        onclick={openPanel}
+        data-testid="identities-generate-open"
+      >
+        Generate SSH identity
+      </button>
+    {/if}
   </div>
+
+  {#if panelOpen}
+    <article
+      class="flex flex-col gap-4 rounded-lg border border-emerald-900/40 bg-emerald-950/10 p-6"
+      data-testid="identities-generate-panel"
+    >
+      <header class="flex items-baseline justify-between gap-2">
+        <h3 class="text-sm font-semibold text-zinc-100">
+          Generate a new SSH identity
+        </h3>
+        <button
+          type="button"
+          class="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800 disabled:opacity-50"
+          onclick={closePanel}
+          disabled={generate.kind === "submitting"}
+          data-testid="identities-generate-close"
+        >
+          Close
+        </button>
+      </header>
+
+      <ul class="flex flex-col gap-1 text-xs text-zinc-400">
+        <li>
+          RelayTerm generates the keypair on the backend inside the
+          vault. The private key is encrypted at rest with the master
+          key and never reaches the browser.
+        </li>
+        <li>
+          After generation, copy the public key and append it to the
+          target server's <code class="font-mono text-zinc-300"
+            >~/.ssh/authorized_keys</code
+          > manually. Password bootstrap and <code
+            class="font-mono text-zinc-300">ssh-copy-id</code
+          > automation are deliberate later slices.
+        </li>
+        <li>
+          The private key cannot be exported or recovered through the
+          UI today.
+        </li>
+      </ul>
+
+      <form
+        class="flex flex-col gap-3"
+        onsubmit={submitGenerate}
+        data-testid="identities-generate-form"
+      >
+        <label class="flex flex-col gap-1 text-sm text-zinc-200">
+          <span class="text-xs uppercase tracking-wide text-zinc-400">
+            Name
+          </span>
+          <input
+            type="text"
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-700 focus:outline-none disabled:opacity-50"
+            bind:value={formName}
+            placeholder="e.g. workstation-primary"
+            maxlength="64"
+            disabled={generate.kind === "submitting"}
+            data-testid="identities-generate-name"
+            autocomplete="off"
+            spellcheck="false"
+            required
+          />
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm text-zinc-200">
+          <span class="text-xs uppercase tracking-wide text-zinc-400">
+            Key type
+          </span>
+          <select
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-700 focus:outline-none disabled:opacity-50"
+            bind:value={formKeyType}
+            disabled={generate.kind === "submitting"}
+            data-testid="identities-generate-key-type"
+          >
+            {#each SUPPORTED_GENERATION_KEY_TYPES as keyType (keyType)}
+              <option value={keyType}>{keyType}</option>
+            {/each}
+          </select>
+          <span class="text-[11px] text-zinc-500">
+            Ed25519 is the only key type the vault can generate today.
+          </span>
+        </label>
+
+        <div class="flex items-center gap-2">
+          <button
+            type="submit"
+            class="rounded-md border border-emerald-700 bg-emerald-800 px-3 py-1.5 text-sm text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+            disabled={generate.kind === "submitting" ||
+              formName.trim().length === 0}
+            data-testid="identities-generate-submit"
+          >
+            {generate.kind === "submitting"
+              ? "Generating…"
+              : "Generate identity"}
+          </button>
+          {#if generate.kind === "submitting"}
+            <span class="text-xs text-zinc-400">
+              Generating keypair on the backend…
+            </span>
+          {/if}
+        </div>
+      </form>
+
+      {#if generate.kind === "error"}
+        <p
+          class="rounded-md border border-rose-900/40 bg-rose-950/20 px-3 py-2 text-xs text-rose-200/80"
+          data-testid="identities-generate-error"
+        >
+          {generate.summary}
+        </p>
+      {:else if generate.kind === "success"}
+        {@const generated = generate.identity}
+        <article
+          class="flex flex-col gap-2 rounded-md border border-emerald-900/50 bg-emerald-950/30 p-4 text-sm text-emerald-50"
+          data-testid="identities-generate-success"
+        >
+          <header class="flex items-baseline justify-between gap-2">
+            <span class="text-sm font-semibold">
+              Generated <span data-testid="identities-generate-success-name"
+                >{generated.name}</span
+              >
+            </span>
+            <span
+              class="font-mono text-xs uppercase tracking-wide text-emerald-200/80"
+              data-testid="identities-generate-success-key-type"
+            >
+              {generated.key_type}
+            </span>
+          </header>
+          <span
+            class="font-mono text-xs text-emerald-100/80"
+            data-testid="identities-generate-success-fingerprint"
+          >
+            {generated.fingerprint_sha256}
+          </span>
+          <span class="text-xs text-emerald-200/70">
+            Created
+            <time class="font-mono">{generated.created_at}</time>
+          </span>
+          <div class="flex flex-col gap-1">
+            <span class="text-xs uppercase tracking-wide text-emerald-200/70">
+              Public key
+            </span>
+            <pre
+              class="overflow-x-auto rounded-md border border-emerald-900/40 bg-zinc-950/60 p-3 font-mono text-[11px] text-emerald-50/90"
+              data-testid="identities-generate-success-public-key"><code
+                >{generated.public_key}</code
+              ></pre>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700"
+                onclick={() => copyPublicKey(generated)}
+                data-testid="identities-generate-success-copy"
+              >
+                {copyLabel(copy[generated.id])}
+              </button>
+              <span class="text-[11px] text-emerald-200/60">
+                Append to the target server's
+                <code class="font-mono">~/.ssh/authorized_keys</code>.
+              </span>
+            </div>
+          </div>
+        </article>
+      {/if}
+    </article>
+  {/if}
 
   {#if view.kind === "loading" || view.kind === "idle"}
     <p
@@ -126,9 +368,8 @@
       </header>
       {#if view.identities.length === 0}
         <p class="text-sm text-zinc-400" data-testid="identities-empty">
-          No SSH identities yet. Generation UI is not implemented in
-          this view — identities are created through the backend API
-          today.
+          No SSH identities yet. Use “Generate SSH identity” above to
+          create one.
         </p>
       {:else}
         <ul
@@ -206,7 +447,8 @@
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Generation UI, deletion, and private-key import are deliberate
+    Deletion, rename, private-key import, and password bootstrap /
+    <code class="font-mono">ssh-copy-id</code> automation are deliberate
     later slices. This view never renders or copies private material.
   </p>
 </section>
