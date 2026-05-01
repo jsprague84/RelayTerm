@@ -16,6 +16,7 @@
    */
   import ProductionTerminal from "../terminal/ProductionTerminal.svelte";
   import type { ActiveLaunch } from "../terminal/activeLaunch.js";
+  import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
 
   interface Props {
     launch: ActiveLaunch | null;
@@ -71,6 +72,22 @@
         </span>
       </li>
     </ul>
+    <div class="grid grid-cols-1 gap-2 text-[11px] text-zinc-500 md:grid-cols-2">
+      <p
+        class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2"
+        data-testid="terminal-empty-settings-note"
+      >
+        <span class="font-medium text-zinc-400">Appearance.</span>
+        {TERMINAL_UX_COPY.settingsApplyNote}
+      </p>
+      <p
+        class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2"
+        data-testid="terminal-empty-copy-paste-note"
+      >
+        <span class="font-medium text-zinc-400">Copy &amp; paste.</span>
+        {TERMINAL_UX_COPY.copyPasteNote}
+      </p>
+    </div>
     <p
       class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
     >

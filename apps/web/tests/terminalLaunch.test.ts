@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   buildAttachWsUrl,
   computeWorkspaceEnablement,
@@ -8,6 +8,10 @@ import {
   describeWorkspaceError,
   phaseLabel,
   phaseTone,
+  safeClearViewport,
+  safeFit,
+  safeFocus,
+  TERMINAL_UX_COPY,
   type WorkspacePhase,
 } from "../src/lib/app/terminal/terminalLaunch.js";
 
@@ -99,13 +103,16 @@ describe("phase label/tone tables", () => {
 });
 
 describe("computeWorkspaceEnablement", () => {
-  it("enables detach/close/dispose only while attached", () => {
+  it("enables detach/close/dispose/focus/fit/clear only while attached", () => {
     const e = computeWorkspaceEnablement({ phase: "attached", lastSeenSeq: 0 });
     expect(e).toEqual({
       detach: true,
       close: true,
       reconnect: false,
       dispose: true,
+      focus: true,
+      fit: true,
+      clear: true,
     });
   });
 
@@ -115,6 +122,9 @@ describe("computeWorkspaceEnablement", () => {
     expect(e.close).toBe(true);
     expect(e.dispose).toBe(true);
     expect(e.reconnect).toBe(false);
+    expect(e.focus).toBe(true);
+    expect(e.fit).toBe(true);
+    expect(e.clear).toBe(true);
   });
 
   it("enables reconnect from detached/closed/error only when lastSeenSeq > 0", () => {
@@ -144,6 +154,9 @@ describe("computeWorkspaceEnablement", () => {
       close: false,
       reconnect: false,
       dispose: false,
+      focus: false,
+      fit: false,
+      clear: false,
     });
   });
 
@@ -151,6 +164,22 @@ describe("computeWorkspaceEnablement", () => {
     expect(
       computeWorkspaceEnablement({ phase: "creating", lastSeenSeq: 0 }).dispose,
     ).toBe(false);
+  });
+
+  it("disables focus/fit/clear unless live", () => {
+    for (const p of [
+      "idle",
+      "creating",
+      "connecting",
+      "detached",
+      "closed",
+      "error",
+    ] as const) {
+      const e = computeWorkspaceEnablement({ phase: p, lastSeenSeq: 5 });
+      expect(e.focus).toBe(false);
+      expect(e.fit).toBe(false);
+      expect(e.clear).toBe(false);
+    }
   });
 });
 
@@ -246,6 +275,112 @@ describe("describeWorkspaceError", () => {
     ];
     for (const err of inputs) {
       expect(describeWorkspaceError(err)).not.toContain(SENTINEL);
+    }
+  });
+});
+
+describe("safeFocus", () => {
+  it("returns false for null/undefined renderer", () => {
+    expect(safeFocus(null)).toBe(false);
+    expect(safeFocus(undefined)).toBe(false);
+  });
+
+  it("calls focus and returns true on a present renderer", () => {
+    const focus = vi.fn();
+    expect(safeFocus({ focus })).toBe(true);
+    expect(focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns false when renderer.focus throws (dispose race)", () => {
+    const focus = vi.fn(() => {
+      throw new Error("disposed");
+    });
+    expect(safeFocus({ focus })).toBe(false);
+    expect(focus).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("safeFit", () => {
+  it("returns null for missing renderer", () => {
+    expect(safeFit(null)).toBeNull();
+    expect(safeFit(undefined)).toBeNull();
+  });
+
+  it("forwards the renderer's fit dims when defined", () => {
+    expect(safeFit({ fit: () => ({ cols: 132, rows: 50 }) })).toEqual({
+      cols: 132,
+      rows: 50,
+    });
+  });
+
+  it("returns null when renderer declines (pre-mount) without throwing", () => {
+    expect(safeFit({ fit: () => null })).toBeNull();
+  });
+
+  it("returns null when renderer.fit throws", () => {
+    expect(
+      safeFit({
+        fit: () => {
+          throw new Error("disposed");
+        },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("safeClearViewport", () => {
+  it("returns false for missing renderer", () => {
+    expect(safeClearViewport(null)).toBe(false);
+    expect(safeClearViewport(undefined)).toBe(false);
+  });
+
+  it("calls clear and never invokes any wire-frame surface", () => {
+    const clear = vi.fn();
+    const surface = { clear };
+    expect(safeClearViewport(surface)).toBe(true);
+    expect(clear).toHaveBeenCalledTimes(1);
+    // No backend client surface is reachable from the helper signature
+    // — this test pins the contract by structure: `safeClearViewport`
+    // takes a `ClearableRenderer` only, never a session client or
+    // transport. Adding a wire-side call would require widening the
+    // type, which would trip review.
+  });
+
+  it("returns false when renderer.clear throws", () => {
+    expect(
+      safeClearViewport({
+        clear: () => {
+          throw new Error("disposed");
+        },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("TERMINAL_UX_COPY", () => {
+  it("settings note names the apply-on-new-session limitation", () => {
+    expect(TERMINAL_UX_COPY.settingsApplyNote.toLowerCase()).toContain(
+      "new terminal sessions",
+    );
+  });
+
+  it("copy/paste note flags bracketed paste / OSC 52 as future work", () => {
+    const note = TERMINAL_UX_COPY.copyPasteNote.toLowerCase();
+    expect(note).toContain("future work");
+    expect(note).toContain("bracketed");
+    expect(note).toContain("osc 52");
+  });
+
+  it("static UX copy never contains operator-detail / bytes / private-key sentinels", () => {
+    const blob = Object.values(TERMINAL_UX_COPY).join("\n");
+    for (const banned of [
+      SENTINEL,
+      "private_key",
+      "encrypted_private_key",
+      "BEGIN OPENSSH",
+      "session_output",
+    ]) {
+      expect(blob).not.toContain(banned);
     }
   });
 });

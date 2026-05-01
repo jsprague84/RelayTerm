@@ -37,6 +37,7 @@
     TERMINAL_THEME_PRESETS,
     findThemePreset,
   } from "../settings/themePresets.js";
+  import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
 
   type SaveState =
     | { kind: "idle" }
@@ -351,13 +352,30 @@ Last login: Mon May  1 14:02:51
     {/if}
   </div>
 
+  <div class="grid grid-cols-1 gap-2 text-[11px] text-zinc-500 md:grid-cols-2">
+    <p
+      class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2"
+      data-testid="settings-apply-note"
+    >
+      <span class="font-medium text-zinc-400">When changes apply.</span>
+      {TERMINAL_UX_COPY.settingsApplyNote}
+    </p>
+    <p
+      class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2"
+      data-testid="settings-copy-paste-note"
+    >
+      <span class="font-medium text-zinc-400">Copy &amp; paste.</span>
+      {TERMINAL_UX_COPY.copyPasteNote}
+    </p>
+  </div>
+
   <p
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
     Per-server-profile preferences, custom palettes, keybinding editor,
-    copy/paste policy, production renderer selection, and mobile/Tauri
-    settings are deliberate later slices. Today's settings are stored
-    locally in this browser only.
+    copy/paste policy editor, production renderer selection, and
+    mobile/Tauri settings are deliberate later slices. Today's settings
+    are stored locally in this browser only.
   </p>
 </section>

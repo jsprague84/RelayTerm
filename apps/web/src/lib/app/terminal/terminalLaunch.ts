@@ -132,6 +132,25 @@ export interface WorkspaceEnablement {
   reconnect: boolean;
   /** Tear down the local client/renderer and return to idle. */
   dispose: boolean;
+  /**
+   * Move browser focus into the renderer surface. Meaningful whenever
+   * a renderer is mounted — the live-replay phases — and a no-op
+   * otherwise (the safe-focus helper still tolerates a missing
+   * renderer; the enablement just hides the affordance).
+   */
+  focus: boolean;
+  /**
+   * Refit the renderer to the container and emit a fresh `resize`
+   * frame to the backend. Same scope as `focus`: only meaningful while
+   * a renderer is live.
+   */
+  fit: boolean;
+  /**
+   * Clear the LOCAL viewport + scrollback. Safe whenever the renderer
+   * is mounted; never sends a wire frame and never mutates the backend
+   * replay buffer.
+   */
+  clear: boolean;
 }
 
 const ATTACHED_PHASES = new Set<WorkspacePhase>(["attached", "replaying"]);
@@ -151,6 +170,9 @@ export function computeWorkspaceEnablement(
     close: attached,
     reconnect: reconnectable && input.lastSeenSeq > 0,
     dispose: input.phase !== "idle" && input.phase !== "creating",
+    focus: attached,
+    fit: attached,
+    clear: attached,
   };
 }
 
@@ -214,6 +236,102 @@ export function describeWorkspaceError(err: TerminalClientError): string {
         : `Server error: ${err.code}`;
   }
 }
+
+/**
+ * Renderer surface a workspace control needs to drive. Kept minimal so
+ * the safe-helper functions below can be exercised against a stub in
+ * vitest without dragging in the real `XtermRenderer`.
+ */
+export interface FocusableRenderer {
+  focus(): void;
+}
+
+export interface FittableRenderer {
+  /**
+   * Returns the post-fit cell-grid dimensions, or `null` if the
+   * renderer declined (e.g. before mount). The shape mirrors
+   * `XtermRenderer.fit`.
+   */
+  fit(): { cols: number; rows: number } | null;
+}
+
+export interface ClearableRenderer {
+  clear(): void;
+}
+
+/**
+ * Call `renderer.focus()` if the renderer exists and the call is safe.
+ * Returns `true` when the call was made, `false` otherwise. The wrapper
+ * absorbs synchronous throws so a torn-down or mid-dispose renderer
+ * never escalates a focus request into an uncaught exception. Errors
+ * are NOT logged — the renderer disposed-state branch is expected, and
+ * silencing the rest matches the redaction posture (an error message
+ * could surface the renderer's internal state).
+ */
+export function safeFocus(renderer: FocusableRenderer | null | undefined): boolean {
+  if (!renderer) return false;
+  try {
+    renderer.focus();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Call `renderer.fit()` if the renderer exists. Returns the post-fit
+ * dims when the renderer fitted, or `null` if it declined or threw.
+ *
+ * The wire `resize` frame is driven by the renderer's own `onResize`
+ * fanout — xterm's fit addon fires the listener synchronously, and the
+ * workspace subscribes to that signal in exactly one place. Do NOT
+ * call `client.sendResize` from the call site of this helper, and do
+ * NOT call it from inside this helper. See AGENTS.md "Encountered
+ * Lessons" for the double-emit rule and the regression that prompted
+ * it.
+ */
+export function safeFit(
+  renderer: FittableRenderer | null | undefined,
+): { cols: number; rows: number } | null {
+  if (!renderer) return null;
+  try {
+    return renderer.fit();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Call `renderer.clear()` if the renderer exists. Local viewport /
+ * scrollback only — this helper NEVER sends a wire frame, NEVER
+ * mutates the backend replay buffer, and NEVER asks the remote shell
+ * to run `clear`. Returns `true` when the call was made.
+ */
+export function safeClearViewport(
+  renderer: ClearableRenderer | null | undefined,
+): boolean {
+  if (!renderer) return false;
+  try {
+    renderer.clear();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stable UX-copy strings rendered by the production terminal workspace.
+ * Centralised so the redaction sentinel test can pin them as wire-noise
+ * free, and so a SPEC drift trips a unit test rather than a manual
+ * smoke. None of these strings depend on runtime state — they are
+ * static copy that the workspace mounts inline.
+ */
+export const TERMINAL_UX_COPY = {
+  settingsApplyNote:
+    "Appearance settings apply to new terminal sessions. Save preferences in the Settings view, then launch (or reconnect) the session to see them.",
+  copyPasteNote:
+    "Use your browser's selection + clipboard shortcuts (Ctrl/Cmd+C / Ctrl/Cmd+V, or right-click Paste). Bracketed-paste confirmation, OSC 52, and a clipboard policy editor are future work.",
+} as const;
 
 /**
  * Build the WebSocket URL for a session-id attach. The path is the

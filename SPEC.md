@@ -830,6 +830,65 @@ The first production-safe local preferences UI for the terminal workspace. An op
 
 Backend / account settings persistence; per-server-profile preferences; live-update of an attached terminal (re-fit / atlas reset / palette swap); production renderer selector and per-renderer preferences; keybinding editor; copy/paste policy UI; theme import/export; Alacritty config import; durable session-recording settings; mobile/Tauri-specific settings; custom 16-slot palette editor; theme marketplace. Each is a separate slice.
 
+### Production terminal viewport controls
+
+Polish slice that layers small UX affordances onto the existing production terminal workspace. No backend changes, no new wire messages, no renderer additions: the slice adds renderer-driven controls (focus, fit, local-viewport-clear), a post-attach focus, and stable production copy for "appearance settings apply on the next session" and "copy/paste lives at the browser level for now". The production renderer remains xterm baseline only.
+
+**Scope (load-bearing — this slice).**
+
+1. **Renderer surface — `clear()`.** `XtermRenderer` gains a `clear()` method that delegates to xterm's `Terminal.clear()`. This method is **not** added to the renderer-neutral `TerminalRenderer` interface in `@relayterm/terminal-core` — it is xterm-specific today. The production workspace happily talks to the concrete `XtermRenderer` since it is the only allowed renderer in the production shell; promoting `clear` to the neutral contract is deferred until a second renderer needs it. Tests pin idempotency, pre-mount safety, and post-dispose safety.
+2. **Renderer surface — `fit()` already exists.** No interface change. The production workspace calls the existing `XtermRenderer.fit()`; xterm's fit addon synchronously fans out the new dims to the renderer's `onResize` listeners, and the workspace's existing `onResize` subscriber drives the wire `resize` frame (the AGENTS.md "Encountered Lessons" double-emit rule still holds — the Fit button does NOT call `client.sendResize` itself).
+3. **Workspace controls** — `apps/web/src/lib/app/terminal/ProductionTerminal.svelte` gains three compact buttons in the existing button row:
+   - **Focus terminal** — calls `safeFocus(renderer)` so the renderer takes keyboard focus.
+   - **Fit** — calls `safeFit(renderer)`; the renderer's own resize fanout drives the wire `resize`.
+   - **Clear local viewport** — calls `safeClearViewport(renderer)`. Local-only; never sends a wire frame, never mutates the backend replay buffer, never asks the remote shell to run `clear`.
+   The existing **Detach / End session / Reconnect / Disconnect / Back to servers** buttons are unchanged.
+4. **Post-attach focus.** When the client transitions into `attached`, the workspace pulls focus into the renderer via `safeFocus(...)` so an operator can start typing immediately. The call happens once per attach inside the existing `state_change` handler; the `myGen !== generation` guard already protects against dispose races, and `safeFocus` swallows any synchronous throw from a torn-down renderer. An additional focus is also issued immediately after `mount` so the viewport is keyboard-accessible during the brief `connecting` phase before the socket flips to `attached` — pre-existing behaviour preserved.
+5. **UX copy module.** `terminalLaunch.ts` exports `TERMINAL_UX_COPY` — a frozen `{ settingsApplyNote, copyPasteNote }` map. The production terminal workspace, the empty-state Terminal view, and the Settings view all consume the same strings so the wording stays aligned.
+   - `settingsApplyNote`: "Appearance settings apply to new terminal sessions. Save preferences in the Settings view, then launch (or reconnect) the session to see them."
+   - `copyPasteNote`: "Use your browser's selection + clipboard shortcuts (Ctrl/Cmd+C / Ctrl/Cmd+V, or right-click Paste). Bracketed-paste confirmation, OSC 52, and a clipboard policy editor are future work."
+6. **Pure helpers.** `safeFocus(renderer)`, `safeFit(renderer)`, `safeClearViewport(renderer)` live in `terminalLaunch.ts`. Each tolerates a `null`/`undefined` renderer and absorbs a synchronous throw (dispose race) without logging — the redaction posture forbids surfacing renderer internals through error strings. The helpers take a structural-typed renderer surface (`FocusableRenderer`, `FittableRenderer`, `ClearableRenderer`) so vitest can exercise the contract against a stub. The structural type for `safeClearViewport` deliberately excludes any session-client / transport surface — adding a wire-side call would require widening the type, which would trip review.
+7. **`computeWorkspaceEnablement` extended.** The enablement object grows three new booleans: `focus`, `fit`, `clear`. Each is `true` only while live (`attached` or `replaying`). `idle`, `creating`, `connecting`, `detached`, `closed`, `error` all keep them disabled — the affordance hides rather than no-ops on a torn-down renderer.
+
+**No backend changes.** The slice is purely a frontend polish slice. No new routes, no schema, no new wire messages, no protocol changes.
+
+**Architecture rule preserved.** The production shell still imports only `@relayterm/terminal-core` and `@relayterm/terminal-xterm`; the experimental adapters remain dev-lab-only. `appShellIsolation.test.ts` is unchanged. The `clear()` method is xterm-specific and lives on `XtermRenderer` only; it does NOT pollute `TerminalRenderer` or `terminal-core`.
+
+**Local-clear viewport semantics (load-bearing).**
+
+- The Clear button calls `XtermRenderer.clear()`, which delegates to xterm's `Terminal.clear()`. Per xterm's contract this clears the visible viewport AND the scrollback ring within xterm.
+- It does NOT send any wire frame. It does NOT call `client.sendInput` with a `clear` command, an `ESC[2J`, or any other terminal control sequence. The remote shell is unaware of the operation.
+- It does NOT mutate the backend's replay buffer, the backend's sequence counter, or any audit-log event. Reconnect with `last_seen_seq` after a Clear will resume the live stream from the same bookmark — Clear is a renderer-only concern.
+- The button is enabled only while live. Pressing it on a detached / closed / error workspace is impossible (the affordance is disabled), but the helper still tolerates a missing renderer for forward-safety.
+
+**Fit/reflow semantics (load-bearing).**
+
+- The Fit button calls `XtermRenderer.fit()`. That call delegates to the xterm fit addon, which sets the cell-grid dims AND synchronously fans out an `onResize` event.
+- The workspace's existing `onResize` subscriber is the single place that calls `client.sendResize(...)`. The Fit button does NOT call `client.sendResize` itself — re-pinning the AGENTS.md "Encountered Lessons" double-emit rule.
+- A renderer that has not been mounted (no live `Terminal`) returns `null` from `fit()`; the helper treats that as a clean no-op and the wire stays silent.
+
+**Settings application copy (load-bearing).**
+
+- Production terminal settings still apply on **next attach / next session** only. Live re-fit, atlas reset, and palette swap on a mounted xterm are explicit future work — the slice deliberately does not introduce hot-reload of an active session.
+- The same `settingsApplyNote` string is rendered in three places: the production terminal workspace (next to the viewport), the empty Terminal view (when no launch is active), and the Settings view (next to Save / Reset). Centralising the copy means a SPEC drift trips a unit test rather than a UI smoke.
+
+**Copy/paste policy notes (load-bearing).**
+
+- The same `copyPasteNote` string is rendered in the production terminal workspace and the Settings view. The note explicitly names browser shortcuts as the current path and flags bracketed-paste / OSC 52 / clipboard-policy as future work. The slice does NOT implement any clipboard automation.
+- Browser clipboard semantics depend on the browser, OS, and (in some embeddings) page focus. The note is intentionally short — operator behaviour, not a specification.
+
+**Redaction posture (load-bearing).**
+
+- The new buttons NEVER read terminal output, NEVER read input bytes, and NEVER include any payload in their `data-testid`, `title`, or click-handler argument. They are static-copy controls.
+- `safeFocus` / `safeFit` / `safeClearViewport` swallow synchronous throws WITHOUT logging — a renderer-dispose race could otherwise produce an `Error` whose `message` describes internal state. Tests pin that the swallowed-throw branch returns the documented sentinel value (`false` / `null`).
+- `TERMINAL_UX_COPY` is frozen by structure (a `const` object literal) and a sentinel test asserts none of its values contain `private_key`, `encrypted_private_key`, `BEGIN OPENSSH`, `session_output`, or the launch-summary redaction sentinel.
+
+**Stable selectors (additions only).** `production-terminal-focus`, `production-terminal-fit`, `production-terminal-clear`, `production-terminal-settings-note`, `production-terminal-copy-paste-note`, `terminal-empty-settings-note`, `terminal-empty-copy-paste-note`, `settings-apply-note`, `settings-copy-paste-note`. The pre-existing `production-terminal-*` selectors are unchanged.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Production renderer selector; ghostty-web / restty / wterm in production; multi-tab workspace; durable session recording UI; backend VT observer / `libghostty-vt` snapshot; profile-specific terminal preferences; live hot-reload of font / theme on a mounted xterm; mobile / Tauri keyboard UI; custom keybinding editor; OSC 52 clipboard automation; bracketed-paste confirmation / multiline-paste preview; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.

@@ -50,6 +50,10 @@
     describeWorkspaceError,
     phaseLabel,
     phaseTone,
+    safeClearViewport,
+    safeFit,
+    safeFocus,
+    TERMINAL_UX_COPY,
     type WorkspacePhase,
   } from "./terminalLaunch.js";
   import {
@@ -164,6 +168,10 @@
         // single place that calls `client.sendResize` — see
         // "Encountered Lessons" in AGENTS.md.
         r.resize(cols, rows);
+        // Pull browser focus into the renderer once the socket is
+        // live so an operator can start typing without an extra click.
+        // `safeFocus` swallows the dispose-race case.
+        safeFocus(r);
       }
     });
     next.on("attached", () => {
@@ -298,6 +306,24 @@
     await attach({ resume: true });
   }
 
+  function focusClicked() {
+    safeFocus(renderer);
+  }
+
+  function fitClicked() {
+    // The renderer's `fit()` synchronously fans out to its `onResize`
+    // listeners — that subscription is the single place that drives
+    // `client.sendResize` (AGENTS.md "Encountered Lessons"). We
+    // deliberately do NOT call `client.sendResize` here.
+    safeFit(renderer);
+  }
+
+  function clearViewportClicked() {
+    // Local viewport + scrollback only. No wire frame; replay buffer
+    // is untouched; the remote shell is not asked to run `clear`.
+    safeClearViewport(renderer);
+  }
+
   onMount(() => {
     void attach();
   });
@@ -350,6 +376,37 @@
   </header>
 
   <div class="flex flex-wrap gap-2">
+    <button
+      type="button"
+      class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+      onclick={focusClicked}
+      disabled={!enablement.focus}
+      data-testid="production-terminal-focus"
+      title="Move keyboard focus into the terminal viewport"
+    >
+      Focus terminal
+    </button>
+    <button
+      type="button"
+      class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+      onclick={fitClicked}
+      disabled={!enablement.fit}
+      data-testid="production-terminal-fit"
+      title="Refit the terminal to the container; backend PTY resizes via the renderer's onResize signal"
+    >
+      Fit
+    </button>
+    <button
+      type="button"
+      class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+      onclick={clearViewportClicked}
+      disabled={!enablement.clear}
+      data-testid="production-terminal-clear"
+      title="Clear the local viewport and scrollback only — replay buffer and remote shell are untouched"
+    >
+      Clear local viewport
+    </button>
+    <span class="mx-1 self-center text-zinc-700" aria-hidden="true">·</span>
     <button
       type="button"
       class="rounded-md border border-amber-700/60 bg-amber-900/20 px-3 py-1 text-xs text-amber-100 transition hover:border-amber-600 hover:bg-amber-900/40 disabled:cursor-not-allowed disabled:opacity-50"
@@ -437,4 +494,21 @@
     class="h-[28rem] overflow-hidden rounded-md border border-zinc-800 bg-black"
     data-testid="production-terminal-viewport"
   ></div>
+
+  <div class="grid grid-cols-1 gap-2 text-[11px] text-zinc-500 md:grid-cols-2">
+    <p
+      class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2"
+      data-testid="production-terminal-settings-note"
+    >
+      <span class="font-medium text-zinc-400">Appearance.</span>
+      {TERMINAL_UX_COPY.settingsApplyNote}
+    </p>
+    <p
+      class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2"
+      data-testid="production-terminal-copy-paste-note"
+    >
+      <span class="font-medium text-zinc-400">Copy &amp; paste.</span>
+      {TERMINAL_UX_COPY.copyPasteNote}
+    </p>
+  </div>
 </section>

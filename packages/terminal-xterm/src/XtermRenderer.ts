@@ -169,6 +169,16 @@ export class XtermRenderer implements TerminalRenderer {
     return { cols: this.#terminal.cols, rows: this.#terminal.rows };
   }
 
+  /**
+   * Clear the LOCAL viewport and scrollback. This affects the renderer
+   * surface only — no wire frame is sent, the backend's replay buffer
+   * is untouched, and the remote shell is not asked to run `clear`.
+   * Safe before mount and after dispose (no-op).
+   */
+  clear(): void {
+    this.#terminal?.clear();
+  }
+
   #fanoutInput(data: RendererInput): void {
     for (const listener of [...this.#inputListeners]) {
       try {

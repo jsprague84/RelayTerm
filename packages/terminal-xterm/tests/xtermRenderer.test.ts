@@ -23,6 +23,7 @@ const hoisted = vi.hoisted(() => {
     writes: Array<string | Uint8Array> = [];
     focused = false;
     disposed = false;
+    cleared = 0;
     loadedAddons: unknown[] = [];
     dataListeners = new Set<FakeListener<string>>();
     resizeListeners = new Set<FakeListener<FakeOnResizeArg>>();
@@ -63,6 +64,9 @@ const hoisted = vi.hoisted(() => {
       this.cols = cols;
       this.rows = rows;
       for (const l of [...this.resizeListeners]) l({ cols, rows });
+    }
+    clear() {
+      this.cleared += 1;
     }
     dispose() {
       this.disposed = true;
@@ -285,6 +289,39 @@ describe("XtermRenderer satisfies TerminalRenderer", () => {
     expect(term.focused).toBe(false);
     renderer.focus();
     expect(term.focused).toBe(true);
+  });
+
+  it("focus() before mount and after dispose is a silent no-op", () => {
+    const renderer = new XtermRenderer();
+    expect(() => renderer.focus()).not.toThrow();
+    renderer.mount(stubElement);
+    renderer.dispose();
+    expect(() => renderer.focus()).not.toThrow();
+  });
+
+  it("clear() invokes Terminal.clear and is safe before mount / after dispose", () => {
+    const renderer = new XtermRenderer();
+    // Pre-mount: no FakeTerminal exists yet, so clear() has nothing
+    // to delegate to and must not throw or accidentally construct one.
+    expect(() => renderer.clear()).not.toThrow();
+    expect(FakeTerminal.instances).toHaveLength(0);
+    renderer.mount(stubElement);
+    const term = FakeTerminal.instances[0]!;
+    renderer.clear();
+    renderer.clear();
+    expect(term.cleared).toBe(2);
+    renderer.dispose();
+    expect(() => renderer.clear()).not.toThrow();
+  });
+
+  it("fit() returns null before mount and post-fit dims after mount", () => {
+    const renderer = new XtermRenderer();
+    expect(renderer.fit()).toBeNull();
+    renderer.mount(stubElement);
+    const term = FakeTerminal.instances[0]!;
+    term.cols = 120;
+    term.rows = 40;
+    expect(renderer.fit()).toEqual({ cols: 120, rows: 40 });
   });
 
   it("dispose is idempotent and tears down listeners", () => {

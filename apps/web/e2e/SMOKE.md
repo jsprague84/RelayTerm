@@ -70,6 +70,13 @@ update this file in the same change.
 | `[data-testid="production-terminal-closed"]`      | Closed-state hint banner.                                     |
 | `[data-testid="production-terminal-error"]`       | Workspace error summary (safe formatter only — never echoes wire `message` or transport detail). |
 | `[data-testid="production-terminal-viewport"]`    | xterm renderer host element (terminal output renders inside).  |
+| `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer; enabled while live). |
+| `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). |
+| `[data-testid="production-terminal-clear"]`       | "Clear local viewport" button (renderer-only; never sends a wire frame, never mutates backend replay buffer, never asks the remote shell to run `clear`). |
+| `[data-testid="production-terminal-settings-note"]` | Inline workspace note: "Appearance settings apply to new terminal sessions." (sourced from `TERMINAL_UX_COPY`). |
+| `[data-testid="production-terminal-copy-paste-note"]` | Inline workspace note: browser-shortcut copy/paste guidance with bracketed-paste / OSC 52 flagged as future work (sourced from `TERMINAL_UX_COPY`). |
+| `[data-testid="terminal-empty-settings-note"]`    | Empty-state Terminal view inline copy mirroring `production-terminal-settings-note`. |
+| `[data-testid="terminal-empty-copy-paste-note"]`  | Empty-state Terminal view inline copy mirroring `production-terminal-copy-paste-note`. |
 | `[data-testid="production-view-sessions"]`        | Terminal sessions list/status view root.                      |
 | `[data-testid="sessions-refresh-button"]`         | Sessions view explicit refresh button.                        |
 | `[data-testid="sessions-loading"]`                | Sessions view loading state.                                  |
@@ -109,6 +116,8 @@ update this file in the same change.
 | `[data-testid="settings-reset"]`                  | "Reset to defaults" button (restores defaults and persists them). |
 | `[data-testid="settings-status-saved"]`           | Save-success status text (rendered after a successful save / reset). |
 | `[data-testid="settings-status-failed"]`          | Save-failure status text (rendered when localStorage write throws). |
+| `[data-testid="settings-apply-note"]`             | Settings view inline copy mirroring `production-terminal-settings-note` (sourced from `TERMINAL_UX_COPY`). |
+| `[data-testid="settings-copy-paste-note"]`        | Settings view inline copy mirroring `production-terminal-copy-paste-note` (sourced from `TERMINAL_UX_COPY`). |
 | `[data-testid="dev-mode-badge"]`                  | "dev build" badge in top bar (only visible under `vite dev`). |
 | `[data-testid="nav-devtools-toggle"]`             | Sidebar dev-tools toggle (only visible under `vite dev`).     |
 | `[data-testid="dev-tools-panel"]`                 | Dev tools panel rendered when toggle is open (dev only).      |
