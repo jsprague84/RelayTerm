@@ -19,10 +19,12 @@ import { MAX_USERNAME_LEN, type Host } from "./hosts.js";
 import {
   fetchJsonList,
   postJsonItem,
+  readErrorEnvelope,
   type LoadOptions,
   type LoadResult,
   type WireError,
 } from "./apiErrors.js";
+import type { SshKeyType } from "./sshIdentities.js";
 
 export interface ServerProfile {
   id: string;
@@ -441,4 +443,371 @@ export function resolveProfileLinks(
     };
   }
   return { host: null, effectiveUsername: null, inheritedFromHost: null };
+}
+
+// ---------------------------------------------------------------------------
+// Host-key preflight + trust helpers
+// ---------------------------------------------------------------------------
+//
+// Wire shapes mirror `crates/relayterm-api/src/dto/preflight.rs`. The wire
+// `host_key_status` is one of `unknown | trusted | changed`; `revoked` is
+// NOT a wire status today — a previously-revoked fingerprint that the
+// server presents fresh surfaces as `unknown`, and the trust route
+// rejects it with a `409 conflict { entity: "host_key" }`. The UI layer
+// therefore models `revoked` ONLY as a derived trust-rejection reason,
+// never as a parsed-status value.
+//
+// Redaction posture: the responses parsed here carry only public host-side
+// data (fingerprint, key type, hostname/port). No private-key field is
+// declared on either DTO. The error formatter is a function of `kind` +
+// `status` + `code` only — operator detail and transport `Error.message`
+// never reach the UI.
+
+/**
+ * Wire-stable host-key status returned by the preflight route.
+ *
+ * - `unknown` — no active pinned entry matches the captured key. First
+ *   time seen, or the prior pin was revoked.
+ * - `trusted` — an active, non-revoked pinned entry matches.
+ * - `changed` — an active pinned entry exists but the captured key
+ *   differs. The trust route refuses to silently overwrite.
+ */
+export type HostKeyStatus = "unknown" | "trusted" | "changed";
+
+const HOST_KEY_STATUSES: ReadonlySet<HostKeyStatus> = new Set([
+  "unknown",
+  "trusted",
+  "changed",
+]);
+
+/**
+ * Parsed shape of `POST /api/v1/server-profiles/:id/host-key-preflight`.
+ *
+ * Carries ONLY public host-side data — no private-key field is declared
+ * here. The parser builds the DTO field-by-field, so any stray
+ * `private_key` / `encrypted_private_key` smuggled onto the wire body
+ * cannot reach the returned object. See the redaction-sentinel tests in
+ * `tests/hostKeyApi.test.ts`.
+ */
+export interface HostKeyPreflightResponse {
+  profile_id: string;
+  host_id: string;
+  hostname: string;
+  port: number;
+  host_key_status: HostKeyStatus;
+  host_key_type: SshKeyType;
+  /** `SHA256:<base64>` form. Public-ish security metadata; safe to
+   * display deliberately. */
+  host_key_fingerprint: string;
+  /** Static, server-supplied human-facing message keyed to the status.
+   * The backend wires this from a fixed string per status — no operator
+   * detail is interpolated. The UI is free to use it but does not
+   * depend on its exact wording. */
+  message: string;
+}
+
+export function parseHostKeyPreflightResponse(
+  raw: unknown,
+): HostKeyPreflightResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.profile_id !== "string" ||
+    typeof r.host_id !== "string" ||
+    typeof r.hostname !== "string" ||
+    typeof r.port !== "number" ||
+    typeof r.host_key_status !== "string" ||
+    typeof r.host_key_type !== "string" ||
+    typeof r.host_key_fingerprint !== "string" ||
+    typeof r.message !== "string"
+  ) {
+    return null;
+  }
+  if (!HOST_KEY_STATUSES.has(r.host_key_status as HostKeyStatus)) {
+    return null;
+  }
+  // Construct field-by-field. A stray `encrypted_private_key` /
+  // `private_key` on `r` cannot reach the returned object because no
+  // path here copies it.
+  return {
+    profile_id: r.profile_id,
+    host_id: r.host_id,
+    hostname: r.hostname,
+    port: r.port,
+    host_key_status: r.host_key_status as HostKeyStatus,
+    host_key_type: r.host_key_type as SshKeyType,
+    host_key_fingerprint: r.host_key_fingerprint,
+    message: r.message,
+  };
+}
+
+/**
+ * Parsed shape of `POST /api/v1/server-profiles/:id/trust-host-key`.
+ *
+ * Same redaction posture as the preflight response — only public
+ * host-side data is declared. `trusted_at` is an RFC 3339 timestamp.
+ */
+export interface TrustHostKeyResponse {
+  known_host_entry_id: string;
+  host_id: string;
+  host_key_type: SshKeyType;
+  host_key_fingerprint: string;
+  trusted_at: string;
+}
+
+export function parseTrustHostKeyResponse(
+  raw: unknown,
+): TrustHostKeyResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.known_host_entry_id !== "string" ||
+    typeof r.host_id !== "string" ||
+    typeof r.host_key_type !== "string" ||
+    typeof r.host_key_fingerprint !== "string" ||
+    typeof r.trusted_at !== "string"
+  ) {
+    return null;
+  }
+  return {
+    known_host_entry_id: r.known_host_entry_id,
+    host_id: r.host_id,
+    host_key_type: r.host_key_type as SshKeyType,
+    host_key_fingerprint: r.host_key_fingerprint,
+    trusted_at: r.trusted_at,
+  };
+}
+
+/**
+ * Sanity-check the fingerprint shape on the client before posting it
+ * back to the trust endpoint. Mirrors the backend's
+ * `validated_expected_fingerprint` (`crates/relayterm-api/src/dto/preflight.rs`):
+ * must start with `SHA256:`, length 8..=128, no whitespace or control
+ * characters. Backend remains authoritative.
+ */
+export function isValidFingerprintShape(fp: string): boolean {
+  if (!fp.startsWith("SHA256:")) return false;
+  if (fp.length < 8 || fp.length > 128) return false;
+  for (let i = 0; i < fp.length; i++) {
+    const code = fp.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return false;
+    // Whitespace: space, tab, newline, carriage return, form feed,
+    // vertical tab.
+    if (
+      code === 0x20 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0d ||
+      code === 0x0b ||
+      code === 0x0c
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export interface HostKeyPreflightOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/server-profiles/:id/host-key-preflight`. */
+  endpoint?: string;
+}
+
+export type PreflightError = WireError;
+
+export type HostKeyPreflightResult =
+  | { ok: true; preflight: HostKeyPreflightResponse }
+  | { ok: false; error: PreflightError };
+
+/**
+ * POST a host-key preflight request and parse the typed response.
+ *
+ * The route runs an SSH KEX-only probe and disconnects WITHOUT
+ * authenticating. This helper is a thin transport — it does not throw,
+ * does not log raw response bodies, and does not echo wire / transport
+ * detail through any user-facing string.
+ */
+export async function hostKeyPreflight(
+  profileId: string,
+  options: HostKeyPreflightOptions = {},
+): Promise<HostKeyPreflightResult> {
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/server-profiles/${encodeURIComponent(profileId)}/host-key-preflight`;
+  const result = await postJsonItem<HostKeyPreflightResponse>(
+    endpoint,
+    {},
+    parseHostKeyPreflightResponse,
+    options,
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, preflight: result.data };
+}
+
+/**
+ * Format a host-key preflight error as a one-line UI summary. Stays a
+ * function of `kind` + `status` + `code` ONLY — never echoes the wire
+ * `message` of an HTTP error or the thrown `Error.message` of a
+ * transport failure.
+ *
+ * Per-status copy mirrors the backend's failure shapes:
+ *  - `502 bad_gateway` — the SSH probe itself failed (unreachable,
+ *    timeout, transport, unsupported algorithm). Wire body is the static
+ *    `"bad gateway"` string per the ApiError contract.
+ *  - `503 service_unavailable` — the vault is disabled.
+ *  - `404 not_found` — the profile is missing or foreign-owned.
+ *  - `401 unauthorized` — dev-auth disabled.
+ */
+export function describePreflightError(err: PreflightError): string {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 502 && err.code === "bad_gateway") {
+        return "Host-key preflight failed: could not reach the server (network, timeout, or unsupported host-key algorithm)";
+      }
+      if (err.status === 503 && err.code === "service_unavailable") {
+        return "Host-key preflight failed: backend vault is not configured";
+      }
+      if (err.status === 404 && err.code === "not_found") {
+        return "Host-key preflight failed: server profile not found";
+      }
+      if (err.status === 401) {
+        return "Host-key preflight failed: not authenticated";
+      }
+      return `Host-key preflight failed: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Host-key preflight failed: transport error";
+    case "malformed_response":
+      return "Host-key preflight failed: malformed response";
+  }
+}
+
+export interface TrustHostKeyOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/server-profiles/:id/trust-host-key`. */
+  endpoint?: string;
+}
+
+export type TrustHostKeyError =
+  | { kind: "validation"; reason: "invalid_fingerprint_shape" }
+  | { kind: "http"; status: number; code: string; message: string }
+  | { kind: "transport"; message: string }
+  | { kind: "malformed_response" };
+
+export type TrustHostKeyResult =
+  | { ok: true; trust: TrustHostKeyResponse }
+  | { ok: false; error: TrustHostKeyError };
+
+/**
+ * POST a trust-host-key request with the caller's expected fingerprint.
+ *
+ * The backend re-probes, refuses to trust if the captured key changed
+ * or differs from `expected_fingerprint`, and refuses if a revoked row
+ * exists for the captured `(key_type, fingerprint)`. This helper does
+ * NOT auto-trust, does NOT throw, does NOT log raw response bodies, and
+ * does NOT echo wire / transport detail through the formatter.
+ *
+ * The local validator rejects an obviously malformed `expected_fingerprint`
+ * before any wire round-trip; the backend remains authoritative.
+ */
+export async function trustHostKey(
+  profileId: string,
+  expectedFingerprint: string,
+  options: TrustHostKeyOptions = {},
+): Promise<TrustHostKeyResult> {
+  if (!isValidFingerprintShape(expectedFingerprint)) {
+    return {
+      ok: false,
+      error: { kind: "validation", reason: "invalid_fingerprint_shape" },
+    };
+  }
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/server-profiles/${encodeURIComponent(profileId)}/trust-host-key`;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ expected_fingerprint: expectedFingerprint }),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const parsed = parseTrustHostKeyResponse(body);
+  if (parsed === null) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, trust: parsed };
+}
+
+/**
+ * Format a trust-host-key error as a one-line UI summary. Same
+ * redaction posture as {@link describePreflightError}: a function of
+ * `kind` + `status` + `code` ONLY.
+ *
+ * `409 conflict { entity: "host_key" }` collapses to a single deliberately
+ * conservative message — the backend uses the same status for "captured
+ * fingerprint changed", "expected_fingerprint stale", and "revoked
+ * fingerprint reappeared". The UI cannot distinguish them from the
+ * wire body, so the formatter names what is true in all three cases:
+ * trust was refused; do not retry without re-running preflight.
+ */
+export function describeTrustHostKeyError(err: TrustHostKeyError): string {
+  switch (err.kind) {
+    case "validation":
+      return "Cannot trust host key: fingerprint shape is invalid";
+    case "http":
+      if (err.status === 409) {
+        return "Trust refused: the host key changed, was revoked, or no longer matches the fingerprint shown — re-run preflight before trying again";
+      }
+      if (err.status === 400 && err.code === "invalid_input") {
+        return "Trust refused: backend rejected the fingerprint shape";
+      }
+      if (err.status === 502 && err.code === "bad_gateway") {
+        return "Trust refused: could not re-probe the server (network, timeout, or unsupported host-key algorithm)";
+      }
+      if (err.status === 503 && err.code === "service_unavailable") {
+        return "Trust refused: backend vault is not configured";
+      }
+      if (err.status === 404 && err.code === "not_found") {
+        return "Trust refused: server profile not found";
+      }
+      if (err.status === 401) {
+        return "Trust refused: not authenticated";
+      }
+      return `Trust refused: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Trust refused: transport error";
+    case "malformed_response":
+      return "Trust refused: malformed response";
+  }
 }

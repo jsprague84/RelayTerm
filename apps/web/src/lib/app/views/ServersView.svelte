@@ -20,6 +20,7 @@
     type SshIdentity,
   } from "../../api/sshIdentities.js";
   import { describeLoadError } from "../../api/apiErrors.js";
+  import HostKeyPanel from "./HostKeyPanel.svelte";
 
   type LoadState =
     | { kind: "idle" }
@@ -293,9 +294,10 @@
     </h2>
     <p class="text-sm text-zinc-400">
       Hosts are reachable target definitions. Server profiles bind a
-      host to an SSH identity. Host-key trust, auth-check, and terminal
-      launch are future work — creating a profile here does NOT verify
-      the server, install the public key, or trust the host key.
+      host to an SSH identity. Run host-key preflight per profile to
+      capture and explicitly trust the server's host key. SSH auth-check
+      and terminal launch are future work — creating or trusting here
+      does NOT verify SSH authentication or install the public key.
     </p>
   </header>
 
@@ -808,6 +810,7 @@
                   {/each}
                 </ul>
               {/if}
+              <HostKeyPanel profileId={profile.id} />
             </li>
           {/each}
         </ul>
@@ -819,8 +822,8 @@
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Edit / delete forms, host-key trust, auth-check, and terminal
-    launch land alongside the production terminal workspace. Profile
-    creation here does not imply trust or reachability.
+    Edit / delete forms, auth-check, and terminal launch land alongside
+    the production terminal workspace. Host-key preflight and trust
+    are above; SSH authentication has not been verified by either.
   </p>
 </section>

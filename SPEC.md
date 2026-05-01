@@ -608,7 +608,48 @@ The next production-safe write flows on the Servers view: an operator can create
 
 **Future work (explicit out-of-scope for this slice).**
 
-Edit / delete forms for hosts and profiles; host-key preflight and trust UI; auth-check UI; terminal session launch from the production shell; password bootstrap / `ssh-copy-id`; `username_override` / `tags` editing on existing profiles; per-row "view details" / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice.
+Edit / delete forms for hosts and profiles; auth-check UI; terminal session launch from the production shell; password bootstrap / `ssh-copy-id`; `username_override` / `tags` editing on existing profiles; per-row "view details" / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice. (Host-key preflight and trust UI is now wired — see "Production host-key preflight & trust UI" below.)
+
+### Production host-key preflight & trust UI
+
+The next production-safe security flow on the Servers view: an operator can run `host-key-preflight` for a server profile, see the captured fingerprint and trust classification, and explicitly trust an unknown key by confirming the fingerprint. This is NOT auth-check, NOT terminal launch, and NOT automatic trust-on-first-use.
+
+**Scope (load-bearing — this slice).**
+
+1. **Per-profile "Host key" panel** is rendered inside each profile row on `ServersView.svelte` via the `HostKeyPanel.svelte` component. The panel exposes a "Run host-key preflight" button, a status badge (`Not trusted` / `Trusted` / `Changed`), the captured key type, the captured `SHA256:<base64>` fingerprint (selectable / copyable), and — only for the `unknown` outcome — a fingerprint-confirmation input + "Trust this host key" button. The panel holds local Svelte state ONLY (no global stores, no router, no polling, no auto-retry).
+2. **`hostKeyPreflight(profileId, options)` and `trustHostKey(profileId, expectedFingerprint, options)`** in `lib/api/serverProfiles.ts` are the single client entry points. Each parses the response with a field-by-field DTO guard (`parseHostKeyPreflightResponse` / `parseTrustHostKeyResponse`) so a stray `private_key` / `encrypted_private_key` smuggled onto a wire body cannot reach the parsed object. Neither helper throws, logs raw response bodies, or echoes wire / transport detail through any user-facing string.
+3. **Trust is NEVER auto-issued.** The "Trust this host key" button is enabled only when ALL of: (a) the most recent preflight returned `unknown`; (b) the captured fingerprint is non-empty AND passes the local `isValidFingerprintShape` shape check; (c) the operator has typed the captured fingerprint into the confirmation input AND it matches the captured value byte-exactly. `trustGateForPreflight(preflight)` is the pure function that decides this; `fingerprintConfirmationMatches(captured, confirmation)` is the pure function that compares the strings (case-significant — base64 is case-significant).
+4. **`changed` and `revoked` outcomes refuse trust.** `changed` is a wire status and the UI surfaces it as a non-actionable refusal. `revoked` is NOT a wire status today — the backend collapses revoked-and-reappearing keys to `unknown`, then refuses the trust request with `409 conflict { entity: "host_key" }`. The UI treats `revoked` ONLY as a derived trust-rejection reason, deferred to the trust-error formatter, never as a parsed-status value. The trust-error formatter collapses `409` to a single deliberately conservative message ("the host key changed, was revoked, or no longer matches the fingerprint shown — re-run preflight before trying again") because the wire body cannot distinguish the three sub-cases.
+5. **Client-side fingerprint shape check.** `isValidFingerprintShape(fp)` mirrors the backend's `validated_expected_fingerprint` (`crates/relayterm-api/src/dto/preflight.rs`): must start with `SHA256:`, length 8..=128, no whitespace or control characters. The `trustHostKey` helper refuses a malformed fingerprint with `{ kind: "validation", reason: "invalid_fingerprint_shape" }` BEFORE any wire round-trip. Backend remains authoritative.
+6. **No backend changes.** The existing `POST /api/v1/server-profiles/:id/host-key-preflight` and `POST /api/v1/server-profiles/:id/trust-host-key` routes already return the wire shapes the new helpers parse; the slice is purely a frontend addition.
+7. **Architecture rule preserved.** No import added under `lib/app/` touches `lib/dev/` or any renderer adapter; `appShellIsolation.test.ts` continues to pass.
+
+**Redaction posture (load-bearing).**
+
+- `parseHostKeyPreflightResponse` and `parseTrustHostKeyResponse` build their DTOs field-by-field, so a backend bug or hostile fixture that includes `private_key` / `encrypted_private_key` on a 200 response cannot smuggle them onto the parsed object. Sentinel-string redaction tests in `tests/hostKeyApi.test.ts` pin this for both parsers (the parsed object, `JSON.stringify` of the parsed object).
+- `describePreflightError` and `describeTrustHostKeyError` are functions of `kind` + `status` + `code` ONLY. Sentinel-string tests pin that they NEVER echo the wire `message` of an HTTP error or the thrown `Error.message` of a transport failure, across `400`, `401`, `404`, `409`, `502`, `503`, and unknown statuses, plus `transport` and `malformed_response`.
+- Helpers do NOT log raw response bodies. Tests pin `console.log/warn/error` as untouched across success, HTTP failure, and transport failure for both `hostKeyPreflight` and `trustHostKey`.
+- Host-key fingerprints are public-ish security metadata; they are deliberately rendered. Identity-side material (encrypted blob, decrypted PEM) is never on the wire for either route, never declared on either DTO, and never reachable from the panel.
+
+**Wire shapes (mirror of `crates/relayterm-api/src/dto/preflight.rs`).**
+
+- Preflight request: empty body. Response (`200 OK`): `{ profile_id, host_id, hostname, port, host_key_status: "unknown" | "trusted" | "changed", host_key_type, host_key_fingerprint, message }`.
+- Trust request: `{ "expected_fingerprint": "SHA256:<base64>" }`. Response (`200 OK`): `{ known_host_entry_id, host_id, host_key_type, host_key_fingerprint, trusted_at }`.
+
+**UX copy (load-bearing).**
+
+- Preflight disclaimer (`PREFLIGHT_DISCLAIMER`): "Preflight verifies the server's host key during SSH key exchange. It does not authenticate, does not open a terminal, and does not install your public key."
+- Trust disclaimer (`TRUST_DISCLAIMER`): "Only trust if the fingerprint matches what you expect for the server. RelayTerm will not overwrite a changed or revoked host key automatically."
+- `unknown` description: "Host key was captured during SSH key exchange, but no pinned entry matches it. Verify the fingerprint matches what you expect for this server before trusting it."
+- `trusted` description: "Host key matches an active pinned entry. SSH authentication and terminal launch are still future work."
+- `changed` description: "Host key differs from the pinned entry for this host. RelayTerm will not overwrite a pinned key automatically. This may indicate server reinstallation, key rotation, or a possible man-in-the-middle."
+- The success message after a trust action explicitly disclaims auth and terminal launch: "Host key pinned. … SSH authentication and terminal launch are still future work."
+
+**Stable selectors.** New `data-testid` hooks on `HostKeyPanel.svelte`: `host-key-panel`, `host-key-preflight-button`, `host-key-idle`, `host-key-preflighting`, `host-key-preflight-error`, `host-key-status-badge` (with `data-status` attribute), `host-key-status-description`, `host-key-fingerprint`, `host-key-already-trusted`, `host-key-changed-refused`, `host-key-confirm-input`, `host-key-confirm-mismatch`, `host-key-trust-button`, `host-key-trust-error`, `host-key-trusted-success`. The panel root carries `data-profile-id` for per-row targeting.
+
+**Future work (explicit out-of-scope for this slice).**
+
+SSH auth-check UI; terminal session launch from the production shell; changed-host-key override / re-pin UI; revoked-entry recovery UI; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI; mobile/Tauri shell integration; backend VT observer. Each is a separate slice.
 
 ### Live SSH PTY bridge contract
 

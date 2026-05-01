@@ -40,6 +40,15 @@ update this file in the same change.
 | `[data-testid="servers-create-profile-open"]`     | "Create server profile" button on the Servers view (disabled when there are no hosts OR no SSH identities). |
 | `[data-testid="servers-create-host-panel"]`       | Create-host panel container (visible after open).             |
 | `[data-testid="servers-create-profile-panel"]`    | Create-server-profile panel container (visible after open).   |
+| `[data-testid="host-key-panel"]`                  | Per-profile host-key preflight + trust panel (one per profile row; carries `data-profile-id`). |
+| `[data-testid="host-key-preflight-button"]`       | "Run host-key preflight" / "Re-run preflight" button inside the panel. |
+| `[data-testid="host-key-status-badge"]`           | Status badge after preflight; carries `data-status` (`unknown`/`trusted`/`changed`). |
+| `[data-testid="host-key-fingerprint"]`            | Captured `SHA256:<base64>` fingerprint (selectable / copyable). |
+| `[data-testid="host-key-confirm-input"]`          | Fingerprint-confirmation input (visible only when status is `unknown`). |
+| `[data-testid="host-key-trust-button"]`           | "Trust this host key" button (enabled only after exact fingerprint confirmation). |
+| `[data-testid="host-key-preflight-error"]`        | Preflight error summary (safe formatter only).                |
+| `[data-testid="host-key-trust-error"]`            | Trust error summary (safe formatter only; collapses 409 to a conservative re-run-preflight message). |
+| `[data-testid="host-key-trusted-success"]`        | Trust success card (rendered after a successful trust action). |
 | `[data-testid="production-view-identities"]`      | Identities view (public-key list + generate panel).           |
 | `[data-testid="identities-refresh-button"]`       | Refresh button on the Identities view.                        |
 | `[data-testid="identities-generate-open"]`        | "Generate SSH identity" button (opens the generate panel).    |
