@@ -21,4 +21,19 @@ export interface ActiveLaunch {
    * The status line still falls back to the session id when omitted.
    */
   profileLabel?: string;
+  /**
+   * Replay bookmark to seed the next attach with. Set ONLY when the
+   * launch came from the local active-session store
+   * (`activeSessionStore.ts`) and the saved record carries a positive
+   * `last_seen_seq`. A fresh launch from a profile row leaves this
+   * unset; a reconnect from the Sessions list leaves it unset too —
+   * the local store is the single producer of this hint.
+   *
+   * The production terminal seeds its `lastSeenSeq` state from this
+   * value when present and passes it to the wire `attach` so the
+   * backend's replay handshake covers the gap. The wire request itself
+   * still gates on `lastSeenSeq > 0`, so a malformed `0` here collapses
+   * to "no resume" rather than a wire-side error.
+   */
+  lastSeenSeq?: number;
 }

@@ -14,6 +14,12 @@
   import DashboardView from "./views/DashboardView.svelte";
   import TerminalView from "./views/TerminalView.svelte";
   import type { ActiveLaunch } from "./terminal/activeLaunch.js";
+  import {
+    activeSessionFromLaunch,
+    clearActiveSession,
+    saveActiveSession,
+    updateActiveSessionSeq,
+  } from "./terminal/activeSessionStore.js";
   import SessionsView from "./views/SessionsView.svelte";
   import ServersView from "./views/ServersView.svelte";
   import IdentitiesView from "./views/IdentitiesView.svelte";
@@ -56,11 +62,51 @@
   function handleLaunch(launch: ActiveLaunch) {
     activeLaunch = launch;
     selected = "terminal";
+    // Persist a local pointer at the just-launched session so a
+    // navigation-away / reload during the bounded detached-TTL window
+    // can offer an explicit "Reconnect last session" affordance. The
+    // saved record carries safe metadata only — see
+    // `activeSessionStore.ts` for the contract.
+    saveActiveSession(activeSessionFromLaunch(launch));
   }
 
   function handleTerminalExit() {
+    // "Back to servers" leaves the saved record alone — the operator
+    // may want to reconnect within the detached-TTL window. The
+    // production terminal has already disposed the local client; the
+    // backend keeps the PTY alive briefly per its bounded TTL.
     activeLaunch = null;
     selected = "servers";
+  }
+
+  function handleSessionClosed() {
+    // Wire-confirmed close (server `SessionClosed`, post-`End session`,
+    // etc.). The backend runtime is gone and a reconnect would fail —
+    // drop the local pointer so the empty-state Terminal view does not
+    // tempt the operator with a stale "Reconnect last session" button.
+    clearActiveSession();
+    activeLaunch = null;
+  }
+
+  function handleLastSeenSeqUpdate(seq: number) {
+    if (!activeLaunch) return;
+    updateActiveSessionSeq(activeLaunch.sessionId, seq);
+  }
+
+  function handleReconnectLastSession(launch: ActiveLaunch) {
+    // Same as `handleLaunch`, but called from the empty-state Terminal
+    // view's "Reconnect last session" affordance. Routing through the
+    // shared launch path keeps the saved-record refresh + view
+    // transition in one place.
+    handleLaunch(launch);
+  }
+
+  function handleForgetLastSession() {
+    // "Forget saved session" affordance: an explicit user action to
+    // drop the local pointer without attempting a reconnect. Useful
+    // when the saved session is stale (e.g. backend was restarted,
+    // TTL expired) and the operator does not want to retry.
+    clearActiveSession();
   }
 </script>
 
@@ -83,7 +129,14 @@
         {#if selected === "dashboard"}
           <DashboardView />
         {:else if selected === "terminal"}
-          <TerminalView launch={activeLaunch} onExit={handleTerminalExit} />
+          <TerminalView
+            launch={activeLaunch}
+            onExit={handleTerminalExit}
+            onSessionClosed={handleSessionClosed}
+            onLastSeenSeqUpdate={handleLastSeenSeqUpdate}
+            onReconnectLastSession={handleReconnectLastSession}
+            onForgetLastSession={handleForgetLastSession}
+          />
         {:else if selected === "sessions"}
           <SessionsView
             onReconnect={handleLaunch}

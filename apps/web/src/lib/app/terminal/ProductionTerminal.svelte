@@ -71,16 +71,69 @@
      * the workspace is fully usable without it.
      */
     profileLabel?: string;
+    /**
+     * Optional replay bookmark for the very first attach. Set when the
+     * mount came from a "Reconnect last session" action backed by the
+     * local active-session store; left unset on a fresh launch from a
+     * profile row or on a Sessions-list reconnect. The component seeds
+     * its `lastSeenSeq` state from this value when it is a positive
+     * integer; a `0` / missing value collapses to "no resume" and the
+     * wire `attach` skips the replay handshake.
+     */
+    initialLastSeenSeq?: number;
     /** Called when the user presses the "Back to servers" button. */
     onExit?: () => void;
+    /**
+     * Fires once when the wire signals that the session is closed
+     * (server `SessionClosed` frame, post-`End session`, or any
+     * lifecycle path that resolves to the `closed` client state). The
+     * shell uses it to clear the local active-session pointer.
+     */
+    onSessionClosed?: () => void;
+    /**
+     * Fires when the workspace observes a meaningful `lastSeenSeq`
+     * transition the shell should persist locally — currently the
+     * detached-state edge and `onDestroy`. Called with the latest
+     * non-negative seq the workspace has observed; the shell-side
+     * helper additionally guards on session-id match so a stale write
+     * cannot clobber a fresh launch.
+     */
+    onLastSeenSeqUpdate?: (seq: number) => void;
   }
 
-  let { sessionId, cols, rows, profileLabel, onExit }: Props = $props();
+  let {
+    sessionId,
+    cols,
+    rows,
+    profileLabel,
+    initialLastSeenSeq,
+    onExit,
+    onSessionClosed,
+    onLastSeenSeqUpdate,
+  }: Props = $props();
 
   let clientState = $state<TerminalSessionState | null>(null);
   let replayActive = $state(false);
+  /**
+   * `lastSeenSeq` is seeded inside `onMount` from `initialLastSeenSeq`
+   * rather than via the `$state(...)` initializer. The initializer
+   * pattern would only capture the initial prop value AND would trigger
+   * Svelte 5's `state_referenced_locally` warning even though the
+   * parent's `{#key sessionId}` block guarantees a remount on
+   * session-id change. Deferring to `onMount` makes the intent
+   * explicit: this value is a one-shot seed, never reactive on the
+   * prop.
+   */
   let lastSeenSeq = $state(0);
   let lastError = $state<string | null>(null);
+  /**
+   * Local debounce: the `closed` lifecycle edge can fire from multiple
+   * paths (server frame, explicit close, dispose race). The shell-level
+   * `onSessionClosed` consumer is idempotent today but we still gate
+   * here so a regression that adds a side-effect to the consumer cannot
+   * trip a double-fire.
+   */
+  let closeNotified = $state(false);
   /**
    * `true` once a wire `Close` frame was sent (or HTTP close acked).
    * Used to suppress the "still in TTL" hint on close — the row is gone,
@@ -172,6 +225,16 @@
         // live so an operator can start typing without an extra click.
         // `safeFocus` swallows the dispose-race case.
         safeFocus(r);
+      }
+      if (s === "detached") {
+        // Persist the latest replay bookmark so a fresh nav can resume
+        // within the bounded TTL window. The shell-side helper guards
+        // on session-id match; the seq itself is metadata-only.
+        onLastSeenSeqUpdate?.(lastSeenSeq);
+      }
+      if (s === "closed" && !closeNotified) {
+        closeNotified = true;
+        onSessionClosed?.();
       }
     });
     next.on("attached", () => {
@@ -325,10 +388,26 @@
   }
 
   onMount(() => {
-    void attach();
+    // Resume from the seeded bookmark when present. The wire-side
+    // `attach` already gates on `lastSeenSeq > 0`, so a `0` here
+    // collapses to "no resume" and the call is identical to a fresh
+    // attach — the explicit `resume` flag just makes the intent clear.
+    const seed = initialLastSeenSeq;
+    if (typeof seed === "number" && Number.isInteger(seed) && seed > 0) {
+      lastSeenSeq = seed;
+    }
+    void attach({ resume: lastSeenSeq > 0 });
   });
 
   onDestroy(() => {
+    // Best-effort persistence of the latest replay bookmark on unmount
+    // (e.g. user navigated away). Only emits when we observed live
+    // output during the session — `onLastSeenSeqUpdate` itself is a
+    // no-op on `seq === 0`, but the shell-side helper costs a load /
+    // save per call so we skip the noise.
+    if (lastSeenSeq > 0 && !closeNotified) {
+      onLastSeenSeqUpdate?.(lastSeenSeq);
+    }
     teardownLocal({ keepRenderer: false });
   });
 

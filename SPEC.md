@@ -889,6 +889,49 @@ Polish slice that layers small UX affordances onto the existing production termi
 
 Production renderer selector; ghostty-web / restty / wterm in production; multi-tab workspace; durable session recording UI; backend VT observer / `libghostty-vt` snapshot; profile-specific terminal preferences; live hot-reload of font / theme on a mounted xterm; mobile / Tauri keyboard UI; custom keybinding editor; OSC 52 clipboard automation; bracketed-paste confirmation / multiline-paste preview; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI. Each is a separate slice.
 
+### Production active terminal local recovery
+
+After the production terminal launch UI shipped, an operator who navigated away from the Terminal view (or did a full-page reload) had no way to find their way back to a still-alive backend session: the AppShell's `activeLaunch` was an in-memory pointer, not a stored one. Detached sessions survive the bounded ~30-second TTL window on the backend, but the operator had to copy the session id by hand and reconnect from the Sessions list. This slice adds a **local-only browser convenience pointer** at the most-recent terminal session so the empty-state Terminal view can offer an explicit "Reconnect last session" affordance.
+
+This is **not** multi-tab workspace, **not** durable recording, **not** backend-restart recovery, and **not** automatic reconnect. The backend remains authoritative on every lifecycle decision; the local pointer is a UX shortcut.
+
+**Scope (load-bearing — this slice).**
+
+1. **Active session store** — `apps/web/src/lib/app/terminal/activeSessionStore.ts`. localStorage-backed helper module. Storage key: `relayterm.active-terminal.v1`. Persists ONLY safe public metadata (`session_id`, optional `profile_label`, optional `cols`/`rows`, optional non-negative `last_seen_seq`, optional cached `status_hint`, required `saved_at` ISO timestamp). Public surface: `parseActiveSession`, `serializeActiveSession`, `loadActiveSession`, `saveActiveSession`, `updateActiveSessionSeq`, `clearActiveSession`, `activeSessionFromLaunch`, `buildReconnectAttempt`. Tests live in `apps/web/tests/activeSessionStore.test.ts`.
+2. **AppShell wiring** — `apps/web/src/lib/app/AppShell.svelte` writes the saved record on `handleLaunch` (covers fresh profile-row launches AND Sessions-list reconnects). On wire-confirmed close it clears the record (`handleSessionClosed`). On detach / `onDestroy` it refreshes the saved record's `last_seen_seq` (`handleLastSeenSeqUpdate`). The "Back to servers" exit deliberately does NOT clear — the operator may want to reconnect within the detached-TTL window.
+3. **Empty-state Terminal view affordance** — `apps/web/src/lib/app/views/TerminalView.svelte` reads `loadActiveSession()` once per mount. When a record exists AND it does not match the currently-active launch, the empty state renders a "Reconnect last session" button alongside a "Forget saved session" affordance. Clicking Reconnect routes through `AppShell.handleLaunch` (the same path a profile-row launch takes); clicking Forget calls `clearActiveSession` and removes the affordance from the view.
+4. **Production terminal seeded resume** — `apps/web/src/lib/app/terminal/ProductionTerminal.svelte` accepts `initialLastSeenSeq?: number`. When set and positive, the workspace seeds its local `lastSeenSeq` state and passes it to the very first `client.attach` so the backend's replay handshake covers the gap. Zero / missing values collapse to "no resume" — identical to a fresh attach. The workspace also fires two new optional callbacks: `onSessionClosed()` on the wire-confirmed `closed` lifecycle edge (debounced via a local `closeNotified` flag), and `onLastSeenSeqUpdate(seq)` on the `detached` lifecycle edge AND on `onDestroy` when `lastSeenSeq > 0`.
+5. **`ActiveLaunch.lastSeenSeq` extension** — the cross-view launch struct gains an optional `lastSeenSeq?: number`. The local store is the single producer; profile-row launches and Sessions-list reconnects continue to leave it unset.
+
+**No backend changes.** The slice is purely a frontend UX polish slice. No new routes, no schema, no new wire messages, no protocol changes. The local store is browser-local and per-device; clearing browser storage drops the record.
+
+**Reconnect attempt contract (load-bearing).**
+
+- `buildReconnectAttempt(record)` returns an `ActiveLaunch` whose `lastSeenSeq` is set ONLY when the saved value is a strictly positive integer. Zero, missing, and any malformed value collapse to "no resume bookmark" — the wire `attach` then skips the replay request and the operator gets a fresh attach.
+- Cell-grid dims fall back to the standard 80×24 if the saved record omitted them.
+- The reconnect attempt is gated by an explicit user action (the "Reconnect last session" button click). The view does NOT auto-reconnect on mount.
+
+**Stale handling (load-bearing).**
+
+- Wire-confirmed `closed` is the canonical "this session is gone" signal. When `ProductionTerminal` observes `clientState === "closed"` it calls `onSessionClosed()` once; `AppShell` clears the local pointer. This covers both the explicit "End session" path and a server-side close (e.g. PTY exited, TTL elapsed, operator closed the row from the Sessions list).
+- Reconnect against a stale record routes through the same path: the wire returns `closed` quickly and the local pointer is dropped.
+- A pure transport failure (WebSocket open rejected with no `closed` lifecycle signal) leaves the record alone — the failure could be transient. The operator can press "Forget saved session" manually.
+
+**Redaction posture (load-bearing).**
+
+- The persisted record stores ONLY safe public metadata. It MUST NOT carry secrets, terminal input, terminal output, replay frames, public/private keys, `encrypted_private_key`, host fingerprints, peer banners, or `session_event` payloads.
+- `parseActiveSession` builds the record field-by-field. A hostile fixture that injects `private_key`, `encrypted_private_key`, `session_output`, `access_token`, or `replay_buffer` cannot smuggle those keys onto the parsed object — the parser explicitly drops anything outside the seven documented fields. Sentinel-string tests pin this in `tests/activeSessionStore.test.ts` against the parsed object, the serialized JSON, the persisted localStorage value, and the `activeSessionFromLaunch` projection.
+- Parse failures (missing key, malformed JSON, wrong schema, hostile fixture, oversized fields) collapse to `null` silently. Save failures (storage unavailable, quota exceeded, unnormalisable draft) return `false`. NEITHER branch logs.
+- The empty-state UI does NOT echo wire-side error detail. It surfaces the backend's lifecycle signal indirectly via `onSessionClosed` (which the shell uses to clear the record) — never via a wire `message` string.
+
+**Stable selectors (additions only).** `terminal-empty-saved` (carries `data-saved-session-id`), `terminal-empty-reconnect-last`, `terminal-empty-forget-last`. The pre-existing `production-terminal-*` and `terminal-empty-*-note` selectors are unchanged.
+
+**TTL / runtime limitation (load-bearing).** The local pointer is a *pointer*, not a runtime. Reconnect succeeds only while the backend's bounded detached-TTL window is still open AND the in-memory replay buffer survives in the live runtime. A backend restart drops every PTY and every replay buffer; the local pointer would still resolve, but the wire `attach` would receive a `closed` lifecycle and the pointer would be cleared. The empty-state copy says this in operator language ("Reconnect only succeeds while the backend runtime is still alive — replay is in-memory and does not survive a backend restart").
+
+**Future work (explicit out-of-scope for this slice).**
+
+Multi-tab workspace; durable session recording UI; backend VT observer / `libghostty-vt` snapshot for backend-restart recovery; cross-device sync of the saved pointer; per-profile recovery hints; auto-reconnect on page load; smarter stale-detection (poll the Sessions list before offering recovery); a local "saved sessions history" beyond the most-recent one. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.
