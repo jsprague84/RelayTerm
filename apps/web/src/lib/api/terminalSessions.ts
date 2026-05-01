@@ -39,6 +39,14 @@
  */
 
 import { CELL_GRID_MAX, CELL_GRID_MIN } from "../terminal/cellGrid.js";
+import {
+  fetchJsonList,
+  postJsonItem,
+  type LoadError,
+  type LoadOptions,
+  type LoadResult,
+  type WireError,
+} from "./apiErrors.js";
 
 /** Cell-grid bounds — the wire-side `relayterm_protocol::ResizeMsg` clamp. */
 export { CELL_GRID_MAX, CELL_GRID_MIN } from "../terminal/cellGrid.js";
@@ -299,4 +307,218 @@ function parseCreateResponse(
     message: b.message,
     pty_live: b.pty_live,
   };
+}
+
+// ---------------------------------------------------------------------------
+// List + close helpers (Sessions list view)
+// ---------------------------------------------------------------------------
+//
+// `GET /api/v1/terminal-sessions` and `POST /:id/close` mirror the backend
+// `TerminalSessionResponse` / `CloseTerminalSessionResponse` DTOs in
+// `crates/relayterm-api/src/dto/terminal_session.rs`. The list response
+// does NOT carry the `message` / `pty_live` fields — those are only on the
+// create envelope. The close response carries an `already_closed` boolean.
+//
+// Redaction posture (load-bearing):
+//  - Parsers build the DTO field-by-field. A stray `private_key` /
+//    `encrypted_private_key` / `peer_banner` smuggled onto the wire body
+//    cannot reach the parsed object because no path here copies it. The
+//    backend never emits those fields on this surface, but the rule lives
+//    in the helper so a future regression cannot smuggle them through.
+//  - {@link describeSessionLoadError} / {@link describeCloseSessionError}
+//    stay functions of `kind` + `status` + `code` ONLY. The wire `message`
+//    field of an HTTP error and the thrown `Error.message` of a transport
+//    failure are NEVER echoed in any user-facing string. The typed errors
+//    keep them for programmatic callers.
+
+/**
+ * Read-only snapshot of a `terminal_session` row as returned by
+ * `GET /api/v1/terminal-sessions`.
+ *
+ * Carries the safe public fields the SessionsView renders. The DTO is a
+ * subset of the create-response shape — the list endpoint does not emit
+ * `message` or `pty_live`, and we don't synthesize them here. Callers
+ * that need those fields should hit the create response instead.
+ */
+export interface TerminalSession {
+  id: string;
+  server_profile_id: string;
+  status: TerminalSessionStatus;
+  cols: number;
+  rows: number;
+  /** RFC 3339 timestamp. */
+  created_at: string;
+  /** RFC 3339 timestamp; the last point the orchestrator observed activity. */
+  last_seen_at: string;
+  /** RFC 3339 timestamp; `null` while the row is still alive. */
+  closed_at: string | null;
+}
+
+/**
+ * Parse one session row from the list / close-response wire bodies.
+ *
+ * Constructs the DTO field-by-field so unknown extra fields are dropped
+ * silently. A stray `private_key` / `encrypted_private_key` cannot smuggle
+ * onto the parsed object because no path here copies it. Returns `null`
+ * if any required field is missing or has the wrong shape — the caller
+ * collapses that to `malformed_response`.
+ */
+export function parseTerminalSession(raw: unknown): TerminalSession | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.id !== "string" ||
+    typeof r.server_profile_id !== "string" ||
+    typeof r.status !== "string" ||
+    typeof r.cols !== "number" ||
+    typeof r.rows !== "number" ||
+    typeof r.created_at !== "string" ||
+    typeof r.last_seen_at !== "string"
+  ) {
+    return null;
+  }
+  if (
+    r.status !== "starting" &&
+    r.status !== "active" &&
+    r.status !== "detached" &&
+    r.status !== "closed"
+  ) {
+    return null;
+  }
+  const closedAt = r.closed_at;
+  if (closedAt !== undefined && closedAt !== null && typeof closedAt !== "string") {
+    return null;
+  }
+  return {
+    id: r.id,
+    server_profile_id: r.server_profile_id,
+    status: r.status,
+    cols: r.cols,
+    rows: r.rows,
+    created_at: r.created_at,
+    last_seen_at: r.last_seen_at,
+    closed_at: closedAt === undefined ? null : closedAt,
+  };
+}
+
+export interface ListTerminalSessionsOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to `/api/v1/terminal-sessions`. */
+  endpoint?: string;
+}
+
+/**
+ * GET the caller's terminal sessions.
+ *
+ * Returns a typed {@link LoadResult}; transport, HTTP, and parse failures
+ * collapse to a single envelope so the UI can render loading/empty/error
+ * states without try/catch noise. The helper does NOT throw and does NOT
+ * log raw response bodies.
+ */
+export async function listTerminalSessions(
+  options: ListTerminalSessionsOptions = {},
+): Promise<LoadResult<TerminalSession[]>> {
+  const endpoint = options.endpoint ?? "/api/v1/terminal-sessions";
+  return fetchJsonList<TerminalSession>(endpoint, parseTerminalSession, options);
+}
+
+/**
+ * Format a {@link LoadError} as a one-line UI summary. Stays a function of
+ * `kind` + `status` + `code` ONLY — never echoes the wire `message` of
+ * an HTTP error or the thrown `Error.message` of a transport failure.
+ *
+ * Narrows on the imported `LoadError` union so a future variant added to
+ * the shared envelope forces this formatter to be updated in lockstep.
+ */
+export function describeSessionLoadError(err: LoadError): string {
+  switch (err.kind) {
+    case "http":
+      return `Failed to load terminal sessions: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Failed to load terminal sessions: transport error";
+    case "malformed_response":
+      return "Failed to load terminal sessions: malformed response";
+  }
+}
+
+/**
+ * Parsed shape of `POST /api/v1/terminal-sessions/:id/close`. The backend
+ * flattens the session row alongside `already_closed` so a single object
+ * carries both the post-close row state AND whether close was a no-op.
+ */
+export interface CloseTerminalSessionResult {
+  session: TerminalSession;
+  already_closed: boolean;
+}
+
+function parseCloseResponse(raw: unknown): CloseTerminalSessionResult | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const session = parseTerminalSession(r);
+  if (session === null) return null;
+  if (typeof r.already_closed !== "boolean") return null;
+  return { session, already_closed: r.already_closed };
+}
+
+export interface CloseTerminalSessionOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/terminal-sessions/:id/close`. */
+  endpoint?: string;
+}
+
+export type CloseTerminalSessionError = WireError;
+
+export type CloseTerminalSessionResponse =
+  | { ok: true; result: CloseTerminalSessionResult }
+  | { ok: false; error: CloseTerminalSessionError };
+
+/**
+ * POST a close request for the given session id.
+ *
+ * Backend semantics (mirrored, not re-implemented here):
+ *  - Idempotent: closing an already-closed session returns `200 OK` with
+ *    `already_closed = true`.
+ *  - Foreign-owned ids surface as `404 not_found`.
+ *
+ * The helper does NOT throw, does NOT log raw response bodies, and does
+ * NOT echo wire / transport detail through the formatter.
+ */
+export async function closeTerminalSession(
+  sessionId: string,
+  options: CloseTerminalSessionOptions = {},
+): Promise<CloseTerminalSessionResponse> {
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/terminal-sessions/${encodeURIComponent(sessionId)}/close`;
+  const result = await postJsonItem<CloseTerminalSessionResult>(
+    endpoint,
+    {},
+    parseCloseResponse,
+    options,
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, result: result.data };
+}
+
+/**
+ * Format a close error as a one-line UI summary. Same redaction posture
+ * as {@link describeSessionLoadError}: a function of `kind` + `status` +
+ * `code` ONLY.
+ */
+export function describeCloseSessionError(
+  err: CloseTerminalSessionError,
+): string {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 404 && err.code === "not_found") {
+        return "Could not close session: session not found";
+      }
+      if (err.status === 401) {
+        return "Could not close session: not authenticated";
+      }
+      return `Could not close session: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Could not close session: transport error";
+    case "malformed_response":
+      return "Could not close session: malformed response";
+  }
 }

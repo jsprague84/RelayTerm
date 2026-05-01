@@ -85,7 +85,11 @@
         {:else if selected === "terminal"}
           <TerminalView launch={activeLaunch} onExit={handleTerminalExit} />
         {:else if selected === "sessions"}
-          <SessionsView />
+          <SessionsView
+            onReconnect={handleLaunch}
+            activeSessionId={activeLaunch?.sessionId ?? null}
+          />
+
         {:else if selected === "servers"}
           <ServersView onLaunch={handleLaunch} />
         {:else if selected === "identities"}

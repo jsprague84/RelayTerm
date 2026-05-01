@@ -745,6 +745,46 @@ After a host key has been pinned and trusted AND auth-check has confirmed creden
 
 Multi-tab terminal workspace; durable / polished session list; renderer selector in production; renderer-preference persistence; backend VT observer / `libghostty-vt` snapshot for resume-across-restart; durable session recording UI; mobile/Tauri shell integration; password bootstrap / `ssh-copy-id`; private-key import UI; edit / delete UI for hosts and profiles; URL-driven routes / deep-linking; resume-from-detached on browser tab restore. Each is a separate slice.
 
+### Production terminal sessions list/status UI
+
+After the production terminal launch UI shipped, an operator could create and re-attach a single session via the AppShell active-launch state but had no inventory view of their existing sessions. This slice replaces the Terminal Sessions placeholder with a read-only/session-control view that surfaces the live + detached + closed rows the backend already owns and lets the operator reconnect or close any non-terminal row.
+
+**Scope (load-bearing — this slice).**
+
+1. **`SessionsView.svelte`** — production view at `apps/web/src/lib/app/views/SessionsView.svelte`. Replaces the prior `PlaceholderView` shim. Loads sessions on mount and on explicit Refresh; renders explicit loading / empty / error / list states. No polling, no auto-retry storms.
+2. **API helpers** — `apps/web/src/lib/api/terminalSessions.ts` gains `listTerminalSessions()`, `closeTerminalSession(sessionId)`, the `TerminalSession` DTO, `parseTerminalSession()`, and the `describeSessionLoadError` / `describeCloseSessionError` formatters. The list helper reuses the shared `fetchJsonList` envelope; the close helper reuses `postJsonItem`. Both compose against `apiErrors.ts` so the redaction rule matches the rest of the inventory surface.
+3. **Status helpers** — pure module at `apps/web/src/lib/app/terminal/sessionStatus.ts`. Exports `statusLabel`, `statusTone`, `describeSessionStatus`, `canReconnect`, `canClose`, `showsTtlHint`. Tests live in `apps/web/tests/sessionStatus.test.ts`.
+4. **Per-row actions.**
+   - **Open** (a.k.a. Reconnect) — enabled when `canReconnect(status)` is true (`active` or `detached`). Clicking calls `onReconnect` which the AppShell wires to `handleLaunch`; the shell sets the existing `ActiveLaunch` and switches `selected = "terminal"`. Reconnect from this list does NOT pre-supply a `lastSeenSeq` — that bookmark only exists when the current frontend has been attached to the same session in the current page lifetime, which `ProductionTerminal` tracks locally via its `lastSeenSeq` state. Honouring the bookmark across navigations would require shell-level persistence (out of scope).
+   - **Close** — enabled when `canClose(status)` is true (anything but `closed`). Calls `closeTerminalSession(id)`; on success the row is replaced in place with the parsed close response (no full list refetch — that would steal focus and reset scroll). Per-row close error state is dismissable; the formatter never echoes the wire `message` or transport `Error.message`.
+   - **Refresh** — explicit reload button; the only non-mount entry point.
+5. **Reconnect handoff.** AppShell already owns `activeLaunch: ActiveLaunch | null`. The Sessions view receives `onReconnect` AND `activeSessionId` (the current `activeLaunch?.sessionId`). If the row's id matches `activeSessionId`, the action button shows "Attached" and is disabled — clicking through would tear down and rebuild the existing attachment, which is a footgun. The Terminal view's `{#key launch.sessionId}` block already remounts cleanly on a different session.
+6. **No backend changes.** `GET /api/v1/terminal-sessions`, `POST /api/v1/terminal-sessions/:id/close`, and the WebSocket attach route all already carry the wire shape this slice consumes.
+
+**Honesty rules (load-bearing).**
+
+- **Closed sessions cannot be reconnected.** `canReconnect("closed")` is `false`. The Open button is disabled and the per-status copy says "Session ended … cannot be reconnected. Launch a new session from the originating server profile." Test pin: `sessionStatus.test.ts` asserts the literal "cannot be reconnected" substring.
+- **Detached sessions are TTL-bounded.** When `showsTtlHint(status)` is true (only for `detached`), the row renders a disclaimer that names the ~30s TTL, the in-memory replay constraint, and that a backend restart drops everything. Test pin: the helper copy contains both the `30s` window AND the literal `in-memory` substring.
+- **Starting sessions are not yet reconnectable.** `canReconnect("starting")` is `false`. The runtime is not yet bound; attaching would race the create call. Per-status copy says reconnect becomes available once the orchestrator promotes the row to active.
+- **Active sessions point at the close action without overpromising.** Per-status copy is short: "Session is live on the backend. Open it to attach, or close it to end the PTY immediately."
+- **One active terminal at a time.** This is the same limitation the production terminal launch UI already pinned: the AppShell holds a single `ActiveLaunch`. Reconnect from this list overwrites it. Multi-tab is explicit future work.
+
+**Redaction posture (load-bearing).**
+
+- The `TerminalSession` interface declares only safe public fields (`id`, `server_profile_id`, `status`, `cols`, `rows`, `created_at`, `last_seen_at`, `closed_at`). It does NOT declare `private_key` or `encrypted_private_key` — and the parser builds the DTO field-by-field so a stray field on the wire body cannot reach the parsed object. Sentinel test `parseTerminalSession does NOT carry private_key or encrypted_private_key onto the parsed DTO` pins this.
+- `describeSessionLoadError` and `describeCloseSessionError` are functions of `kind` + `status` + `code` ONLY. They NEVER echo the wire `message` of an HTTP error or the thrown `Error.message` of a transport failure. Sentinel tests pin both formatters against URL-bearing transport messages and operator-detail-bearing wire bodies.
+- The view never shows raw terminal output, replay buffer contents, or any field that could reconstruct input/output. Only safe metadata (id, profile id/name, status, cols/rows, timestamps) reaches the DOM. Helpers do NOT log raw response bodies, request bodies, or any payload.
+
+**Profile name resolution.** The list view fetches `listServerProfiles()` in parallel with the sessions list and maps `server_profile_id → profile.name` for a friendlier label. Profiles-list failure is silent: the view falls back to the short id form (first 8 chars) and renders the sessions anyway. Surfacing the profile error here would be misleading — the page is about terminal sessions.
+
+**Stable selectors.** `production-view-sessions` (root), `sessions-refresh-button`, `sessions-loading`, `sessions-error`, `sessions-empty`, `sessions-list`, `sessions-row` (carries `data-session-id` and `data-status`), `sessions-row-status`, `sessions-row-description`, `sessions-row-ttl-hint`, `sessions-row-reconnect`, `sessions-row-close`, `sessions-row-close-error`.
+
+**Architecture rule.** The view imports only from `lib/app/`, `lib/api/`, and `lib/app/terminal/sessionStatus.ts`. It does NOT import any `@relayterm/terminal-*` adapter — terminal rendering remains the Terminal view's concern. `appShellIsolation.test.ts` continues to enforce this; no rule change.
+
+**Future work (explicit out-of-scope for this slice).**
+
+Multi-tab workspace; durable / persistent session listing across browser sessions; durable session-recording UI / replay player; backend VT observer / `libghostty-vt` snapshot for resume-across-restart; production renderer selector; mobile/Tauri shell integration; URL-driven routes / deep-linking; auto-refresh / live status updates (today the operator presses Refresh); session filtering / search / pagination; admin cross-user view. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.
