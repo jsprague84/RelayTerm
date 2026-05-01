@@ -785,6 +785,51 @@ After the production terminal launch UI shipped, an operator could create and re
 
 Multi-tab workspace; durable / persistent session listing across browser sessions; durable session-recording UI / replay player; backend VT observer / `libghostty-vt` snapshot for resume-across-restart; production renderer selector; mobile/Tauri shell integration; URL-driven routes / deep-linking; auto-refresh / live status updates (today the operator presses Refresh); session filtering / search / pagination; admin cross-user view. Each is a separate slice.
 
+### Production terminal settings foundation
+
+The first production-safe local preferences UI for the terminal workspace. An operator can pick a font, font size, line height, cursor shape/blink, scrollback depth, and a small theme preset; the production xterm-baseline workspace honours those preferences on the next session it launches. This is the **local-only** foundation — there is no backend settings API, no per-user/account persistence, no per-server-profile override surface, and no production renderer selector in this slice.
+
+**Scope (load-bearing — this slice).**
+
+1. **Settings model** — `apps/web/src/lib/app/settings/terminalSettings.ts`. The `TerminalSettings` shape is renderer-neutral and maps cleanly onto `BaseTerminalRendererOptions` from `@relayterm/terminal-core`: `fontFamily`, `fontSize`, `lineHeight`, `cursorStyle`, `cursorBlink`, `scrollbackLines`, plus a `themePresetId` that resolves to a curated `RendererTheme`. The module exports `defaultTerminalSettings`, `parseTerminalSettings`, `normalizeTerminalSettings`, `serializeSettings`, `loadTerminalSettings`, `saveTerminalSettings`, `clearTerminalSettings`, `resolveTheme`, and `settingsToRendererOptions`. Validators clamp / reject rather than throw so a corrupted entry can never lock the operator out of the terminal.
+2. **Theme presets** — `apps/web/src/lib/app/settings/themePresets.ts`. Curated set: `relayterm-dark` (the default; visually identical to the pre-slice inline defaults), `alacritty-ish-dark` (deliberately labelled "ish" — NO claim of byte-for-byte parity with upstream Alacritty), `high-contrast`, `solarized-dark`. Each preset is a plain `RendererTheme`. The set is intentionally small until per-profile theming lands.
+3. **localStorage-only persistence** — single key `relayterm.terminal-settings.v1`. Adding fields is a breaking change relative to existing entries: bump the key (`v2`) and migrate. The loader collapses every failure path (missing key, JSON parse error, schema mismatch, hostile fixture, storage unavailable) to defaults silently — no `console.*` noise. Out-of-range numerics are clamped; unknown theme ids fall back to the default. Unknown / extra fields are dropped: a hostile fixture that injects `private_key` / `encrypted_private_key` / `session_output` cannot smuggle them onto the parsed object.
+4. **Production terminal wiring** — `apps/web/src/lib/app/terminal/ProductionTerminal.svelte` reads settings via `loadTerminalSettings()` once per attach and constructs `XtermRenderer` with `settingsToRendererOptions(settings)`. Mid-session live-updates (re-fit, atlas reset, palette swap on a mounted xterm) are explicit future work; the slice ships "applies on next session" semantics, and the Settings UI says so. The dev lab is unchanged — it has its own `XtermLiveTerminalLab` controls and is not driven by these preferences.
+5. **Settings view** — `apps/web/src/lib/app/views/SettingsView.svelte`. Replaces the prior `PlaceholderView` shim. Two-way bindings build a draft `TerminalSettings`; the Save button calls `saveTerminalSettings(normalized)`; the Reset button restores `defaultTerminalSettings()` and persists the defaults. A small inline preview card renders sample shell output using the selected theme, font, and line-height so the operator sees the change before applying it.
+
+**No backend changes.** The slice is purely a frontend addition. No new routes, no schema, no new wire shapes.
+
+**Architecture rule preserved.** The new module lives entirely under `lib/app/settings/`. It does NOT import anything under `lib/dev/` and does NOT import any experimental renderer adapter; only `@relayterm/terminal-core` (renderer-neutral types) is imported. `appShellIsolation.test.ts` continues to enforce both bans.
+
+**Redaction posture (load-bearing).**
+
+- `serializeSettings` writes ONLY the seven documented fields. Sentinel-string tests in `tests/terminalSettings.test.ts` pin that a hostile draft carrying `private_key`, `encrypted_private_key`, `session_output`, or `access_token` cannot reach the persisted JSON — the keys are absent, the values are absent, and the JSON does not match the corresponding key names.
+- `parseTerminalSettings` reads ONLY the documented keys; `__proto__` is not honoured for prototype mutation.
+- The loader / saver / reset paths NEVER `console.log/warn/error`. Tests pin this against future regressions.
+- Settings carry no secrets, no host/profile/identity references, no session ids, and no terminal output. The slice is purely cosmetic preferences.
+
+**Validation bounds (load-bearing copy).**
+
+- `fontSize`: integer 8–32; non-integers rounded; non-finite collapses to the default.
+- `lineHeight`: 0.8–2.5, rounded to two decimals (so `1.4 - 0.1` does not drift into `1.299999…`).
+- `scrollbackLines`: integer 0–100,000; truncated; non-finite collapses to the default. This is the renderer's visible scrollback only, NOT the backend replay buffer (the operator UI states this explicitly).
+- `cursorStyle`: closed set `block | underline | bar`. Anything else collapses to `block`.
+- `fontFamily`: stripped of ASCII control characters and trimmed; falls back to the default if empty after stripping; clipped to 256 chars.
+- `themePresetId`: must match an entry in `TERMINAL_THEME_PRESETS`; unknown ids collapse to `relayterm-dark`.
+
+**Stable selectors.** `production-view-settings` (root), `settings-terminal-appearance`, `settings-font-family`, `settings-font-size`, `settings-line-height`, `settings-scrollback-lines`, `settings-cursor-style`, `settings-cursor-blink`, `settings-theme-preset`, `settings-preview`, `settings-apply`, `settings-reset`, `settings-status-saved`, `settings-status-failed`.
+
+**UX copy (load-bearing).**
+
+- View summary: "Local terminal preferences for this browser. Stored in localStorage only — there is no backend / account settings yet, and these preferences do not sync to other devices. Changes apply to the next terminal session you launch."
+- Save success: "Saved locally. Applies to the next terminal session."
+- Save failure: "Couldn't save to local storage. Settings stayed in memory only."
+- Footer note: "Per-server-profile preferences, custom palettes, keybinding editor, copy/paste policy, production renderer selection, and mobile/Tauri settings are deliberate later slices. Today's settings are stored locally in this browser only."
+
+**Future work (explicit out-of-scope for this slice).**
+
+Backend / account settings persistence; per-server-profile preferences; live-update of an attached terminal (re-fit / atlas reset / palette swap); production renderer selector and per-renderer preferences; keybinding editor; copy/paste policy UI; theme import/export; Alacritty config import; durable session-recording settings; mobile/Tauri-specific settings; custom 16-slot palette editor; theme marketplace. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.

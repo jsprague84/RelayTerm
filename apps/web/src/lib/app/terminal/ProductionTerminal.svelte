@@ -52,6 +52,10 @@
     phaseTone,
     type WorkspacePhase,
   } from "./terminalLaunch.js";
+  import {
+    loadTerminalSettings,
+    settingsToRendererOptions,
+  } from "../settings/terminalSettings.js";
 
   interface Props {
     sessionId: string;
@@ -126,19 +130,14 @@
     if (client || !mountTarget) return;
     const myGen = bumpGeneration();
 
-    const r = new XtermRenderer({
-      fontFamily:
-        'ui-monospace, "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-      fontSize: 13,
-      cursorBlink: true,
-      cursorStyle: "block",
-      scrollbackLines: 2000,
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e4e4e7",
-        cursor: "#e4e4e7",
-      },
-    });
+    // Settings are read once per attach. localStorage is the source of
+    // truth; a parse failure or missing entry collapses to defaults
+    // silently inside `loadTerminalSettings`. Mid-session live-updates
+    // are explicit future work — applying font/theme to a mounted
+    // xterm involves more than option-merging (re-fit, atlas reset),
+    // so the slice ships "applies on next session" behaviour.
+    const settings = loadTerminalSettings();
+    const r = new XtermRenderer(settingsToRendererOptions(settings));
     r.mount(mountTarget);
     if (myGen !== generation) {
       r.dispose();
