@@ -13,10 +13,16 @@
     listTerminalSessions,
     type TerminalSession,
   } from "../../api/terminalSessions.js";
+  import {
+    listRecentAuditEvents,
+    type AuditEvent,
+  } from "../../api/auditEvents.js";
   import type { LoadResult } from "../../api/apiErrors.js";
   import StatusBadge from "../StatusBadge.svelte";
   import {
     DASHBOARD_NAV_ACTIONS,
+    DASHBOARD_RECENT_ACTIVITY_LIMIT,
+    activitySectionFromLoad,
     deriveChecklist,
     sessionStatusOrder,
     summarizeInventory,
@@ -47,6 +53,12 @@
   let sessionsResult = $state<LoadResult<TerminalSession[]> | null>(null);
   let inventoryPending = $state(false);
 
+  // Recent activity is its own load slot — a 401 / transport blip on
+  // the audit feed must NOT poison the inventory cards or the health
+  // probe. Manual refresh only; the dashboard is a snapshot.
+  let activityResult = $state<LoadResult<AuditEvent[]> | null>(null);
+  let activityPending = $state(false);
+
   let inventory = $derived(
     summarizeInventory({
       hosts: hostsResult,
@@ -57,6 +69,7 @@
   );
   let sessionBreakdown = $derived(summarizeSessionStatuses(sessionsResult));
   let checklist = $derived(deriveChecklist(inventory));
+  let activity = $derived(activitySectionFromLoad(activityResult));
 
   async function probeHealth() {
     healthPending = true;
@@ -80,10 +93,21 @@
     inventoryPending = false;
   }
 
+  async function loadActivity() {
+    // Recent activity is independent of inventory and health. A failed
+    // audit fetch is rendered as a small "Unavailable" line and never
+    // collapses the rest of the dashboard.
+    activityPending = true;
+    activityResult = await listRecentAuditEvents({
+      limit: DASHBOARD_RECENT_ACTIVITY_LIMIT,
+    });
+    activityPending = false;
+  }
+
   async function refreshAll() {
-    // Manual refresh only — no polling, no auto-refresh. Drives both the
-    // health probe and the inventory load in parallel.
-    await Promise.all([probeHealth(), loadInventory()]);
+    // Manual refresh only — no polling, no auto-refresh. Drives the
+    // health probe, inventory load, AND recent-activity load in parallel.
+    await Promise.all([probeHealth(), loadInventory(), loadActivity()]);
   }
 
   // One-shot mount load. The effect deliberately reads no reactive state
@@ -110,6 +134,12 @@
       case "ready":
         return "";
     }
+  }
+
+  function formatRecordedAt(rfc3339: string): string {
+    const t = Date.parse(rfc3339);
+    if (Number.isNaN(t)) return rfc3339;
+    return new Date(t).toLocaleString();
   }
 
   function checklistDotClass(step: ChecklistStep): string {
@@ -275,6 +305,86 @@
       >
         Unavailable. Check the Sessions view for details.
       </p>
+    {/if}
+  </article>
+
+  <article
+    class="flex flex-col gap-3 rounded-lg border border-zinc-800 bg-zinc-950/40 p-4"
+    data-testid="dashboard-recent-activity"
+  >
+    <header class="flex items-start justify-between gap-2">
+      <div class="flex flex-col gap-1">
+        <span class="text-sm font-semibold text-zinc-100">
+          Recent activity
+        </span>
+        <span class="text-xs text-zinc-500">
+          Most recent audit events for your account. Settings has the
+          fuller list.
+        </span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button
+          type="button"
+          class="text-xs text-zinc-400 transition hover:text-zinc-200 disabled:opacity-50"
+          onclick={loadActivity}
+          disabled={activityPending}
+          data-testid="dashboard-recent-activity-refresh"
+        >
+          {activityPending ? "Refreshing…" : "Refresh"}
+        </button>
+        <button
+          type="button"
+          class="text-xs text-zinc-400 transition hover:text-zinc-200"
+          onclick={() => navigateTo("settings")}
+          data-testid="dashboard-recent-activity-view-all"
+        >
+          View all →
+        </button>
+      </div>
+    </header>
+    {#if activity.kind === "loading"}
+      <p
+        class="text-xs text-zinc-500"
+        data-testid="dashboard-recent-activity-loading"
+      >
+        Loading…
+      </p>
+    {:else if activity.kind === "error"}
+      <p
+        class="rounded-md border border-rose-900/40 bg-rose-950/20 px-3 py-2 text-xs text-rose-200"
+        data-testid="dashboard-recent-activity-error"
+      >
+        {activity.summary}
+      </p>
+    {:else if activity.lines.length === 0}
+      <p
+        class="text-xs text-zinc-500"
+        data-testid="dashboard-recent-activity-empty"
+      >
+        No audit events yet. Server-profile create / disable / enable
+        actions appear here.
+      </p>
+    {:else}
+      <ul
+        class="flex flex-col gap-1.5 text-sm text-zinc-200"
+        data-testid="dashboard-recent-activity-list"
+      >
+        {#each activity.lines as line (line.id)}
+          <li
+            class="flex items-baseline justify-between gap-3 rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2"
+            data-testid="dashboard-recent-activity-row"
+            data-kind={line.kind}
+          >
+            <span class="truncate">{line.summary}</span>
+            <time
+              class="shrink-0 font-mono text-[11px] text-zinc-500"
+              datetime={line.recorded_at}
+            >
+              {formatRecordedAt(line.recorded_at)}
+            </time>
+          </li>
+        {/each}
+      </ul>
     {/if}
   </article>
 

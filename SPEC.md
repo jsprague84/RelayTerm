@@ -1126,6 +1126,35 @@ The Dashboard view is now a real read-only summary instead of a single health ba
 
 Backend exposure of host-key trust state and last-auth-check outcome on the profile DTO; a checklist that promotes those rows from `manual` to inferable; charts / time-series widgets; admin / cross-user reporting; auto-refresh / polling; mobile-specific dashboard layout; setup-wizard UX (step-by-step flow); terminal launch directly from dashboard; host-key trust / auth-check directly from dashboard; URL-driven dashboard parameters. Each is a separate slice.
 
+### Dashboard recent activity
+
+The Dashboard view also surfaces a compact **Recent activity** section that reuses the existing read-only current-user audit feed (`GET /api/v1/audit-events/recent`). It is a snapshot designed to make the most recent server-profile lifecycle events (and any other current-user audit events) visible from the landing view without forcing the operator into Settings. No new backend route, no new DTO, no admin / cross-user view.
+
+**Scope (load-bearing — this slice).**
+
+1. **Source.** The section reuses `listRecentAuditEvents` from `apps/web/src/lib/api/auditEvents.ts` with `limit: 5`. The frontend never exposes the raw payload JSON; events are rendered through the same `summarizeAuditEvent` helper as the Settings panel. Unknown wire kinds collapse to a generic "Audit event" line.
+2. **Bounded count.** The dashboard caps the rendered list at `DASHBOARD_RECENT_ACTIVITY_LIMIT = 5` (pinned in `dashboardSummary.test.ts`). The Settings `RecentActivityPanel` continues to request `limit: 20` — the dashboard intentionally renders fewer rows so it stays a snapshot, not a feed.
+3. **Independent failure.** The audit fetch is its own load slot. A 401 / transport blip on the audit feed must NOT poison the inventory cards or the health probe. The section renders one of `loading` / `ready` (with rows or empty-state) / `error` and nothing else.
+4. **Manual refresh only.** Two refresh paths exist: (a) the dashboard-wide `Refresh` button drives the health probe, the four inventory loads, AND the audit fetch in parallel; (b) the section's own `Refresh` affordance re-fetches activity alone, leaving the rest of the dashboard untouched. There is no polling, no auto-refresh, no retry storm.
+5. **Navigation to Settings.** A `View all →` button uses the existing AppShell `onNavigate(AppViewId)` path to jump to the Settings view, which hosts the fuller `RecentActivityPanel`. The dashboard does NOT introduce route parameters and does NOT trigger a full-page reload. The target is pinned against `routing.ts` so the link cannot silently drift to a placeholder.
+6. **No backend changes.** No new route, no new DTO, no new audit kind. The slice is purely a frontend composition on top of the existing audit read API.
+7. **No admin / cross-user view.** This section, like the existing Settings panel, is the current-user audit feed only. Cross-user / admin reporting, search, filter, export, and audit-payload detail panes are deliberate later slices.
+
+**Architecture rule preserved.** The helper module is `apps/web/src/lib/app/dashboard/dashboardSummary.ts` (extended with `summarizeRecentActivity`, `activitySectionFromLoad`, `DASHBOARD_RECENT_ACTIVITY_LIMIT`, and `RecentActivitySection` / `RecentActivityLine` types). The view stays at `apps/web/src/lib/app/views/DashboardView.svelte`. No imports from `lib/dev/` and no imports from any `@relayterm/terminal-*` adapter package. `appShellIsolation.test.ts` continues to enforce both bans.
+
+**Redaction posture (load-bearing).**
+
+- The dashboard renders only fields that have already passed through `parseAuditEvent` (which builds the structured `AuditPayloadSummary` field-by-field). Smuggled `private_key` / `encrypted_private_key` / `client_info` / `remote_addr` / `user_agent` / `session_output` / `access_token` keys cannot survive — pinned by sentinel-string tests in `dashboardSummary.test.ts` against the rendered `RecentActivityLine` JSON.
+- The dashboard does NOT show actor identifiers (`actor_id`), remote addresses, user-agent strings, or any raw payload JSON. The visible row carries: a safe summary string (kind label + lifecycle profile name when present) and a formatted timestamp.
+- Error states use `describeLoadError("audit events", err)` only — the helper never echoes the wire `message` of an HTTP error or the thrown `Error.message` of a transport failure. Pinned with a sentinel string in `activitySectionFromLoad` tests.
+- The helper does NOT log raw response bodies. Operator detail belongs in server logs, not the browser console.
+
+**Stable selectors (additions).** `dashboard-recent-activity`, `dashboard-recent-activity-refresh`, `dashboard-recent-activity-view-all`, `dashboard-recent-activity-loading`, `dashboard-recent-activity-error`, `dashboard-recent-activity-empty`, `dashboard-recent-activity-list`, `dashboard-recent-activity-row` (carries `data-kind` set to the wire `AuditEventKind` tag).
+
+**Future work (explicit out-of-scope for this slice).**
+
+Cross-user / admin audit views, audit search / filter / export, audit-payload detail modals, raw-payload expansion, polling / auto-refresh, charts / time-series widgets, audit-by-resource drill-downs, mobile-specific dashboard layout, route-parameter-driven activity filtering, and audit pagination. Each is a separate slice.
+
 ### Live SSH PTY bridge contract
 
 After the host key is pinned and trusted (preceding section), an operator may open a `terminal_session` that is backed by a **live SSH PTY**. The create flow does the metadata write AND starts the PTY in one shot; if any precondition fails the row is transitioned to `closed` with a `closed { reason: ssh_start_failed, category }` event.

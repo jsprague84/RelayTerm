@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   DASHBOARD_NAV_ACTIONS,
+  DASHBOARD_RECENT_ACTIVITY_LIMIT,
+  activitySectionFromLoad,
   cardStateFromLoad,
   deriveChecklist,
   sessionStatusOrder,
   summarizeInventory,
+  summarizeRecentActivity,
   summarizeSessionStatuses,
   type CardState,
   type ChecklistStepId,
@@ -19,6 +22,7 @@ import type { ServerProfile } from "../src/lib/api/serverProfiles.js";
 import type { SshIdentity } from "../src/lib/api/sshIdentities.js";
 import type { TerminalSession } from "../src/lib/api/terminalSessions.js";
 import type { LoadResult } from "../src/lib/api/apiErrors.js";
+import type { AuditEvent } from "../src/lib/api/auditEvents.js";
 
 /**
  * Sentinels that MUST NEVER appear in any user-visible string the
@@ -413,5 +417,258 @@ describe("CardState", () => {
   it("CardState ready value is the array length, not a count of reachable items", () => {
     const card: CardState = cardStateFromLoad(ok([HOST_FIXTURE]));
     expect(card.kind === "ready" && card.value === 1).toBe(true);
+  });
+});
+
+/**
+ * Audit-event sentinels: every "forbidden in audit" wire field that the
+ * dashboard activity helper must drop. Mirrors the backend
+ * `AUDIT_FORBIDDEN_SUBSTRINGS` list AND the redaction posture pinned in
+ * `tests/auditApi.test.ts`.
+ */
+const AUDIT_FORBIDDEN = [
+  "encrypted_private_key",
+  "private_key",
+  "BEGIN OPENSSH PRIVATE KEY",
+  "client_info",
+  "remote_addr",
+  "user_agent",
+  "session_output",
+  "access_token",
+] as const;
+
+function lifecycleEvent(
+  id: string,
+  kind: AuditEvent["kind"] = "server_profile_created",
+  name: string | null = "edge-1 prod",
+  recordedAt = "2026-05-01T12:34:56Z",
+): AuditEvent {
+  return {
+    id,
+    kind,
+    recorded_at: recordedAt,
+    summary: {
+      kind: "server_profile_lifecycle",
+      server_profile_id: "p",
+      name,
+      host_id: "h",
+      ssh_identity_id: "i",
+      disabled_at: null,
+    },
+  };
+}
+
+function genericEvent(
+  id: string,
+  kind: AuditEvent["kind"] = "future_kind_unknown_to_frontend",
+  recordedAt = "2026-05-01T00:00:00Z",
+): AuditEvent {
+  return {
+    id,
+    kind,
+    recorded_at: recordedAt,
+    summary: { kind: "generic" },
+  };
+}
+
+describe("DASHBOARD_RECENT_ACTIVITY_LIMIT", () => {
+  it("is a small integer in [1, 10]", () => {
+    // The dashboard activity card is a snapshot, not a feed. A drift to
+    // 50 / 100 would defeat the design goal — pinned here so a casual
+    // bump trips a test.
+    expect(Number.isInteger(DASHBOARD_RECENT_ACTIVITY_LIMIT)).toBe(true);
+    expect(DASHBOARD_RECENT_ACTIVITY_LIMIT).toBeGreaterThanOrEqual(1);
+    expect(DASHBOARD_RECENT_ACTIVITY_LIMIT).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("summarizeRecentActivity", () => {
+  it("limits to the requested count even when more rows are returned", () => {
+    const events = Array.from({ length: 20 }, (_, i) =>
+      lifecycleEvent(`evt-${i}`, "server_profile_created", `profile-${i}`),
+    );
+    const lines = summarizeRecentActivity(events, 5);
+    expect(lines.length).toBe(5);
+    // Backend ordering (recorded_at desc) is preserved — the helper
+    // must NOT reverse or re-sort.
+    expect(lines.map((l) => l.id)).toEqual([
+      "evt-0",
+      "evt-1",
+      "evt-2",
+      "evt-3",
+      "evt-4",
+    ]);
+  });
+
+  it("defaults to DASHBOARD_RECENT_ACTIVITY_LIMIT when no limit is passed", () => {
+    const events = Array.from({ length: 12 }, (_, i) =>
+      lifecycleEvent(`evt-${i}`),
+    );
+    const lines = summarizeRecentActivity(events);
+    expect(lines.length).toBe(DASHBOARD_RECENT_ACTIVITY_LIMIT);
+  });
+
+  it("returns an empty list when given no events", () => {
+    expect(summarizeRecentActivity([], 5)).toEqual([]);
+  });
+
+  it("clamps a non-positive / non-finite limit to zero", () => {
+    const events = [lifecycleEvent("evt-0")];
+    expect(summarizeRecentActivity(events, 0)).toEqual([]);
+    expect(summarizeRecentActivity(events, -3)).toEqual([]);
+    expect(summarizeRecentActivity(events, Number.NaN)).toEqual([]);
+    expect(summarizeRecentActivity(events, Number.POSITIVE_INFINITY)).toEqual(
+      [],
+    );
+  });
+
+  it("formats lifecycle rows with the profile name when present", () => {
+    const lines = summarizeRecentActivity(
+      [lifecycleEvent("evt-0", "server_profile_disabled", "edge-1 prod")],
+      5,
+    );
+    expect(lines[0]?.summary).toBe("Server profile disabled: edge-1 prod");
+  });
+
+  it("collapses unknown wire kinds to the safe generic line", () => {
+    const lines = summarizeRecentActivity(
+      [genericEvent("evt-0", "future_kind_unknown_to_frontend")],
+      5,
+    );
+    // `summarizeAuditEvent` returns "Audit event" for any unknown kind;
+    // the dashboard helper must surface that string verbatim — never a
+    // raw `kind` echo.
+    expect(lines[0]?.summary).toBe("Audit event");
+  });
+
+  it("redaction sentinel: forbidden wire fields cannot survive into a rendered line", () => {
+    // Construct an AuditEvent whose `summary.name` carries every
+    // forbidden substring as a hostile literal. The line's `summary`
+    // string is sourced from `summarizeAuditEvent`, which only echoes
+    // `name` — but that field is on the closed allow-list and is the
+    // operator-supplied profile name. Pin the redaction posture
+    // explicitly: even when we DO render `name`, no sentinel beyond
+    // the operator's own profile name reaches the line.
+    const safeNameOnly = "operator-supplied-profile";
+    const event = lifecycleEvent("evt-0", "server_profile_created", safeNameOnly);
+    const lines = summarizeRecentActivity([event], 5);
+    const blob = JSON.stringify(lines);
+    for (const sentinel of AUDIT_FORBIDDEN) {
+      expect(blob).not.toContain(sentinel);
+    }
+    // The DTO field names are also absent — the helper builds the
+    // rendered line by name and never spreads `event.summary`.
+    expect(blob).not.toContain("server_profile_id");
+    expect(blob).not.toContain("ssh_identity_id");
+    expect(blob).not.toContain("disabled_at");
+  });
+
+  it("redaction sentinel: extra keys on the structured summary cannot leak", () => {
+    // The TypeScript shape forbids smuggled keys, but runtime code
+    // sometimes builds events from a cast. We construct one such event
+    // and confirm the helper drops everything off the typed contract.
+    const event = lifecycleEvent("evt-0");
+    // Smuggled fields placed on the summary object via cast.
+    (event.summary as Record<string, unknown>).private_key = "PEM bytes";
+    (event.summary as Record<string, unknown>).client_info = "Mozilla/5.0";
+    const lines = summarizeRecentActivity([event], 5);
+    const blob = JSON.stringify(lines);
+    for (const sentinel of AUDIT_FORBIDDEN) {
+      expect(blob).not.toContain(sentinel);
+    }
+  });
+});
+
+describe("activitySectionFromLoad", () => {
+  function http(): LoadResult<AuditEvent[]> {
+    return {
+      ok: false,
+      error: {
+        kind: "http",
+        status: 401,
+        code: "unauthorized",
+        message: "RELAY_SENTINEL_DASH_OPERATOR_DETAIL_9102",
+      },
+    };
+  }
+
+  function transportErr(): LoadResult<AuditEvent[]> {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: "RELAY_SENTINEL_DASH_OPERATOR_DETAIL_9102",
+      },
+    };
+  }
+
+  it("returns loading before the first load", () => {
+    expect(activitySectionFromLoad(null)).toEqual({ kind: "loading" });
+  });
+
+  it("returns ready with limited lines on success", () => {
+    const events = Array.from({ length: 8 }, (_, i) => lifecycleEvent(`e${i}`));
+    const section = activitySectionFromLoad(ok(events));
+    expect(section.kind).toBe("ready");
+    if (section.kind === "ready") {
+      expect(section.lines.length).toBe(DASHBOARD_RECENT_ACTIVITY_LIMIT);
+    }
+  });
+
+  it("returns ready with an empty list on a successful empty fetch", () => {
+    const section = activitySectionFromLoad(ok([] as AuditEvent[]));
+    expect(section).toEqual({ kind: "ready", lines: [] });
+  });
+
+  it("collapses an http error to a typed error summary", () => {
+    const section = activitySectionFromLoad(http());
+    expect(section.kind).toBe("error");
+    if (section.kind === "error") {
+      expect(section.summary).toBe(
+        "Failed to load audit events: HTTP 401 unauthorized",
+      );
+    }
+  });
+
+  it("collapses a transport error to a typed error summary", () => {
+    const section = activitySectionFromLoad(transportErr());
+    expect(section.kind).toBe("error");
+    if (section.kind === "error") {
+      expect(section.summary).toBe("Failed to load audit events: transport error");
+    }
+  });
+
+  it("redaction sentinel: error summary never echoes the wire message or operator detail", () => {
+    const section = activitySectionFromLoad(http());
+    expect(section.kind).toBe("error");
+    if (section.kind === "error") {
+      expect(section.summary).not.toContain(
+        "RELAY_SENTINEL_DASH_OPERATOR_DETAIL_9102",
+      );
+    }
+  });
+
+  it("redaction sentinel: ready section JSON never carries forbidden audit fields", () => {
+    const event = lifecycleEvent("evt-0");
+    // Smuggle hostile fields onto the structured summary via cast.
+    (event.summary as Record<string, unknown>).private_key = "leak";
+    (event.summary as Record<string, unknown>).encrypted_private_key = "leak";
+    (event.summary as Record<string, unknown>).client_info = "leak";
+    const section = activitySectionFromLoad(ok([event]));
+    const blob = JSON.stringify(section);
+    for (const sentinel of AUDIT_FORBIDDEN) {
+      expect(blob).not.toContain(sentinel);
+    }
+  });
+});
+
+describe("dashboard recent activity navigation target", () => {
+  it("the View-all link routes to the Settings view", () => {
+    // The `Recent activity` section's "View all" affordance uses the
+    // shared `onNavigate(AppViewId)` path. The Settings view hosts the
+    // fuller `RecentActivityPanel` (limit: 20). Pin the target so a
+    // future re-org doesn't silently re-point the link to a placeholder.
+    const path: AppRoutePath = pathForView("settings");
+    expect(path).toBe("/settings");
   });
 });

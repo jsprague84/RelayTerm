@@ -197,6 +197,14 @@ update this file in the same change.
 | `[data-testid="dashboard-session-breakdown"]`     | Dashboard sessions-by-status card (active/detached/starting/closed). |
 | `[data-testid="dashboard-setup-checklist"]`       | Dashboard connection-flow checklist (count-inferable + manual rows). |
 | `[data-testid="dashboard-nav-actions"]`           | Dashboard quick-action navigation buttons (Manage servers / Manage SSH identities / Open terminal / View sessions / Configure terminal). |
+| `[data-testid="dashboard-recent-activity"]`       | Dashboard recent-activity card root (current-user audit feed snapshot, capped at 5 rows; not an admin view). |
+| `[data-testid="dashboard-recent-activity-refresh"]` | Per-section refresh button (re-fetches the audit feed only; no polling). |
+| `[data-testid="dashboard-recent-activity-view-all"]` | "View all" button inside the recent-activity card; routes through the AppShell `onNavigate("settings")` path to the Settings view, which hosts the fuller `RecentActivityPanel` (rendered as a `<button>`, not an anchor). |
+| `[data-testid="dashboard-recent-activity-loading"]` | Recent-activity loading state (pre-fetch placeholder). |
+| `[data-testid="dashboard-recent-activity-error"]` | Recent-activity error summary (safe formatter only — never echoes wire `message` or transport detail). |
+| `[data-testid="dashboard-recent-activity-empty"]` | Recent-activity empty state ("No audit events yet."). |
+| `[data-testid="dashboard-recent-activity-list"]`  | Recent-activity list container (one row per event, capped at 5). |
+| `[data-testid="dashboard-recent-activity-row"]`   | One row inside the recent-activity list (carries `data-kind` set to the wire `AuditEventKind` tag). |
 | `[data-testid="production-view-settings"]`        | Settings view root (local terminal preferences).              |
 | `[data-testid="settings-terminal-appearance"]`    | Terminal appearance card (font / cursor / scrollback / theme controls). |
 | `[data-testid="settings-font-family"]`            | Font-family text input.                                       |

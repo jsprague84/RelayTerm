@@ -28,7 +28,12 @@
  *    in a formatted summary.
  */
 
-import type { LoadResult } from "../../api/apiErrors.js";
+import { describeLoadError, type LoadResult } from "../../api/apiErrors.js";
+import {
+  summarizeAuditEvent,
+  type AuditEvent,
+  type AuditEventKindTag,
+} from "../../api/auditEvents.js";
 import type { Host } from "../../api/hosts.js";
 import type { ServerProfile } from "../../api/serverProfiles.js";
 import type { SshIdentity } from "../../api/sshIdentities.js";
@@ -266,6 +271,113 @@ export interface NavigationAction {
   readonly label: string;
   readonly view: AppViewId;
   readonly path: AppRoutePath;
+}
+
+/**
+ * Maximum number of recent audit events the Dashboard activity section
+ * renders. Kept small so the dashboard stays a snapshot — operators who
+ * want the fuller feed open the Settings view, where the
+ * `RecentActivityPanel` requests `limit: 20`.
+ *
+ * Pinned in tests as the upper bound the helper imposes regardless of
+ * how many rows the backend returns. The current-user audit API itself
+ * still owns the absolute hard cap (100).
+ */
+export const DASHBOARD_RECENT_ACTIVITY_LIMIT = 5;
+
+/**
+ * One rendered row in the Dashboard "Recent activity" section. The
+ * shape is deliberately tiny: it carries only fields that have already
+ * passed through `parseAuditEvent` (so smuggled `private_key` /
+ * `encrypted_private_key` / `client_info` / `remote_addr` / `user_agent`
+ * keys cannot survive) plus the formatted summary string from
+ * `summarizeAuditEvent`. Rendering callers MUST NOT pull anything else
+ * off the original wire payload.
+ */
+export interface RecentActivityLine {
+  readonly id: string;
+  readonly kind: AuditEventKindTag;
+  /** RFC 3339 timestamp; the caller formats it for display. */
+  readonly recorded_at: string;
+  /** Safe one-line summary — never echoes raw payload content. */
+  readonly summary: string;
+}
+
+/**
+ * Section-level state for the Dashboard "Recent activity" card.
+ *
+ *  - `loading` — pre-fetch placeholder.
+ *  - `ready`   — at least one fetch completed; `lines` may be empty
+ *                (the empty-state copy is rendered by the view).
+ *  - `error`   — last fetch failed. The `summary` is a typed
+ *                {@link describeLoadError} string — it never echoes the
+ *                wire `message` of an HTTP error or transport detail.
+ *
+ * Mirrors the `CardState` / `SessionStatusBreakdown` shape already used
+ * by the dashboard so the view stays a thin imperative wrapper.
+ */
+export type RecentActivitySection =
+  | { kind: "loading" }
+  | { kind: "ready"; lines: readonly RecentActivityLine[] }
+  | { kind: "error"; summary: string };
+
+/**
+ * Map the raw audit-events `LoadResult` (plus the fixed dashboard
+ * limit) into a {@link RecentActivitySection}. Pure — the helper does
+ * not log, does not retry, and never echoes wire detail.
+ *
+ * The `limit` is applied client-side as a defence-in-depth: the backend
+ * already clamps `limit` to `1..=100` and the dashboard helper requests
+ * `5`, but a future caller that forgets to pass the query param would
+ * still be capped here.
+ */
+export function activitySectionFromLoad(
+  result: LoadResult<AuditEvent[]> | null,
+  limit: number = DASHBOARD_RECENT_ACTIVITY_LIMIT,
+): RecentActivitySection {
+  if (result === null) return { kind: "loading" };
+  if (!result.ok) {
+    return {
+      kind: "error",
+      summary: describeLoadError("audit events", result.error),
+    };
+  }
+  return {
+    kind: "ready",
+    lines: summarizeRecentActivity(result.data, limit),
+  };
+}
+
+/**
+ * Build the rendered list for the Dashboard "Recent activity" section.
+ *
+ * Inputs are already-typed `AuditEvent` rows from `parseAuditEvent`;
+ * the helper takes their structured `summary` shape through
+ * `summarizeAuditEvent` (which itself never reads off raw wire fields).
+ * `limit` is clamped to `[0, ∞)` and applied with `slice` — the helper
+ * never re-orders the input, so the backend ordering (recorded_at
+ * descending) is preserved.
+ *
+ * Unknown wire kinds collapse to the generic "Audit event" line via
+ * `summarizeAuditEvent` — a backend that ships a new event tag before
+ * the frontend updates does NOT crash this section.
+ */
+export function summarizeRecentActivity(
+  events: readonly AuditEvent[],
+  limit: number = DASHBOARD_RECENT_ACTIVITY_LIMIT,
+): readonly RecentActivityLine[] {
+  const cap = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0;
+  const out: RecentActivityLine[] = [];
+  for (let i = 0; i < events.length && out.length < cap; i += 1) {
+    const e = events[i];
+    out.push({
+      id: e.id,
+      kind: e.kind,
+      recorded_at: e.recorded_at,
+      summary: summarizeAuditEvent(e),
+    });
+  }
+  return out;
 }
 
 export const DASHBOARD_NAV_ACTIONS: readonly NavigationAction[] = [
