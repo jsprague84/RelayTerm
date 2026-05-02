@@ -8562,6 +8562,256 @@ async fn me_response_does_not_leak_session_or_password_material(pool: PgPool) {
 }
 
 // ----------------------------------------------------------------------
+// last_seen_at touch (SPEC.md "Auth extractor and route migration")
+// ----------------------------------------------------------------------
+//
+// Every successful `AuthenticatedUser` extraction stamps
+// `user_sessions.last_seen_at`. Failed / expired / revoked / unknown
+// extractions MUST NOT touch the column. The touch is best-effort —
+// a repository failure logs `warn!` and the request still succeeds.
+//
+// The tests below pin the four positive / negative guarantees. The
+// "best-effort under repository failure" half of the contract is
+// exercised at the unit level via the extractor docs and in code
+// review — a `Db`-level fault injection would require swapping the
+// repository accessor to a trait object on `AppState`, which is
+// scoped beyond this slice; the wire-side guarantees the tests cover
+// (no behavior change on success, no `last_seen_at` write on failure)
+// are the load-bearing observable contract.
+
+/// Look up the persisted `last_seen_at` for the given plaintext token.
+/// Helper kept local to the `last_seen_at` tests so the wire-side
+/// assertions stay terse. The token plaintext crosses the helper
+/// boundary read-only and is hashed via the same one-way digest the
+/// repository uses for lookups — never persisted, never logged.
+async fn read_last_seen_at(pool: &PgPool, token: &str) -> chrono::DateTime<chrono::Utc> {
+    let token_hash = relayterm_auth::hash_session_token(token).into_bytes();
+    let row = relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .get_by_token_hash(&token_hash)
+        .await
+        .expect("lookup session row")
+        .expect("session row exists");
+    row.last_seen_at
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_advances_last_seen_at_on_valid_cookie(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "lastseen-me@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "lastseen-me@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    let before = read_last_seen_at(&pool, &token).await;
+
+    // Sleep past microsecond resolution so the post-touch timestamp
+    // is strictly greater on every platform's `Utc::now()` clock.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = read_last_seen_at(&pool, &token).await;
+    assert!(
+        after > before,
+        "last_seen_at must advance on successful /auth/me extraction \
+         (before={before}, after={after})",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn protected_get_advances_last_seen_at_on_valid_cookie(pool: PgPool) {
+    // Same property as above but on a non-auth route (`/api/v1/hosts`)
+    // so the touch is proven to ride on the shared extractor and not
+    // a per-route accident.
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
+
+    let before = read_last_seen_at(&pool, &cookie).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let resp = app.oneshot(get("/api/v1/hosts", &cookie)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = read_last_seen_at(&pool, &cookie).await;
+    assert!(
+        after > before,
+        "last_seen_at must advance on successful protected GET \
+         (before={before}, after={after})",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn expired_session_does_not_touch_last_seen_at(pool: PgPool) {
+    // Insert a session row with `expires_at` already in the past and
+    // capture the initial `last_seen_at`. Drive `/auth/me` — the
+    // extractor MUST surface 401 AND MUST NOT have stamped
+    // `last_seen_at`.
+    let (app, user_id) =
+        setup_with_first_user(pool.clone(), "lastseen-expired@relayterm.local").await;
+    let token = relayterm_auth::SessionToken::generate();
+    let token_hash = token.hash().into_bytes();
+    let already_expired = chrono::Utc::now() - chrono::Duration::seconds(60);
+    let row = relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateUserSession {
+            user_id,
+            token_hash,
+            expires_at: already_expired,
+        })
+        .await
+        .expect("insert pre-expired session");
+
+    let before = row.last_seen_at;
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", token.expose()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let after = read_last_seen_at(&pool, token.expose()).await;
+    assert_eq!(
+        after, before,
+        "last_seen_at must NOT advance for an expired session \
+         (before={before}, after={after})",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoked_session_does_not_touch_last_seen_at(pool: PgPool) {
+    // Mint a real session via /login, revoke its row directly, and
+    // then drive /auth/me. The extractor MUST 401 AND MUST NOT have
+    // stamped `last_seen_at` post-revoke.
+    let (app, _user_id) =
+        setup_with_first_user(pool.clone(), "lastseen-revoked@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "lastseen-revoked@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    // Revoke the session row directly so the cookie is structurally
+    // valid but no longer authoritative.
+    let token_hash = relayterm_auth::hash_session_token(&token).into_bytes();
+    let sessions = relayterm_db::PgUserSessionRepository::new(pool.clone());
+    let row = sessions
+        .get_by_token_hash(&token_hash)
+        .await
+        .expect("lookup session row")
+        .expect("session row exists");
+    sessions
+        .revoke(row.id, chrono::Utc::now(), Some("test-revoke"))
+        .await
+        .expect("revoke");
+
+    let before = read_last_seen_at(&pool, &token).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let after = read_last_seen_at(&pool, &token).await;
+    assert_eq!(
+        after, before,
+        "last_seen_at must NOT advance for a revoked session \
+         (before={before}, after={after})",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn unknown_token_does_not_create_or_touch_any_session(pool: PgPool) {
+    // A cookie value that never corresponded to any session row MUST
+    // NOT result in a session insert (no row appears) AND MUST NOT
+    // disturb existing rows. The extractor returns 401 and walks away.
+    let (app, _user_id) =
+        setup_with_first_user(pool.clone(), "lastseen-unknown@relayterm.local").await;
+
+    // Bootstrap a real session for the same user so we have an
+    // existing `last_seen_at` row to confirm is left untouched.
+    let real_login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "lastseen-unknown@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let real_cookie = extract_set_cookie(&real_login).unwrap();
+    let real_token = cookie_token_from_set_cookie(&real_cookie).to_owned();
+    let _ = real_login.into_body();
+
+    let real_before = read_last_seen_at(&pool, &real_token).await;
+
+    // No `tokio::time::sleep` here (unlike the four "advances" /
+    // "does-not-advance-after-touch" tests) — this test asserts
+    // strict equality between `real_before` and `real_after`, not
+    // ordering, so microsecond-level clock resolution does not
+    // matter. A touch of the legitimate session row would be
+    // observable as ANY change to `last_seen_at`, however small.
+    // Drive /auth/me with a token that hashes to a digest no row owns.
+    let stranger = relayterm_auth::SessionToken::generate();
+    let resp = app
+        .clone()
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", stranger.expose()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // No row exists for the stranger token's hash.
+    let stranger_hash = stranger.hash().into_bytes();
+    let strangers_row = relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .get_by_token_hash(&stranger_hash)
+        .await
+        .expect("lookup stranger");
+    assert!(
+        strangers_row.is_none(),
+        "an unknown-token request must not create a session row",
+    );
+
+    // The legitimate session's last_seen_at must still match the
+    // pre-stranger sample — proves the failed extraction did not
+    // touch any unrelated row.
+    let real_after = read_last_seen_at(&pool, &real_token).await;
+    assert_eq!(
+        real_after, real_before,
+        "an unknown-token request must not touch any other session's last_seen_at",
+    );
+}
+
+// ----------------------------------------------------------------------
 // Login throttling (SPEC.md "Password authentication (v1)" → Throttling)
 // ----------------------------------------------------------------------
 

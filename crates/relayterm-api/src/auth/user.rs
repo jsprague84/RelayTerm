@@ -16,19 +16,32 @@
 //! [`crate::error::ApiError::IntoResponse`] and never reaches the
 //! caller.
 //!
+//! ## What the extractor does
+//!
+//! * It DOES stamp `user_sessions.last_seen_at` on every successful
+//!   extraction, best-effort and inline. The touch runs AFTER the
+//!   session is validated AND the user row is loaded — so a missing /
+//!   invalid / expired / revoked session, or a session whose user row
+//!   is gone, never produces a `last_seen_at` write. A failed touch is
+//!   logged at `warn!` (with the session id only — never the cookie,
+//!   token hash, or repository internals) and the request still
+//!   succeeds. `AuthService::validate_session_token` is kept a pure
+//!   read so future routes that want a non-touching validation can
+//!   call it directly. SPEC.md "Auth extractor and route migration"
+//!   pins the best-effort posture.
+//!
 //! ## What the extractor does NOT do
 //!
-//! * It does NOT touch `last_seen_at`. Stamping `last_seen_at` on every
-//!   authenticated request is best-effort, error-tolerant, and a
-//!   future slice — see SPEC.md "Auth extractor and route migration"
-//!   for the deferred behaviour. `AuthService::validate_session_token`
-//!   is a pure read for that reason.
 //! * It does NOT enforce CSRF. The shared CSRF middleware is a
 //!   separate slice (SPEC step 6); the auth-route inline `Origin`
 //!   guard remains until then.
 //! * It does NOT expose the session token, the token hash, or the
 //!   session row to the handler. The handler receives the
 //!   [`UserId`] and the [`User`] only.
+//! * It does NOT spawn a background task to stamp `last_seen_at`. The
+//!   touch is awaited inline so a single failing repository call
+//!   cannot accumulate orphaned futures, and so observability tooling
+//!   that only sees the request span still captures the latency.
 //!
 //! ## Redaction posture
 //!
@@ -44,7 +57,7 @@ use axum::{
 };
 use chrono::Utc;
 use relayterm_core::ids::UserId;
-use relayterm_core::repository::UserRepository;
+use relayterm_core::repository::{UserRepository, UserSessionRepository};
 use relayterm_core::user::User;
 
 use crate::AppState;
@@ -126,6 +139,28 @@ where
                 // — the cookie is no longer authoritative.
                 ApiError::Unauthorized("session references missing user".to_owned())
             })?;
+
+        // Best-effort `last_seen_at` stamp. The touch runs only after
+        // the session AND user row are confirmed valid — failed /
+        // expired / revoked / missing-user paths above already
+        // returned, so a row will never be touched outside the
+        // happy-path. A repository failure here is logged at `warn!`
+        // and the request still succeeds; SPEC.md "Auth extractor and
+        // route migration" pins this posture. Logging the session id
+        // is safe (it is the audit-event reference) — never the
+        // cookie value, the token hash, or the repository internals.
+        if let Err(err) = app_state
+            .db
+            .user_sessions()
+            .touch_last_seen(session.id, now)
+            .await
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                error = %err,
+                "touch_last_seen failed; ignoring",
+            );
+        }
 
         Ok(Self { user })
     }
