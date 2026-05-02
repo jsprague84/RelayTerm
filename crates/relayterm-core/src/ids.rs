@@ -98,6 +98,12 @@ define_id!(
     /// Identifies an [`AuditEvent`](crate::audit_event::AuditEvent).
     AuditEventId
 );
+define_id!(
+    /// Identifies a [`UserSession`](crate::user_session::UserSession) — one
+    /// issued browser session row. NOT the cookie token; the cookie value
+    /// is a separate 32-byte random secret hashed into `token_hash`.
+    UserSessionId
+);
 
 #[cfg(test)]
 mod tests {

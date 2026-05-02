@@ -21,13 +21,16 @@
 
 #![cfg(feature = "postgres-tests")]
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use relayterm_core::audit_event::AuditEventKind;
+use relayterm_core::ids::UserSessionId;
 use relayterm_core::repository::{
-    AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry, CreateServerProfile,
-    CreateSessionEvent, CreateSshIdentity, CreateTerminalSession, CreateTerminalSessionAttachment,
-    CreateUser, HostRepository, KnownHostEntryRepository, RepositoryError, ServerProfileRepository,
-    SessionEventRepository, SshIdentityRepository, TerminalSessionRepository, UserRepository,
+    AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry,
+    CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
+    CreateTerminalSession, CreateTerminalSessionAttachment, CreateUser, CreateUserSession,
+    HostRepository, KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
+    ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
+    TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
@@ -38,8 +41,9 @@ use relayterm_core::validation::{
 };
 use relayterm_db::{
     PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
-    PgServerProfileRepository, PgSessionEventRepository, PgSshIdentityRepository,
-    PgTerminalSessionRepository, PgUserRepository,
+    PgPasswordCredentialRepository, PgServerProfileRepository, PgSessionEventRepository,
+    PgSshIdentityRepository, PgTerminalSessionRepository, PgUserRepository,
+    PgUserSessionRepository,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -1012,4 +1016,426 @@ async fn user_email_unique_conflict(pool: PgPool) {
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
+}
+
+// ----------------------------------------------------------------------
+// Password credentials
+// ----------------------------------------------------------------------
+//
+// Sentinel hash strings are deliberately distinctive so a test that
+// asserts "no hash leaked into Debug / RepositoryError" has something
+// to grep for. They are NOT real Argon2id PHC strings — the auth
+// service will produce real ones; this layer just stores text.
+
+const PHC_SENTINEL_V1: &str = "$argon2id$v=19$m=19456,t=2,p=1$DO-NOT-LEAK-SALT$DO-NOT-LEAK-HASH-V1";
+const PHC_SENTINEL_V2: &str = "$argon2id$v=19$m=19456,t=2,p=1$DO-NOT-LEAK-SALT$DO-NOT-LEAK-HASH-V2";
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn password_credential_round_trip(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgPasswordCredentialRepository::new(pool.clone());
+
+    let created = repo
+        .upsert_for_user(CreatePasswordCredential {
+            user_id: user.id,
+            password_hash: PHC_SENTINEL_V1.to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(created.user_id, user.id);
+    assert_eq!(created.password_hash, PHC_SENTINEL_V1);
+    assert_eq!(created.created_at, created.updated_at);
+    assert_eq!(created.created_at, created.password_changed_at);
+
+    let fetched = repo
+        .get_for_user(user.id)
+        .await
+        .unwrap()
+        .expect("get returns row");
+    assert_eq!(fetched, created);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn password_credential_upsert_replaces_hash_and_bumps_changed_at(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgPasswordCredentialRepository::new(pool.clone());
+
+    let first = repo
+        .upsert_for_user(CreatePasswordCredential {
+            user_id: user.id,
+            password_hash: PHC_SENTINEL_V1.to_owned(),
+        })
+        .await
+        .unwrap();
+
+    // Sleep a few ms so NOW() advances measurably between INSERT and UPDATE.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let second = repo
+        .upsert_for_user(CreatePasswordCredential {
+            user_id: user.id,
+            password_hash: PHC_SENTINEL_V2.to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(second.user_id, user.id);
+    assert_eq!(second.password_hash, PHC_SENTINEL_V2);
+    // created_at is preserved across upsert.
+    assert_eq!(second.created_at, first.created_at);
+    // password_changed_at and updated_at advance.
+    assert!(second.password_changed_at > first.password_changed_at);
+    assert!(second.updated_at > first.updated_at);
+
+    // get returns the post-upsert row, not a stale one.
+    let fetched = repo.get_for_user(user.id).await.unwrap().unwrap();
+    assert_eq!(fetched.password_hash, PHC_SENTINEL_V2);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn password_credential_get_for_user_without_password_returns_none(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgPasswordCredentialRepository::new(pool.clone());
+
+    let result = repo.get_for_user(user.id).await.unwrap();
+    assert!(
+        result.is_none(),
+        "get_for_user must return None for a user without a password row"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn password_credential_get_for_nonexistent_user_returns_none(pool: PgPool) {
+    let repo = PgPasswordCredentialRepository::new(pool.clone());
+    // The FK is enforced on upsert (writes a row referencing users.id),
+    // not on get — a get for a never-existed user id must collapse to
+    // `None`, not surface an error. This matches the route layer's
+    // existing "byte-identical 404 for unknown vs unauthorized" rule.
+    let result = repo
+        .get_for_user(relayterm_core::ids::UserId::new())
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn password_credential_redaction_sentinels(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgPasswordCredentialRepository::new(pool.clone());
+
+    let cred = repo
+        .upsert_for_user(CreatePasswordCredential {
+            user_id: user.id,
+            password_hash: PHC_SENTINEL_V1.to_owned(),
+        })
+        .await
+        .unwrap();
+
+    // Domain-level Debug must redact.
+    let dbg = format!("{cred:?}");
+    assert!(
+        !dbg.contains("DO-NOT-LEAK-HASH"),
+        "PasswordCredential Debug leaked hash: {dbg}"
+    );
+
+    // Input-level Debug must redact.
+    let input_dbg = format!(
+        "{:?}",
+        CreatePasswordCredential {
+            user_id: user.id,
+            password_hash: PHC_SENTINEL_V1.to_owned(),
+        }
+    );
+    assert!(
+        !input_dbg.contains("DO-NOT-LEAK-HASH"),
+        "CreatePasswordCredential Debug leaked hash: {input_dbg}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// User sessions
+// ----------------------------------------------------------------------
+
+const TOKEN_HASH_SENTINEL_A: [u8; 32] = [0xAA; 32];
+const TOKEN_HASH_SENTINEL_B: [u8; 32] = [0xBB; 32];
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_round_trip(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let now = Utc::now();
+    let expires = now + Duration::days(30);
+
+    let created = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: TOKEN_HASH_SENTINEL_A.to_vec(),
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(created.user_id, user.id);
+    assert_eq!(created.token_hash, TOKEN_HASH_SENTINEL_A);
+    assert!(created.revoked_at.is_none());
+    assert!(created.revoked_reason.is_none());
+    // Postgres rounds to microseconds; allow a small delta.
+    assert!((created.expires_at - expires).num_milliseconds().abs() < 5);
+
+    // get_by_token_hash returns the same row.
+    let by_hash = repo
+        .get_by_token_hash(&TOKEN_HASH_SENTINEL_A)
+        .await
+        .unwrap()
+        .expect("by-hash lookup returns row");
+    assert_eq!(by_hash.id, created.id);
+    assert_eq!(by_hash.token_hash, created.token_hash);
+
+    // get by id round-trips.
+    let by_id = repo.get(created.id).await.unwrap().unwrap();
+    assert_eq!(by_id.id, created.id);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_get_by_unknown_token_hash_returns_none(pool: PgPool) {
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let absent = repo.get_by_token_hash(&[0xCC; 32]).await.unwrap();
+    assert!(absent.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_get_by_unknown_id_returns_none(pool: PgPool) {
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let absent = repo.get(UserSessionId::new()).await.unwrap();
+    assert!(absent.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_duplicate_token_hash_conflicts(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let expires = Utc::now() + Duration::days(30);
+
+    repo.create(CreateUserSession {
+        user_id: user.id,
+        token_hash: TOKEN_HASH_SENTINEL_A.to_vec(),
+        expires_at: expires,
+    })
+    .await
+    .unwrap();
+
+    let err = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: TOKEN_HASH_SENTINEL_A.to_vec(),
+            expires_at: expires,
+        })
+        .await
+        .expect_err("duplicate token_hash must conflict");
+
+    match err {
+        RepositoryError::Conflict { entity, constraint } => {
+            assert_eq!(entity, "user_session");
+            // The unique index name in the migration.
+            assert_eq!(constraint, "user_sessions_token_hash_key");
+            // Constraint must NEVER echo the hash bytes — the entire
+            // point of the redaction contract is that the digest is
+            // unreachable through a public error.
+            assert!(
+                !constraint.contains("aa") && !constraint.contains("AA"),
+                "constraint must not echo token_hash bytes: {constraint}"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_touch_last_seen_updates_timestamp(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: TOKEN_HASH_SENTINEL_A.to_vec(),
+            expires_at: Utc::now() + Duration::days(30),
+        })
+        .await
+        .unwrap();
+
+    let later = session.last_seen_at + Duration::seconds(5);
+    repo.touch_last_seen(session.id, later).await.unwrap();
+
+    let touched = repo.get(session.id).await.unwrap().unwrap();
+    assert!(touched.last_seen_at >= later - Duration::milliseconds(5));
+    assert!(touched.last_seen_at >= session.last_seen_at);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_touch_last_seen_unknown_id_returns_not_found(pool: PgPool) {
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let err = repo
+        .touch_last_seen(UserSessionId::new(), Utc::now())
+        .await
+        .expect_err("unknown id must surface NotFound");
+    match err {
+        RepositoryError::NotFound { entity } => assert_eq!(entity, "user_session"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_is_idempotent(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: TOKEN_HASH_SENTINEL_A.to_vec(),
+            expires_at: Utc::now() + Duration::days(30),
+        })
+        .await
+        .unwrap();
+
+    let first = Utc::now();
+    repo.revoke(session.id, first, Some("logout"))
+        .await
+        .unwrap();
+
+    let after_first = repo.get(session.id).await.unwrap().unwrap();
+    assert!(after_first.revoked_at.is_some());
+    assert_eq!(after_first.revoked_reason.as_deref(), Some("logout"));
+
+    // Second revoke is a no-op: original revoked_at and reason are preserved.
+    let later = first + Duration::seconds(60);
+    repo.revoke(session.id, later, Some("admin_revoke"))
+        .await
+        .unwrap();
+
+    let after_second = repo.get(session.id).await.unwrap().unwrap();
+    assert_eq!(after_second.revoked_at, after_first.revoked_at);
+    assert_eq!(after_second.revoked_reason, after_first.revoked_reason);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_unknown_id_returns_not_found(pool: PgPool) {
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let err = repo
+        .revoke(UserSessionId::new(), Utc::now(), None)
+        .await
+        .expect_err("unknown id must surface NotFound");
+    match err {
+        RepositoryError::NotFound { entity } => assert_eq!(entity, "user_session"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_all_for_user_only_touches_that_user(pool: PgPool) {
+    let user_a = make_user(&pool).await;
+    let user_b = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let expires = Utc::now() + Duration::days(30);
+
+    let a1 = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x01; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    let a2 = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x02; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    let b1 = repo
+        .create(CreateUserSession {
+            user_id: user_b.id,
+            token_hash: vec![0x03; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+
+    // Pre-revoke a2 so we can confirm idempotency: the second sweep
+    // does NOT count it.
+    repo.revoke(a2.id, Utc::now(), Some("logout"))
+        .await
+        .unwrap();
+
+    let touched = repo
+        .revoke_all_for_user(user_a.id, Utc::now(), Some("admin_revoke"))
+        .await
+        .unwrap();
+    assert_eq!(
+        touched, 1,
+        "only the still-active session should transition"
+    );
+
+    // a1 is now revoked.
+    let a1_after = repo.get(a1.id).await.unwrap().unwrap();
+    assert!(a1_after.revoked_at.is_some());
+    // a2's original logout timestamp is preserved (idempotency).
+    let a2_after = repo.get(a2.id).await.unwrap().unwrap();
+    assert_eq!(a2_after.revoked_reason.as_deref(), Some("logout"));
+    // b1 (user B) is untouched.
+    let b1_after = repo.get(b1.id).await.unwrap().unwrap();
+    assert!(b1_after.revoked_at.is_none());
+    assert!(b1_after.revoked_reason.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_all_for_unknown_user_returns_zero(pool: PgPool) {
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let touched = repo
+        .revoke_all_for_user(relayterm_core::ids::UserId::new(), Utc::now(), None)
+        .await
+        .unwrap();
+    assert_eq!(touched, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_redaction_sentinels(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: TOKEN_HASH_SENTINEL_B.to_vec(),
+            expires_at: Utc::now() + Duration::days(30),
+        })
+        .await
+        .unwrap();
+
+    // Domain-level Debug.
+    let session_dbg = format!("{session:?}");
+    // 0xBB byte rendered as Vec<u8> Debug would be "187"; check both
+    // that string and the raw byte-pattern fragments.
+    assert!(
+        !session_dbg.contains("187, 187, 187"),
+        "UserSession Debug leaked token_hash bytes: {session_dbg}"
+    );
+
+    // Input-level Debug.
+    let input_dbg = format!(
+        "{:?}",
+        CreateUserSession {
+            user_id: user.id,
+            token_hash: TOKEN_HASH_SENTINEL_B.to_vec(),
+            expires_at: session.expires_at,
+        }
+    );
+    assert!(
+        !input_dbg.contains("187, 187, 187"),
+        "CreateUserSession Debug leaked token_hash bytes: {input_dbg}"
+    );
 }

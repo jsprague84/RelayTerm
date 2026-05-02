@@ -9,32 +9,38 @@ pub mod audit_event;
 pub mod host;
 pub mod ids;
 pub mod known_host;
+pub mod password_credential;
 pub mod repository;
 pub mod server_profile;
 pub mod session_event;
 pub mod ssh_identity;
 pub mod terminal_session;
 pub mod user;
+pub mod user_session;
 pub mod validation;
 
 pub use audit_event::{AuditEvent, AuditEventKind};
 pub use host::Host;
 pub use ids::{
     AuditEventId, HostId, KnownHostEntryId, ServerProfileId, SessionEventId, SshIdentityId,
-    TerminalSessionAttachmentId, TerminalSessionId, UserId,
+    TerminalSessionAttachmentId, TerminalSessionId, UserId, UserSessionId,
 };
 pub use known_host::KnownHostEntry;
+pub use password_credential::PasswordCredential;
 pub use repository::{
-    AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry, CreateServerProfile,
-    CreateSessionEvent, CreateSshIdentity, CreateTerminalSession, CreateTerminalSessionAttachment,
-    CreateUser, HostRepository, KnownHostEntryRepository, RepositoryError, ServerProfileRepository,
-    SessionEventRepository, SshIdentityRepository, TerminalSessionRepository, UserRepository,
+    AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry,
+    CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
+    CreateTerminalSession, CreateTerminalSessionAttachment, CreateUser, CreateUserSession,
+    HostRepository, KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
+    ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
+    TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 pub use server_profile::ServerProfile;
 pub use session_event::{SessionEvent, SessionEventKind};
 pub use ssh_identity::{SshIdentity, SshKeyType};
 pub use terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 pub use user::User;
+pub use user_session::UserSession;
 pub use validation::{
     HostDisplayName, Hostname, ProfileName, SshPort, SshUsername, Tag, ValidationError,
     validate_host_display_name, validate_hostname, validate_profile_name, validate_ssh_port,

@@ -18,14 +18,16 @@ use crate::audit_event::{AuditEvent, AuditEventKind};
 use crate::host::Host;
 use crate::ids::{
     AuditEventId, HostId, ServerProfileId, SessionEventId, SshIdentityId,
-    TerminalSessionAttachmentId, TerminalSessionId, UserId,
+    TerminalSessionAttachmentId, TerminalSessionId, UserId, UserSessionId,
 };
 use crate::known_host::KnownHostEntry;
+use crate::password_credential::PasswordCredential;
 use crate::server_profile::ServerProfile;
 use crate::session_event::{SessionEvent, SessionEventKind};
 use crate::ssh_identity::{SshIdentity, SshKeyType};
 use crate::terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 use crate::user::User;
+use crate::user_session::UserSession;
 use crate::validation::{HostDisplayName, Hostname, ProfileName, SshPort, SshUsername, Tag};
 
 /// Errors a repository call may return.
@@ -167,6 +169,59 @@ pub struct CreateAuditEvent {
     pub kind: AuditEventKind,
     pub payload: JsonValue,
     pub remote_addr: Option<String>,
+}
+
+/// Repository input for upserting a password credential.
+///
+/// `Debug` is implemented manually so [`Self::password_hash`] never
+/// leaks into tracing logs or error messages. The auth service is the
+/// only caller; it hashes the plaintext password (Argon2id, PHC string)
+/// before constructing this input.
+#[derive(Clone)]
+pub struct CreatePasswordCredential {
+    pub user_id: UserId,
+    /// Argon2id PHC string (`$argon2id$...`). Sensitive — never log.
+    pub password_hash: String,
+}
+
+impl fmt::Debug for CreatePasswordCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreatePasswordCredential")
+            .field("user_id", &self.user_id)
+            .field(
+                "password_hash",
+                &format_args!("<redacted: {} chars>", self.password_hash.len()),
+            )
+            .finish()
+    }
+}
+
+/// Repository input for issuing a new browser session row.
+///
+/// `Debug` is implemented manually so [`Self::token_hash`] never leaks
+/// into tracing logs or error messages. The auth service generates the
+/// random cookie token, SHA-256-hashes it, and passes only the digest
+/// here.
+#[derive(Clone)]
+pub struct CreateUserSession {
+    pub user_id: UserId,
+    /// SHA-256 digest of the random cookie token. Sensitive — paired
+    /// with a captured plaintext token it permits session takeover.
+    pub token_hash: Vec<u8>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for CreateUserSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateUserSession")
+            .field("user_id", &self.user_id)
+            .field(
+                "token_hash",
+                &format_args!("<redacted: {} bytes>", self.token_hash.len()),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -334,4 +389,117 @@ pub trait AuditEventRepository: Send + Sync {
         limit: u32,
     ) -> Result<Vec<AuditEvent>, RepositoryError>;
     async fn get(&self, id: AuditEventId) -> Result<Option<AuditEvent>, RepositoryError>;
+}
+
+/// Password credential persistence.
+///
+/// One row per user with a password set. The hash is an Argon2id PHC
+/// string produced by the auth service; this layer is opaque to the
+/// hashing scheme. Plaintext passwords are never represented here.
+///
+/// Inputs and outputs both redact the hash via `Debug` so a stray
+/// `tracing::debug!(?credential, ?input)` cannot leak the bytes.
+#[async_trait]
+pub trait PasswordCredentialRepository: Send + Sync {
+    /// Insert or replace the password row for a user.
+    ///
+    /// Behavior:
+    /// - First call for a user inserts the row with
+    ///   `created_at = updated_at = password_changed_at = NOW()`.
+    /// - Subsequent calls overwrite `password_hash`, bump
+    ///   `updated_at = password_changed_at = NOW()`, and leave
+    ///   `created_at` unchanged.
+    /// - Returns the post-write [`PasswordCredential`].
+    /// - A foreign-key failure (no matching `users.id`) is mapped to
+    ///   [`RepositoryError::Database`] via the `users` constraint name —
+    ///   the auth service is expected to ensure the user row exists
+    ///   before calling this.
+    async fn upsert_for_user(
+        &self,
+        input: CreatePasswordCredential,
+    ) -> Result<PasswordCredential, RepositoryError>;
+
+    /// Fetch the password row for a user, or `None` if the user has no
+    /// password set yet.
+    async fn get_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Option<PasswordCredential>, RepositoryError>;
+}
+
+/// Browser session persistence.
+///
+/// Plaintext cookie tokens never reach this layer. The auth service
+/// generates the token, SHA-256-hashes it, and passes only the digest
+/// here. Lookup is by digest. The repository does NOT filter on
+/// `revoked_at` / `expires_at` — those are returned on the row and the
+/// service decides whether to honor them. Keeping the SQL trivial and
+/// pushing the policy to one place (the auth service) avoids two
+/// sources of truth drifting.
+#[async_trait]
+pub trait UserSessionRepository: Send + Sync {
+    /// Insert a fresh session row.
+    ///
+    /// A duplicate `token_hash` (astronomically unlikely with 32 random
+    /// bytes, but possible if a caller mishashes) is mapped to
+    /// [`RepositoryError::Conflict`] with constraint name
+    /// `"user_sessions_token_hash_key"` so the route can surface a safe
+    /// generic 500 without echoing any digest material.
+    async fn create(&self, input: CreateUserSession) -> Result<UserSession, RepositoryError>;
+
+    /// Look up a session by the SHA-256 digest of its cookie token.
+    ///
+    /// Returns the row regardless of `revoked_at` / `expires_at` — the
+    /// auth extractor is the single place that validates those fields.
+    /// `None` is returned for an unknown digest.
+    async fn get_by_token_hash(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<UserSession>, RepositoryError>;
+
+    /// Look up a session by its primary key.
+    ///
+    /// Used by audit / management surfaces that already know the row's
+    /// `id`. NOT used by the auth extractor — the extractor goes through
+    /// [`Self::get_by_token_hash`] only.
+    async fn get(&self, id: UserSessionId) -> Result<Option<UserSession>, RepositoryError>;
+
+    /// Stamp `last_seen_at` on an existing session.
+    ///
+    /// Best-effort by the auth extractor — a failure is logged at
+    /// `warn!` and does NOT fail the request. The extractor MAY skip
+    /// the call entirely on hot paths if the row's `last_seen_at` is
+    /// already within a small window. Returns
+    /// [`RepositoryError::NotFound`] for an unknown id so callers can
+    /// distinguish "row was deleted under us" from a write failure.
+    async fn touch_last_seen(
+        &self,
+        id: UserSessionId,
+        at: DateTime<Utc>,
+    ) -> Result<(), RepositoryError>;
+
+    /// Stamp `revoked_at` and an optional short reason on an existing
+    /// session. Idempotent: a second call against an already-revoked
+    /// row is a no-op and returns `Ok(())` — the original `revoked_at`
+    /// and `revoked_reason` are preserved so the audit trail stays
+    /// honest. Returns [`RepositoryError::NotFound`] for an unknown id.
+    async fn revoke(
+        &self,
+        id: UserSessionId,
+        at: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<(), RepositoryError>;
+
+    /// Stamp `revoked_at` on every non-revoked session for a user.
+    ///
+    /// Idempotent across already-revoked rows (those rows are skipped).
+    /// Returns the number of rows transitioned from non-revoked to
+    /// revoked so the caller can decide whether to write any audit
+    /// events. An unknown `user_id` simply returns `0`.
+    async fn revoke_all_for_user(
+        &self,
+        user_id: UserId,
+        at: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<u64, RepositoryError>;
 }

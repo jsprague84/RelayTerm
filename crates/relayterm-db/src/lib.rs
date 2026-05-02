@@ -23,8 +23,9 @@ use std::time::Duration;
 pub use error::map_sqlx_error;
 pub use repositories::{
     PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
-    PgServerProfileRepository, PgSessionEventRepository, PgSshIdentityRepository,
-    PgTerminalSessionRepository, PgUserRepository,
+    PgPasswordCredentialRepository, PgServerProfileRepository, PgSessionEventRepository,
+    PgSshIdentityRepository, PgTerminalSessionRepository, PgUserRepository,
+    PgUserSessionRepository,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -104,5 +105,15 @@ impl Db {
     #[must_use]
     pub fn audit_events(&self) -> PgAuditEventRepository {
         PgAuditEventRepository::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn password_credentials(&self) -> PgPasswordCredentialRepository {
+        PgPasswordCredentialRepository::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn user_sessions(&self) -> PgUserSessionRepository {
+        PgUserSessionRepository::new(self.pool.clone())
     }
 }

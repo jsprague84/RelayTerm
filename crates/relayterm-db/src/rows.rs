@@ -16,9 +16,10 @@ use relayterm_core::audit_event::{AuditEvent, AuditEventKind};
 use relayterm_core::host::Host;
 use relayterm_core::ids::{
     AuditEventId, HostId, KnownHostEntryId, ServerProfileId, SessionEventId, SshIdentityId,
-    TerminalSessionAttachmentId, TerminalSessionId, UserId,
+    TerminalSessionAttachmentId, TerminalSessionId, UserId, UserSessionId,
 };
 use relayterm_core::known_host::KnownHostEntry;
+use relayterm_core::password_credential::PasswordCredential;
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::server_profile::ServerProfile;
 use relayterm_core::session_event::{SessionEvent, SessionEventKind};
@@ -27,6 +28,7 @@ use relayterm_core::terminal_session::{
     TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
 use relayterm_core::user::User;
+use relayterm_core::user_session::UserSession;
 use relayterm_core::validation::{
     HostDisplayName, Hostname, ProfileName, SshPort, SshUsername, Tag,
 };
@@ -58,6 +60,65 @@ impl UserRow {
             display_name: self.display_name,
             created_at: self.created_at,
             last_login_at: self.last_login_at,
+        }
+    }
+}
+
+/// SQLx row for `user_passwords`.
+///
+/// `Debug` is intentionally NOT derived on this type — the row carries
+/// the password hash and is private to this module. If a future caller
+/// needs to log it, the conversion to [`PasswordCredential`] (which has
+/// a redacting `Debug`) is the correct intermediate.
+#[derive(FromRow)]
+pub(crate) struct PasswordCredentialRow {
+    pub user_id: Uuid,
+    pub password_hash: String,
+    pub password_changed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl PasswordCredentialRow {
+    pub(crate) fn into_domain(self) -> PasswordCredential {
+        PasswordCredential {
+            user_id: UserId::from_uuid(self.user_id),
+            password_hash: self.password_hash,
+            password_changed_at: self.password_changed_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// SQLx row for `user_sessions`.
+///
+/// `Debug` is intentionally NOT derived — the row carries the
+/// `token_hash` digest. Convert to [`UserSession`] (redacting `Debug`)
+/// before any formatter exposure.
+#[derive(FromRow)]
+pub(crate) struct UserSessionRow {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub token_hash: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_reason: Option<String>,
+}
+
+impl UserSessionRow {
+    pub(crate) fn into_domain(self) -> UserSession {
+        UserSession {
+            id: UserSessionId::from_uuid(self.id),
+            user_id: UserId::from_uuid(self.user_id),
+            token_hash: self.token_hash,
+            created_at: self.created_at,
+            last_seen_at: self.last_seen_at,
+            expires_at: self.expires_at,
+            revoked_at: self.revoked_at,
+            revoked_reason: self.revoked_reason,
         }
     }
 }

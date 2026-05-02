@@ -25,17 +25,21 @@
 mod audit_event;
 mod host;
 mod known_host_entry;
+mod password_credential;
 mod server_profile;
 mod session_event;
 mod ssh_identity;
 mod terminal_session;
 mod user;
+mod user_session;
 
 pub use audit_event::PgAuditEventRepository;
 pub use host::PgHostRepository;
 pub use known_host_entry::PgKnownHostEntryRepository;
+pub use password_credential::PgPasswordCredentialRepository;
 pub use server_profile::PgServerProfileRepository;
 pub use session_event::PgSessionEventRepository;
 pub use ssh_identity::PgSshIdentityRepository;
 pub use terminal_session::PgTerminalSessionRepository;
 pub use user::PgUserRepository;
+pub use user_session::PgUserSessionRepository;
