@@ -21,6 +21,7 @@ pub(crate) struct Config {
     pub(crate) database: DatabaseConfig,
     pub(crate) auth: AuthConfig,
     pub(crate) vault: VaultConfig,
+    pub(crate) terminal_recording: TerminalRecordingConfig,
 }
 
 #[derive(Debug)]
@@ -189,6 +190,186 @@ impl fmt::Debug for VaultConfig {
     }
 }
 
+/// Encryption mode for durable terminal-recording payloads.
+///
+/// `Disabled` writes plaintext-at-rest chunks (`payload` column carries
+/// raw PTY output bytes). `Required` writes XChaCha20-Poly1305 envelope
+/// rows AND, in production, fails boot if no master key resolves. The
+/// design doc `docs/terminal-recording.md` Section 6.3 spells out the
+/// at-rest threat model and the operator warning that gates the choice.
+///
+/// The `optional` mode reserved by the design (write encrypted when a
+/// key is present, fall through to plaintext otherwise) is intentionally
+/// NOT modeled here yet — adding a third state without a writer slice
+/// would let an operator configure a posture that no code branches on.
+/// A later slice that implements the chunk writer adds it explicitly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TerminalRecordingEncryptionMode {
+    /// No envelope; chunk rows persist plaintext PTY bytes. Operator
+    /// has accepted the documented at-rest risk; production refuses
+    /// this combination when `terminal_recording.enabled = true`.
+    #[default]
+    Disabled,
+    /// XChaCha20-Poly1305 envelope keyed by the recording master key.
+    /// Mandatory in production when recording is enabled. The schema
+    /// reserves `encryption = 1` for this mode (see Section 6.3 of the
+    /// design doc).
+    Required,
+}
+
+impl FromStr for TerminalRecordingEncryptionMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "disabled" => Ok(Self::Disabled),
+            "required" => Ok(Self::Required),
+            other => Err(anyhow!(
+                "unrecognized terminal_recording.encryption.mode value (expected \
+                 \"disabled\" or \"required\"): {other:?}"
+            )),
+        }
+    }
+}
+
+/// Compression mode for durable terminal-recording payloads.
+///
+/// Only `None` (plain bytes, no zstd) ships in v1; the design doc
+/// reserves `zstd` for a later slice (Section 6.2). Modeled as an enum
+/// so the env/TOML parsers reject unknown values *now*, before a future
+/// reader has to deal with operator-supplied garbage.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TerminalRecordingCompressionMode {
+    #[default]
+    None,
+}
+
+impl FromStr for TerminalRecordingCompressionMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            other => Err(anyhow!(
+                "unrecognized terminal_recording.compression.mode value (expected \
+                 \"none\"): {other:?}"
+            )),
+        }
+    }
+}
+
+/// Encryption configuration for terminal recording.
+///
+/// `mode` selects the envelope; `master_key_b64` / `master_key_file` are
+/// the two key sources. Exactly one source must be set when `mode =
+/// required`. `Debug` is implemented manually so the raw key value never
+/// reaches a log line — only the *presence* of each source is rendered,
+/// mirroring [`VaultConfig`].
+pub(crate) struct TerminalRecordingEncryptionConfig {
+    pub(crate) mode: TerminalRecordingEncryptionMode,
+    pub(crate) master_key_b64: Option<String>,
+    pub(crate) master_key_file: Option<std::path::PathBuf>,
+}
+
+impl fmt::Debug for TerminalRecordingEncryptionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TerminalRecordingEncryptionConfig")
+            .field("mode", &self.mode)
+            .field("master_key_b64_set", &self.master_key_b64.is_some())
+            .field("master_key_file", &self.master_key_file)
+            .finish()
+    }
+}
+
+/// Compression configuration for terminal recording. Wrapped in its own
+/// struct (instead of a bare enum on [`TerminalRecordingConfig`]) so the
+/// TOML / env layout matches the design's `[terminal_recording.compression]`
+/// section and can grow operator-tunable knobs (e.g. zstd level) in a
+/// later slice without breaking the existing keys.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalRecordingCompressionConfig {
+    pub(crate) mode: TerminalRecordingCompressionMode,
+}
+
+/// Durable terminal-recording configuration.
+///
+/// `enabled = false` is the default and the recommended posture for
+/// every deployment until the writer slice (Section 13 step 3 of
+/// `docs/terminal-recording.md`) lands. Adding this config in step 1b
+/// changes NO runtime behaviour — there is no chunk writer, no replay
+/// API, no UI. The validation envelope merely refuses to start a
+/// production deploy that has *declared intent* to record without a key.
+///
+/// Numeric defaults match Section 6.1 / 12 of the design doc:
+/// * `retention_days = 30` (per-session retention from `closed_at`)
+/// * `max_bytes_per_session = 64 MiB` (per-session byte cap)
+/// * `chunk_target_bytes = 64 KiB` (soft chunk flush target)
+/// * `chunk_hard_cap_bytes = 2 MiB` (defence-in-depth row size cap;
+///   covers the 1 MiB envelope frame plus AEAD overhead)
+///
+/// These numbers do nothing today; they exist so the writer slice has a
+/// canonical place to read them from and operators can tune posture
+/// without a code change. The validation envelope enforces internal
+/// consistency (`chunk_target_bytes <= chunk_hard_cap_bytes`,
+/// `chunk_hard_cap_bytes >= 1 MiB + envelope`,
+/// `max_bytes_per_session >= chunk_hard_cap_bytes`, retention bounded).
+pub(crate) struct TerminalRecordingConfig {
+    pub(crate) enabled: bool,
+    pub(crate) retention_days: u32,
+    pub(crate) max_bytes_per_session: u64,
+    pub(crate) chunk_target_bytes: u32,
+    pub(crate) chunk_hard_cap_bytes: u32,
+    pub(crate) encryption: TerminalRecordingEncryptionConfig,
+    pub(crate) compression: TerminalRecordingCompressionConfig,
+}
+
+impl fmt::Debug for TerminalRecordingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TerminalRecordingConfig")
+            .field("enabled", &self.enabled)
+            .field("retention_days", &self.retention_days)
+            .field("max_bytes_per_session", &self.max_bytes_per_session)
+            .field("chunk_target_bytes", &self.chunk_target_bytes)
+            .field("chunk_hard_cap_bytes", &self.chunk_hard_cap_bytes)
+            .field("encryption", &self.encryption)
+            .field("compression", &self.compression)
+            .finish()
+    }
+}
+
+/// Numeric defaults for [`TerminalRecordingConfig`]. Pulled into
+/// constants so the test suite, the example TOML, and the production
+/// docs reference the same source of truth.
+pub(crate) mod terminal_recording_defaults {
+    /// Retention window from `terminal_sessions.closed_at`.
+    pub(crate) const RETENTION_DAYS: u32 = 30;
+    /// Maximum retention window the validator accepts. ~10 years is
+    /// already past any reasonable single-tenant compliance window;
+    /// values above this almost certainly indicate a unit confusion
+    /// (e.g. minutes-as-days) and are easier to refuse than to debug.
+    pub(crate) const RETENTION_DAYS_HARD_CAP: u32 = 3_650;
+    /// Per-session byte cap (64 MiB).
+    pub(crate) const MAX_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
+    /// Per-session byte cap upper bound the validator accepts (1 TiB).
+    /// Same intent as the retention cap: refuse "infinite" values.
+    pub(crate) const MAX_BYTES_PER_SESSION_HARD_CAP: u64 = 1024 * 1024 * 1024 * 1024;
+    /// Soft chunk flush target (64 KiB; matches Section 6.1).
+    pub(crate) const CHUNK_TARGET_BYTES: u32 = 64 * 1024;
+    /// Defence-in-depth row size cap (2 MiB; matches Section 5.1 / 6.4).
+    /// MUST exceed the live wire's 1 MiB single-frame cap plus envelope
+    /// overhead so a legitimate workload is never refused.
+    pub(crate) const CHUNK_HARD_CAP_BYTES: u32 = 2 * 1024 * 1024;
+    /// Lower bound for `chunk_hard_cap_bytes`. Derived from the binary
+    /// envelope's 1 MiB single-frame cap plus a comfortable budget for
+    /// XChaCha20-Poly1305 overhead (24-byte nonce, 16-byte tag, magic,
+    /// version — roughly 41 bytes total). Rounded up to 1 MiB + 64 KiB
+    /// to leave room for any future format-version growth without
+    /// forcing every existing operator to retune.
+    pub(crate) const CHUNK_HARD_CAP_BYTES_FLOOR: u32 = (1024 * 1024) + (64 * 1024);
+}
+
 impl Config {
     pub(crate) fn load() -> anyhow::Result<Self> {
         let mut cfg = Self::defaults();
@@ -232,6 +413,25 @@ impl Config {
                 enabled: true,
                 master_key_b64: None,
                 master_key_file: None,
+            },
+            // Recording is OFF by default. Step 1b lands the typed
+            // config + validation envelope; the chunk writer, replay
+            // API, and UI are deliberately later slices. Operators
+            // who flip `enabled = true` today get validation but no
+            // runtime change — see SPEC.md "Durable terminal recording
+            // and replay architecture" for the staged plan.
+            terminal_recording: TerminalRecordingConfig {
+                enabled: false,
+                retention_days: terminal_recording_defaults::RETENTION_DAYS,
+                max_bytes_per_session: terminal_recording_defaults::MAX_BYTES_PER_SESSION,
+                chunk_target_bytes: terminal_recording_defaults::CHUNK_TARGET_BYTES,
+                chunk_hard_cap_bytes: terminal_recording_defaults::CHUNK_HARD_CAP_BYTES,
+                encryption: TerminalRecordingEncryptionConfig {
+                    mode: TerminalRecordingEncryptionMode::default(),
+                    master_key_b64: None,
+                    master_key_file: None,
+                },
+                compression: TerminalRecordingCompressionConfig::default(),
             },
         }
     }
@@ -320,6 +520,58 @@ impl Config {
         if let Some(v) = getenv("RELAYTERM_VAULT__MASTER_KEY_FILE") {
             cfg.vault.master_key_file = Some(std::path::PathBuf::from(v));
         }
+        // Terminal recording. Stricter parse policy than the vault /
+        // auth scalar fields above: a malformed scalar env var is a hard
+        // boot failure here rather than a silent fall-through to default.
+        // Reasoning: `RELAYTERM_TERMINAL_RECORDING__ENABLED=yes` (or `1`,
+        // or any other not-a-bool typo) under the silent-discard pattern
+        // would leave recording disabled while the operator believed the
+        // env override took effect — and the production envelope's
+        // `enabled = true ⇒ encryption.mode = required` gate is designed
+        // to catch exactly the misconfigured case where intent and
+        // configured state diverge. The same posture applies to the
+        // numeric bounds: silent fall-through to a default that no longer
+        // matches operator intent is a worse outcome than a startup
+        // error pointing at the bad input.
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__ENABLED") {
+            cfg.terminal_recording.enabled =
+                v.parse().context("RELAYTERM_TERMINAL_RECORDING__ENABLED")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__RETENTION_DAYS") {
+            cfg.terminal_recording.retention_days = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__RETENTION_DAYS")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__MAX_BYTES_PER_SESSION") {
+            cfg.terminal_recording.max_bytes_per_session = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__MAX_BYTES_PER_SESSION")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CHUNK_TARGET_BYTES") {
+            cfg.terminal_recording.chunk_target_bytes = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CHUNK_TARGET_BYTES")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CHUNK_HARD_CAP_BYTES") {
+            cfg.terminal_recording.chunk_hard_cap_bytes = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CHUNK_HARD_CAP_BYTES")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MODE") {
+            cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::from_str(&v)
+                .context("RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MODE")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64") {
+            cfg.terminal_recording.encryption.master_key_b64 = Some(v);
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_FILE") {
+            cfg.terminal_recording.encryption.master_key_file = Some(std::path::PathBuf::from(v));
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE") {
+            cfg.terminal_recording.compression.mode =
+                TerminalRecordingCompressionMode::from_str(&v)
+                    .context("RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE")?;
+        }
         Ok(())
     }
 
@@ -393,6 +645,192 @@ impl Config {
         }
     }
 
+    /// Validate the durable terminal-recording configuration at boot.
+    ///
+    /// Same posture as [`Config::validate_auth`]: pure inspection of the
+    /// resolved structure, no filesystem reads, no key consumption. Error
+    /// messages name the failing field but never echo a key value or any
+    /// prefix of it. Numeric bounds are checked unconditionally; key
+    /// sources are checked only when `enabled = true`, mirroring the
+    /// vault's "disabled means we don't care" policy.
+    ///
+    /// Production envelope (when `enabled = true` AND `auth.mode =
+    /// production`):
+    /// 1. `encryption.mode = required` (operator MUST opt in to
+    ///    at-rest envelope encryption — `docs/terminal-recording.md`
+    ///    Section 6.3 documents the threat model).
+    /// 2. Exactly one of `encryption.master_key_b64` /
+    ///    `encryption.master_key_file` is set (zero → reject; both →
+    ///    reject as ambiguous).
+    ///
+    /// Cross-cutting (regardless of mode, when `enabled = true`):
+    /// * The recording master key MUST be SEPARATE from the vault master
+    ///   key. When both configs use the same source kind we compare the
+    ///   raw values and reject equal pairs. Mixed sources (one b64, one
+    ///   file) cannot be compared without filesystem reads — that gap is
+    ///   documented and a future writer slice that loads both keys can
+    ///   add a runtime check on resolved bytes.
+    /// * Numeric bounds are internally consistent:
+    ///   `chunk_target_bytes <= chunk_hard_cap_bytes`,
+    ///   `chunk_hard_cap_bytes >= CHUNK_HARD_CAP_BYTES_FLOOR`,
+    ///   `max_bytes_per_session >= chunk_hard_cap_bytes`,
+    ///   retention bounded `1..=RETENTION_DAYS_HARD_CAP`,
+    ///   `max_bytes_per_session <= MAX_BYTES_PER_SESSION_HARD_CAP`.
+    pub(crate) fn validate_terminal_recording(&self) -> anyhow::Result<()> {
+        let rec = &self.terminal_recording;
+
+        // Numeric bounds run regardless of `enabled` so a misconfigured
+        // operator who toggles `enabled = true` later does not boot a
+        // half-validated runtime — the bounds are also a useful sanity
+        // check on a disabled config that ships pre-tuned numbers.
+        if rec.retention_days == 0 {
+            bail!(
+                "terminal_recording.retention_days must be greater than 0 (got 0); a 0-day \
+                 retention would purge every chunk on the next sweep — disable recording \
+                 instead"
+            );
+        }
+        if rec.retention_days > terminal_recording_defaults::RETENTION_DAYS_HARD_CAP {
+            bail!(
+                "terminal_recording.retention_days = {got} exceeds the hard cap of {cap} days; \
+                 values above this almost always indicate a unit confusion",
+                got = rec.retention_days,
+                cap = terminal_recording_defaults::RETENTION_DAYS_HARD_CAP,
+            );
+        }
+        if rec.max_bytes_per_session == 0 {
+            bail!("terminal_recording.max_bytes_per_session must be greater than 0");
+        }
+        if rec.max_bytes_per_session > terminal_recording_defaults::MAX_BYTES_PER_SESSION_HARD_CAP {
+            bail!(
+                "terminal_recording.max_bytes_per_session = {got} exceeds the hard cap of {cap} \
+                 bytes",
+                got = rec.max_bytes_per_session,
+                cap = terminal_recording_defaults::MAX_BYTES_PER_SESSION_HARD_CAP,
+            );
+        }
+        if rec.chunk_hard_cap_bytes < terminal_recording_defaults::CHUNK_HARD_CAP_BYTES_FLOOR {
+            bail!(
+                "terminal_recording.chunk_hard_cap_bytes = {got} is below the floor of {floor} \
+                 bytes; the cap MUST cover a 1 MiB live-wire frame plus AEAD envelope overhead",
+                got = rec.chunk_hard_cap_bytes,
+                floor = terminal_recording_defaults::CHUNK_HARD_CAP_BYTES_FLOOR,
+            );
+        }
+        if rec.chunk_target_bytes == 0 {
+            bail!("terminal_recording.chunk_target_bytes must be greater than 0");
+        }
+        if rec.chunk_target_bytes > rec.chunk_hard_cap_bytes {
+            bail!(
+                "terminal_recording.chunk_target_bytes = {target} must be <= \
+                 chunk_hard_cap_bytes = {cap} (target is the soft flush size, cap is the row \
+                 size ceiling)",
+                target = rec.chunk_target_bytes,
+                cap = rec.chunk_hard_cap_bytes,
+            );
+        }
+        // `chunk_hard_cap_bytes` is u32 (max ~4 GiB); `max_bytes_per_session`
+        // is u64. Compare in u64 to avoid spurious type mismatches.
+        if rec.max_bytes_per_session < u64::from(rec.chunk_hard_cap_bytes) {
+            bail!(
+                "terminal_recording.max_bytes_per_session = {bytes} must be >= \
+                 chunk_hard_cap_bytes = {cap}; otherwise a single legitimate chunk could \
+                 exceed the per-session budget",
+                bytes = rec.max_bytes_per_session,
+                cap = rec.chunk_hard_cap_bytes,
+            );
+        }
+
+        if !rec.enabled {
+            // Stale key sources on a disabled recording config are not
+            // a boot failure — operator may be staging future enable
+            // and we should not punish them at validate time. Mirrors
+            // the vault's "disabled drops sources without resolving"
+            // policy.
+            return Ok(());
+        }
+
+        // Encryption mode must match production posture. Dev permits
+        // `disabled` (plaintext-at-rest) so a contributor exercising
+        // recording locally without a key file does not have to mint
+        // one; production refuses every shape that would persist
+        // plaintext bytes.
+        match rec.encryption.mode {
+            TerminalRecordingEncryptionMode::Disabled => {
+                if matches!(self.auth.mode, AuthMode::Production) {
+                    bail!(
+                        "terminal_recording.enabled = true with auth.mode = production requires \
+                         terminal_recording.encryption.mode = required (production refuses to \
+                         persist plaintext PTY bytes)"
+                    );
+                }
+                // In dev mode + disabled encryption we still refuse
+                // accidental key sources so the config is honest about
+                // what it stores: a key set under `mode = disabled` is
+                // either dead config (will never be read) or evidence
+                // that the operator confused the modes.
+                if rec.encryption.master_key_b64.is_some()
+                    || rec.encryption.master_key_file.is_some()
+                {
+                    bail!(
+                        "terminal_recording.encryption.mode = disabled but a master key source \
+                         is configured; either set encryption.mode = required to consume the \
+                         key, or unset the key sources"
+                    );
+                }
+            }
+            TerminalRecordingEncryptionMode::Required => {
+                match (
+                    rec.encryption.master_key_b64.is_some(),
+                    rec.encryption.master_key_file.is_some(),
+                ) {
+                    (false, false) => bail!(
+                        "terminal_recording.encryption.mode = required but no master key is \
+                         configured — set terminal_recording.encryption.master_key_b64 or \
+                         terminal_recording.encryption.master_key_file \
+                         (RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64 / \
+                         RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_FILE)"
+                    ),
+                    (true, true) => bail!(
+                        "terminal_recording.encryption.master_key_b64 and \
+                         terminal_recording.encryption.master_key_file are both set; pick \
+                         exactly one"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+
+        // Recording master key MUST be a different secret from the vault
+        // master key. We can compare statically only when both configs
+        // use the same source kind; mixed sources are out-of-scope for
+        // this static check and need a runtime check after key load.
+        if let (Some(rec_b64), Some(vault_b64)) = (
+            rec.encryption.master_key_b64.as_deref(),
+            self.vault.master_key_b64.as_deref(),
+        ) && rec_b64 == vault_b64
+        {
+            bail!(
+                "terminal_recording.encryption.master_key_b64 must not equal \
+                 vault.master_key_b64; recording uses a SEPARATE key so a recording \
+                 compromise does not leak SSH identities"
+            );
+        }
+        if let (Some(rec_path), Some(vault_path)) = (
+            rec.encryption.master_key_file.as_deref(),
+            self.vault.master_key_file.as_deref(),
+        ) && rec_path == vault_path
+        {
+            bail!(
+                "terminal_recording.encryption.master_key_file must not equal \
+                 vault.master_key_file; recording uses a SEPARATE key so a recording \
+                 compromise does not leak SSH identities"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Resolve the configured master key, or return `None` when the vault
     /// is intentionally disabled. Consumes the configured key sources so
     /// the raw base64 string does not linger on the heap for the process
@@ -438,6 +876,7 @@ struct FileConfig {
     database: Option<FileDatabaseConfig>,
     auth: Option<FileAuthConfig>,
     vault: Option<FileVaultConfig>,
+    terminal_recording: Option<FileTerminalRecordingConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,6 +950,56 @@ impl fmt::Debug for FileVaultConfig {
     }
 }
 
+/// File-side mirror of [`TerminalRecordingConfig`]. Same redaction
+/// discipline as [`FileVaultConfig`] / [`FileAuthConfig`]: `Debug`
+/// renders only the *presence* of each key source, never the value.
+#[derive(Default, Deserialize)]
+struct FileTerminalRecordingConfig {
+    enabled: Option<bool>,
+    retention_days: Option<u32>,
+    max_bytes_per_session: Option<u64>,
+    chunk_target_bytes: Option<u32>,
+    chunk_hard_cap_bytes: Option<u32>,
+    encryption: Option<FileTerminalRecordingEncryptionConfig>,
+    compression: Option<FileTerminalRecordingCompressionConfig>,
+}
+
+impl fmt::Debug for FileTerminalRecordingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileTerminalRecordingConfig")
+            .field("enabled", &self.enabled)
+            .field("retention_days", &self.retention_days)
+            .field("max_bytes_per_session", &self.max_bytes_per_session)
+            .field("chunk_target_bytes", &self.chunk_target_bytes)
+            .field("chunk_hard_cap_bytes", &self.chunk_hard_cap_bytes)
+            .field("encryption", &self.encryption)
+            .field("compression", &self.compression)
+            .finish()
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct FileTerminalRecordingEncryptionConfig {
+    mode: Option<TerminalRecordingEncryptionMode>,
+    master_key_b64: Option<String>,
+    master_key_file: Option<std::path::PathBuf>,
+}
+
+impl fmt::Debug for FileTerminalRecordingEncryptionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileTerminalRecordingEncryptionConfig")
+            .field("mode", &self.mode)
+            .field("master_key_b64_set", &self.master_key_b64.is_some())
+            .field("master_key_file", &self.master_key_file)
+            .finish()
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileTerminalRecordingCompressionConfig {
+    mode: Option<TerminalRecordingCompressionMode>,
+}
+
 impl FileConfig {
     fn merge_into(self, cfg: &mut Config) {
         if let Some(s) = self.server
@@ -560,6 +1049,39 @@ impl FileConfig {
                 cfg.vault.master_key_file = Some(p);
             }
         }
+        if let Some(r) = self.terminal_recording {
+            if let Some(enabled) = r.enabled {
+                cfg.terminal_recording.enabled = enabled;
+            }
+            if let Some(d) = r.retention_days {
+                cfg.terminal_recording.retention_days = d;
+            }
+            if let Some(b) = r.max_bytes_per_session {
+                cfg.terminal_recording.max_bytes_per_session = b;
+            }
+            if let Some(t) = r.chunk_target_bytes {
+                cfg.terminal_recording.chunk_target_bytes = t;
+            }
+            if let Some(c) = r.chunk_hard_cap_bytes {
+                cfg.terminal_recording.chunk_hard_cap_bytes = c;
+            }
+            if let Some(enc) = r.encryption {
+                if let Some(m) = enc.mode {
+                    cfg.terminal_recording.encryption.mode = m;
+                }
+                if let Some(b64) = enc.master_key_b64 {
+                    cfg.terminal_recording.encryption.master_key_b64 = Some(b64);
+                }
+                if let Some(p) = enc.master_key_file {
+                    cfg.terminal_recording.encryption.master_key_file = Some(p);
+                }
+            }
+            if let Some(comp) = r.compression
+                && let Some(m) = comp.mode
+            {
+                cfg.terminal_recording.compression.mode = m;
+            }
+        }
     }
 }
 
@@ -591,6 +1113,19 @@ mod tests {
                 enabled: true,
                 master_key_b64: None,
                 master_key_file: None,
+            },
+            terminal_recording: TerminalRecordingConfig {
+                enabled: false,
+                retention_days: terminal_recording_defaults::RETENTION_DAYS,
+                max_bytes_per_session: terminal_recording_defaults::MAX_BYTES_PER_SESSION,
+                chunk_target_bytes: terminal_recording_defaults::CHUNK_TARGET_BYTES,
+                chunk_hard_cap_bytes: terminal_recording_defaults::CHUNK_HARD_CAP_BYTES,
+                encryption: TerminalRecordingEncryptionConfig {
+                    mode: TerminalRecordingEncryptionMode::Disabled,
+                    master_key_b64: None,
+                    master_key_file: None,
+                },
+                compression: TerminalRecordingCompressionConfig::default(),
             },
         }
     }
@@ -1135,6 +1670,553 @@ allowed_origins = ["https://relay.example.com"]
         assert_eq!(
             cfg.auth.allowed_origins,
             vec!["https://relay.example.com".to_owned()]
+        );
+    }
+
+    // --- Terminal recording config -----------------------------------
+
+    /// Sentinel string injected into recording-secret-shaped fields so a
+    /// future regression that starts substituting key values into errors
+    /// or `Debug` output gets caught the same way the auth tests catch
+    /// the matching auth surface.
+    const RECORDING_SECRET_MARKER: &str = "AAAA-RECORDING-SECRET-MARKER-AAAA";
+
+    fn b64_32() -> String {
+        BASE64_STANDARD.encode([0x42u8; 32])
+    }
+
+    /// Production + recording-enabled fixture that satisfies every
+    /// `validate_terminal_recording` requirement. Tests build on this
+    /// and mutate the field they care about, mirroring `production_cfg`.
+    fn production_recording_cfg() -> Config {
+        let mut cfg = production_cfg();
+        cfg.terminal_recording.enabled = true;
+        cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::Required;
+        cfg.terminal_recording.encryption.master_key_b64 = Some(b64_32());
+        cfg
+    }
+
+    #[test]
+    fn terminal_recording_default_is_disabled_and_validates() {
+        let cfg = Config::defaults();
+        assert!(
+            !cfg.terminal_recording.enabled,
+            "recording must default to disabled to keep step 1b a no-op for existing operators"
+        );
+        cfg.validate_terminal_recording()
+            .expect("default recording config must validate");
+    }
+
+    #[test]
+    fn terminal_recording_disabled_config_validates_without_key() {
+        // Disabled is the default and must be a config-only no-op.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.enabled = false;
+        cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::Disabled;
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_dev_enabled_with_disabled_encryption_validates() {
+        // A contributor exercising recording locally without minting a
+        // key must be able to boot. Production is the strict envelope;
+        // dev relaxes the at-rest posture, same shape as auth.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.enabled = true;
+        cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::Disabled;
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_production_enabled_without_key_fails() {
+        let mut cfg = production_cfg();
+        cfg.terminal_recording.enabled = true;
+        // mode left at default `disabled` — production must refuse
+        // because a plaintext-at-rest posture is not a deployable
+        // production configuration.
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auth.mode = production") || msg.contains("encryption.mode = required"),
+            "error must point at the production posture: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_production_required_without_key_source_fails() {
+        let mut cfg = production_recording_cfg();
+        cfg.terminal_recording.encryption.master_key_b64 = None;
+        cfg.terminal_recording.encryption.master_key_file = None;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("master key"),
+            "error must name the missing key: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_required_with_both_key_sources_fails() {
+        let mut cfg = production_recording_cfg();
+        cfg.terminal_recording.encryption.master_key_file =
+            Some(std::path::PathBuf::from("/dev/null"));
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("both") || msg.contains("pick exactly one"),
+            "error must describe ambiguity: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_required_with_b64_key_only_validates() {
+        let cfg = production_recording_cfg();
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_required_with_file_key_only_validates() {
+        let mut cfg = production_recording_cfg();
+        cfg.terminal_recording.encryption.master_key_b64 = None;
+        cfg.terminal_recording.encryption.master_key_file =
+            Some(std::path::PathBuf::from("/etc/relayterm/recording-key"));
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_disabled_mode_with_key_source_is_dead_config() {
+        // A key set under `mode = disabled` is never read; reject
+        // rather than silently ignore so the operator notices.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.enabled = true;
+        cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::Disabled;
+        cfg.terminal_recording.encryption.master_key_b64 = Some(b64_32());
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("encryption.mode = disabled"),
+            "error must explain the inconsistency: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_key_equal_to_vault_b64_fails() {
+        let mut cfg = production_recording_cfg();
+        let shared = b64_32();
+        cfg.vault.master_key_b64 = Some(shared.clone());
+        cfg.terminal_recording.encryption.master_key_b64 = Some(shared);
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SEPARATE"),
+            "error must mandate separateness: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_key_equal_to_vault_file_path_fails() {
+        let mut cfg = production_recording_cfg();
+        cfg.terminal_recording.encryption.master_key_b64 = None;
+        cfg.terminal_recording.encryption.master_key_file =
+            Some(std::path::PathBuf::from("/etc/relayterm/key"));
+        cfg.vault.master_key_b64 = None;
+        cfg.vault.master_key_file = Some(std::path::PathBuf::from("/etc/relayterm/key"));
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SEPARATE"),
+            "error must mandate separateness: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_zero_retention_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.retention_days = 0;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention_days"),
+            "error must name retention_days: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_huge_retention_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.retention_days =
+            terminal_recording_defaults::RETENTION_DAYS_HARD_CAP + 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention_days"),
+            "error must name retention_days: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_max_bytes_below_chunk_cap_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.max_bytes_per_session =
+            u64::from(cfg.terminal_recording.chunk_hard_cap_bytes) - 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_bytes_per_session"),
+            "error must name the failing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_max_bytes_zero_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.max_bytes_per_session = 0;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_bytes_per_session"),
+            "error must name max_bytes_per_session: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_huge_max_bytes_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.max_bytes_per_session =
+            terminal_recording_defaults::MAX_BYTES_PER_SESSION_HARD_CAP + 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_bytes_per_session"),
+            "error must name max_bytes_per_session: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_chunk_target_above_hard_cap_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.chunk_target_bytes = cfg.terminal_recording.chunk_hard_cap_bytes + 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunk_target_bytes"),
+            "error must name chunk_target_bytes: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_chunk_hard_cap_below_floor_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.chunk_hard_cap_bytes =
+            terminal_recording_defaults::CHUNK_HARD_CAP_BYTES_FLOOR - 1;
+        cfg.terminal_recording.chunk_target_bytes = cfg.terminal_recording.chunk_hard_cap_bytes;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunk_hard_cap_bytes"),
+            "error must name chunk_hard_cap_bytes: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_malformed_enabled_env_value_fails_safely() {
+        // The recording env parser is stricter than the vault / auth
+        // scalar parsers (see the env-loading comment in config.rs):
+        // `ENABLED=yes` is a typo, not a no-op. Pin the policy so a
+        // future cleanup that "harmonises" the parsers does not
+        // re-introduce the silent-discard channel for the recording
+        // gate. Production validation depends on `enabled = true`
+        // surfacing accurately so the `encryption.mode = required`
+        // requirement actually fires.
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[("RELAYTERM_TERMINAL_RECORDING__ENABLED", "yes")]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__ENABLED"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_malformed_retention_env_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[("RELAYTERM_TERMINAL_RECORDING__RETENTION_DAYS", "abc")]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__RETENTION_DAYS"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_malformed_max_bytes_env_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[("RELAYTERM_TERMINAL_RECORDING__MAX_BYTES_PER_SESSION", "-1")]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__MAX_BYTES_PER_SESSION"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_unsupported_encryption_mode_in_env_fails() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MODE",
+                "totally-bogus",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MODE"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_unsupported_compression_mode_in_env_fails() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE",
+                "zstd-later",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_unsupported_encryption_mode_in_toml_fails() {
+        let raw = "[terminal_recording.encryption]\nmode = \"halfway\"\n";
+        let err = toml::from_str::<FileConfig>(raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") && msg.contains("halfway"),
+            "TOML parse error must name the unknown variant: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_config_debug_redacts_master_key_b64() {
+        let cfg = TerminalRecordingEncryptionConfig {
+            mode: TerminalRecordingEncryptionMode::Required,
+            master_key_b64: Some(RECORDING_SECRET_MARKER.to_owned()),
+            master_key_file: None,
+        };
+        let s = format!("{cfg:?}");
+        assert!(
+            !s.contains(RECORDING_SECRET_MARKER),
+            "TerminalRecordingEncryptionConfig debug must not echo master_key_b64: {s}"
+        );
+        assert!(s.contains("master_key_b64_set: true"));
+    }
+
+    #[test]
+    fn file_terminal_recording_config_debug_redacts_master_key_b64() {
+        let fr = FileTerminalRecordingEncryptionConfig {
+            mode: Some(TerminalRecordingEncryptionMode::Required),
+            master_key_b64: Some(RECORDING_SECRET_MARKER.to_owned()),
+            master_key_file: None,
+        };
+        let s = format!("{fr:?}");
+        assert!(
+            !s.contains(RECORDING_SECRET_MARKER),
+            "FileTerminalRecordingEncryptionConfig debug must not echo master_key_b64: {s}"
+        );
+        assert!(s.contains("master_key_b64_set: true"));
+    }
+
+    #[test]
+    fn terminal_recording_outer_debug_redacts_master_key_b64() {
+        // The outer struct's manual Debug impl must propagate the
+        // redaction discipline from the encryption sub-struct, mirroring
+        // how `AuthConfig`'s Debug propagates from its secret-shaped
+        // fields.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.encryption.master_key_b64 = Some(RECORDING_SECRET_MARKER.to_owned());
+        let s = format!("{:?}", cfg.terminal_recording);
+        assert!(
+            !s.contains(RECORDING_SECRET_MARKER),
+            "TerminalRecordingConfig debug must not echo master_key_b64 through any field: {s}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_validation_errors_do_not_echo_secret_values() {
+        // Same redaction posture as `auth_validation_errors_do_not_echo_secret_env_values`:
+        // every reachable failure path on a recording config that has
+        // sentinel-shaped secrets must NOT splice those secrets into the
+        // operator-visible error message.
+
+        // (1) Production + enabled + mode = disabled (key present is
+        // also dead config but the production check fires first).
+        {
+            let mut cfg = production_cfg();
+            cfg.terminal_recording.enabled = true;
+            cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::Disabled;
+            cfg.terminal_recording.encryption.master_key_b64 =
+                Some(RECORDING_SECRET_MARKER.to_owned());
+            let err = cfg.validate_terminal_recording().unwrap_err();
+            assert!(
+                !err.to_string().contains(RECORDING_SECRET_MARKER),
+                "production-disabled error must not echo recording-key value: {err}"
+            );
+        }
+
+        // (2) Required + both sources set (b64 carries the marker).
+        {
+            let mut cfg = production_recording_cfg();
+            cfg.terminal_recording.encryption.master_key_b64 =
+                Some(RECORDING_SECRET_MARKER.to_owned());
+            cfg.terminal_recording.encryption.master_key_file =
+                Some(std::path::PathBuf::from("/dev/null"));
+            let err = cfg.validate_terminal_recording().unwrap_err();
+            assert!(
+                !err.to_string().contains(RECORDING_SECRET_MARKER),
+                "ambiguous-key error must not echo recording-key value: {err}"
+            );
+        }
+
+        // (3) Recording key equal to vault key (b64). The error mandates
+        // separateness; it MUST NOT echo the shared secret value.
+        {
+            let mut cfg = production_recording_cfg();
+            cfg.vault.master_key_b64 = Some(RECORDING_SECRET_MARKER.to_owned());
+            cfg.terminal_recording.encryption.master_key_b64 =
+                Some(RECORDING_SECRET_MARKER.to_owned());
+            let err = cfg.validate_terminal_recording().unwrap_err();
+            assert!(
+                !err.to_string().contains(RECORDING_SECRET_MARKER),
+                "recording==vault error must not echo the shared key value: {err}"
+            );
+        }
+
+        // (4) Disabled-mode dead-config rejection (key carries the marker).
+        {
+            let mut cfg = empty_cfg();
+            cfg.terminal_recording.enabled = true;
+            cfg.terminal_recording.encryption.mode = TerminalRecordingEncryptionMode::Disabled;
+            cfg.terminal_recording.encryption.master_key_b64 =
+                Some(RECORDING_SECRET_MARKER.to_owned());
+            let err = cfg.validate_terminal_recording().unwrap_err();
+            assert!(
+                !err.to_string().contains(RECORDING_SECRET_MARKER),
+                "disabled-mode-with-key error must not echo recording-key value: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_recording_env_overrides_apply() {
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[
+                ("RELAYTERM_TERMINAL_RECORDING__ENABLED", "true"),
+                ("RELAYTERM_TERMINAL_RECORDING__RETENTION_DAYS", "14"),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__MAX_BYTES_PER_SESSION",
+                    "67108864",
+                ),
+                ("RELAYTERM_TERMINAL_RECORDING__CHUNK_TARGET_BYTES", "65536"),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__CHUNK_HARD_CAP_BYTES",
+                    "2097152",
+                ),
+                ("RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MODE", "required"),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64",
+                    "k",
+                ),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_FILE",
+                    "/dev/null",
+                ),
+                ("RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE", "none"),
+            ]),
+        )
+        .unwrap();
+        assert!(cfg.terminal_recording.enabled);
+        assert_eq!(cfg.terminal_recording.retention_days, 14);
+        assert_eq!(cfg.terminal_recording.max_bytes_per_session, 67_108_864);
+        assert_eq!(cfg.terminal_recording.chunk_target_bytes, 65_536);
+        assert_eq!(cfg.terminal_recording.chunk_hard_cap_bytes, 2_097_152);
+        assert_eq!(
+            cfg.terminal_recording.encryption.mode,
+            TerminalRecordingEncryptionMode::Required
+        );
+        assert_eq!(
+            cfg.terminal_recording.encryption.master_key_b64.as_deref(),
+            Some("k")
+        );
+        assert_eq!(
+            cfg.terminal_recording.encryption.master_key_file.as_deref(),
+            Some(std::path::Path::new("/dev/null"))
+        );
+        assert_eq!(
+            cfg.terminal_recording.compression.mode,
+            TerminalRecordingCompressionMode::None
+        );
+    }
+
+    #[test]
+    fn terminal_recording_toml_round_trip() {
+        let raw = r#"
+[terminal_recording]
+enabled = true
+retention_days = 7
+max_bytes_per_session = 33554432
+chunk_target_bytes = 32768
+chunk_hard_cap_bytes = 2097152
+
+[terminal_recording.encryption]
+mode = "required"
+master_key_b64 = "AAAA-BASE64-PLACEHOLDER-AAAA"
+
+[terminal_recording.compression]
+mode = "none"
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert!(cfg.terminal_recording.enabled);
+        assert_eq!(cfg.terminal_recording.retention_days, 7);
+        assert_eq!(cfg.terminal_recording.max_bytes_per_session, 33_554_432);
+        assert_eq!(cfg.terminal_recording.chunk_target_bytes, 32_768);
+        assert_eq!(cfg.terminal_recording.chunk_hard_cap_bytes, 2_097_152);
+        assert_eq!(
+            cfg.terminal_recording.encryption.mode,
+            TerminalRecordingEncryptionMode::Required
+        );
+        assert!(
+            cfg.terminal_recording.encryption.master_key_b64.is_some(),
+            "TOML key must be merged into the runtime config"
+        );
+        assert_eq!(
+            cfg.terminal_recording.compression.mode,
+            TerminalRecordingCompressionMode::None
         );
     }
 }

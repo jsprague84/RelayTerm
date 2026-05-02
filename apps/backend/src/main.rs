@@ -32,9 +32,19 @@ async fn main() -> anyhow::Result<()> {
     // signing key, non-empty `allowed_origins`, and `cookie_secure =
     // true`; dev relaxes all three for local convenience).
     cfg.validate_auth().context("validate auth config")?;
+    // Recording config foundation. Step 1b (this slice) wires typed
+    // config + boot validation only — there is no chunk writer, no
+    // replay API, no UI yet. Validation runs alongside auth so a
+    // misconfigured production deploy fails fast (e.g. recording
+    // enabled in production with no master key) before binding the
+    // listener. See `docs/terminal-recording.md` Section 13 for the
+    // staged plan and what each later slice will add.
+    cfg.validate_terminal_recording()
+        .context("validate terminal recording config")?;
     info!(
         addr = %cfg.server.bind,
         auth_mode = cfg.auth.mode.as_str(),
+        recording_enabled = cfg.terminal_recording.enabled,
         "relayterm-backend starting",
     );
 

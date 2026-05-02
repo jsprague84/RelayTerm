@@ -1441,7 +1441,7 @@ Backend VT observer / `libghostty-vt` snapshot engine (the future replacement fo
 
 The full design for durable PTY-output recording, durable replay across the in-memory ring's window, closed-session replay, and backend-restart display-history recovery lives in [`docs/terminal-recording.md`](docs/terminal-recording.md). That document is normative for any future recording slice. The bullets below are the load-bearing invariants that anchor the design — implementation slices MUST preserve every one of them, and any drift goes through `docs/terminal-recording.md` first, not through code.
 
-**Status (this slice).** Design only. No schema, no migrations, no repository, no orchestrator writes, no API, no UI. The load-bearing invariants below describe what the future recording subsystem WILL look like; they do not promise any of it is shipped.
+**Status (this slice).** Design landed (step 1a) AND typed-config foundation landed (step 1b — `[terminal_recording]` section, env overrides, boot-time validation envelope, redaction-aware `Debug` impls; no DB writes, no chunk writer, no replay API, no UI). The load-bearing invariants below describe the recording subsystem's full target shape — implementation slices 2–9 (`docs/terminal-recording.md` Section 13) are still ahead, and flipping `terminal_recording.enabled = true` today does not record anything.
 
 - **Scope is display-history**, not live-PTY persistence. A future recording subsystem captures the same PTY OUTPUT bytes the live wire already carries and stores them durably so a reconnect after the in-memory ring's window OR a closed-session review can reproduce what the operator's terminal printed. It does NOT resurrect the live `russh::Channel` after a backend restart — long-running tmux/screen-style detached-PTY persistence beyond `DETACHED_LIVE_PTY_TTL` remains separate, deliberate future work owned by a different slice.
 - **Recording is OFF by default and config-gated.** A self-hosted operator opts in at the config layer; production-mode boot validation refuses to start with recording enabled and no recording master key. The recording master key is SEPARATE from the SSH-identity vault master key — compromise of one MUST NOT leak the other.
@@ -1461,7 +1461,7 @@ The full design for durable PTY-output recording, durable replay across the in-m
 
 #### Implementation order (summary; full plan in `docs/terminal-recording.md` Section 13)
 
-1. This design doc (step 1a — current slice) + typed-config flags + config-validation envelope (step 1b — separate follow-on slice; no DB writes).
+1. This design doc (step 1a — landed) + typed-config flags + config-validation envelope (step 1b — landed in `apps/backend/src/config.rs` as the `[terminal_recording]` section; production refuses to start with `enabled = true` and `encryption.mode = disabled` or no master key; recording master key MUST be a SEPARATE secret from the vault key — the validator rejects equal sources statically; no DB writes, no chunk writer, no replay API, no UI).
 2. Schema + repository for chunks and markers.
 3. Orchestrator writes chunks + markers (bounded, drop-oldest-on-overflow, never blocks the live wire).
 4. Durable replay read API (metadata + chunks).

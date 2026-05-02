@@ -100,3 +100,53 @@ enabled = true
 # rather than committing it here.
 # master_key_b64  = "REPLACE_ME_WITH_BASE64_32_BYTES"
 # master_key_file = "/etc/relayterm/vault-master-key"
+
+# Durable terminal recording (config foundation; writer not yet
+# implemented).
+#
+# This section is the typed config landed by step 1b of
+# `docs/terminal-recording.md` Section 13. The config is accepted at
+# boot, validated, and otherwise unused — the chunk writer, replay API,
+# and frontend replay viewer are deliberately later slices. Flipping
+# `enabled = true` today does not record anything; it only causes
+# production validation to require a master key.
+#
+# Recording is OFF by default. Leave the whole section commented out
+# unless you have read `docs/terminal-recording.md` end-to-end, including
+# the privacy posture in Section 7.
+# [terminal_recording]
+# enabled = true
+# # Per-session retention from `terminal_sessions.closed_at`. The cleanup
+# # worker (later slice) will sweep chunks older than this; until that
+# # slice ships, this number is informational. Bounded 1..=3650.
+# retention_days = 30
+# # Per-session byte cap. The future writer drops further chunks for
+# # *recording only* once a session exceeds this; the live wire is
+# # never affected. Default 64 MiB.
+# max_bytes_per_session = 67108864
+# # Soft chunk flush target (64 KiB).
+# chunk_target_bytes = 65536
+# # Hard per-row size cap (2 MiB). MUST exceed the live wire's 1 MiB
+# # single-frame cap plus AEAD envelope overhead.
+# chunk_hard_cap_bytes = 2097152
+#
+# [terminal_recording.encryption]
+# # `disabled` writes plaintext PTY bytes at rest; production refuses
+# # this combination. `required` writes XChaCha20-Poly1305 envelope
+# # rows and refuses to start without a key. The recording master key
+# # MUST be a SEPARATE secret from `vault.master_key_b64` /
+# # `vault.master_key_file`; the validator rejects equal sources.
+# mode = "required"
+# # 32 bytes, base64 — same shape as the vault key but a DIFFERENT
+# # secret. Generate with: openssl rand -base64 32
+# # Recommended: set
+# # `RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64` or
+# # `RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_FILE` on the
+# # process and leave the keys below commented out.
+# # master_key_b64  = "REPLACE_ME_WITH_BASE64_32_BYTES"
+# # master_key_file = "/etc/relayterm/recording-master-key"
+#
+# [terminal_recording.compression]
+# # Only `none` ships in v1. The schema reserves `zstd` for a later
+# # slice; configuring an unknown value is a hard boot failure.
+# mode = "none"

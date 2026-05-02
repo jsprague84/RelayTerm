@@ -830,18 +830,46 @@ posture (Section 7) defensible at every stop.
 
 1. **This design doc + config flags** (split: 1a = doc only,
    1b = config plumb).
-   - **Step 1a (this slice)**: this design doc lands by itself.
+   - **Step 1a (landed)**: this design doc landed by itself.
      No code, no config changes, no migrations, no UI. The doc
-     becomes the binding contract every later step references.
-   - **Step 1b (separate follow-on slice, NOT part of step 1a)**:
-     add `recording.enabled: bool = false` and (placeholder)
-     `recording.master_key: Option<[u8; 32]>` to typed config; wire
-     `recording.enabled` through the config-validation envelope so
-     production mode refuses to start with `recording.enabled =
-     true` and no master key. Update `docs/config-examples/` to
-     show the disabled-by-default shape.
+     is the binding contract every later step references.
+   - **Step 1b (landed)**: typed `[terminal_recording]` section
+     wired into `apps/backend/src/config.rs` (TOML + env overrides,
+     redaction-aware `Debug`), validated at boot in
+     `apps/backend/src/main.rs` immediately after `validate_auth`.
+     Defaults: `enabled = false`, `retention_days = 30`,
+     `max_bytes_per_session = 64 MiB`, `chunk_target_bytes = 64 KiB`,
+     `chunk_hard_cap_bytes = 2 MiB`, `encryption.mode = disabled`,
+     `compression.mode = none`. Production envelope: `enabled = true`
+     requires `encryption.mode = required` AND exactly one of
+     `master_key_b64` / `master_key_file`; the recording master key
+     MUST be a SEPARATE secret from `vault.master_key_b64` /
+     `vault.master_key_file` — the validator rejects equal-source
+     pairs statically (mixed sources, e.g. b64 vs. file path, are an
+     acknowledged gap and a future runtime check after key load).
+     Numeric bounds are enforced unconditionally:
+     `chunk_target_bytes <= chunk_hard_cap_bytes`;
+     `chunk_hard_cap_bytes >= 1 MiB + envelope budget`;
+     `max_bytes_per_session >= chunk_hard_cap_bytes`;
+     `retention_days` in `1..=3650`;
+     `max_bytes_per_session <= 1 TiB`. Env names follow the existing
+     double-underscore-as-section convention:
+     `RELAYTERM_TERMINAL_RECORDING__ENABLED`,
+     `RELAYTERM_TERMINAL_RECORDING__RETENTION_DAYS`,
+     `RELAYTERM_TERMINAL_RECORDING__MAX_BYTES_PER_SESSION`,
+     `RELAYTERM_TERMINAL_RECORDING__CHUNK_TARGET_BYTES`,
+     `RELAYTERM_TERMINAL_RECORDING__CHUNK_HARD_CAP_BYTES`,
+     `RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MODE`,
+     `RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64`,
+     `RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_FILE`,
+     `RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE`. The example
+     TOML files at `docs/config-examples/relayterm.{production,dev}.example.toml`
+     show the disabled-by-default shape and enable-time guidance.
    - Step 1b ships **no DB writes**. The repository in step 2 is
-     the first slice that creates tables.
+     the first slice that creates tables. Flipping
+     `terminal_recording.enabled = true` today changes no runtime
+     behaviour — it only causes production validation to require a
+     separate master key.
 2. **Schema + repository for output chunks and markers**.
    - One sqlx migration adding `terminal_recording_chunks` and
      `terminal_recording_markers` per Section 5; commit `.sqlx/`
