@@ -12,11 +12,13 @@ a small set of stable selectors.
 - Playwright lives globally as an MCP server; pulling
   `@playwright/test` into `apps/web` as a devDep would add browsers,
   config, and a CI surface that isn't paying for itself yet.
-- The dev lab is intentionally dev-only — the production terminal UI is
-  out of scope, so a heavyweight e2e harness would mostly verify that
-  the lab is gated correctly, which a 30-second manual run already does.
-- Stable `data-testid` hooks live on the dev lab so this procedure (and
-  any future committed runner) targets the same selectors.
+- The smoke covers the dev renderer lab AND the production app shell
+  (including the production terminal launch surface) to a depth a short
+  manual procedure can verify against stable selectors. A heavyweight
+  e2e harness is not paying for itself yet.
+- Stable `data-testid` hooks live on both the dev lab and the production
+  shell so this procedure (and any future committed runner) targets the
+  same selectors.
 
 ## Stable selectors
 
