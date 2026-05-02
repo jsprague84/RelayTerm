@@ -277,8 +277,10 @@ Constraints actually enforced (see migration):
   `(terminal_session_id, seq_start)` for `from_seq` reads.
 
 Notes on the cap rationale: `byte_len <= 2 MiB` is defence-in-depth
-against a runaway chunk row. The chunk writer (a future slice) is the
-primary bound; the CHECK is the hard upper bound. 2 MiB covers the
+against a runaway chunk row. The chunk writer
+(`crates/relayterm-terminal/src/recording.rs`) is the primary bound
+(`chunk_hard_cap_bytes`, default 2 MiB); the CHECK is the hard upper
+bound. 2 MiB covers the
 worst-case single 1 MiB binary-envelope `Output` frame plus envelope
 overhead from a future encrypted-row scheme (Section 6.3 — XChaCha20
 nonce + Poly1305 tag + magic + version ≈ 41 bytes), with comfortable
@@ -380,7 +382,10 @@ the audit forbidden-substring rule (`AGENTS.md` → "Things to avoid",
 - `resized` — `{ "cols": <u16>, "rows": <u16> }`. No client_info,
   no remote_addr, no attachment id (those live on the attachment row).
 - `replay_gap` — `{ "from_seq", "to_seq", "reason": "<enum>" }`.
-  `reason` is one of `writer_overflow`, `writer_error`, `unknown`.
+  `reason` is one of `writer_overflow`, `writer_error`,
+  `frame_oversized` (matching the constants in the
+  `replay_gap_reason` module in
+  `crates/relayterm-terminal/src/recording.rs`).
   No bytes, no error text.
 - The marker payload **never** carries `attachment_id` /
   `remote_addr` / `client_info`. The attachment surface

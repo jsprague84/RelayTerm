@@ -414,11 +414,14 @@ impl Config {
                 master_key_b64: None,
                 master_key_file: None,
             },
-            // Recording is OFF by default. Step 1b lands the typed
-            // config + validation envelope; the chunk writer, replay
-            // API, and UI are deliberately later slices. Operators
-            // who flip `enabled = true` today get validation but no
-            // runtime change — see SPEC.md "Durable terminal recording
+            // Recording is OFF by default. The chunk writer is wired
+            // when an operator opts in (`enabled = true` AND
+            // `encryption.mode = disabled` — dev-only for now, since
+            // `auth.mode = production` rejects the disabled mode at
+            // boot to refuse plaintext-at-rest; see Section 13 of
+            // `docs/terminal-recording.md`). The replay API, retention
+            // worker, encryption-aware writer, and replay UI are still
+            // later slices. See SPEC.md "Durable terminal recording
             // and replay architecture" for the staged plan.
             terminal_recording: TerminalRecordingConfig {
                 enabled: false,
