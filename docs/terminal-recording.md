@@ -948,19 +948,71 @@ posture (Section 7) defensible at every stop.
      retention worker, no encryption / compression implementation,
      no `recording_purged` audit kind, no VT snapshot observer,
      and no export endpoint exist yet.
-3. **Orchestrator writes chunks + markers**.
-   - Tee from the PTY forwarder into a bounded async chunk
-     writer; flush on size / frame-count / time deadline.
-   - Markers written for `started`, `attached`, `detached`,
-     `reattached`, `resized`, `closed` at the seq the event
-     observed.
-   - Backpressure: drop oldest unflushed chunks on overflow,
-     emit `replay_gap`. Live wire never blocks.
-   - Tests: chunk continuity invariant (`chunk[n].seq_start ==
-     chunk[n-1].seq_end + 1`); replay_gap on simulated overflow;
-     redaction sentinel test (no chunk bytes in any
-     `tracing::*` line, no chunk bytes in any `audit_events`
-     row written by this slice).
+3. **Orchestrator writes chunks + markers** (writer foundation
+   landed; `attached`/`detached`/`reattached` markers deferred).
+   - **Landed (this slice)**:
+     - `RecordingWriter` + `RecordingRuntime` in
+       `crates/relayterm-terminal/src/recording.rs`. The writer is
+       a tee from the PTY forwarder, never a gate — the live wire
+       cannot stall on it.
+     - Manager wiring: `TerminalSessionManager::with_recording`
+       attaches a runtime; `start_live_pty` spawns one writer task
+       per session; the forwarder calls `recording.record_output`
+       AFTER fanning each frame to broadcast + replay.
+     - Chunk batcher: accumulates consecutive output frames up to
+       `chunk_target_bytes`, never overshoots `chunk_hard_cap_bytes`,
+       flushes the trailing partial chunk on shutdown.
+     - Bounded queue (256 commands) between forwarder and writer
+       task. On overflow the producer drops the new frame and
+       extends a pending gap; on next successful enqueue the writer
+       flushes its open chunk and emits a `replay_gap` marker
+       carrying `{ from_seq, to_seq, reason: "writer_overflow" }`.
+       Same path covers DB-write failure (`reason: "writer_error"`)
+       and oversized single frames (`reason: "frame_oversized"`).
+     - Markers: `started` at `seq = 0` on writer construction,
+       `closed` at the highest observed seq on shutdown, `resized`
+       on every successful `resize_session` against a live PTY.
+     - Marker payloads are public-safe metadata only (counts,
+       dims, reason codes) — built field-by-field from explicit
+       primitives.
+     - Shutdown is bounded (5s deadline) and the manager awaits
+       the forwarder before signalling shutdown so trailing
+       frames are observed before the closed marker lands.
+     - Supported runtime mode: only `terminal_recording.enabled =
+       true` AND `encryption.mode = disabled` (plaintext-at-rest).
+       `enabled = true` AND `encryption.mode = required` is
+       config-valid but the writer for that mode has not landed;
+       the backend now FAILS TO BOOT in that combination rather
+       than silently degrade to plaintext.
+     - Errors are logged operator-side as static category tags
+       only — never the bytes, never `?err` formatting that could
+       round-trip driver text. The writer's `Debug` impl exposes
+       only the variant tag and (when enabled) the session id.
+     - Tests landed: writer unit tests in
+       `crates/relayterm-terminal/src/recording.rs` (disabled
+       no-op, started+closed lifecycle, batching, target-flush,
+       hard-cap split, oversized-frame gap, writer-error gap,
+       seq-zero rejection for non-started, payload-order
+       preservation, byte-sentinel redaction); manager
+       integration tests in
+       `crates/relayterm-terminal/tests/recording_writer.rs`
+       (recording-disabled writes nothing, recording-enabled
+       writes chunk + started + closed, resize emits resized
+       marker at last seq, sentinel never appears in any marker
+       payload / Debug, input bytes are never recorded).
+   - **Deferred to a follow-up slice**:
+     - `attached` / `detached` / `reattached` markers — these
+       require threading the live writer handle from the
+       attach/detach path through the manager, and the slice's
+       scope was capped at the always-on lifecycle markers
+       (started/closed) plus resize. The schema CHECK already
+       allows the variants; only the emit-site is missing.
+     - Chunk continuity assertion test against a real Postgres
+       row (the in-memory fake covers the invariant). The
+       repository layer's existing per-row CHECKs and the unique
+       `(session_id, seq_start)` index are the durable backstop.
+     - Encryption-aware writer (the `encryption.mode = required`
+       path; landing this unblocks production recording).
 4. **Durable replay read API**.
    - The two HTTP endpoints in Section 10.1 / 10.2.
    - Owner-scope tests (foreign session 404), no-recording 404

@@ -26,6 +26,7 @@
 //! `create_session` / `close_session` and read the returned domain value.
 
 pub mod manager;
+pub mod recording;
 pub mod replay;
 
 pub use manager::{
@@ -36,4 +37,5 @@ pub use manager::{
     STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE, STUB_PTY_NOT_IMPLEMENTED_MESSAGE,
     TerminalSessionManager, TerminalSessionManagerError, TerminalSessionRuntime,
 };
+pub use recording::{RecordingRuntime, RecordingWriter, RecordingWriterConfig, replay_gap_reason};
 pub use replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};

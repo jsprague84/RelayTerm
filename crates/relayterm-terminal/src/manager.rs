@@ -7,6 +7,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::recording::{RecordingRuntime, RecordingWriter};
 use crate::replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};
 
 use chrono::{DateTime, Utc};
@@ -158,11 +159,14 @@ struct LiveRuntime {
     /// [`LiveRuntimeView`] handed to handlers.
     replay: Arc<Mutex<ReplayBuffer>>,
     /// Forwarder task handle. Tied to the lifetime of the runtime entry
-    /// so the manager can detach it cleanly on close. Never awaited
-    /// from a request handler — the task will exit when the bridge's
-    /// `output_rx` returns `None` (transport tore down) or when the
-    /// handle's `close()` is called.
-    forwarder: tokio::task::JoinHandle<()>,
+    /// so the manager can detach it cleanly on close. The close path
+    /// awaits this (bounded) so every PTY frame the forwarder will
+    /// observe has been teed into the recording writer BEFORE the
+    /// writer's shutdown drains its queue — without this barrier a
+    /// race between `handle.close()` dropping the bridge sender and
+    /// `recording.shutdown()` sending its `Shutdown` command would
+    /// allow the writer to exit before the trailing frames landed.
+    forwarder: Option<tokio::task::JoinHandle<()>>,
     /// Bridge's own driver task (russh impl: the channel multiplexer;
     /// fakes: `None`). Stored so the manager can `abort()` it on close
     /// rather than relying solely on the channel-closure teardown path.
@@ -173,6 +177,20 @@ struct LiveRuntime {
     /// window. Carries the deadline plus the TTL close task. Cleared
     /// (and the task aborted) on reattach or explicit close.
     detach_close: Option<DetachClose>,
+    /// Recording writer for this session. Disabled when recording is
+    /// off at config time (every method is a no-op); enabled when the
+    /// manager was constructed with a [`RecordingRuntime`]. The
+    /// forwarder calls `record_output(seq, bytes)` on every PTY frame
+    /// AFTER fanning it out to broadcast/replay so recording can never
+    /// block the live wire. `close_session` calls `shutdown` on this
+    /// writer to flush the trailing chunk and write the `closed`
+    /// marker.
+    recording: RecordingWriter,
+    /// Highest output seq the forwarder stamped. Updated on every
+    /// frame so `close_session` / `resize_session` know which seq to
+    /// stamp on lifecycle markers (resize, closed) without touching
+    /// the broadcast surface.
+    last_seq: Arc<AtomicU64>,
 }
 
 /// In-memory bookkeeping for a session that has been detached but whose
@@ -206,7 +224,9 @@ impl Drop for LiveRuntime {
         // drop doesn't leave them running. The driver task in russh_pty
         // would also tear down on its own when the handle's senders
         // drop, but `abort()` is the explicit "stop now" signal.
-        self.forwarder.abort();
+        if let Some(forwarder) = self.forwarder.take() {
+            forwarder.abort();
+        }
         if let Some(driver) = self.driver.take() {
             driver.abort();
         }
@@ -413,6 +433,11 @@ pub struct TerminalSessionManager {
     /// [`Self::with_detach_ttl`] so they don't have to burn real
     /// wall-clock budget driving the timer.
     detach_ttl: Duration,
+    /// Recording runtime (`Some` when `terminal_recording.enabled =
+    /// true` and the writer is supported in the configured mode). When
+    /// `None`, every live session gets a [`RecordingWriter::disabled`]
+    /// so the PTY forwarder's tee call sites stay branch-free.
+    recording: Option<RecordingRuntime>,
 }
 
 impl TerminalSessionManager {
@@ -441,7 +466,27 @@ impl TerminalSessionManager {
             runtimes: RwLock::new(HashMap::new()),
             attachments: RwLock::new(HashMap::new()),
             detach_ttl,
+            recording: None,
         }
+    }
+
+    /// Attach a [`RecordingRuntime`] for durable PTY-output recording.
+    ///
+    /// Builder-style: returns `self` so the caller can chain construction
+    /// at backend boot. When recording is configured-disabled the caller
+    /// simply does not call this method and every live session uses a
+    /// [`RecordingWriter::disabled`] tee point with zero overhead.
+    #[must_use]
+    pub fn with_recording(mut self, recording: RecordingRuntime) -> Self {
+        self.recording = Some(recording);
+        self
+    }
+
+    /// Returns `true` when this manager will fan PTY output bytes
+    /// into a backing recording repository. Test-only convenience.
+    #[must_use]
+    pub fn recording_enabled(&self) -> bool {
+        self.recording.is_some()
     }
 
     /// Currently-configured detach TTL. Diagnostic getter for tests
@@ -566,12 +611,24 @@ impl TerminalSessionManager {
                 .map(|e| e.next_seq.clone())
                 .ok_or(TerminalSessionManagerError::NotFound)?
         };
+        let last_seq = Arc::new(AtomicU64::new(0));
+
+        // Spawn the recording writer for this session BEFORE the
+        // forwarder so the forwarder owns a clone of the writer's
+        // sender from the very first frame. The writer is `Disabled`
+        // (zero-cost) when recording is configured-off.
+        let recording_writer = match &self.recording {
+            Some(runtime) => runtime.writer_for(session_id),
+            None => RecordingWriter::disabled(),
+        };
+        let recording_for_task = recording_writer.clone();
 
         let sessions_repo = self.sessions.clone();
         let events_repo = self.events.clone();
         let output_tx_for_task = output_tx.clone();
         let next_seq_for_task = next_seq.clone();
         let replay_for_task = replay.clone();
+        let last_seq_for_task = last_seq.clone();
         let forwarder_session_id = session_id;
         let forwarder_owner_id = owner_id;
         let forwarder = tokio::spawn(forward_pty_output(
@@ -583,6 +640,8 @@ impl TerminalSessionManager {
             events_repo,
             forwarder_session_id,
             forwarder_owner_id,
+            recording_for_task,
+            last_seq_for_task,
         ));
 
         // Mark the persisted row Active. `closed_at` stays NULL on the
@@ -614,9 +673,11 @@ impl TerminalSessionManager {
             handle: handle.clone(),
             output_tx,
             replay,
-            forwarder,
+            forwarder: Some(forwarder),
             driver,
             detach_close: None,
+            recording: recording_writer,
+            last_seq,
         };
         let leftover = {
             let mut runtimes = self
@@ -794,14 +855,28 @@ impl TerminalSessionManager {
     /// fires its `Drop` impl: forwarder + driver + any pending TTL
     /// close task are aborted as a unit.
     async fn shutdown_runtime(&self, entry: RuntimeEntry) {
-        if let Some(live) = entry.live {
+        if let Some(mut live) = entry.live {
             // Notify the bridge handle so the SSH session is torn down
             // promptly; the forwarder task observes the resulting
             // `Closed` event and exits.
             live.handle.close().await;
-            // The forwarder will exit when the bridge's output_rx
-            // drains. We DO NOT await it here — that would tie the
-            // close response to remote SSH teardown latency.
+            // Bounded await on the forwarder so every queued PTY frame
+            // has been teed into the recording writer BEFORE we send
+            // the writer's shutdown signal. Without this barrier the
+            // writer can exit before the trailing frames are
+            // observable to the recording reader. The deadline is
+            // tight (the bridge's output_rx is bounded ≤ 256 frames
+            // and `recv()` on a closed channel resolves as fast as the
+            // task is scheduled).
+            if let Some(forwarder) = live.forwarder.take() {
+                let _ = tokio::time::timeout(Duration::from_millis(500), forwarder).await;
+            }
+            // Bounded shutdown of the recording writer: drain pending
+            // queue, flush trailing chunk, write the `closed` marker.
+            // The writer's own deadline keeps the close response
+            // bounded — the manager never stalls on a slow DB.
+            let last_seq = live.last_seq.load(Ordering::SeqCst);
+            live.recording.shutdown(last_seq).await;
             let _ = live;
         }
     }
@@ -1362,7 +1437,15 @@ impl TerminalSessionManager {
         // means the session row outlived its placeholder (e.g. across a
         // restart). The event still gets written so audit history records
         // the resize.
-        {
+        //
+        // While we hold the lock briefly: snapshot the recording writer
+        // and the live seq counter so a `resized` marker can be appended
+        // OUTSIDE the lock. The marker's seq is the latest output seq
+        // observed by the forwarder so a reader paging by ascending
+        // `seq >= n + 1` sees the resize alongside the surrounding
+        // chunk window. If no live runtime exists (or the writer is
+        // disabled), the `record_marker` call is a no-op.
+        let recording_marker_target = {
             let mut guard = self
                 .runtimes
                 .write()
@@ -1370,7 +1453,29 @@ impl TerminalSessionManager {
             if let Some(entry) = guard.get_mut(&session.id) {
                 entry.snapshot.cols = cols;
                 entry.snapshot.rows = rows;
+                entry
+                    .live
+                    .as_ref()
+                    .map(|live| (live.recording.clone(), live.last_seq.load(Ordering::SeqCst)))
+            } else {
+                None
             }
+        };
+        if let Some((writer, latest)) = recording_marker_target {
+            // The schema requires `seq >= 1` for non-`started` markers;
+            // record_marker enforces the same and silently drops a
+            // pre-output resize.
+            let marker_seq = latest.max(1);
+            writer
+                .record_marker(
+                    relayterm_core::terminal_recording::TerminalRecordingMarkerKind::Resized,
+                    marker_seq,
+                    serde_json::json!({
+                        "cols": cols,
+                        "rows": rows,
+                    }),
+                )
+                .await;
         }
 
         self.events
@@ -1466,6 +1571,8 @@ async fn forward_pty_output(
     events: Arc<dyn SessionEventRepository>,
     session_id: TerminalSessionId,
     owner_id: UserId,
+    recording: RecordingWriter,
+    last_seq: Arc<AtomicU64>,
 ) {
     let mut closed_reason: Option<ClosedReason> = None;
 
@@ -1488,7 +1595,14 @@ async fn forward_pty_output(
                 // `send` returns the number of subscribers reached; we
                 // ignore — broadcast::Sender has no failure mode short
                 // of "no subscribers", which is fine.
-                let _ = output_tx.send(frame);
+                let _ = output_tx.send(frame.clone());
+                // Tee the frame into the durable recording AFTER the
+                // live wire and replay ring. The writer is bounded and
+                // non-blocking — a full queue drops the frame for
+                // recording only and brackets it with a `replay_gap`
+                // marker. Live attachments never wait on recording.
+                last_seq.store(seq, Ordering::SeqCst);
+                recording.record_output(seq, &frame.data).await;
             }
             SshPtyEvent::Exit { status: _ } => {
                 // Recorded operator-side via tracing only. The wire signal

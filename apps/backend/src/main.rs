@@ -4,15 +4,15 @@ use anyhow::{Context, bail};
 use relayterm_api::{AppState, AuthRoutesConfig, router};
 use relayterm_auth::{AuthService, LoginThrottleConfig, LoginThrottler, PasswordHasher};
 use relayterm_core::repository::{
-    PasswordCredentialRepository, SessionEventRepository, TerminalSessionRepository,
-    UserSessionRepository,
+    PasswordCredentialRepository, SessionEventRepository, TerminalRecordingRepository,
+    TerminalSessionRepository, UserSessionRepository,
 };
 use relayterm_db::Db;
 use relayterm_ssh::{
     HostKeyPreflightService, RusshAuthChecker, RusshHostKeyProbe, RusshPtyBridge,
     SshAuthCheckService, SshPtyBridge,
 };
-use relayterm_terminal::TerminalSessionManager;
+use relayterm_terminal::{RecordingRuntime, RecordingWriterConfig, TerminalSessionManager};
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
@@ -125,10 +125,32 @@ async fn main() -> anyhow::Result<()> {
     // SCOPE: this slice manages session lifecycle metadata only. Real
     // PTY allocation, SSH channel ownership, and replay-buffer state are
     // future slices.
-    let terminal_sessions = Arc::new(TerminalSessionManager::new(
-        Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
-        Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
-    ));
+    //
+    // Recording wiring: when `terminal_recording.enabled = true` AND the
+    // configured encryption mode is supported by the writer (currently
+    // only `disabled` — i.e. plaintext-at-rest), the manager fans every
+    // PTY output frame into a bounded background writer that appends
+    // chunks/markers to Postgres. The writer is a tee, not a gate: a
+    // full queue or DB outage drops frames for recording only and the
+    // live wire is unaffected. See `docs/terminal-recording.md` Section
+    // 6.1 + Section 13 step 3.
+    //
+    // Encryption.required is config-valid (the validator accepts it for
+    // production) but the writer for that mode has not landed; we
+    // refuse to start in that combination so an operator who configured
+    // encryption.required does not silently get plaintext.
+    let recording_runtime = build_recording_runtime(&cfg, &db)?;
+    let terminal_sessions = {
+        let mut mgr = TerminalSessionManager::new(
+            Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+            Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+        );
+        if let Some(runtime) = recording_runtime {
+            mgr = mgr.with_recording(runtime);
+            info!("terminal recording writer enabled (plaintext-at-rest)");
+        }
+        Arc::new(mgr)
+    };
 
     // Compose the auth service from the existing repositories. The
     // hasher uses production parameters (`PasswordHasher::default()` =
@@ -191,6 +213,41 @@ async fn main() -> anyhow::Result<()> {
         .context("axum::serve")?;
 
     Ok(())
+}
+
+/// Resolve the recording writer runtime, or return `None` when recording
+/// is configured-disabled.
+///
+/// Failure modes:
+/// * `enabled = true` AND `encryption.mode = required`: the writer for
+///   that mode has not landed yet. We return an explicit error so the
+///   backend fails to boot rather than silently degrade to plaintext —
+///   the validator already accepted this combination on the assumption
+///   that the writer would respect it.
+fn build_recording_runtime(
+    cfg: &config::Config,
+    db: &Db,
+) -> anyhow::Result<Option<RecordingRuntime>> {
+    let rec = &cfg.terminal_recording;
+    if !rec.enabled {
+        return Ok(None);
+    }
+    match rec.encryption.mode {
+        config::TerminalRecordingEncryptionMode::Disabled => {
+            let writer_cfg = RecordingWriterConfig {
+                chunk_target_bytes: rec.chunk_target_bytes,
+                chunk_hard_cap_bytes: rec.chunk_hard_cap_bytes,
+            };
+            let repo: Arc<dyn TerminalRecordingRepository> = Arc::new(db.terminal_recordings());
+            Ok(Some(RecordingRuntime::new(repo, writer_cfg)))
+        }
+        config::TerminalRecordingEncryptionMode::Required => bail!(
+            "terminal_recording.enabled = true with encryption.mode = required, but the \
+             encryption-aware recording writer has not landed yet. Either set \
+             encryption.mode = disabled (dev only — operator accepts plaintext-at-rest) or \
+             leave terminal_recording.enabled = false until the encryption writer lands"
+        ),
+    }
 }
 
 async fn shutdown_signal() {
