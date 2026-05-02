@@ -11,11 +11,9 @@
 //! (exact-match, empty-value-as-absent, prefix/suffix-confusion-safe).
 //!
 //! The CSRF helper ([`csrf::check_origin`]) and extractor
-//! ([`csrf::CsrfGuard`]) are shared between the auth routes (today)
-//! and every browser-write route that migrates off
-//! [`crate::DevUser`] (SPEC step 7). Both shapes implement the same
-//! policy so a handler that switches from one to the other does not
-//! change the wire response.
+//! ([`csrf::CsrfGuard`]) gate every state-changing browser-write route.
+//! Both shapes implement the same policy so a handler that switches
+//! from one to the other does not change the wire response.
 
 pub(crate) mod cookie;
 pub(crate) mod csrf;

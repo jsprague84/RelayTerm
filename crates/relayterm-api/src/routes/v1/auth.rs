@@ -1,11 +1,9 @@
 //! `/api/v1/auth/*` — bootstrap, login, logout, current-user.
 //!
-//! The four routes here are the first real-auth surface (SPEC.md
-//! "Production authentication architecture" → "Implementation order"
-//! step 4). Existing app routes still go through [`crate::DevUser`];
-//! production-auth enablement still fails fast at boot. As of step 5,
-//! [`AuthenticatedUser`] has landed (`crate::auth`) and `GET /me` is
-//! the first consumer; broad route migration is the next slice.
+//! These four routes are the auth surface for the SPA. Bootstrap is
+//! one-shot (creates the first user only); login mints the session
+//! cookie; logout revokes; `me` reports the current user via the
+//! cookie-backed [`AuthenticatedUser`] extractor.
 //!
 //! ## Cookie
 //!
@@ -406,13 +404,6 @@ async fn logout(
 /// `unauthorized` body — the operator-side detail (`session invalid`
 /// vs `session expired` vs `missing cookie`) lives in the existing
 /// `warn!` line in `error.rs::IntoResponse`.
-///
-/// First production consumer of [`AuthenticatedUser`]. The remaining
-/// protected app routes (`hosts`, `server-profiles`, `ssh-identities`,
-/// `terminal-sessions`, `audit-events`) still go through
-/// [`crate::DevUser`] until the route-migration slice — SPEC.md
-/// "Production authentication architecture → Implementation order"
-/// step 7.
 async fn me(user: AuthenticatedUser) -> Json<UserResponse> {
     Json(user.into_user().into())
 }

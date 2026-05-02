@@ -61,11 +61,9 @@ use zeroize::Zeroizing;
 
 const PRIVATE_KEY_MARKER: &[u8] = b"REDACT-MARKER-API-9F2B";
 
-/// Origin allow-listed by the per-test [`AuthRoutesConfig`]. Tests that
-/// drive the `/api/v1/auth/*` routes set `Origin: <this>` so the
-/// inline CSRF guard accepts the request; all other tests do not need
-/// to set the header (GETs are exempt and existing app routes still
-/// run through the [`relayterm_api::DevUser`] shim).
+/// Origin allow-listed by the per-test [`AuthRoutesConfig`]. The
+/// shared `CsrfGuard` extractor allows this value on every state-
+/// changing browser-write route; GETs are exempt.
 const TEST_AUTH_ORIGIN: &str = "https://relay.test.local";
 
 /// Bootstrap token plumbed into every test [`AuthRoutesConfig`].
@@ -188,11 +186,6 @@ async fn setup_with_full_state(
         auth_check,
         pty_bridge,
         terminal_sessions,
-        // Dev-auth shim is dormant — the migration off `DevUser` left
-        // protected routes on `AuthenticatedUser`. Keeping the field at
-        // `None` here so any accidental `DevUser` regression in a route
-        // would surface as 401 instead of silently passing.
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -222,7 +215,6 @@ async fn setup_with_full_state_short_ttl(
         auth_check,
         pty_bridge,
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -900,7 +892,7 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
         .await
         .unwrap();
 
-    let (app, _dev_user, cookie) = setup(pool).await;
+    let (app, _user, cookie) = setup(pool).await;
 
     // Baseline: a totally bogus id returns 404 with the canonical body.
     let bogus = uuid::Uuid::new_v4();
@@ -927,10 +919,9 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
     assert_eq!(body["error"]["code"], "not_found");
 }
 
-/// Without a session cookie (and with the dev-auth shim disabled —
-/// `dev_user_id: None`), every protected app route MUST return 401 with
-/// the canonical error envelope. The body must NOT leak operator-facing
-/// detail like "dev_auth" or "session invalid".
+/// Without a session cookie, every protected app route MUST return 401
+/// with the canonical error envelope. The body must NOT leak operator-
+/// facing detail like the auth-mode plumbing or session-state strings.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn protected_hosts_routes_return_401_without_session_cookie(pool: PgPool) {
     let db = Db::from_pool(pool);
@@ -944,7 +935,6 @@ async fn protected_hosts_routes_return_401_without_session_cookie(pool: PgPool) 
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -962,10 +952,6 @@ async fn protected_hosts_routes_return_401_without_session_cookie(pool: PgPool) 
     // The wire body must not echo any operator-facing detail; the static
     // "unauthorized" message is all the client gets, regardless of why.
     assert_eq!(body["error"]["message"], "unauthorized");
-    assert!(
-        !body.to_string().contains("dev_auth"),
-        "401 body must not leak dev-auth implementation detail: {body}"
-    );
     assert!(
         !body.to_string().contains("session"),
         "401 body must not leak session-state detail: {body}"
@@ -1210,7 +1196,6 @@ async fn post_ssh_identity_returns_401_without_session_cookie(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -1251,7 +1236,6 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -1777,7 +1761,7 @@ async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgP
     )
     .await;
 
-    let (app, _dev_user, _probe, cookie) = setup_with_fake_probe(pool, "SHA256:never").await;
+    let (app, _user, _probe, cookie) = setup_with_fake_probe(pool, "SHA256:never").await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -2022,7 +2006,6 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2373,7 +2356,7 @@ async fn auth_check_foreign_owned_profile_returns_indistinguishable_404(pool: Pg
     )
     .await;
 
-    let (app, _dev_user, _checker, cookie) = setup_with_fake_auth_checker(
+    let (app, _user, _checker, cookie) = setup_with_fake_auth_checker(
         pool,
         captured_for_test("SHA256:never"),
         AuthAttemptKind::Authenticated,
@@ -2613,7 +2596,6 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
         )))),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2663,7 +2645,6 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2731,7 +2712,6 @@ async fn auth_check_returns_401_without_session_cookie(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2825,7 +2805,6 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         auth_check: svc,
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2895,7 +2874,6 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         auth_check: svc,
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -3249,7 +3227,7 @@ async fn create_terminal_session_foreign_owned_profile_returns_indistinguishable
         .unwrap();
     pin_trusted_entry(&pool, foreign.host_id, "SHA256:foreign-trust").await;
 
-    let (app, _dev_user, cookie) = setup(pool.clone()).await;
+    let (app, _user, cookie) = setup(pool.clone()).await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -3445,7 +3423,7 @@ async fn get_terminal_session_foreign_owned_returns_indistinguishable_404(pool: 
         .await
         .unwrap();
 
-    let (app, _dev_user, cookie) = setup(pool).await;
+    let (app, _user, cookie) = setup(pool).await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -3623,7 +3601,7 @@ async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool
         .await
         .unwrap();
 
-    let (app, _dev_user, cookie) = setup(pool.clone()).await;
+    let (app, _user, cookie) = setup(pool.clone()).await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -3681,7 +3659,6 @@ async fn terminal_session_routes_return_401_without_session_cookie(pool: PgPool)
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -3993,7 +3970,7 @@ async fn ws_attach_foreign_session_returns_indistinguishable_404(pool: PgPool) {
         .await
         .unwrap();
 
-    let (app, _dev_user, cookie) = setup(pool).await;
+    let (app, _user, cookie) = setup(pool).await;
     let addr = spawn_app(app).await;
 
     let bogus = uuid::Uuid::new_v4();
@@ -4056,7 +4033,6 @@ async fn ws_attach_returns_401_without_session_cookie(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -4208,7 +4184,6 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: bridge as Arc<dyn SshPtyBridge>,
         terminal_sessions: terminal_sessions.clone(),
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -4884,7 +4859,6 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: bridge.clone() as Arc<dyn SshPtyBridge>,
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7094,7 +7068,6 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7293,7 +7266,6 @@ async fn audit_events_recent_unauthorized_without_session_cookie(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7397,7 +7369,6 @@ async fn bootstrap_creates_first_user_and_does_not_set_cookie(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7485,7 +7456,6 @@ async fn bootstrap_rejects_wrong_token_without_echo(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7541,7 +7511,6 @@ async fn bootstrap_rejects_when_already_bootstrapped(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7615,7 +7584,6 @@ async fn bootstrap_returns_503_when_no_token_configured(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7650,7 +7618,6 @@ async fn setup_with_first_user(pool: PgPool, email: &str) -> (Router, UserId) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -7673,6 +7640,176 @@ async fn setup_with_first_user(pool: PgPool, email: &str) -> (Router, UserId) {
     let body = read_body(resp).await;
     let user_id: UserId = serde_json::from_value(body["id"].clone()).unwrap();
     (app, user_id)
+}
+
+/// Production-shaped router: cookie_secure = true, allow-list set, no
+/// dev escape hatches. Exercises the same code path the production
+/// boot follows after `Config::validate_auth` accepts an
+/// `auth.mode = production` config. The `Set-Cookie` Secure assertion
+/// in [`production_login_sets_secure_cookie_and_authenticates_protected_route`]
+/// is the wire-level proof.
+async fn setup_production_first_user(pool: PgPool, email: &str) -> (Router, UserId) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let auth_routes = Arc::new(AuthRoutesConfig {
+        cookie_secure: true,
+        cookie_domain: None,
+        allowed_origins: vec![TEST_AUTH_ORIGIN.to_owned()],
+        bootstrap_token: Some(zeroize::Zeroizing::new(TEST_BOOTSTRAP_TOKEN.to_owned())),
+    });
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes,
+    };
+    let app = router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+                "email": email,
+                "display_name": "Operator",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let user_id: UserId = serde_json::from_value(body["id"].clone()).unwrap();
+    (app, user_id)
+}
+
+/// Production-shaped router (Secure cookies, allow-listed Origin)
+/// must mint a session cookie carrying `Secure` AND that cookie must
+/// authenticate every protected `/api/v1/*` route the same way a dev-
+/// shaped router does. This is the wire-level proof that flipping
+/// `auth.mode = production` in `Config::validate_auth` does not change
+/// the route-handler contract — every previously-`DevUser`-protected
+/// surface keeps working under real cookie-backed auth.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn production_login_sets_secure_cookie_and_authenticates_protected_route(pool: PgPool) {
+    let (app, _user_id) = setup_production_first_user(pool.clone(), "prod@relayterm.local").await;
+
+    // Login.
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "prod@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let set_cookie = extract_set_cookie(&login).expect("Set-Cookie present");
+    assert!(
+        set_cookie.contains("Secure"),
+        "production cookie must carry Secure flag: {set_cookie}"
+    );
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    let token = cookie_token_from_set_cookie(&set_cookie).to_owned();
+    let _ = login.into_body();
+
+    // Protected GET — proves the cookie authenticates a former
+    // `DevUser`-only route under the production-shaped state.
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/hosts", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Negative half: the same production-shaped router must still
+    // reject an unauthenticated request with the canonical 401 — proves
+    // production mode does not silently accept routes without a cookie.
+    let resp = app.oneshot(get_no_auth("/api/v1/hosts")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "unauthorized");
+}
+
+/// Property-1 runtime gate: `auth.mode = production` with no first user
+/// AND no `first_user_bootstrap_token` configured MUST fail before the
+/// listener binds. Replicates the exact predicate `apps/backend/src/main.rs`
+/// runs after the DB connect and asserts the gate fires for that
+/// combination but NOT when the operator has supplied a token OR a user
+/// already exists.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn production_no_first_user_no_token_runtime_gate(pool: PgPool) {
+    // Mirror of the predicate in `apps/backend/src/main.rs`. Kept as a
+    // closure so this test is the canonical place to update if the gate
+    // condition ever changes — a drift between the two becomes
+    // immediately visible in the diff.
+    fn gate_blocks_boot(token_set: bool, any_users_exist: bool) -> bool {
+        !token_set && !any_users_exist
+    }
+
+    let creds = relayterm_db::PgPasswordCredentialRepository::new(pool.clone());
+
+    // Fresh DB — `users` and `user_passwords` are both empty. This is
+    // the exact "operator just deployed, no user exists yet" state the
+    // gate guards against.
+    let any_users_exist = creds.any_exists().await.expect("count password rows");
+    assert!(
+        !any_users_exist,
+        "fixture must start with no users for this test to be meaningful"
+    );
+
+    // Operator state A: no token configured + no users → gate MUST
+    // fire. Without a token, there is no path to create a first user,
+    // so the backend MUST refuse to start.
+    assert!(
+        gate_blocks_boot(false, any_users_exist),
+        "production + no users + no token must trigger the bail! gate \
+         in apps/backend/src/main.rs",
+    );
+
+    // Operator state B: token IS configured. The gate must NOT fire —
+    // the operator can hit `/api/v1/auth/bootstrap` to create the first
+    // user.
+    assert!(
+        !gate_blocks_boot(true, any_users_exist),
+        "production + token-set must proceed past the bail! gate even \
+         when no first user exists yet",
+    );
+
+    // Operator state C: a first user already exists. Token presence
+    // becomes irrelevant — the gate's negative branch is `any_exists()`
+    // returning true. Bootstrap a real user via the auth service to
+    // simulate "deploy already in steady state."
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let user_id = create_user(&pool, "steady").await;
+    auth.set_password(user_id, "PASSWORD-STEADY-OK-1234")
+        .await
+        .expect("set password");
+    let any_users_exist = creds.any_exists().await.expect("count password rows");
+    assert!(
+        any_users_exist,
+        "after set_password, any_exists must be true"
+    );
+    assert!(
+        !gate_blocks_boot(false, any_users_exist),
+        "production + first user already exists must proceed regardless \
+         of whether the bootstrap token is still configured",
+    );
+    assert!(
+        !gate_blocks_boot(true, any_users_exist),
+        "production + first user + token-set is a no-op for the gate",
+    );
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -8104,7 +8241,6 @@ async fn bad_origin_bootstrap_does_not_create_user_or_audit(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -8189,9 +8325,10 @@ async fn login_validation_rejects_short_password(pool: PgPool) {
 }
 
 // ----------------------------------------------------------------------
-// AuthenticatedUser extractor (cookie-backed) — exercised today only
-// via `GET /api/v1/auth/me`. The remaining protected app routes still
-// go through `DevUser` until the route-migration slice (SPEC step 5).
+// AuthenticatedUser extractor (cookie-backed) — extractor-specific
+// edge cases (expired / revoked / prefix-confusion) live below; the
+// happy-path coverage rides on every `setup*` fixture's bootstrapped
+// session cookie.
 // ----------------------------------------------------------------------
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]

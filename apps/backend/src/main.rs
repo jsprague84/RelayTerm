@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use relayterm_api::{AppState, AuthRoutesConfig, router};
 use relayterm_auth::{AuthService, PasswordHasher};
-use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
-    CreateUser, PasswordCredentialRepository, SessionEventRepository, TerminalSessionRepository,
-    UserRepository, UserSessionRepository,
+    PasswordCredentialRepository, SessionEventRepository, TerminalSessionRepository,
+    UserSessionRepository,
 };
 use relayterm_db::Db;
 use relayterm_ssh::{
@@ -21,12 +20,6 @@ use zeroize::Zeroizing;
 
 mod config;
 
-/// Email used by the temporary single-user dev context.
-///
-/// Replaced by real auth in a future slice; see `relayterm_api::dev_user`.
-const DEV_USER_EMAIL: &str = "dev@relayterm.local";
-const DEV_USER_DISPLAY_NAME: &str = "RelayTerm Dev User";
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     relayterm_observability::init();
@@ -34,11 +27,10 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = config::Config::load().context("load config")?;
     // Boot-time auth gate. Runs BEFORE any irreversible work (db connect,
     // ssh services, listener bind) so a misconfigured deploy fails fast and
-    // never opens a socket without a valid auth posture. Today this rejects
-    // `auth.mode = production` (the production code path is not implemented
-    // yet) AND the `auth.mode = production` + `dev_auth.enabled = true`
-    // mutual-exclusion violation. See `Config::validate_auth` for the
-    // matrix.
+    // never opens a socket without a valid auth posture. See
+    // `Config::validate_auth` for the matrix (production requires a
+    // signing key, non-empty `allowed_origins`, and `cookie_secure =
+    // true`; dev relaxes all three for local convenience).
     cfg.validate_auth().context("validate auth config")?;
     info!(
         addr = %cfg.server.bind,
@@ -50,35 +42,27 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connect to postgres")?;
 
-    // STOPGAP — see `bootstrap_dev_user_for_unimplemented_auth` below.
-    //
-    // Two-phase removal of this shim:
-    //   1. Land real auth alongside the shim. While both are wired the
-    //      shim wins and tags requests with the dev user.
-    //   2. Flip `dev_auth.enabled = false`. The backend keeps starting;
-    //      `DevUser`-guarded routes return 401 until each handler is
-    //      ported to the real auth extractor.
-    //   3. Delete the bootstrap call, the `DevUser` module, and the
-    //      `dev_auth` config field in the same change that retires the
-    //      last `DevUser` use site.
-    let dev_user_id = if cfg.dev_auth.enabled {
-        let id = bootstrap_dev_user_for_unimplemented_auth(&db)
+    // Production deploys must be reachable as a real user. Without a
+    // first user AND without a `first_user_bootstrap_token`, no operator
+    // path exists to create one. Reject before binding the listener so a
+    // misconfigured production deploy never starts serving 401s with no
+    // recovery affordance. Dev mode is exempt — local development can
+    // mint users via the bootstrap route at any time, or hit the DB
+    // directly. SPEC.md "Security properties to test" property 1.
+    if matches!(cfg.auth.mode, config::AuthMode::Production)
+        && cfg.auth.first_user_bootstrap_token.is_none()
+        && !db
+            .password_credentials()
+            .any_exists()
             .await
-            .context("bootstrap dev user for unimplemented auth")?;
-        warn!(
-            dev_user_id = %id,
-            "AUTH NOT IMPLEMENTED — every request is attributed to the hardcoded dev user; \
-             flip dev_auth.enabled to false once real auth is wired",
+            .context("check first-user state")?
+    {
+        bail!(
+            "auth.mode = production with no existing user requires \
+             auth.first_user_bootstrap_token to be set so the operator \
+             can bootstrap the first account"
         );
-        Some(id)
-    } else {
-        warn!(
-            "dev_auth.enabled = false — DevUser-guarded routes will return 401 until \
-             every handler is ported to the real auth extractor, then this whole shim \
-             can be deleted",
-        );
-        None
-    };
+    }
 
     // Resolve the vault master key. Failure here is fatal — we will not
     // boot a backend that silently disables encrypted-private-key storage.
@@ -139,10 +123,9 @@ async fn main() -> anyhow::Result<()> {
     // Compose the auth service from the existing repositories. The
     // hasher uses production parameters (`PasswordHasher::default()` =
     // `PasswordHasherConfig::OWASP_2023`); tests construct their own
-    // tuned-down hasher. The `auth.mode = production` boot gate has
-    // not flipped yet — the auth service is reachable only by the new
-    // `/api/v1/auth/*` routes; existing app routes still go through
-    // the `DevUser` shim until the extractor migration slice lands.
+    // tuned-down hasher. Every protected route runs through this
+    // service (cookie-backed `AuthenticatedUser` extractor in
+    // `relayterm-api::auth`).
     let auth = Arc::new(AuthService::new(
         Arc::new(db.password_credentials()) as Arc<dyn PasswordCredentialRepository>,
         Arc::new(db.user_sessions()) as Arc<dyn UserSessionRepository>,
@@ -172,7 +155,6 @@ async fn main() -> anyhow::Result<()> {
         auth_check,
         pty_bridge,
         terminal_sessions,
-        dev_user_id,
         auth,
         auth_routes,
     };
@@ -190,29 +172,6 @@ async fn main() -> anyhow::Result<()> {
         .context("axum::serve")?;
 
     Ok(())
-}
-
-/// **DELETE WHEN REAL AUTH LANDS.**
-///
-/// Find-or-create the single hardcoded dev user that every request is
-/// attributed to while authentication is unimplemented. The function name
-/// is intentionally long and unambiguous so a code search for `unimplemented_auth`
-/// surfaces this and the matching `DevUser` extractor in one shot.
-///
-/// Removal sequence is in the `main()` doc-comment above; the fixture is
-/// idempotent so a re-deploy behaves the same as a fresh container.
-async fn bootstrap_dev_user_for_unimplemented_auth(db: &Db) -> anyhow::Result<UserId> {
-    let users = db.users();
-    if let Some(existing) = users.get_by_email(DEV_USER_EMAIL).await? {
-        return Ok(existing.id);
-    }
-    let created = users
-        .create(CreateUser {
-            email: DEV_USER_EMAIL.to_owned(),
-            display_name: DEV_USER_DISPLAY_NAME.to_owned(),
-        })
-        .await?;
-    Ok(created.id)
 }
 
 async fn shutdown_signal() {

@@ -19,7 +19,6 @@ use zeroize::Zeroizing;
 pub(crate) struct Config {
     pub(crate) server: ServerConfig,
     pub(crate) database: DatabaseConfig,
-    pub(crate) dev_auth: DevAuthConfig,
     pub(crate) auth: AuthConfig,
     pub(crate) vault: VaultConfig,
 }
@@ -77,30 +76,17 @@ fn redact_database_url(url: &str) -> String {
     )
 }
 
-/// Stopgap toggle for the unimplemented-auth shim.
-///
-/// While `enabled = true` the backend bootstraps a single hardcoded dev user
-/// at startup and stamps every request with their id (see
-/// `relayterm_api::DevUser`). When real auth lands the operator MUST flip
-/// this to `false`; the backend will then refuse to start until the
-/// bootstrap call site is removed and replaced by the session/passkey
-/// middleware. The whole struct is expected to disappear at that point.
-#[derive(Debug)]
-pub(crate) struct DevAuthConfig {
-    pub(crate) enabled: bool,
-}
-
 /// Top-level authentication mode. Decided at boot from typed config and is
 /// fail-fast if misconfigured (see [`Config::validate_auth`]).
 ///
-/// Today only [`AuthMode::Dev`] resolves to a working backend.
-/// [`AuthMode::Production`] is a reserved value that refuses to boot — the
-/// production auth path (sessions, password verification, login routes,
-/// `AuthenticatedUser` extractor) is not yet implemented. The mode lives in
-/// config so future production-auth slices land without flipping a build
-/// flag and so a deploy can be rejected at startup BEFORE it accepts traffic
-/// without auth. See `SPEC.md` "Production authentication architecture →
-/// Auth mode model" for the full contract.
+/// Both modes route requests through the same real-auth code path
+/// (`AuthenticatedUser` extractor, password verification, opaque server-
+/// side sessions). The difference is the boot-time validation envelope:
+/// [`AuthMode::Production`] requires a session signing key, a non-empty
+/// `allowed_origins` list, and `cookie_secure = true`; [`AuthMode::Dev`]
+/// relaxes those requirements for local development. See `SPEC.md`
+/// "Production authentication architecture → Auth mode model" for the
+/// full contract.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum AuthMode {
@@ -134,14 +120,13 @@ impl FromStr for AuthMode {
 
 /// Production authentication configuration.
 ///
-/// All fields except `mode` are reserved for upcoming auth slices and are
-/// NOT consumed today — the production code path is rejected at boot via
-/// [`Config::validate_auth`]. The fields exist so operators can shape their
-/// config files / environment against the final names while real auth is
-/// being built; per `SPEC.md` "Auth mode model" the reserved keys are
-/// `mode`, `session_signing_key_b64`, `session_signing_key_file`,
-/// `first_user_bootstrap_token`, `cookie_secure`, `cookie_domain`, and
-/// `allowed_origins`.
+/// `mode` selects the validation envelope; the remaining fields shape
+/// runtime auth behaviour (cookie flags, CSRF allow-list, bootstrap-
+/// token policy). The session-signing key (`session_signing_key_b64` /
+/// `session_signing_key_file`) is reserved for future signed-CSRF /
+/// signed-cookie variants — required for `auth.mode = production` per
+/// SPEC.md "Security properties to test" property 1, but not yet
+/// consumed by the v1 hashed-opaque-token session model.
 ///
 /// `Debug` is implemented manually so the secret-shaped fields
 /// (`session_signing_key_b64`, `first_user_bootstrap_token`) never reach a
@@ -229,11 +214,11 @@ impl Config {
                 url: "postgres://relayterm:relayterm@127.0.0.1:5432/relayterm".to_owned(),
                 max_connections: 10,
             },
-            dev_auth: DevAuthConfig { enabled: true },
-            // Default to dev mode so existing local development keeps
-            // booting unchanged. Production deploys MUST explicitly set
-            // `auth.mode = production` once a future slice implements the
-            // production path; today that selection is rejected at boot.
+            // Default to dev mode so local development keeps booting
+            // unchanged. Production deploys MUST explicitly set
+            // `auth.mode = production`, which then enforces the strict
+            // boot-time envelope (session signing key, non-empty
+            // `allowed_origins`, `cookie_secure = true`).
             auth: AuthConfig {
                 mode: AuthMode::default(),
                 session_signing_key_b64: None,
@@ -290,11 +275,6 @@ impl Config {
         if let Some(v) = getenv("DATABASE_URL") {
             cfg.database.url = v;
         }
-        if let Some(v) = getenv("RELAYTERM_DEV_AUTH__ENABLED")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.dev_auth.enabled = parsed;
-        }
         // Auth mode is parsed strictly: an unrecognized value is a hard
         // boot failure rather than a silent fall-through to default,
         // because misreading "production" → "dev" would silently disable
@@ -345,48 +325,70 @@ impl Config {
 
     /// Validate the auth configuration at boot.
     ///
-    /// Boot-time gate: inspects the resolved [`AuthConfig`] +
-    /// [`DevAuthConfig`] combination and refuses to proceed when they
-    /// describe a state the running build cannot serve safely. Does NOT
-    /// consume any secret material — secrets are still owned by `AuthConfig`
-    /// after a successful return so a future slice can move them into the
-    /// auth service. Error messages name the failing input but never echo
-    /// any value (same redaction posture as [`Config::vault_master_key`]).
+    /// Boot-time gate: inspects the resolved [`AuthConfig`] and refuses to
+    /// proceed when it describes a state the running build cannot serve
+    /// safely. Does NOT consume any secret material — secrets are still
+    /// owned by `AuthConfig` after a successful return. Error messages
+    /// name the failing input but never echo a value (same redaction
+    /// posture as [`Config::vault_master_key`]).
     ///
     /// Cases:
-    /// * `mode = dev` → always Ok. Whether `dev_auth.enabled = true` or
-    ///   `false` is up to the caller (the existing `main.rs` warn-line
-    ///   covers the latter — the API is unprotected because no auth source
-    ///   is wired). This matches `SPEC.md` "Security properties to test"
-    ///   property 1.
-    /// * `mode = production` AND `dev_auth.enabled = true` → reject. The
-    ///   two flags are mutually exclusive (`SPEC.md` "Auth mode model"
-    ///   rule 3). This case gets its own error so an operator who flipped
-    ///   `auth.mode = production` without flipping `dev_auth.enabled` sees
-    ///   exactly which input is wrong.
-    /// * `mode = production` (any `dev_auth.enabled`) → reject. Production
-    ///   auth (sessions, password verification, login routes,
-    ///   `AuthenticatedUser` extractor) is not implemented in this build
-    ///   yet. Failing fast here is the load-bearing guarantee that a deploy
-    ///   never silently runs without auth.
+    /// * `mode = dev` → always Ok. Local development picks its own
+    ///   cookie/origin posture (insecure cookies, loopback origins,
+    ///   missing signing key are all acceptable). The same real-auth
+    ///   code path runs as in production; only the validation envelope
+    ///   differs.
+    /// * `mode = production` → enforce, in this order:
+    ///   1. Exactly one of `session_signing_key_b64` /
+    ///      `session_signing_key_file` is set (zero → reject; both →
+    ///      reject as ambiguous).
+    ///   2. `allowed_origins` is non-empty (an empty list rejects every
+    ///      browser-write — that is the secure default the CSRF guard
+    ///      already enforces, but failing fast here gives a clearer
+    ///      operator signal than every POST returning 403).
+    ///   3. `cookie_secure = true` (production cookies MUST carry the
+    ///      `Secure` flag — there is no escape hatch).
+    ///
+    /// `first_user_bootstrap_token` is NOT required by this gate; the
+    /// bootstrap route returns `503` when the token is unset and
+    /// `409 already_bootstrapped` once a first user exists. The
+    /// "production + no first user + no token" hard-fail is a runtime
+    /// check in `apps/backend/src/main.rs` after the DB connect, not a
+    /// config-only check (config cannot see DB state).
     pub(crate) fn validate_auth(&self) -> anyhow::Result<()> {
         match self.auth.mode {
             AuthMode::Dev => Ok(()),
             AuthMode::Production => {
-                if self.dev_auth.enabled {
+                match (
+                    self.auth.session_signing_key_b64.is_some(),
+                    self.auth.session_signing_key_file.is_some(),
+                ) {
+                    (false, false) => bail!(
+                        "auth.mode = production requires a session signing key — set \
+                         auth.session_signing_key_b64 or auth.session_signing_key_file \
+                         (RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64 / \
+                         RELAYTERM_AUTH__SESSION_SIGNING_KEY_FILE)"
+                    ),
+                    (true, true) => bail!(
+                        "auth.session_signing_key_b64 and auth.session_signing_key_file are \
+                         both set; pick exactly one"
+                    ),
+                    _ => {}
+                }
+                if self.auth.allowed_origins.is_empty() {
                     bail!(
-                        "auth.mode = production is mutually exclusive with \
-                         dev_auth.enabled = true (set dev_auth.enabled = false \
-                         or RELAYTERM_DEV_AUTH__ENABLED=false)"
+                        "auth.mode = production requires auth.allowed_origins to list at \
+                         least one origin (state-changing browser-write routes reject every \
+                         request when the allow-list is empty)"
                     );
                 }
-                bail!(
-                    "auth.mode = production is not implemented in this build yet — \
-                     production authentication (sessions, password verification, \
-                     login routes, AuthenticatedUser extractor) requires future \
-                     implementation slices. Set auth.mode = dev for local \
-                     development, or pin a build that ships production auth."
-                )
+                if !self.auth.cookie_secure {
+                    bail!(
+                        "auth.mode = production requires auth.cookie_secure = true — \
+                         session cookies must carry the Secure flag"
+                    );
+                }
+                Ok(())
             }
         }
     }
@@ -434,7 +436,6 @@ impl Config {
 struct FileConfig {
     server: Option<FileServerConfig>,
     database: Option<FileDatabaseConfig>,
-    dev_auth: Option<FileDevAuthConfig>,
     auth: Option<FileAuthConfig>,
     vault: Option<FileVaultConfig>,
 }
@@ -448,11 +449,6 @@ struct FileServerConfig {
 struct FileDatabaseConfig {
     url: Option<String>,
     max_connections: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileDevAuthConfig {
-    enabled: Option<bool>,
 }
 
 /// File-side mirror of [`AuthConfig`]. `Debug` is implemented manually
@@ -530,11 +526,6 @@ impl FileConfig {
                 cfg.database.max_connections = mx;
             }
         }
-        if let Some(a) = self.dev_auth
-            && let Some(enabled) = a.enabled
-        {
-            cfg.dev_auth.enabled = enabled;
-        }
         if let Some(a) = self.auth {
             if let Some(mode) = a.mode {
                 cfg.auth.mode = mode;
@@ -587,7 +578,6 @@ mod tests {
                 url: "x".to_owned(),
                 max_connections: 1,
             },
-            dev_auth: DevAuthConfig { enabled: true },
             auth: AuthConfig {
                 mode: AuthMode::Dev,
                 session_signing_key_b64: None,
@@ -603,6 +593,18 @@ mod tests {
                 master_key_file: None,
             },
         }
+    }
+
+    /// Production-shaped config that satisfies every `validate_auth`
+    /// requirement. Tests build on this and mutate the field that the
+    /// case under test cares about.
+    fn production_cfg() -> Config {
+        let mut cfg = empty_cfg();
+        cfg.auth.mode = AuthMode::Production;
+        cfg.auth.session_signing_key_b64 = Some(BASE64_STANDARD.encode([0x42u8; 32]));
+        cfg.auth.cookie_secure = true;
+        cfg.auth.allowed_origins = vec!["https://relay.example.com".to_owned()];
+        cfg
     }
 
     fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -757,10 +759,6 @@ mod tests {
     fn auth_config_default_resolves_to_dev_mode() {
         let cfg = Config::defaults();
         assert_eq!(cfg.auth.mode, AuthMode::Dev);
-        assert!(
-            cfg.dev_auth.enabled,
-            "dev_auth.enabled stays true by default"
-        );
         cfg.validate_auth().expect("default config must validate");
     }
 
@@ -770,57 +768,147 @@ mod tests {
         cfg.auth.mode = AuthMode::Production; // ensure env genuinely overrides
         Config::apply_env_with(&mut cfg, env_from(&[("RELAYTERM_AUTH__MODE", "dev")])).unwrap();
         assert_eq!(cfg.auth.mode, AuthMode::Dev);
+        cfg.validate_auth().expect("dev mode must validate");
+    }
+
+    #[test]
+    fn auth_mode_dev_with_loose_settings_validates() {
+        // Dev mode is the relaxed envelope: insecure cookies, empty
+        // allow-list, missing signing key are all acceptable. The same
+        // real-auth code path runs as in production; only the boot
+        // validation differs.
+        let mut cfg = empty_cfg();
+        cfg.auth.mode = AuthMode::Dev;
+        cfg.auth.cookie_secure = false;
+        cfg.auth.allowed_origins = Vec::new();
+        cfg.auth.session_signing_key_b64 = None;
+        cfg.auth.session_signing_key_file = None;
+        cfg.validate_auth().expect("dev mode must validate");
+    }
+
+    #[test]
+    fn auth_mode_production_with_valid_config_validates() {
+        // The canonical "production deploy" shape: signing key set,
+        // non-empty allow-list, Secure cookies. Today the signing key
+        // is reserved (the v1 session model uses opaque random tokens),
+        // but its presence is required.
+        let cfg = production_cfg();
         cfg.validate_auth()
-            .expect("dev mode + dev_auth.enabled = true must validate");
+            .expect("production with full config must validate");
     }
 
     #[test]
-    fn auth_mode_from_env_production_fails_fast() {
-        let mut cfg = empty_cfg();
-        cfg.dev_auth.enabled = false;
-        Config::apply_env_with(
-            &mut cfg,
-            env_from(&[("RELAYTERM_AUTH__MODE", "production")]),
-        )
-        .unwrap();
-        assert_eq!(cfg.auth.mode, AuthMode::Production);
-        let err = cfg.validate_auth().unwrap_err();
-        assert!(
-            err.to_string().contains("not implemented"),
-            "production mode must fail fast until real auth lands: {err}"
-        );
-    }
-
-    #[test]
-    fn auth_mode_production_with_dev_auth_enabled_is_explicit_conflict() {
-        let mut cfg = empty_cfg();
-        cfg.auth.mode = AuthMode::Production;
-        cfg.dev_auth.enabled = true;
+    fn auth_mode_production_missing_signing_key_fails_fast() {
+        let mut cfg = production_cfg();
+        cfg.auth.session_signing_key_b64 = None;
+        cfg.auth.session_signing_key_file = None;
         let err = cfg.validate_auth().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("mutually exclusive"),
-            "production + dev_auth.enabled must surface the explicit conflict: {msg}"
-        );
-        // The conflict error must be distinct from the not-implemented
-        // error so an operator can tell which knob to flip.
-        assert!(
-            !msg.contains("not implemented"),
-            "conflict path must not collapse into the not-implemented message: {msg}"
+            msg.contains("session signing key"),
+            "error must name the missing signing key: {msg}"
         );
     }
 
     #[test]
-    fn auth_mode_dev_with_dev_auth_disabled_validates() {
-        // Per SPEC.md "Security properties to test" #1:
-        // `auth.mode = dev` with `dev_auth.enabled = false` is allowed but
-        // logs a warning that the API is unprotected. The warn-line itself
-        // is emitted by main.rs; this test pins the policy.
-        let mut cfg = empty_cfg();
-        cfg.auth.mode = AuthMode::Dev;
-        cfg.dev_auth.enabled = false;
+    fn auth_mode_production_both_signing_key_sources_set_is_ambiguous() {
+        let mut cfg = production_cfg();
+        cfg.auth.session_signing_key_file = Some(std::path::PathBuf::from("/dev/null"));
+        let err = cfg.validate_auth().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("both") || msg.contains("pick exactly one"),
+            "error must describe ambiguity: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_empty_allowed_origins_fails_fast() {
+        let mut cfg = production_cfg();
+        cfg.auth.allowed_origins = Vec::new();
+        let err = cfg.validate_auth().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allowed_origins"),
+            "error must name allowed_origins: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_cookie_secure_false_fails_fast() {
+        let mut cfg = production_cfg();
+        cfg.auth.cookie_secure = false;
+        let err = cfg.validate_auth().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cookie_secure"),
+            "error must name cookie_secure: {msg}"
+        );
+        assert!(
+            msg.contains("Secure"),
+            "error must mention the Secure flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_with_signing_key_file_only_validates() {
+        // The b64 source is the alternate; either branch satisfies the
+        // "exactly one" requirement.
+        let mut cfg = production_cfg();
+        cfg.auth.session_signing_key_b64 = None;
+        cfg.auth.session_signing_key_file = Some(std::path::PathBuf::from("/etc/relayterm/key"));
         cfg.validate_auth()
-            .expect("dev mode + dev_auth.enabled = false must validate");
+            .expect("production with key file only must validate");
+    }
+
+    #[test]
+    fn auth_mode_production_with_optional_bootstrap_token_validates() {
+        // The bootstrap token is OPTIONAL at the config-validation
+        // layer; the "no first user + no token" hard-fail is a runtime
+        // check in main.rs (it needs DB state). validate_auth must not
+        // refuse a production config solely because the token is unset.
+        let mut cfg = production_cfg();
+        cfg.auth.first_user_bootstrap_token = None;
+        cfg.validate_auth()
+            .expect("production without bootstrap token must validate at config layer");
+    }
+
+    #[test]
+    fn dev_auth_env_var_is_silently_ignored() {
+        // The legacy `RELAYTERM_DEV_AUTH__ENABLED` knob no longer maps
+        // to any field on `Config`. An operator who still has it set
+        // should not see a config-load failure; dropping the field
+        // makes the env var a no-op. Pin this so a future "let's
+        // re-introduce a dev-shim toggle" PR has to delete this test
+        // explicitly.
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[("RELAYTERM_DEV_AUTH__ENABLED", "true")]),
+        )
+        .expect("legacy dev_auth env var is silently ignored");
+        cfg.validate_auth()
+            .expect("validation unaffected by legacy var");
+    }
+
+    #[test]
+    fn legacy_dev_auth_toml_section_is_silently_ignored() {
+        // Same policy at the TOML layer — an operator's stale
+        // `[dev_auth]` block must not block a config load. Default
+        // serde rejects unknown fields only when annotated; the
+        // `FileConfig` derive does not opt in, so this is a behavior
+        // test, not a structural one.
+        let raw = r#"
+[dev_auth]
+enabled = true
+
+[auth]
+mode = "dev"
+"#;
+        let parsed: FileConfig = toml::from_str(raw).expect("legacy dev_auth section ignored");
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert_eq!(cfg.auth.mode, AuthMode::Dev);
     }
 
     #[test]
@@ -923,18 +1011,66 @@ mod tests {
         // A secret-shaped value supplied via env must not survive into the
         // validation error string. We pin the policy here so a future edit
         // that starts substituting the value into the error gets caught.
+        // Drive every reachable production-mode failure path: missing
+        // signing key, ambiguous signing key, empty allow-list, and
+        // cookie_secure=false. Each case primes the secret-shaped fields
+        // so the assertion is meaningful regardless of which check fires.
         const SECRET_MARKER: &str = "AAAA-SECRET-IN-ERROR-MARKER-AAAA";
-        let mut cfg = empty_cfg();
-        cfg.auth.mode = AuthMode::Production;
-        cfg.dev_auth.enabled = true;
-        cfg.auth.first_user_bootstrap_token = Some(SECRET_MARKER.to_owned());
-        cfg.auth.session_signing_key_b64 = Some(SECRET_MARKER.to_owned());
-        let err = cfg.validate_auth().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            !msg.contains(SECRET_MARKER),
-            "validation error must not echo secret-shaped values: {msg}"
-        );
+
+        // Missing signing key — the bootstrap token is set but never
+        // consulted by the validator on this path; the assertion proves
+        // the validator does not opportunistically interpolate it.
+        {
+            let mut cfg = production_cfg();
+            cfg.auth.session_signing_key_b64 = None;
+            cfg.auth.session_signing_key_file = None;
+            cfg.auth.first_user_bootstrap_token = Some(SECRET_MARKER.to_owned());
+            let err = cfg.validate_auth().unwrap_err();
+            assert!(
+                !err.to_string().contains(SECRET_MARKER),
+                "missing-key error must not echo secret-shaped values: {err}"
+            );
+        }
+
+        // Ambiguous signing key — both b64 and file are set; the b64
+        // value is sentinel-shaped.
+        {
+            let mut cfg = production_cfg();
+            cfg.auth.session_signing_key_b64 = Some(SECRET_MARKER.to_owned());
+            cfg.auth.session_signing_key_file = Some(std::path::PathBuf::from("/dev/null"));
+            let err = cfg.validate_auth().unwrap_err();
+            assert!(
+                !err.to_string().contains(SECRET_MARKER),
+                "ambiguous-key error must not echo secret-shaped values: {err}"
+            );
+        }
+
+        // Empty allow-list — the bootstrap token + signing key are set
+        // but the validator must still not echo them.
+        {
+            let mut cfg = production_cfg();
+            cfg.auth.allowed_origins = Vec::new();
+            cfg.auth.session_signing_key_b64 = Some(SECRET_MARKER.to_owned());
+            cfg.auth.first_user_bootstrap_token = Some(SECRET_MARKER.to_owned());
+            let err = cfg.validate_auth().unwrap_err();
+            assert!(
+                !err.to_string().contains(SECRET_MARKER),
+                "empty-allowed-origins error must not echo secret-shaped values: {err}"
+            );
+        }
+
+        // cookie_secure = false — same redaction posture.
+        {
+            let mut cfg = production_cfg();
+            cfg.auth.cookie_secure = false;
+            cfg.auth.session_signing_key_b64 = Some(SECRET_MARKER.to_owned());
+            cfg.auth.first_user_bootstrap_token = Some(SECRET_MARKER.to_owned());
+            let err = cfg.validate_auth().unwrap_err();
+            assert!(
+                !err.to_string().contains(SECRET_MARKER),
+                "cookie_secure error must not echo secret-shaped values: {err}"
+            );
+        }
     }
 
     #[test]

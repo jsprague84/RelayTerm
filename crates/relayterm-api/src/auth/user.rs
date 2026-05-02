@@ -1,8 +1,7 @@
 //! Cookie-backed `AuthenticatedUser` axum extractor.
 //!
-//! This is the foundation of the route-migration arc that replaces
-//! [`crate::DevUser`]. Use it on a handler to require a valid,
-//! non-revoked, non-expired session cookie. The extractor:
+//! Use it on a handler to require a valid, non-revoked, non-expired
+//! session cookie. The extractor:
 //!
 //! 1. Reads the `Cookie:` header via [`extract_session_cookie`].
 //! 2. Hashes the plaintext token and validates it through
@@ -16,16 +15,6 @@
 //! `session references missing user`) survives in the `warn!` line in
 //! [`crate::error::ApiError::IntoResponse`] and never reaches the
 //! caller.
-//!
-//! ## Scope of this slice
-//!
-//! Only the `/api/v1/auth/me` route consumes the extractor today. The
-//! rest of the protected app routes (`hosts`, `server-profiles`,
-//! `ssh-identities`, `terminal-sessions`, `audit-events`) keep using
-//! [`crate::DevUser`] until the route-migration slice. SPEC.md
-//! "Production authentication architecture → Implementation order"
-//! step 7 owns that migration (this slice is step 5 — the extractor
-//! itself, Phase A coexistence).
 //!
 //! ## What the extractor does NOT do
 //!

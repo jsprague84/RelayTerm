@@ -7,8 +7,8 @@
 //! and on `STUB_PTY_NOT_IMPLEMENTED_MESSAGE` for the full contract.
 //!
 //! Ownership rules mirror the rest of the v1 API:
-//! - The caller's user is taken from the `AuthenticatedUser` extractor
-//!   (cookie-backed; SPEC step 7 migrated this surface off `DevUser`).
+//! - The caller's user is taken from the cookie-backed
+//!   `AuthenticatedUser` extractor.
 //! - `create` verifies the referenced server_profile, host, and identity
 //!   all belong to the caller; foreign-owned references collapse to the
 //!   same 404 the route would return for a missing resource.

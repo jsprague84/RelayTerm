@@ -1,15 +1,14 @@
 //! HTTP/WebSocket surface.
 //!
 //! Handlers are kept thin — they extract from axum, validate, and hand off
-//! to a service in another crate. Auth and session orchestration are NOT
-//! implemented at this layer; `dev_user` injects a stopgap [`UserId`] until
-//! they are.
+//! to a service in another crate. Every protected route is gated by the
+//! cookie-backed [`AuthenticatedUser`] extractor; state-changing browser-
+//! write routes additionally take [`CsrfGuard`].
 
 use std::sync::Arc;
 
-use axum::{Router, extract::FromRef};
+use axum::Router;
 use relayterm_auth::AuthService;
-use relayterm_core::ids::UserId;
 use relayterm_db::Db;
 use relayterm_ssh::{HostKeyPreflightService, SshAuthCheckService, SshPtyBridge};
 use relayterm_terminal::TerminalSessionManager;
@@ -17,13 +16,11 @@ use relayterm_vault::VaultService;
 use tower_http::trace::TraceLayer;
 
 mod auth;
-mod dev_user;
 mod dto;
 mod error;
 mod routes;
 
 pub use auth::{AuthenticatedUser, CsrfGuard};
-pub use dev_user::DevUser;
 pub use error::ApiError;
 pub use routes::v1::auth::AuthRoutesConfig;
 
@@ -74,40 +71,20 @@ pub struct AppState {
     /// it does NOT open SSH channels, allocate PTYs, or stream terminal
     /// data. See [`TerminalSessionManager`] docs for the full contract.
     pub terminal_sessions: Arc<TerminalSessionManager>,
-    /// Dev-only owner id stamped onto every created row until auth lands.
-    /// `None` when `dev_auth.enabled = false` (the shim is off but real
-    /// auth has not yet been wired up); in that mode `DevUser` extractors
-    /// return `401`. See [`dev_user`](crate::dev_user) for the full
-    /// transition story.
-    ///
-    /// **Scope today.** SPEC step 7 migrated every protected app route
-    /// off `DevUser` onto [`AuthenticatedUser`], so this field no longer
-    /// gates any production handler. It survives ONLY as a placeholder
-    /// during the dev-auth retirement window — the field can be removed
-    /// in a follow-up slice once the dev-auth shim itself is deleted.
-    pub dev_user_id: Option<UserId>,
     /// Server-issued opaque session + password primitives. Used by every
     /// protected app route through the [`AuthenticatedUser`] extractor
     /// (`crate::auth`) and by the `/api/v1/auth/*` routes. Held behind
     /// `Arc` so `AppState` stays `Clone`.
     ///
-    /// **Scope**: SPEC step 7 (this slice) wired the cookie-backed
-    /// extractor onto every protected route — `hosts`,
-    /// `ssh-identities`, `server-profiles`, `terminal-sessions`,
-    /// `audit-events`, and the WebSocket attach route. Production-auth
-    /// enablement still fails fast at boot until the frontend auth UI
-    /// and DevUser retirement slices land.
+    /// **Scope**: cookie-backed extractor on every protected route —
+    /// `hosts`, `ssh-identities`, `server-profiles`,
+    /// `terminal-sessions`, `audit-events`, and the WebSocket attach
+    /// route.
     pub auth: Arc<AuthService>,
     /// Cookie / Origin / bootstrap-token policy for the auth routes.
     /// Shared via `Arc` so secret-shaped fields are not cloned on every
     /// request and so `AppState` stays cheap to clone.
     pub auth_routes: Arc<AuthRoutesConfig>,
-}
-
-impl FromRef<AppState> for Option<UserId> {
-    fn from_ref(state: &AppState) -> Self {
-        state.dev_user_id
-    }
 }
 
 /// Build the top-level router.

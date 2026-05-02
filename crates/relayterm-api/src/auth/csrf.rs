@@ -10,10 +10,10 @@
 //! ## Two consumption shapes
 //!
 //! * [`CsrfGuard`] — an axum extractor (`FromRequestParts`) wrapping
-//!   [`check_origin`]. **This is the primary consumption shape.** All
-//!   four `/api/v1/auth/*` write routes take `_csrf: CsrfGuard` today;
-//!   step-7 app routes (`DevUser → AuthenticatedUser` migration) pick
-//!   up the same extractor in the same commit as their auth switch.
+//!   [`check_origin`]. **This is the primary consumption shape.** Every
+//!   state-changing browser-write route (`/api/v1/auth/*`, `hosts`,
+//!   `ssh-identities`, `server-profiles`, `terminal-sessions`) takes
+//!   `_csrf: CsrfGuard` ahead of the body extractor.
 //! * [`check_origin`] — the underlying helper. An internal building
 //!   block exposed at `pub(crate)` visibility for any future handler
 //!   that needs to call the check imperatively mid-flow (e.g. a route
@@ -122,11 +122,11 @@ pub(crate) fn check_origin(
 /// single `FromRequest` body extractor regardless of source order),
 /// but listing it first keeps the call-site self-documenting.
 ///
-/// **Scope today.** This slice (SPEC step 6) lands the foundation; no
-/// existing app route consumes it yet. The `DevUser → AuthenticatedUser`
-/// migration (SPEC step 7) is the first wave of consumers; until then
-/// the four `/api/v1/auth/*` routes are the only enforcement points
-/// (they call [`check_origin`] directly).
+/// **Scope.** Every state-changing browser-write route consumes this
+/// extractor (the four `/api/v1/auth/*` writes plus every protected
+/// `/api/v1/*` mutation). GET / WebSocket-upgrade routes do not take
+/// `CsrfGuard` — they rely on [`AuthenticatedUser`](super::user::AuthenticatedUser)
+/// for their auth gate.
 #[derive(Debug, Clone, Copy)]
 pub struct CsrfGuard;
 
