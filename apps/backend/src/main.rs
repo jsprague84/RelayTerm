@@ -29,7 +29,19 @@ async fn main() -> anyhow::Result<()> {
     relayterm_observability::init();
 
     let mut cfg = config::Config::load().context("load config")?;
-    info!(addr = %cfg.server.bind, "relayterm-backend starting");
+    // Boot-time auth gate. Runs BEFORE any irreversible work (db connect,
+    // ssh services, listener bind) so a misconfigured deploy fails fast and
+    // never opens a socket without a valid auth posture. Today this rejects
+    // `auth.mode = production` (the production code path is not implemented
+    // yet) AND the `auth.mode = production` + `dev_auth.enabled = true`
+    // mutual-exclusion violation. See `Config::validate_auth` for the
+    // matrix.
+    cfg.validate_auth().context("validate auth config")?;
+    info!(
+        addr = %cfg.server.bind,
+        auth_mode = cfg.auth.mode.as_str(),
+        "relayterm-backend starting",
+    );
 
     let db = Db::connect(&cfg.database.url, cfg.database.max_connections)
         .await
