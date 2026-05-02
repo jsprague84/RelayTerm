@@ -33,7 +33,7 @@ use relayterm_core::repository::AuditEventRepository;
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::dev_user::DevUser;
+use crate::auth::AuthenticatedUser;
 use crate::dto::audit_event::AuditEventResponse;
 use crate::error::ApiError;
 
@@ -61,15 +61,15 @@ struct RecentQuery {
 /// out at the SQL layer. The response is a list of redaction-safe DTOs
 /// — see [`AuditEventResponse`] for the contract.
 async fn recent(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Query(q): Query<RecentQuery>,
 ) -> Result<Json<Vec<AuditEventResponse>>, ApiError> {
     let limit = clamp_limit(q.limit);
     let events = state
         .db
         .audit_events()
-        .recent_for_actor(user.0, limit)
+        .recent_for_actor(user.user_id(), limit)
         .await?;
     Ok(Json(
         events

@@ -8,7 +8,7 @@ use relayterm_core::ids::HostId;
 use relayterm_core::repository::HostRepository;
 
 use crate::AppState;
-use crate::dev_user::DevUser;
+use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::host::{CreateHostRequest, HostResponse};
 use crate::error::ApiError;
 
@@ -21,26 +21,27 @@ pub(super) fn router() -> Router<AppState> {
 }
 
 async fn create(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Json(req): Json<CreateHostRequest>,
 ) -> Result<(StatusCode, Json<HostResponse>), ApiError> {
-    let input = req.into_create(user)?;
+    let input = req.into_create(user.user_id())?;
     let host = state.db.hosts().create(input).await?;
     Ok((StatusCode::CREATED, Json(host.into())))
 }
 
 async fn list(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
 ) -> Result<Json<Vec<HostResponse>>, ApiError> {
-    let hosts = state.db.hosts().list_for_user(user.0).await?;
+    let hosts = state.db.hosts().list_for_user(user.user_id()).await?;
     Ok(Json(hosts.into_iter().map(HostResponse::from).collect()))
 }
 
 async fn get_by_id(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<HostId>,
 ) -> Result<Json<HostResponse>, ApiError> {
     // Cross-user reads must be indistinguishable from a missing row — the
@@ -51,7 +52,7 @@ async fn get_by_id(
         .hosts()
         .get(id)
         .await?
-        .filter(|h| h.owner_id == user.0)
+        .filter(|h| h.owner_id == user.user_id())
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok(Json(host.into()))
 }

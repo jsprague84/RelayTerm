@@ -79,18 +79,24 @@ pub struct AppState {
     /// auth has not yet been wired up); in that mode `DevUser` extractors
     /// return `401`. See [`dev_user`](crate::dev_user) for the full
     /// transition story.
-    pub dev_user_id: Option<UserId>,
-    /// Server-issued opaque session + password primitives. Reachable
-    /// today only by the `/api/v1/auth/*` routes; existing app routes
-    /// continue to use [`DevUser`]. The handle is held behind `Arc` so
-    /// `AppState` stays `Clone`.
     ///
-    /// **Scope**: this slice exposes login, logout, bootstrap, and
-    /// `/auth/me`. As of SPEC step 5, the [`AuthenticatedUser`]
-    /// extractor (`crate::auth`) has landed and `GET /auth/me`
-    /// consumes it; the broad route migration off [`DevUser`] is
-    /// SPEC step 7. Production-auth enablement still fails fast at
-    /// boot.
+    /// **Scope today.** SPEC step 7 migrated every protected app route
+    /// off `DevUser` onto [`AuthenticatedUser`], so this field no longer
+    /// gates any production handler. It survives ONLY as a placeholder
+    /// during the dev-auth retirement window — the field can be removed
+    /// in a follow-up slice once the dev-auth shim itself is deleted.
+    pub dev_user_id: Option<UserId>,
+    /// Server-issued opaque session + password primitives. Used by every
+    /// protected app route through the [`AuthenticatedUser`] extractor
+    /// (`crate::auth`) and by the `/api/v1/auth/*` routes. Held behind
+    /// `Arc` so `AppState` stays `Clone`.
+    ///
+    /// **Scope**: SPEC step 7 (this slice) wired the cookie-backed
+    /// extractor onto every protected route — `hosts`,
+    /// `ssh-identities`, `server-profiles`, `terminal-sessions`,
+    /// `audit-events`, and the WebSocket attach route. Production-auth
+    /// enablement still fails fast at boot until the frontend auth UI
+    /// and DevUser retirement slices land.
     pub auth: Arc<AuthService>,
     /// Cookie / Origin / bootstrap-token policy for the auth routes.
     /// Shared via `Arc` so secret-shaped fields are not cloned on every

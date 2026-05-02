@@ -112,11 +112,37 @@ async fn create_user(pool: &PgPool, label: &str) -> UserId {
         .id
 }
 
-async fn setup(pool: PgPool) -> (Router, UserId) {
+/// Bootstrap a real session for `user_id` directly through
+/// [`AuthService`] and return the plaintext cookie token.
+///
+/// Going through the service rather than the `/auth/login` route keeps
+/// the per-test cost down (no JSON body parse, no audit append, no
+/// Argon2id hash — the password row is irrelevant for cookie minting)
+/// while producing a wire-shaped session: the resulting cookie
+/// validates through the same `AuthenticatedUser` extractor production
+/// traffic uses. The token plaintext crosses the function boundary
+/// EXACTLY ONCE and immediately becomes the value the test attaches to
+/// the `Cookie:` header. Mirrors the discipline the production
+/// `Set-Cookie` writer keeps.
+async fn bootstrap_test_session(auth: &Arc<AuthService>, user_id: UserId) -> String {
+    let now = chrono::Utc::now();
+    let created = auth
+        .create_session(user_id, chrono::Duration::days(30), now)
+        .await
+        .expect("create fixture session");
+    let token = created.token.expose().to_owned();
+    drop(created);
+    token
+}
+
+async fn setup(pool: PgPool) -> (Router, UserId, String) {
     setup_with_probe(pool, default_probe()).await
 }
 
-async fn setup_with_probe(pool: PgPool, probe: Arc<dyn SshHostKeyProbe>) -> (Router, UserId) {
+async fn setup_with_probe(
+    pool: PgPool,
+    probe: Arc<dyn SshHostKeyProbe>,
+) -> (Router, UserId, String) {
     setup_full(pool, probe, default_auth_checker()).await
 }
 
@@ -124,7 +150,7 @@ async fn setup_full(
     pool: PgPool,
     probe: Arc<dyn SshHostKeyProbe>,
     checker: Arc<dyn SshAuthChecker>,
-) -> (Router, UserId) {
+) -> (Router, UserId, String) {
     setup_with_auth_check_service(pool, probe, Arc::new(SshAuthCheckService::new(checker))).await
 }
 
@@ -136,7 +162,7 @@ async fn setup_with_auth_check_service(
     pool: PgPool,
     probe: Arc<dyn SshHostKeyProbe>,
     auth_check: Arc<SshAuthCheckService>,
-) -> (Router, UserId) {
+) -> (Router, UserId, String) {
     setup_with_full_state(pool, probe, auth_check, default_pty_bridge()).await
 }
 
@@ -148,12 +174,13 @@ async fn setup_with_full_state(
     probe: Arc<dyn SshHostKeyProbe>,
     auth_check: Arc<SshAuthCheckService>,
     pty_bridge: Arc<dyn SshPtyBridge>,
-) -> (Router, UserId) {
+) -> (Router, UserId, String) {
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -161,11 +188,15 @@ async fn setup_with_full_state(
         auth_check,
         pty_bridge,
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        // Dev-auth shim is dormant — the migration off `DevUser` left
+        // protected routes on `AuthenticatedUser`. Keeping the field at
+        // `None` here so any accidental `DevUser` regression in a route
+        // would surface as 401 instead of silently passing.
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
-    (router(state), user_id)
+    (router(state), user_id, cookie)
 }
 
 /// Variant of [`setup_with_full_state`] that overrides the manager's
@@ -177,12 +208,13 @@ async fn setup_with_full_state_short_ttl(
     auth_check: Arc<SshAuthCheckService>,
     pty_bridge: Arc<dyn SshPtyBridge>,
     detach_ttl: std::time::Duration,
-) -> (Router, UserId) {
+) -> (Router, UserId, String) {
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager_with_short_ttl(&db, detach_ttl);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -190,11 +222,11 @@ async fn setup_with_full_state_short_ttl(
         auth_check,
         pty_bridge,
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
-    (router(state), user_id)
+    (router(state), user_id, cookie)
 }
 
 /// Build a `TerminalSessionManager` wired to the same Postgres pool the
@@ -650,20 +682,68 @@ async fn read_body(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("body is valid JSON")
 }
 
-fn json_post(uri: &str, body: Value) -> Request<Body> {
+/// Build a `POST` request that authenticates with the supplied session
+/// cookie token AND carries the test allow-listed `Origin` so writes
+/// pass the shared `CsrfGuard`. **The default for every protected
+/// browser-write test path** — auth + Origin together so a bad call to
+/// the helper can't accidentally pass either guard half.
+fn json_post(uri: &str, body: Value, cookie: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
         .body(Body::from(body.to_string()))
         .unwrap()
 }
 
-fn get(uri: &str) -> Request<Body> {
+/// Build an authenticated `GET` request for `uri`. GETs don't need a
+/// CSRF guard, so the `Origin` header is omitted intentionally — the
+/// helper never makes a request "browser-write-shaped" beyond what the
+/// route demands.
+fn get(uri: &str, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Variant of [`json_post`] that omits the cookie. Used by tests that
+/// pin the "missing session cookie → 401" wire contract.
+fn json_post_no_auth(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Variant of [`get`] that omits the cookie. Used by tests that pin
+/// the "missing session cookie → 401" wire contract on GET routes.
+fn get_no_auth(uri: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri(uri)
         .body(Body::empty())
+        .unwrap()
+}
+
+/// Variant of [`json_post`] that overrides the `Origin` header with
+/// `origin`. Used by tests that pin the "bad Origin → 403 before body
+/// parse" wire contract on browser-write routes.
+fn json_post_with_origin(uri: &str, body: Value, cookie: &str, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, origin)
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -673,7 +753,7 @@ fn get(uri: &str) -> Request<Body> {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_host_success(pool: PgPool) {
-    let (app, _user) = setup(pool).await;
+    let (app, _user, cookie) = setup(pool).await;
 
     let resp = app
         .clone()
@@ -685,6 +765,7 @@ async fn create_host_success(pool: PgPool) {
                 "port": 2222,
                 "default_username": "ops",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -701,7 +782,11 @@ async fn create_host_success(pool: PgPool) {
     );
 
     // Listing surfaces the row we just created.
-    let listed = app.clone().oneshot(get("/api/v1/hosts")).await.unwrap();
+    let listed = app
+        .clone()
+        .oneshot(get("/api/v1/hosts", &cookie))
+        .await
+        .unwrap();
     assert_eq!(listed.status(), StatusCode::OK);
     let arr = read_body(listed).await;
     assert_eq!(arr.as_array().unwrap().len(), 1);
@@ -709,7 +794,7 @@ async fn create_host_success(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_host_default_port_22(pool: PgPool) {
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
 
     let resp = app
         .oneshot(json_post(
@@ -719,6 +804,7 @@ async fn create_host_default_port_22(pool: PgPool) {
                 "hostname": "h.example.com",
                 "default_username": "deploy",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -729,7 +815,7 @@ async fn create_host_default_port_22(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_host_invalid_input_returns_400(pool: PgPool) {
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
 
     // hostname has whitespace, which `validate_hostname` rejects.
     let resp = app
@@ -741,6 +827,7 @@ async fn create_host_invalid_input_returns_400(pool: PgPool) {
                 "hostname": "bad host",
                 "default_username": "ops",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -759,6 +846,7 @@ async fn create_host_invalid_input_returns_400(pool: PgPool) {
                 "port": 70_000,
                 "default_username": "ops",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -773,6 +861,7 @@ async fn create_host_invalid_input_returns_400(pool: PgPool) {
                 "hostname": "h.example.com",
                 "default_username": "",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -781,10 +870,10 @@ async fn create_host_invalid_input_returns_400(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn get_host_unknown_id_returns_404(pool: PgPool) {
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
     let bogus = uuid::Uuid::new_v4();
     let resp = app
-        .oneshot(get(&format!("/api/v1/hosts/{bogus}")))
+        .oneshot(get(&format!("/api/v1/hosts/{bogus}"), &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -811,13 +900,13 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
         .await
         .unwrap();
 
-    let (app, _dev_user) = setup(pool).await;
+    let (app, _dev_user, cookie) = setup(pool).await;
 
     // Baseline: a totally bogus id returns 404 with the canonical body.
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/hosts/{bogus}")))
+        .oneshot(get(&format!("/api/v1/hosts/{bogus}"), &cookie))
         .await
         .unwrap();
     let bogus_status = bogus_resp.status();
@@ -826,7 +915,7 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
 
     // Same id-shape, different owner — must produce the same response.
     let resp = app
-        .oneshot(get(&format!("/api/v1/hosts/{}", foreign_host.id)))
+        .oneshot(get(&format!("/api/v1/hosts/{}", foreign_host.id), &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), bogus_status);
@@ -838,12 +927,12 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
     assert_eq!(body["error"]["code"], "not_found");
 }
 
-/// When the dev-auth shim is disabled (`AppState::dev_user_id == None`) and
-/// no real auth backend has been wired, every `DevUser`-guarded route must
-/// return 401 with the canonical error envelope rather than the backend
-/// hard-bailing on startup.
+/// Without a session cookie (and with the dev-auth shim disabled —
+/// `dev_user_id: None`), every protected app route MUST return 401 with
+/// the canonical error envelope. The body must NOT leak operator-facing
+/// detail like "dev_auth" or "session invalid".
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
+async fn protected_hosts_routes_return_401_without_session_cookie(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
@@ -861,8 +950,12 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
     };
     let app = router(state);
 
-    // GET hosts is DevUser-guarded.
-    let resp = app.clone().oneshot(get("/api/v1/hosts")).await.unwrap();
+    // GET is auth-guarded.
+    let resp = app
+        .clone()
+        .oneshot(get_no_auth("/api/v1/hosts"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let body = read_body(resp).await;
     assert_eq!(body["error"]["code"], "unauthorized");
@@ -873,10 +966,14 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
         !body.to_string().contains("dev_auth"),
         "401 body must not leak dev-auth implementation detail: {body}"
     );
+    assert!(
+        !body.to_string().contains("session"),
+        "401 body must not leak session-state detail: {body}"
+    );
 
     // POST is also guarded — body never reaches the validator.
     let resp = app
-        .oneshot(json_post(
+        .oneshot(json_post_no_auth(
             "/api/v1/hosts",
             json!({
                 "display_name": "x",
@@ -891,13 +988,77 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
     assert_eq!(body["error"]["message"], "unauthorized");
 }
 
+/// `POST /api/v1/hosts` with a bad `Origin` MUST return `403
+/// csrf_origin_mismatch` BEFORE the body is parsed and BEFORE any DB
+/// row is written. Even with a valid session cookie, a request whose
+/// `Origin` is not in the allow-list is rejected by the shared
+/// `CsrfGuard` ahead of `Json<...>`. This is the wire-level proof
+/// of the "bad Origin → 403, no DB mutation" contract for the
+/// hosts-write surface; the same guarantee applies to every other
+/// browser-write route the migration touched.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_host_bad_origin_returns_403_before_body_parse(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+
+    // Malformed JSON body — would normally produce 400/422 if the
+    // request reached the body extractor. The Origin guard sits ahead
+    // of `Json<...>` so the bytes never reach the parser.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/hosts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from("{ this is not valid JSON"))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+    assert_eq!(body["error"]["message"], "forbidden");
+
+    // No host rows persisted.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM hosts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0, "bad-Origin must not create rows");
+}
+
+/// `POST /api/v1/hosts` without an `Origin` header MUST return 403
+/// `csrf_origin_mismatch`. Pinning the missing-header case so a
+/// future "treat missing as same-origin" change is a deliberate one.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_host_missing_origin_returns_403(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/hosts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from(
+            json!({
+                "display_name": "x",
+                "hostname": "h.example.com",
+                "default_username": "deploy",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
 // ----------------------------------------------------------------------
 // SSH identities
 // ----------------------------------------------------------------------
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn post_ssh_identity_returns_public_metadata_only(pool: PgPool) {
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
 
     let resp = app
         .clone()
@@ -906,6 +1067,7 @@ async fn post_ssh_identity_returns_public_metadata_only(pool: PgPool) {
             json!({
                 "name": "homelab-admin",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -957,7 +1119,7 @@ async fn post_ssh_identity_returns_public_metadata_only(pool: PgPool) {
     // Subsequent GET also omits the encrypted blob.
     let id = body["id"].as_str().unwrap();
     let get_resp = app
-        .oneshot(get(&format!("/api/v1/ssh-identities/{id}")))
+        .oneshot(get(&format!("/api/v1/ssh-identities/{id}"), &cookie))
         .await
         .unwrap();
     assert_eq!(get_resp.status(), StatusCode::OK);
@@ -969,7 +1131,7 @@ async fn post_ssh_identity_returns_public_metadata_only(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn post_ssh_identity_invalid_key_type_returns_400(pool: PgPool) {
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
     let resp = app
         .oneshot(json_post(
             "/api/v1/ssh-identities",
@@ -977,6 +1139,7 @@ async fn post_ssh_identity_invalid_key_type_returns_400(pool: PgPool) {
                 "name": "primary",
                 "key_type": "invalid-algo",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -995,7 +1158,7 @@ async fn post_ssh_identity_rsa_returns_400_unsupported(pool: PgPool) {
     // future slice. Unknown tags and known-but-unsupported tags share one
     // canonical 400 shape so clients can match on it without caring which
     // gate caught them.
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
     let resp = app
         .oneshot(json_post(
             "/api/v1/ssh-identities",
@@ -1003,6 +1166,7 @@ async fn post_ssh_identity_rsa_returns_400_unsupported(pool: PgPool) {
                 "name": "primary",
                 "key_type": "rsa",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1014,13 +1178,14 @@ async fn post_ssh_identity_rsa_returns_400_unsupported(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn post_ssh_identity_empty_name_returns_400(pool: PgPool) {
-    let (app, _) = setup(pool).await;
+    let (app, _, cookie) = setup(pool).await;
     let resp = app
         .oneshot(json_post(
             "/api/v1/ssh-identities",
             json!({
                 "name": "",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1030,9 +1195,10 @@ async fn post_ssh_identity_empty_name_returns_400(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
-    // dev-auth off → DevUser extractor short-circuits with 401 BEFORE any
-    // vault work happens. The request body never reaches the vault.
+async fn post_ssh_identity_returns_401_without_session_cookie(pool: PgPool) {
+    // No session cookie → AuthenticatedUser extractor short-circuits
+    // with 401 BEFORE any vault work happens. The request body never
+    // reaches the vault.
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
@@ -1051,7 +1217,7 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let app = router(state);
 
     let resp = app
-        .oneshot(json_post(
+        .oneshot(json_post_no_auth(
             "/api/v1/ssh-identities",
             json!({"name": "should-never-be-created"}),
         ))
@@ -1077,6 +1243,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: None,
@@ -1084,7 +1251,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -1094,6 +1261,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/ssh-identities",
             json!({"name": "primary"}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1115,11 +1283,12 @@ async fn post_ssh_identity_persists_encrypted_blob(pool: PgPool) {
     // After a successful POST the row exists, the public key matches the
     // API response, and the stored ciphertext does NOT contain the
     // OpenSSH PEM header — proving the blob is actually encrypted.
-    let (app, _) = setup(pool.clone()).await;
+    let (app, _, cookie) = setup(pool.clone()).await;
     let resp = app
         .oneshot(json_post(
             "/api/v1/ssh-identities",
             json!({"name": "store-check"}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1149,7 +1318,7 @@ async fn post_ssh_identity_persists_encrypted_blob(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn list_ssh_identities_omits_encrypted_private_key(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
 
     PgSshIdentityRepository::new(pool)
         .create(CreateSshIdentity {
@@ -1166,7 +1335,7 @@ async fn list_ssh_identities_omits_encrypted_private_key(pool: PgPool) {
     // List endpoint.
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/ssh-identities"))
+        .oneshot(get("/api/v1/ssh-identities", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1189,7 +1358,7 @@ async fn list_ssh_identities_omits_encrypted_private_key(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn get_ssh_identity_omits_encrypted_private_key(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let identity = PgSshIdentityRepository::new(pool)
         .create(CreateSshIdentity {
             owner_id: user_id,
@@ -1203,7 +1372,10 @@ async fn get_ssh_identity_omits_encrypted_private_key(pool: PgPool) {
         .unwrap();
 
     let resp = app
-        .oneshot(get(&format!("/api/v1/ssh-identities/{}", identity.id)))
+        .oneshot(get(
+            &format!("/api/v1/ssh-identities/{}", identity.id),
+            &cookie,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1219,7 +1391,7 @@ async fn get_ssh_identity_omits_encrypted_private_key(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_server_profile_success(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let identity = PgSshIdentityRepository::new(pool)
         .create(CreateSshIdentity {
             owner_id: user_id,
@@ -1242,6 +1414,7 @@ async fn create_server_profile_success(pool: PgPool) {
                 "hostname": "prod.example.com",
                 "default_username": "deploy",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1259,6 +1432,7 @@ async fn create_server_profile_success(pool: PgPool) {
                 "username_override": "root",
                 "tags": ["prod", "us-east-1"],
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1272,7 +1446,7 @@ async fn create_server_profile_success(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_server_profile_missing_host_returns_404(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let identity = PgSshIdentityRepository::new(pool)
         .create(CreateSshIdentity {
             owner_id: user_id,
@@ -1295,6 +1469,7 @@ async fn create_server_profile_missing_host_returns_404(pool: PgPool) {
                 "ssh_identity_id": identity.id,
                 "tags": [],
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1306,7 +1481,7 @@ async fn create_server_profile_missing_host_returns_404(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_server_profile_missing_identity_returns_404(pool: PgPool) {
-    let (app, _user_id) = setup(pool).await;
+    let (app, _user_id, cookie) = setup(pool).await;
 
     let host_resp = app
         .clone()
@@ -1317,6 +1492,7 @@ async fn create_server_profile_missing_identity_returns_404(pool: PgPool) {
                 "hostname": "h1.example.com",
                 "default_username": "deploy",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1333,6 +1509,7 @@ async fn create_server_profile_missing_identity_returns_404(pool: PgPool) {
                 "ssh_identity_id": bogus_identity,
                 "tags": [],
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1405,16 +1582,19 @@ async fn make_owned_profile(
         .id
 }
 
-async fn setup_with_fake_probe(pool: PgPool, fingerprint: &str) -> (Router, UserId, FakeProbe) {
+async fn setup_with_fake_probe(
+    pool: PgPool,
+    fingerprint: &str,
+) -> (Router, UserId, FakeProbe, String) {
     let probe = FakeProbe::new(captured_for_test(fingerprint));
     let probe_handle = probe.clone();
-    let (app, user_id) = setup_with_probe(pool, Arc::new(probe)).await;
-    (app, user_id, probe_handle)
+    let (app, user_id, cookie) = setup_with_probe(pool, Arc::new(probe)).await;
+    (app, user_id, probe_handle, cookie)
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn preflight_unknown_when_no_known_host_entries(pool: PgPool) {
-    let (app, user_id, probe) = setup_with_fake_probe(pool.clone(), "SHA256:fake-fp").await;
+    let (app, user_id, probe, cookie) = setup_with_fake_probe(pool.clone(), "SHA256:fake-fp").await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -1428,6 +1608,7 @@ async fn preflight_unknown_when_no_known_host_entries(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1455,7 +1636,7 @@ async fn preflight_unknown_when_no_known_host_entries(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn preflight_trusted_when_pinned_entry_matches(pool: PgPool) {
     let fp = "SHA256:trusted-fp";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), fp).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -1485,6 +1666,7 @@ async fn preflight_trusted_when_pinned_entry_matches(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1496,7 +1678,7 @@ async fn preflight_trusted_when_pinned_entry_matches(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn preflight_changed_when_pinned_fingerprint_differs(pool: PgPool) {
     let new_fp = "SHA256:NEW-fp";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), new_fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), new_fp).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -1525,6 +1707,7 @@ async fn preflight_changed_when_pinned_fingerprint_differs(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1536,7 +1719,7 @@ async fn preflight_changed_when_pinned_fingerprint_differs(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn preflight_returns_502_on_probe_failure(pool: PgPool) {
-    let (app, user_id) =
+    let (app, user_id, cookie) =
         setup_with_probe(pool.clone(), Arc::new(ErrorProbe(ProbeError::Unreachable))).await;
     let profile_id =
         make_owned_profile(&pool, user_id, &test_vault(), "primary", "down.example.com").await;
@@ -1545,6 +1728,7 @@ async fn preflight_returns_502_on_probe_failure(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1557,12 +1741,13 @@ async fn preflight_returns_502_on_probe_failure(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn preflight_unknown_profile_returns_404(pool: PgPool) {
-    let (app, _user_id, _probe) = setup_with_fake_probe(pool, "SHA256:never").await;
+    let (app, _user_id, _probe, cookie) = setup_with_fake_probe(pool, "SHA256:never").await;
     let bogus = uuid::Uuid::new_v4();
     let resp = app
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1574,6 +1759,11 @@ async fn preflight_unknown_profile_returns_404(pool: PgPool) {
 /// A preflight against another user's profile must produce a response
 /// byte-identical to a genuine 404 — same status, same body. This is the
 /// `API get_by_id ownership` lesson from AGENTS.md applied to preflight.
+///
+/// **CSRF guard sanity:** the request goes through `json_post`, which
+/// injects the test allow-listed `Origin`, so `CsrfGuard` passes
+/// cleanly. The 404 we observe comes from the ownership filter
+/// downstream of the guard — not from a CSRF rejection.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgPool) {
     // Provision a profile owned by ANOTHER user.
@@ -1587,7 +1777,7 @@ async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgP
     )
     .await;
 
-    let (app, _dev_user, _probe) = setup_with_fake_probe(pool, "SHA256:never").await;
+    let (app, _dev_user, _probe, cookie) = setup_with_fake_probe(pool, "SHA256:never").await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -1595,6 +1785,7 @@ async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgP
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1606,6 +1797,7 @@ async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgP
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{foreign_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1620,7 +1812,7 @@ async fn preflight_foreign_owned_profile_returns_indistinguishable_404(pool: PgP
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn trust_host_key_records_pinned_entry_when_expected_matches(pool: PgPool) {
     let fp = "SHA256:trust-me";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), fp).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -1634,6 +1826,7 @@ async fn trust_host_key_records_pinned_entry_when_expected_matches(pool: PgPool)
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": fp }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1663,7 +1856,8 @@ async fn trust_host_key_records_pinned_entry_when_expected_matches(pool: PgPool)
 async fn trust_host_key_rejects_when_expected_fingerprint_does_not_match(pool: PgPool) {
     // Probe captures `actual-fp`; caller submits `stale-fp`. The route
     // must NOT pin anything.
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), "SHA256:actual-fp").await;
+    let (app, user_id, _probe, cookie) =
+        setup_with_fake_probe(pool.clone(), "SHA256:actual-fp").await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -1677,6 +1871,7 @@ async fn trust_host_key_rejects_when_expected_fingerprint_does_not_match(pool: P
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": "SHA256:stale-fp" }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1707,7 +1902,7 @@ async fn trust_host_key_does_not_overwrite_a_changed_pinned_key(pool: PgPool) {
     // fingerprint, the route must refuse to pin (the classifier's
     // `Changed` verdict wins).
     let new_fp = "SHA256:NEW-fp";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), new_fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), new_fp).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -1736,6 +1931,7 @@ async fn trust_host_key_does_not_overwrite_a_changed_pinned_key(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": new_fp }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1754,7 +1950,7 @@ async fn trust_host_key_does_not_overwrite_a_changed_pinned_key(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn trust_host_key_rejects_malformed_fingerprint(pool: PgPool) {
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), "SHA256:any").await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), "SHA256:any").await;
     let profile_id =
         make_owned_profile(&pool, user_id, &test_vault(), "primary", "any.example.com").await;
 
@@ -1762,6 +1958,7 @@ async fn trust_host_key_rejects_malformed_fingerprint(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": "MD5:not-supported" }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1773,7 +1970,7 @@ async fn trust_host_key_rejects_malformed_fingerprint(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn trust_host_key_is_idempotent_for_already_trusted_fingerprint(pool: PgPool) {
     let fp = "SHA256:idempotent-fp";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), fp).await;
     let profile_id =
         make_owned_profile(&pool, user_id, &test_vault(), "primary", "idem.example.com").await;
 
@@ -1783,6 +1980,7 @@ async fn trust_host_key_is_idempotent_for_already_trusted_fingerprint(pool: PgPo
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": fp }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1797,6 +1995,7 @@ async fn trust_host_key_is_idempotent_for_already_trusted_fingerprint(pool: PgPo
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": fp }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1815,6 +2014,7 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: None,
@@ -1822,7 +2022,7 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -1869,6 +2069,7 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{}/host-key-preflight", profile.id),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1897,7 +2098,7 @@ async fn trust_host_key_refuses_to_re_trust_a_revoked_fingerprint(pool: PgPool) 
     // pin and "trust" the revoked key. This test pins down the contract:
     // 409, no row mutation.
     let fp = "SHA256:was-revoked";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), fp).await;
     let profile_id =
         make_owned_profile(&pool, user_id, &test_vault(), "primary", "rev.example.com").await;
 
@@ -1922,6 +2123,7 @@ async fn trust_host_key_refuses_to_re_trust_a_revoked_fingerprint(pool: PgPool) 
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": fp }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1950,7 +2152,7 @@ async fn preflight_treats_revoked_match_as_unknown(pool: PgPool) {
     // route's separate guard then refuses to pin it; this test pins down
     // the read-side half of that contract so the wire signal is correct.
     let fp = "SHA256:revoked-key";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), fp).await;
     let profile_id =
         make_owned_profile(&pool, user_id, &test_vault(), "primary", "rev2.example.com").await;
 
@@ -1974,6 +2176,7 @@ async fn preflight_treats_revoked_match_as_unknown(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -1991,7 +2194,8 @@ async fn preflight_response_message_does_not_overclaim_auth_or_session_readiness
     // or that a session can be opened. Pin down the actual phrasing for
     // each status so a future "helpful" rewording trips the test before
     // it reaches users.
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), "SHA256:scope-check").await;
+    let (app, user_id, _probe, cookie) =
+        setup_with_fake_probe(pool.clone(), "SHA256:scope-check").await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -2005,6 +2209,7 @@ async fn preflight_response_message_does_not_overclaim_auth_or_session_readiness
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2042,10 +2247,10 @@ async fn setup_with_fake_auth_checker(
     pool: PgPool,
     captured: CapturedHostKey,
     kind: AuthAttemptKind,
-) -> (Router, UserId, Arc<FakeAuthChecker>) {
+) -> (Router, UserId, Arc<FakeAuthChecker>, String) {
     let checker = Arc::new(FakeAuthChecker::new(captured, kind));
-    let (app, user_id) = setup_full(pool, default_probe(), checker.clone()).await;
-    (app, user_id, checker)
+    let (app, user_id, cookie) = setup_full(pool, default_probe(), checker.clone()).await;
+    (app, user_id, checker, cookie)
 }
 
 async fn pin_trusted_entry(pool: &PgPool, host_id: relayterm_core::ids::HostId, fp: &str) {
@@ -2063,7 +2268,7 @@ async fn pin_trusted_entry(pool: &PgPool, host_id: relayterm_core::ids::HostId, 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_succeeds_with_trusted_host_key_and_successful_auth(pool: PgPool) {
     let fp = "SHA256:auth-trusted";
-    let (app, user_id, checker) = setup_with_fake_auth_checker(
+    let (app, user_id, checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(fp),
         AuthAttemptKind::Authenticated,
@@ -2082,6 +2287,7 @@ async fn auth_check_succeeds_with_trusted_host_key_and_successful_auth(pool: PgP
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2132,7 +2338,7 @@ async fn auth_check_succeeds_with_trusted_host_key_and_successful_auth(pool: PgP
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_unknown_profile_returns_404(pool: PgPool) {
-    let (app, _user_id, _checker) = setup_with_fake_auth_checker(
+    let (app, _user_id, _checker, cookie) = setup_with_fake_auth_checker(
         pool,
         captured_for_test("SHA256:never"),
         AuthAttemptKind::Authenticated,
@@ -2143,6 +2349,7 @@ async fn auth_check_unknown_profile_returns_404(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2166,7 +2373,7 @@ async fn auth_check_foreign_owned_profile_returns_indistinguishable_404(pool: Pg
     )
     .await;
 
-    let (app, _dev_user, _checker) = setup_with_fake_auth_checker(
+    let (app, _dev_user, _checker, cookie) = setup_with_fake_auth_checker(
         pool,
         captured_for_test("SHA256:never"),
         AuthAttemptKind::Authenticated,
@@ -2179,6 +2386,7 @@ async fn auth_check_foreign_owned_profile_returns_indistinguishable_404(pool: Pg
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2190,6 +2398,7 @@ async fn auth_check_foreign_owned_profile_returns_indistinguishable_404(pool: Pg
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{foreign_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2204,7 +2413,7 @@ async fn auth_check_foreign_owned_profile_returns_indistinguishable_404(pool: Pg
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_blocks_when_host_key_unknown(pool: PgPool) {
     let captured_fp = "SHA256:fresh";
-    let (app, user_id, checker) = setup_with_fake_auth_checker(
+    let (app, user_id, checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(captured_fp),
         AuthAttemptKind::HostKeyMismatch,
@@ -2224,6 +2433,7 @@ async fn auth_check_blocks_when_host_key_unknown(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2241,7 +2451,7 @@ async fn auth_check_blocks_when_host_key_unknown(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_blocks_when_host_key_changed(pool: PgPool) {
     let new_fp = "SHA256:NEW-auth";
-    let (app, user_id, checker) = setup_with_fake_auth_checker(
+    let (app, user_id, checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(new_fp),
         AuthAttemptKind::HostKeyMismatch,
@@ -2267,6 +2477,7 @@ async fn auth_check_blocks_when_host_key_changed(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2283,7 +2494,7 @@ async fn auth_check_blocks_when_host_key_changed(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_blocks_when_matching_known_host_is_revoked(pool: PgPool) {
     let fp = "SHA256:revoked-auth";
-    let (app, user_id, checker) = setup_with_fake_auth_checker(
+    let (app, user_id, checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(fp),
         AuthAttemptKind::HostKeyMismatch,
@@ -2317,6 +2528,7 @@ async fn auth_check_blocks_when_matching_known_host_is_revoked(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2333,7 +2545,7 @@ async fn auth_check_blocks_when_matching_known_host_is_revoked(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn auth_check_returns_authentication_failed_safely(pool: PgPool) {
     let fp = "SHA256:badcred";
-    let (app, user_id, _checker) = setup_with_fake_auth_checker(
+    let (app, user_id, _checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(fp),
         AuthAttemptKind::AuthenticationFailed,
@@ -2358,6 +2570,7 @@ async fn auth_check_returns_authentication_failed_safely(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2390,6 +2603,7 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2399,7 +2613,7 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
         )))),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2423,6 +2637,7 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2440,6 +2655,7 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: None,
@@ -2447,7 +2663,7 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2492,6 +2708,7 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{}/auth-check", profile.id),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2502,7 +2719,7 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
+async fn auth_check_returns_401_without_session_cookie(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
@@ -2521,7 +2738,7 @@ async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let app = router(state);
     let bogus = uuid::Uuid::new_v4();
     let resp = app
-        .oneshot(json_post(
+        .oneshot(json_post_no_auth(
             &format!("/api/v1/server-profiles/{bogus}/auth-check"),
             json!({}),
         ))
@@ -2539,7 +2756,7 @@ async fn auth_check_response_does_not_overclaim_session_or_command_execution(poo
     // shell was spawned, or a command ran. Pin the wording for each
     // non-error status so an accidental rewording trips the test.
     let fp = "SHA256:scope";
-    let (app, user_id, _checker) = setup_with_fake_auth_checker(
+    let (app, user_id, _checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(fp),
         AuthAttemptKind::Authenticated,
@@ -2564,6 +2781,7 @@ async fn auth_check_response_does_not_overclaim_session_or_command_execution(poo
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2599,6 +2817,7 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2606,7 +2825,7 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         auth_check: svc,
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2619,6 +2838,7 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2667,6 +2887,7 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2674,7 +2895,7 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         auth_check: svc,
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -2695,11 +2916,13 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
 
     // Fire the first request; it parks on the gate.
     let app_first = app.clone();
+    let cookie_first = cookie.clone();
     let first = tokio::spawn(async move {
         app_first
             .oneshot(json_post(
                 &format!("/api/v1/server-profiles/{profile_first}/auth-check"),
                 json!({}),
+                &cookie_first,
             ))
             .await
             .unwrap()
@@ -2716,6 +2939,7 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_second}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2780,7 +3004,7 @@ async fn make_trusted_profile(
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_returns_active_with_live_pty(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -2799,6 +3023,7 @@ async fn create_terminal_session_returns_active_with_live_pty(pool: PgPool) {
                 "cols": 120,
                 "rows": 30,
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2860,7 +3085,7 @@ async fn create_terminal_session_returns_active_with_live_pty(pool: PgPool) {
 async fn create_terminal_session_defaults_dimensions_when_omitted(pool: PgPool) {
     // Default is 80x24; a client that doesn't supply cols/rows should
     // still get a metadata row in starting status.
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -2875,6 +3100,7 @@ async fn create_terminal_session_defaults_dimensions_when_omitted(pool: PgPool) 
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2889,7 +3115,7 @@ async fn create_terminal_session_without_trusted_host_key_returns_409(pool: PgPo
     // No trust entry pinned → host-key is `unknown`. The route must NOT
     // create a session row; it must return a 409 conflict so the client
     // is forced to run `trust-host-key` first.
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -2903,6 +3129,7 @@ async fn create_terminal_session_without_trusted_host_key_returns_409(pool: PgPo
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2932,7 +3159,7 @@ async fn create_terminal_session_without_trusted_host_key_returns_409(pool: PgPo
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_with_revoked_only_pin_returns_409(pool: PgPool) {
     // A revoked entry is not "trusted" — the create route must refuse.
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -2961,6 +3188,7 @@ async fn create_terminal_session_with_revoked_only_pin_returns_409(pool: PgPool)
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -2983,12 +3211,13 @@ async fn create_terminal_session_with_revoked_only_pin_returns_409(pool: PgPool)
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_unknown_profile_returns_404(pool: PgPool) {
-    let (app, _user_id) = setup(pool).await;
+    let (app, _user_id, cookie) = setup(pool).await;
     let bogus = uuid::Uuid::new_v4();
     let resp = app
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": bogus}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3020,7 +3249,7 @@ async fn create_terminal_session_foreign_owned_profile_returns_indistinguishable
         .unwrap();
     pin_trusted_entry(&pool, foreign.host_id, "SHA256:foreign-trust").await;
 
-    let (app, _dev_user) = setup(pool.clone()).await;
+    let (app, _dev_user, cookie) = setup(pool.clone()).await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -3028,6 +3257,7 @@ async fn create_terminal_session_foreign_owned_profile_returns_indistinguishable
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": bogus}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3039,6 +3269,7 @@ async fn create_terminal_session_foreign_owned_profile_returns_indistinguishable
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": foreign_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3061,7 +3292,7 @@ async fn create_terminal_session_foreign_owned_profile_returns_indistinguishable
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_invalid_dimensions_returns_400(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3078,6 +3309,7 @@ async fn create_terminal_session_invalid_dimensions_returns_400(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id, "cols": 0, "rows": 24}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3090,6 +3322,7 @@ async fn create_terminal_session_invalid_dimensions_returns_400(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id, "cols": 80, "rows": 5_000}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3127,12 +3360,12 @@ async fn list_terminal_sessions_returns_only_current_user(pool: PgPool) {
         .await
         .unwrap();
 
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
 
     // Empty list to start.
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/terminal-sessions"))
+        .oneshot(get("/api/v1/terminal-sessions", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -3158,12 +3391,16 @@ async fn list_terminal_sessions_returns_only_current_user(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
     assert_eq!(create.status(), StatusCode::CREATED);
 
-    let resp = app.oneshot(get("/api/v1/terminal-sessions")).await.unwrap();
+    let resp = app
+        .oneshot(get("/api/v1/terminal-sessions", &cookie))
+        .await
+        .unwrap();
     let body = read_body(resp).await;
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1);
@@ -3175,10 +3412,10 @@ async fn list_terminal_sessions_returns_only_current_user(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn get_terminal_session_unknown_id_returns_404(pool: PgPool) {
-    let (app, _user_id) = setup(pool).await;
+    let (app, _user_id, cookie) = setup(pool).await;
     let bogus = uuid::Uuid::new_v4();
     let resp = app
-        .oneshot(get(&format!("/api/v1/terminal-sessions/{bogus}")))
+        .oneshot(get(&format!("/api/v1/terminal-sessions/{bogus}"), &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -3208,12 +3445,12 @@ async fn get_terminal_session_foreign_owned_returns_indistinguishable_404(pool: 
         .await
         .unwrap();
 
-    let (app, _dev_user) = setup(pool).await;
+    let (app, _dev_user, cookie) = setup(pool).await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/terminal-sessions/{bogus}")))
+        .oneshot(get(&format!("/api/v1/terminal-sessions/{bogus}"), &cookie))
         .await
         .unwrap();
     let bogus_status = bogus_resp.status();
@@ -3221,10 +3458,10 @@ async fn get_terminal_session_foreign_owned_returns_indistinguishable_404(pool: 
     assert_eq!(bogus_status, StatusCode::NOT_FOUND);
 
     let resp = app
-        .oneshot(get(&format!(
-            "/api/v1/terminal-sessions/{}",
-            foreign_session.id
-        )))
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{}", foreign_session.id),
+            &cookie,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), bogus_status);
@@ -3237,7 +3474,7 @@ async fn get_terminal_session_foreign_owned_returns_indistinguishable_404(pool: 
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn close_terminal_session_marks_closed_and_writes_event(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3253,6 +3490,7 @@ async fn close_terminal_session_marks_closed_and_writes_event(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3264,6 +3502,7 @@ async fn close_terminal_session_marks_closed_and_writes_event(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{session_id}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3296,7 +3535,7 @@ async fn close_terminal_session_marks_closed_and_writes_event(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn close_terminal_session_double_close_is_idempotent(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3311,6 +3550,7 @@ async fn close_terminal_session_double_close_is_idempotent(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3321,6 +3561,7 @@ async fn close_terminal_session_double_close_is_idempotent(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{session_id}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3331,6 +3572,7 @@ async fn close_terminal_session_double_close_is_idempotent(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{session_id}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3381,7 +3623,7 @@ async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool
         .await
         .unwrap();
 
-    let (app, _dev_user) = setup(pool.clone()).await;
+    let (app, _dev_user, cookie) = setup(pool.clone()).await;
 
     let bogus = uuid::Uuid::new_v4();
     let bogus_resp = app
@@ -3389,6 +3631,7 @@ async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{bogus}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3400,6 +3643,7 @@ async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{}/close", foreign_session.id),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3425,7 +3669,7 @@ async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool) {
+async fn terminal_session_routes_return_401_without_session_cookie(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
@@ -3444,16 +3688,16 @@ async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool)
     let app = router(state);
 
     for req in [
-        json_post(
+        json_post_no_auth(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": uuid::Uuid::new_v4()}),
         ),
-        get("/api/v1/terminal-sessions"),
-        get(&format!(
+        get_no_auth("/api/v1/terminal-sessions"),
+        get_no_auth(&format!(
             "/api/v1/terminal-sessions/{}",
             uuid::Uuid::new_v4()
         )),
-        json_post(
+        json_post_no_auth(
             &format!("/api/v1/terminal-sessions/{}/close", uuid::Uuid::new_v4()),
             json!({}),
         ),
@@ -3472,7 +3716,7 @@ async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool)
 /// through review.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_message_announces_pty_and_caveats_replay(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3487,6 +3731,7 @@ async fn create_terminal_session_message_announces_pty_and_caveats_replay(pool: 
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -3537,9 +3782,16 @@ async fn spawn_app(app: Router) -> SocketAddr {
 async fn open_ws(
     addr: SocketAddr,
     session_id: relayterm_core::ids::TerminalSessionId,
+    cookie: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let url = format!("ws://{addr}/api/v1/terminal-sessions/{session_id}/ws");
-    let (stream, _resp) = tokio_tungstenite::connect_async(&url)
+    let mut req = url.into_client_request().expect("ws url -> request");
+    req.headers_mut().insert(
+        axum::http::header::COOKIE,
+        format!("relayterm_session={cookie}").parse().unwrap(),
+    );
+    let (stream, _resp) = tokio_tungstenite::connect_async(req)
         .await
         .expect("WebSocket handshake should succeed for an owned, open session");
     stream
@@ -3601,12 +3853,14 @@ async fn send_client_msg(
 async fn create_session_via_api(
     app: &Router,
     profile_id: relayterm_core::ids::ServerProfileId,
+    cookie: &str,
 ) -> relayterm_core::ids::TerminalSessionId {
     let resp = app
         .clone()
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            cookie,
         ))
         .await
         .unwrap();
@@ -3626,7 +3880,7 @@ async fn ws_attach_emits_session_attached_with_session_id_and_writes_attachment_
     // route binds a live PTY. The status MUST be `Active` and the
     // attachment row must land in the DB. Wire wording is asserted
     // separately by `ws_attach_emits_session_attached_active_when_pty_live`.
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3636,10 +3890,10 @@ async fn ws_attach_emits_session_attached_with_session_id_and_writes_attachment_
         "SHA256:ws-attach",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
 
     let msg = recv_server_msg(&mut socket).await;
     match msg {
@@ -3675,14 +3929,25 @@ async fn ws_attach_emits_session_attached_with_session_id_and_writes_attachment_
 /// `tokio-tungstenite` returns the rejected handshake response inside the
 /// `Http` error variant — pull the status code out so tests can assert on
 /// the same numbers the HTTP routes use. Any other error variant is a
-/// test-rig bug, not a route behavior.
+/// test-rig bug, not a route behavior. `cookie` is the session cookie
+/// value to attach to the upgrade handshake; `None` omits the cookie
+/// header entirely and exercises the missing-cookie 401 path.
 async fn ws_handshake_status(
     addr: SocketAddr,
     session_id_uri: &str,
+    cookie: Option<&str>,
 ) -> (axum::http::StatusCode, Option<Vec<u8>>) {
     use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let url = format!("ws://{addr}/api/v1/terminal-sessions/{session_id_uri}/ws");
-    let err = tokio_tungstenite::connect_async(&url)
+    let mut req = url.into_client_request().expect("ws url -> request");
+    if let Some(c) = cookie {
+        req.headers_mut().insert(
+            axum::http::header::COOKIE,
+            format!("relayterm_session={c}").parse().unwrap(),
+        );
+    }
+    let err = tokio_tungstenite::connect_async(req)
         .await
         .expect_err("expected handshake failure");
     match err {
@@ -3696,10 +3961,10 @@ async fn ws_handshake_status(
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_attach_unknown_session_returns_404_before_upgrade(pool: PgPool) {
-    let (app, _user) = setup(pool).await;
+    let (app, _user, cookie) = setup(pool).await;
     let addr = spawn_app(app).await;
     let bogus = uuid::Uuid::new_v4();
-    let (status, body) = ws_handshake_status(addr, &bogus.to_string()).await;
+    let (status, body) = ws_handshake_status(addr, &bogus.to_string(), Some(&cookie)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let body = body.expect("404 must carry an error envelope body");
     let parsed: Value = serde_json::from_slice(&body).expect("body is valid JSON");
@@ -3728,13 +3993,14 @@ async fn ws_attach_foreign_session_returns_indistinguishable_404(pool: PgPool) {
         .await
         .unwrap();
 
-    let (app, _dev_user) = setup(pool).await;
+    let (app, _dev_user, cookie) = setup(pool).await;
     let addr = spawn_app(app).await;
 
     let bogus = uuid::Uuid::new_v4();
-    let (bogus_status, bogus_body) = ws_handshake_status(addr, &bogus.to_string()).await;
+    let (bogus_status, bogus_body) =
+        ws_handshake_status(addr, &bogus.to_string(), Some(&cookie)).await;
     let (foreign_status, foreign_body) =
-        ws_handshake_status(addr, &foreign_session.id.to_string()).await;
+        ws_handshake_status(addr, &foreign_session.id.to_string(), Some(&cookie)).await;
 
     assert_eq!(bogus_status, StatusCode::NOT_FOUND);
     assert_eq!(foreign_status, bogus_status);
@@ -3746,7 +4012,7 @@ async fn ws_attach_foreign_session_returns_indistinguishable_404(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_attach_closed_session_returns_409(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3756,20 +4022,21 @@ async fn ws_attach_closed_session_returns_409(pool: PgPool) {
         "SHA256:ws-closed",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     // Close it before attempting to attach.
     let close = app
         .clone()
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{session_id}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
     assert_eq!(close.status(), StatusCode::OK);
 
     let addr = spawn_app(app).await;
-    let (status, body) = ws_handshake_status(addr, &session_id.to_string()).await;
+    let (status, body) = ws_handshake_status(addr, &session_id.to_string(), Some(&cookie)).await;
     assert_eq!(status, StatusCode::CONFLICT);
     let body = body.expect("409 must carry an error envelope body");
     let parsed: Value = serde_json::from_slice(&body).expect("body is valid JSON");
@@ -3777,7 +4044,7 @@ async fn ws_attach_closed_session_returns_409(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn ws_attach_returns_401_when_dev_auth_disabled(pool: PgPool) {
+async fn ws_attach_returns_401_without_session_cookie(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
@@ -3795,13 +4062,17 @@ async fn ws_attach_returns_401_when_dev_auth_disabled(pool: PgPool) {
     };
     let app = router(state);
     let addr = spawn_app(app).await;
-    let (status, _body) = ws_handshake_status(addr, &uuid::Uuid::new_v4().to_string()).await;
+    // Empty cookie value → no Cookie header on the upgrade. The
+    // AuthenticatedUser extractor short-circuits BEFORE the upgrade
+    // handshake completes, so the client sees a clean HTTP 401 instead
+    // of a socket-open-then-close.
+    let (status, _body) = ws_handshake_status(addr, &uuid::Uuid::new_v4().to_string(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_ping_returns_pong(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3811,9 +4082,9 @@ async fn ws_ping_returns_pong(pool: PgPool) {
         "SHA256:ws-ping",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     // Drain the SessionAttached frame.
     let _ = recv_server_msg(&mut socket).await;
 
@@ -3824,7 +4095,7 @@ async fn ws_ping_returns_pong(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_resize_acks_and_writes_event(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3834,9 +4105,9 @@ async fn ws_resize_acks_and_writes_event(pool: PgPool) {
         "SHA256:ws-resize",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     send_client_msg(
@@ -3871,7 +4142,7 @@ async fn ws_resize_acks_and_writes_event(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_resize_invalid_dims_returns_typed_error(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -3881,9 +4152,9 @@ async fn ws_resize_invalid_dims_returns_typed_error(pool: PgPool) {
         "SHA256:ws-bad-resize",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     send_client_msg(
@@ -3929,6 +4200,7 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db: db.clone(),
         vault: Some(test_vault()),
@@ -3936,7 +4208,7 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: bridge as Arc<dyn SshPtyBridge>,
         terminal_sessions: terminal_sessions.clone(),
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -3965,7 +4237,7 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
     let session_id = session.id;
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached(AttachedStub)
 
     let sentinel = "REDACT-MARKER-WS-INPUT-3D8F";
@@ -3998,7 +4270,7 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_malformed_binary_frame_is_rejected_without_echo(pool: PgPool) {
     use tokio_tungstenite::tungstenite::Message;
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4008,9 +4280,9 @@ async fn ws_malformed_binary_frame_is_rejected_without_echo(pool: PgPool) {
         "SHA256:ws-binary-bad",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     // Sentinel bytes (no RTB1 magic) — the server must reject without
@@ -4039,7 +4311,7 @@ async fn ws_malformed_binary_frame_is_rejected_without_echo(pool: PgPool) {
 async fn ws_oversized_binary_frame_is_rejected_safely(pool: PgPool) {
     use tokio_tungstenite::tungstenite::Message;
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4049,9 +4321,9 @@ async fn ws_oversized_binary_frame_is_rejected_safely(pool: PgPool) {
         "SHA256:ws-binary-huge",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     // Build a header that CLAIMS u32::MAX bytes of payload. The decoder
@@ -4085,7 +4357,7 @@ async fn ws_oversized_binary_frame_is_rejected_safely(pool: PgPool) {
 async fn ws_binary_input_reaches_live_pty(pool: PgPool) {
     use tokio_tungstenite::tungstenite::Message;
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4095,11 +4367,11 @@ async fn ws_binary_input_reaches_live_pty(pool: PgPool) {
         "SHA256:ws-binary-input",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().expect("bridge produced handle");
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
 
     // Non-UTF-8 bytes — the binary path must carry them losslessly.
@@ -4128,7 +4400,7 @@ async fn ws_binary_input_reaches_live_pty(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_invalid_message_returns_typed_error_without_echo(pool: PgPool) {
     use tokio_tungstenite::tungstenite::Message;
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4138,9 +4410,9 @@ async fn ws_invalid_message_returns_typed_error_without_echo(pool: PgPool) {
         "SHA256:ws-bad-msg",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     let sentinel = "REDACT-MARKER-BAD-FRAME-A11C";
@@ -4166,7 +4438,7 @@ async fn ws_invalid_message_returns_typed_error_without_echo(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4176,9 +4448,9 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
         "SHA256:ws-detach",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let attached = recv_server_msg(&mut socket).await;
     let attachment_id = match attached {
         relayterm_protocol::ServerMsg::SessionAttached { attachment_id, .. } => attachment_id,
@@ -4242,7 +4514,7 @@ async fn ws_detach_writes_detached_event_and_closes(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_close_transitions_session_and_emits_session_closed(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4252,9 +4524,9 @@ async fn ws_close_transitions_session_and_emits_session_closed(pool: PgPool) {
         "SHA256:ws-close",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Close).await;
@@ -4288,7 +4560,7 @@ async fn ws_close_transitions_session_and_emits_session_closed(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4298,9 +4570,9 @@ async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
         "SHA256:ws-drop",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     // Drop the socket without sending Detach. The handler's cleanup
@@ -4367,7 +4639,10 @@ async fn ws_socket_drop_marks_attachment_detached(pool: PgPool) {
 
 /// Build the standard router with a [`FakePtyBridge`] of the caller's
 /// choosing wired into AppState.
-async fn setup_with_pty_bridge(pool: PgPool, bridge: Arc<FakePtyBridge>) -> (Router, UserId) {
+async fn setup_with_pty_bridge(
+    pool: PgPool,
+    bridge: Arc<FakePtyBridge>,
+) -> (Router, UserId, String) {
     setup_with_full_state(
         pool,
         default_probe(),
@@ -4380,7 +4655,7 @@ async fn setup_with_pty_bridge(pool: PgPool, bridge: Arc<FakePtyBridge>) -> (Rou
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_starts_live_pty_when_trusted_and_auth_ready(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4396,6 +4671,7 @@ async fn create_terminal_session_starts_live_pty_when_trusted_and_auth_ready(poo
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id, "cols": 132, "rows": 50}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4447,7 +4723,7 @@ async fn create_terminal_session_starts_live_pty_when_trusted_and_auth_ready(poo
 async fn create_terminal_session_with_unknown_host_key_blocks_before_bridge(pool: PgPool) {
     // No trusted entry → API returns 409 BEFORE the bridge is called.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -4462,6 +4738,7 @@ async fn create_terminal_session_with_unknown_host_key_blocks_before_bridge(pool
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4483,7 +4760,7 @@ async fn create_terminal_session_with_unknown_host_key_blocks_before_bridge(pool
 async fn create_terminal_session_with_bridge_host_key_failure_returns_409(pool: PgPool) {
     let bridge =
         FakePtyBridge::with_outcome(FakePtyOutcome::Failure(FakePtyFailure::HostKeyNotTrusted));
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4499,6 +4776,7 @@ async fn create_terminal_session_with_bridge_host_key_failure_returns_409(pool: 
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4528,7 +4806,7 @@ async fn create_terminal_session_with_bridge_auth_failure_returns_conflict(pool:
     let bridge = FakePtyBridge::with_outcome(FakePtyOutcome::Failure(
         FakePtyFailure::AuthenticationFailed,
     ));
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4544,6 +4822,7 @@ async fn create_terminal_session_with_bridge_auth_failure_returns_conflict(pool:
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4565,7 +4844,7 @@ async fn create_terminal_session_with_bridge_auth_failure_returns_conflict(pool:
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_terminal_session_with_bridge_transport_failure_returns_502(pool: PgPool) {
     let bridge = FakePtyBridge::with_outcome(FakePtyOutcome::Failure(FakePtyFailure::Transport));
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4581,6 +4860,7 @@ async fn create_terminal_session_with_bridge_transport_failure_returns_502(pool:
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4596,6 +4876,7 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
     let state = AppState {
         db,
         vault: None,
@@ -4603,7 +4884,7 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: bridge.clone() as Arc<dyn SshPtyBridge>,
         terminal_sessions,
-        dev_user_id: Some(user_id),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -4624,6 +4905,7 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({"server_profile_id": profile_id}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4638,7 +4920,7 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_attach_emits_session_attached_active_when_pty_live(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4648,10 +4930,10 @@ async fn ws_attach_emits_session_attached_active_when_pty_live(pool: PgPool) {
         "SHA256:ws-active",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let msg = recv_server_msg(&mut socket).await;
     match msg {
         relayterm_protocol::ServerMsg::SessionAttached {
@@ -4675,7 +4957,7 @@ async fn ws_attach_emits_session_attached_active_when_pty_live(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_input_forwards_to_live_pty_without_echoing_payload(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4685,10 +4967,10 @@ async fn ws_input_forwards_to_live_pty_without_echoing_payload(pool: PgPool) {
         "SHA256:ws-input",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
 
     let sentinel = "REDACT-MARKER-INPUT-LIVE-7C";
@@ -4734,7 +5016,7 @@ async fn ws_input_forwards_to_live_pty_without_echoing_payload(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_output_from_pty_reaches_attached_client(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4744,13 +5026,13 @@ async fn ws_output_from_pty_reaches_attached_client(pool: PgPool) {
         "SHA256:ws-output",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge
         .last_handle()
         .expect("create flow must produce a handle");
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
 
     // Inject raw PTY bytes from the fake bridge — the orchestrator's
@@ -4776,7 +5058,7 @@ async fn ws_output_from_pty_reaches_attached_client(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_resize_forwards_to_live_pty(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4786,11 +5068,11 @@ async fn ws_resize_forwards_to_live_pty(pool: PgPool) {
         "SHA256:ws-resize",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
 
     send_client_msg(
@@ -4827,8 +5109,9 @@ async fn ws_resize_forwards_to_live_pty(pool: PgPool) {
 async fn open_ws_attached(
     addr: SocketAddr,
     session_id: relayterm_core::ids::TerminalSessionId,
+    cookie: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached(Active)
     socket
 }
@@ -4836,7 +5119,7 @@ async fn open_ws_attached(
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_explicit_close_remains_idempotent(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4846,11 +5129,11 @@ async fn ws_explicit_close_remains_idempotent(pool: PgPool) {
         "SHA256:ws-close-idempotent",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     // First WS: explicit Close.
     let addr = spawn_app(app.clone()).await;
-    let mut s1 = open_ws_attached(addr, session_id).await;
+    let mut s1 = open_ws_attached(addr, session_id, &cookie).await;
     send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Close).await;
     let resp = recv_server_msg(&mut s1).await;
     match resp {
@@ -4864,6 +5147,7 @@ async fn ws_explicit_close_remains_idempotent(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{session_id}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -4893,7 +5177,7 @@ async fn ws_socket_drop_after_explicit_detach_does_not_duplicate_events(pool: Pg
     // exactly once (no duplicate timer), and no Closed event has been
     // written yet.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -4903,10 +5187,10 @@ async fn ws_socket_drop_after_explicit_detach_does_not_duplicate_events(pool: Pg
         "SHA256:ws-detach-race",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws_attached(addr, session_id).await;
+    let mut socket = open_ws_attached(addr, session_id, &cookie).await;
     send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
 
     // Drain the server frames and let the WS task finish its cleanup.
@@ -4950,7 +5234,7 @@ async fn ws_reattach_after_ttl_expiry_returns_409(pool: PgPool) {
     // WS upgrade for the same id must surface 409. Uses a sub-second
     // detach TTL so the test runs in well under a second.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_full_state_short_ttl(
+    let (app, user_id, cookie) = setup_with_full_state_short_ttl(
         pool.clone(),
         default_probe(),
         Arc::new(SshAuthCheckService::new(default_auth_checker())),
@@ -4967,10 +5251,10 @@ async fn ws_reattach_after_ttl_expiry_returns_409(pool: PgPool) {
         "SHA256:ws-reattach",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws_attached(addr, session_id).await;
+    let mut socket = open_ws_attached(addr, session_id, &cookie).await;
     socket.close(None).await.unwrap();
     drop(socket);
 
@@ -4991,7 +5275,7 @@ async fn ws_reattach_after_ttl_expiry_returns_409(pool: PgPool) {
     );
 
     // A reattach must surface 409 — the WS upgrade gate sees the closed row.
-    let (status, _body) = ws_handshake_status(addr, &session_id.to_string()).await;
+    let (status, _body) = ws_handshake_status(addr, &session_id.to_string(), Some(&cookie)).await;
     assert_eq!(
         status,
         axum::http::StatusCode::CONFLICT,
@@ -5009,7 +5293,7 @@ async fn ws_input_after_ttl_expiry_does_not_reach_bridge(pool: PgPool) {
     // bytes appear on the FakePtyBridge handle after a TTL-expired
     // session's lifecycle settles.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_full_state_short_ttl(
+    let (app, user_id, cookie) = setup_with_full_state_short_ttl(
         pool.clone(),
         default_probe(),
         Arc::new(SshAuthCheckService::new(default_auth_checker())),
@@ -5026,11 +5310,11 @@ async fn ws_input_after_ttl_expiry_does_not_reach_bridge(pool: PgPool) {
         "SHA256:ws-input-after",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().expect("create produced a handle");
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws_attached(addr, session_id).await;
+    let mut socket = open_ws_attached(addr, session_id, &cookie).await;
     send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
     while (socket.next().await).is_some() {}
 
@@ -5087,7 +5371,7 @@ async fn await_output_with_seq(
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn ws_live_output_carries_monotonic_seq_starting_at_one(pool: PgPool) {
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5097,11 +5381,11 @@ async fn ws_live_output_carries_monotonic_seq_starting_at_one(pool: PgPool) {
         "SHA256:ws-seq",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await; // SessionAttached
 
     // Inject three output frames; the wire MUST carry seq=1, 2, 3.
@@ -5136,7 +5420,7 @@ async fn ws_attach_with_last_seen_seq_replays_buffered_frames(pool: PgPool) {
     // `Attach { last_seen_seq: 1 }` — the server MUST emit
     // ReplayStart{2,3}, Output(2), Output(3), ReplayEnd{3}.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5146,7 +5430,7 @@ async fn ws_attach_with_last_seen_seq_replays_buffered_frames(pool: PgPool) {
         "SHA256:ws-replay",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
     let addr = spawn_app(app).await;
 
@@ -5154,7 +5438,7 @@ async fn ws_attach_with_last_seen_seq_replays_buffered_frames(pool: PgPool) {
     // NOT send Detach (which would auto-close the live session); we
     // just drop the socket and wait for the cleanup tail to finish.
     {
-        let mut s1 = open_ws(addr, session_id).await;
+        let mut s1 = open_ws(addr, session_id, &cookie).await;
         let _ = recv_server_msg(&mut s1).await;
         handle.inject_output(b"alpha".to_vec()).await;
         handle.inject_output(b"beta".to_vec()).await;
@@ -5167,7 +5451,7 @@ async fn ws_attach_with_last_seen_seq_replays_buffered_frames(pool: PgPool) {
         // → To keep the live PTY alive across detach, hold s1 open until
         //   AFTER s2 has attached, then detach s1 cleanly.
         // Open s2 first:
-        let mut s2 = open_ws(addr, session_id).await;
+        let mut s2 = open_ws(addr, session_id, &cookie).await;
         let _ = recv_server_msg(&mut s2).await; // SessionAttached(Active)
         send_client_msg(
             &mut s2,
@@ -5230,7 +5514,7 @@ async fn ws_attach_without_last_seen_seq_does_not_dump_old_output(pool: PgPool) 
     // A brand-new attach (no last_seen_seq) must NOT receive replayed
     // frames — even when the buffer has them.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5240,19 +5524,19 @@ async fn ws_attach_without_last_seen_seq_does_not_dump_old_output(pool: PgPool) 
         "SHA256:ws-no-replay",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
     let addr = spawn_app(app).await;
 
     // Prime via s1, hold open.
-    let mut s1 = open_ws(addr, session_id).await;
+    let mut s1 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s1).await;
     handle.inject_output(b"old-output".to_vec()).await;
     let _ = await_output_with_seq(&mut s1, 1).await;
 
     // Second socket: attach, explicitly send Attach { last_seen_seq:
     // None }. Server MUST NOT emit any replay frames.
-    let mut s2 = open_ws(addr, session_id).await;
+    let mut s2 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s2).await;
     send_client_msg(
         &mut s2,
@@ -5292,7 +5576,7 @@ async fn ws_attach_with_in_bounds_bookmark_does_not_emit_replay_window_lost(pool
     // coverage we CAN provide here is "replay_window_lost is never
     // emitted on a normal in-bounds attach."
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5302,18 +5586,18 @@ async fn ws_attach_with_in_bounds_bookmark_does_not_emit_replay_window_lost(pool
         "SHA256:ws-no-window-lost",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
     let addr = spawn_app(app).await;
 
-    let mut s1 = open_ws(addr, session_id).await;
+    let mut s1 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s1).await;
     handle.inject_output(b"only".to_vec()).await;
     let _ = await_output_with_seq(&mut s1, 1).await;
 
     // Bookmark equals latest → empty range (no replay frames at all,
     // and definitely no window-lost).
-    let mut s2 = open_ws(addr, session_id).await;
+    let mut s2 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s2).await;
     send_client_msg(
         &mut s2,
@@ -5348,7 +5632,7 @@ async fn ws_replay_does_not_double_deliver_buffered_frames(pool: PgPool) {
     // drop frames whose seq <= range.latest_seq so the renderer doesn't
     // see the replayed frames twice.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5358,18 +5642,18 @@ async fn ws_replay_does_not_double_deliver_buffered_frames(pool: PgPool) {
         "SHA256:ws-no-dup-replay",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
     let addr = spawn_app(app).await;
 
-    let mut s1 = open_ws(addr, session_id).await;
+    let mut s1 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s1).await;
     for byte in [b'a', b'b'] {
         handle.inject_output(vec![byte]).await;
     }
     let _ = await_output_with_seq(&mut s1, 2).await;
 
-    let mut s2 = open_ws(addr, session_id).await;
+    let mut s2 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s2).await;
     // Bookmark = 1 → server replays only frame seq=2. The broadcast
     // subscriber for s2 has been queueing frames 1 AND 2 since attach
@@ -5414,7 +5698,7 @@ async fn ws_second_explicit_attach_is_rejected(pool: PgPool) {
     // server MUST emit error { code: invalid_message, message:
     // "already attached" } and keep the socket open.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5424,9 +5708,9 @@ async fn ws_second_explicit_attach_is_rejected(pool: PgPool) {
         "SHA256:ws-double-attach",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
-    let mut socket = open_ws(addr, session_id).await;
+    let mut socket = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut socket).await;
 
     // First Attach with no bookmark — accepted, no reply.
@@ -5473,7 +5757,7 @@ async fn ws_replay_messages_do_not_leak_payload_in_serialization(pool: PgPool) {
     // (base64) by design — that's their purpose — but the bracketing
     // frames must stay metadata-only.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
+    let (app, user_id, cookie) = setup_with_pty_bridge(pool.clone(), bridge.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -5483,11 +5767,11 @@ async fn ws_replay_messages_do_not_leak_payload_in_serialization(pool: PgPool) {
         "SHA256:ws-replay-redact",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
     let addr = spawn_app(app).await;
 
-    let mut s1 = open_ws(addr, session_id).await;
+    let mut s1 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s1).await;
     let sentinel = b"REDACT-MARKER-REPLAY-SHELL-9F";
     // Two frames so a `last_seen_seq=1` bookmark triggers replay of
@@ -5498,7 +5782,7 @@ async fn ws_replay_messages_do_not_leak_payload_in_serialization(pool: PgPool) {
     handle.inject_output(sentinel.to_vec()).await;
     let _ = await_output_with_seq(&mut s1, 2).await;
 
-    let mut s2 = open_ws(addr, session_id).await;
+    let mut s2 = open_ws(addr, session_id, &cookie).await;
     let _ = recv_server_msg(&mut s2).await;
     send_client_msg(
         &mut s2,
@@ -5540,7 +5824,7 @@ async fn ws_detach_keeps_pty_alive_within_ttl_window(pool: PgPool) {
     // an explicit close arrives. Uses a generous TTL so the assertion
     // observes the live state without racing the timer.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_full_state_short_ttl(
+    let (app, user_id, cookie) = setup_with_full_state_short_ttl(
         pool.clone(),
         default_probe(),
         Arc::new(SshAuthCheckService::new(default_auth_checker())),
@@ -5557,11 +5841,11 @@ async fn ws_detach_keeps_pty_alive_within_ttl_window(pool: PgPool) {
         "SHA256:ws-ttl-alive",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().expect("bridge produced handle");
 
     let addr = spawn_app(app).await;
-    let mut socket = open_ws_attached(addr, session_id).await;
+    let mut socket = open_ws_attached(addr, session_id, &cookie).await;
     send_client_msg(&mut socket, &relayterm_protocol::ClientMsg::Detach).await;
     while (socket.next().await).is_some() {}
 
@@ -5588,7 +5872,7 @@ async fn ws_reattach_within_ttl_resumes_active_session(pool: PgPool) {
     // After detach, a fresh WS upgrade within the TTL window must
     // succeed and the row must transition back to Active.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_full_state_short_ttl(
+    let (app, user_id, cookie) = setup_with_full_state_short_ttl(
         pool.clone(),
         default_probe(),
         Arc::new(SshAuthCheckService::new(default_auth_checker())),
@@ -5605,18 +5889,18 @@ async fn ws_reattach_within_ttl_resumes_active_session(pool: PgPool) {
         "SHA256:ws-ttl-reattach",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app).await;
 
     {
-        let mut s1 = open_ws_attached(addr, session_id).await;
+        let mut s1 = open_ws_attached(addr, session_id, &cookie).await;
         send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Detach).await;
         while (s1.next().await).is_some() {}
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Reattach within the TTL window.
-    let mut s2 = open_ws(addr, session_id).await;
+    let mut s2 = open_ws(addr, session_id, &cookie).await;
     let attached = recv_server_msg(&mut s2).await;
     match attached {
         relayterm_protocol::ServerMsg::SessionAttached { status, .. } => {
@@ -5657,7 +5941,7 @@ async fn ws_reattach_with_last_seen_seq_replays_missed_output_within_ttl(pool: P
     // closing, then reattach with `last_seen_seq=1` — the server must
     // emit ReplayStart{2,2}, Output(2), ReplayEnd{2}.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_full_state_short_ttl(
+    let (app, user_id, cookie) = setup_with_full_state_short_ttl(
         pool.clone(),
         default_probe(),
         Arc::new(SshAuthCheckService::new(default_auth_checker())),
@@ -5674,12 +5958,12 @@ async fn ws_reattach_with_last_seen_seq_replays_missed_output_within_ttl(pool: P
         "SHA256:ws-ttl-replay",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let handle = bridge.last_handle().unwrap();
     let addr = spawn_app(app).await;
 
     {
-        let mut s1 = open_ws_attached(addr, session_id).await;
+        let mut s1 = open_ws_attached(addr, session_id, &cookie).await;
         handle.inject_output(b"alpha".to_vec()).await;
         handle.inject_output(b"beta".to_vec()).await;
         let _ = await_output_with_seq(&mut s1, 2).await;
@@ -5688,7 +5972,7 @@ async fn ws_reattach_with_last_seen_seq_replays_missed_output_within_ttl(pool: P
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mut s2 = open_ws(addr, session_id).await;
+    let mut s2 = open_ws(addr, session_id, &cookie).await;
     // Assert the upgrade-time attach landed as Active so a future
     // change to the upgrade frame doesn't silently pass on the wrong
     // shape.
@@ -5743,7 +6027,7 @@ async fn ws_explicit_close_during_ttl_closes_immediately(pool: PgPool) {
     // duplicate Closed event lands later when the timer would have
     // expired.
     let bridge = FakePtyBridge::new();
-    let (app, user_id) = setup_with_full_state_short_ttl(
+    let (app, user_id, cookie) = setup_with_full_state_short_ttl(
         pool.clone(),
         default_probe(),
         Arc::new(SshAuthCheckService::new(default_auth_checker())),
@@ -5760,11 +6044,11 @@ async fn ws_explicit_close_during_ttl_closes_immediately(pool: PgPool) {
         "SHA256:ws-ttl-explicit-close",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
     let addr = spawn_app(app.clone()).await;
 
     {
-        let mut s1 = open_ws_attached(addr, session_id).await;
+        let mut s1 = open_ws_attached(addr, session_id, &cookie).await;
         send_client_msg(&mut s1, &relayterm_protocol::ClientMsg::Detach).await;
         while (s1.next().await).is_some() {}
     }
@@ -5775,6 +6059,7 @@ async fn ws_explicit_close_during_ttl_closes_immediately(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/terminal-sessions/{session_id}/close"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5818,7 +6103,7 @@ async fn ws_explicit_close_during_ttl_closes_immediately(pool: PgPool) {
 /// secret material.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disable_owned_server_profile_sets_disabled_at(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -5832,6 +6117,7 @@ async fn disable_owned_server_profile_sets_disabled_at(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5858,9 +6144,65 @@ async fn disable_owned_server_profile_sets_disabled_at(pool: PgPool) {
     }
 }
 
+/// `POST /server-profiles/:id/disable` with a bad `Origin` MUST return
+/// 403 `csrf_origin_mismatch` BEFORE any DB write — the row stays
+/// enabled AND no audit event lands. Pinned at the wire level so a
+/// future regression that moves the guard below the lifecycle write
+/// trips this test.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn disable_with_bad_origin_returns_403_and_writes_no_audit(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "csrf-disable",
+        "csrf-disable.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post_with_origin(
+            &format!("/api/v1/server-profiles/{profile_id}/disable"),
+            json!({}),
+            &cookie,
+            "https://attacker.example.com",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+
+    // Profile row stayed enabled.
+    let row = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.disabled_at.is_none(),
+        "bad-Origin disable must not stamp disabled_at",
+    );
+
+    // No `server_profile_disabled` audit row landed.
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let disabled = audit
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::ServerProfileDisabled)
+        .count();
+    assert_eq!(
+        disabled, 0,
+        "bad-Origin disable must not append a disabled audit row",
+    );
+}
+
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disable_is_idempotent_and_preserves_original_timestamp(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -5875,6 +6217,7 @@ async fn disable_is_idempotent_and_preserves_original_timestamp(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5886,6 +6229,7 @@ async fn disable_is_idempotent_and_preserves_original_timestamp(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5899,7 +6243,7 @@ async fn disable_is_idempotent_and_preserves_original_timestamp(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn enable_clears_disabled_at_and_is_idempotent(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -5914,6 +6258,7 @@ async fn enable_clears_disabled_at_and_is_idempotent(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5923,6 +6268,7 @@ async fn enable_clears_disabled_at_and_is_idempotent(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5938,6 +6284,7 @@ async fn enable_clears_disabled_at_and_is_idempotent(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5948,7 +6295,7 @@ async fn enable_clears_disabled_at_and_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
-    let (app, _user_id) = setup(pool.clone()).await;
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
     let bogus = uuid::Uuid::new_v4();
 
     let resp = app
@@ -5956,6 +6303,7 @@ async fn disable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5977,6 +6325,7 @@ async fn disable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{foreign_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -5990,7 +6339,7 @@ async fn disable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn enable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
-    let (app, _user_id) = setup(pool.clone()).await;
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
     let bogus = uuid::Uuid::new_v4();
 
     let resp = app
@@ -5998,6 +6347,7 @@ async fn enable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6022,6 +6372,7 @@ async fn enable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{foreign_id}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6035,7 +6386,7 @@ async fn enable_unknown_profile_returns_indistinguishable_404(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn list_and_get_server_profiles_include_disabled_at(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -6048,7 +6399,10 @@ async fn list_and_get_server_profiles_include_disabled_at(pool: PgPool) {
     // Fresh profile: disabled_at present and null.
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/server-profiles/{profile_id}")))
+        .oneshot(get(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            &cookie,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6065,10 +6419,14 @@ async fn list_and_get_server_profiles_include_disabled_at(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
-    let resp = app.oneshot(get("/api/v1/server-profiles")).await.unwrap();
+    let resp = app
+        .oneshot(get("/api/v1/server-profiles", &cookie))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = read_body(resp).await;
     let arr = body.as_array().expect("list returns array");
@@ -6086,7 +6444,7 @@ async fn list_and_get_server_profiles_include_disabled_at(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disabled_profile_blocks_terminal_session_create_with_safe_409(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     // A trusted profile would normally launch successfully; disable AFTER
     // pinning so the launch path's only failure cause is `disabled_at`.
     let profile_id = make_trusted_profile(
@@ -6107,6 +6465,7 @@ async fn disabled_profile_blocks_terminal_session_create_with_safe_409(pool: PgP
         .oneshot(json_post(
             "/api/v1/terminal-sessions",
             json!({ "server_profile_id": profile_id }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6128,7 +6487,7 @@ async fn disabled_profile_blocks_terminal_session_create_with_safe_409(pool: PgP
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disabled_profile_blocks_auth_check(pool: PgPool) {
     let captured_fp = "SHA256:auth-blocked";
-    let (app, user_id, _checker) = setup_with_fake_auth_checker(
+    let (app, user_id, _checker, cookie) = setup_with_fake_auth_checker(
         pool.clone(),
         captured_for_test(captured_fp),
         AuthAttemptKind::Authenticated,
@@ -6152,6 +6511,7 @@ async fn disabled_profile_blocks_auth_check(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/auth-check"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6167,7 +6527,7 @@ async fn disabled_profile_blocks_auth_check(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disabled_profile_blocks_host_key_preflight(pool: PgPool) {
-    let (app, user_id, _probe) =
+    let (app, user_id, _probe, cookie) =
         setup_with_fake_probe(pool.clone(), "SHA256:preflight-blocked").await;
     let profile_id = make_owned_profile(
         &pool,
@@ -6186,6 +6546,7 @@ async fn disabled_profile_blocks_host_key_preflight(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/host-key-preflight"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6202,7 +6563,7 @@ async fn disabled_profile_blocks_host_key_preflight(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disabled_profile_blocks_trust_host_key(pool: PgPool) {
     let fp = "SHA256:trust-blocked";
-    let (app, user_id, _probe) = setup_with_fake_probe(pool.clone(), fp).await;
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), fp).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -6220,6 +6581,7 @@ async fn disabled_profile_blocks_trust_host_key(pool: PgPool) {
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
             json!({ "expected_fingerprint": fp }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6259,7 +6621,7 @@ async fn disable_after_terminal_session_create_does_not_affect_existing_session_
     // intact and is still readable post-disable. The runtime guarantee
     // that the WS attach is unaffected is pinned at the route layer
     // (the ws_attach upgrade gate does NOT re-check `disabled_at`).
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_trusted_profile(
         &pool,
         user_id,
@@ -6269,7 +6631,7 @@ async fn disable_after_terminal_session_create_does_not_affect_existing_session_
         "SHA256:post-launch",
     )
     .await;
-    let session_id = create_session_via_api(&app, profile_id).await;
+    let session_id = create_session_via_api(&app, profile_id, &cookie).await;
 
     // Disable AFTER launch — must not retroactively close the session.
     let resp = app
@@ -6277,6 +6639,7 @@ async fn disable_after_terminal_session_create_does_not_affect_existing_session_
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6284,7 +6647,10 @@ async fn disable_after_terminal_session_create_does_not_affect_existing_session_
 
     // Session row is still readable and not closed.
     let resp = app
-        .oneshot(get(&format!("/api/v1/terminal-sessions/{session_id}")))
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session_id}"),
+            &cookie,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6351,7 +6717,7 @@ fn assert_audit_payload_redacted(payload: &Value, kind: AuditEventKind) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn create_server_profile_writes_one_audit_event(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let identity = PgSshIdentityRepository::new(pool.clone())
         .create(CreateSshIdentity {
             owner_id: user_id,
@@ -6372,6 +6738,7 @@ async fn create_server_profile_writes_one_audit_event(pool: PgPool) {
                 "hostname": "audit-create.example.com",
                 "default_username": "deploy",
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6390,6 +6757,7 @@ async fn create_server_profile_writes_one_audit_event(pool: PgPool) {
                 "ssh_identity_id": identity.id,
                 "tags": ["audit"],
             }),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6424,7 +6792,7 @@ async fn create_server_profile_writes_one_audit_event(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn disable_server_profile_writes_one_audit_event_only_on_transition(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -6440,6 +6808,7 @@ async fn disable_server_profile_writes_one_audit_event_only_on_transition(pool: 
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6450,6 +6819,7 @@ async fn disable_server_profile_writes_one_audit_event_only_on_transition(pool: 
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6484,7 +6854,7 @@ async fn disable_server_profile_writes_one_audit_event_only_on_transition(pool: 
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn enable_server_profile_writes_one_audit_event_only_on_transition(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let profile_id = make_owned_profile(
         &pool,
         user_id,
@@ -6500,6 +6870,7 @@ async fn enable_server_profile_writes_one_audit_event_only_on_transition(pool: P
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6510,6 +6881,7 @@ async fn enable_server_profile_writes_one_audit_event_only_on_transition(pool: P
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6520,6 +6892,7 @@ async fn enable_server_profile_writes_one_audit_event_only_on_transition(pool: P
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{profile_id}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6554,13 +6927,14 @@ async fn enable_server_profile_writes_one_audit_event_only_on_transition(pool: P
 async fn no_audit_events_for_owner_scoped_404_disable(pool: PgPool) {
     // A 404 (foreign-owned or missing id) MUST NOT leak an audit row.
     // Otherwise the audit log would expose cross-user existence by id.
-    let (app, _user_id) = setup(pool.clone()).await;
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
     let bogus = uuid::Uuid::new_v4();
 
     let resp = app
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/disable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6591,13 +6965,14 @@ async fn no_audit_events_for_owner_scoped_404_disable(pool: PgPool) {
 /// must satisfy it, not just disable.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn no_audit_events_for_owner_scoped_404_enable(pool: PgPool) {
-    let (app, _user_id) = setup(pool.clone()).await;
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
     let bogus = uuid::Uuid::new_v4();
 
     let resp = app
         .oneshot(json_post(
             &format!("/api/v1/server-profiles/{bogus}/enable"),
             json!({}),
+            &cookie,
         ))
         .await
         .unwrap();
@@ -6634,7 +7009,7 @@ async fn no_audit_events_for_owner_scoped_404_enable(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn audit_events_recent_returns_current_user_lifecycle_events(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     // Create + disable a profile so we have two lifecycle audit rows
     // for the current user.
     let profile_id = make_owned_profile(
@@ -6667,7 +7042,7 @@ async fn audit_events_recent_returns_current_user_lifecycle_events(pool: PgPool)
         .unwrap();
 
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent"))
+        .oneshot(get("/api/v1/audit-events/recent", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6701,8 +7076,9 @@ async fn audit_events_recent_returns_current_user_lifecycle_events(pool: PgPool)
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
-    // Set up a router whose dev_user is `caller`. Insert an audit row
-    // for `other` directly. The feed for `caller` must NOT see it.
+    // Set up a router whose authenticated caller is `caller`. Insert an
+    // audit row for `other` directly. The feed for `caller` must NOT
+    // see it.
     let caller = create_user(&pool, "caller").await;
     let other = create_user(&pool, "other").await;
 
@@ -6710,6 +7086,7 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
     let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, caller).await;
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -6717,7 +7094,7 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
         auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
-        dev_user_id: Some(caller),
+        dev_user_id: None,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
     };
@@ -6748,7 +7125,7 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
         .unwrap();
 
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent"))
+        .oneshot(get("/api/v1/audit-events/recent", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6765,7 +7142,7 @@ async fn audit_events_recent_clamps_limit(pool: PgPool) {
     // Insert 12 lifecycle events for the current user, then ask for
     // limit=5: the response MUST contain at most 5. A limit much larger
     // than `MAX_LIMIT` (10000) clamps silently to 100.
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let audit = PgAuditEventRepository::new(pool.clone());
     for i in 0..12 {
         audit
@@ -6784,7 +7161,7 @@ async fn audit_events_recent_clamps_limit(pool: PgPool) {
 
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/audit-events/recent?limit=5"))
+        .oneshot(get("/api/v1/audit-events/recent?limit=5", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6794,7 +7171,7 @@ async fn audit_events_recent_clamps_limit(pool: PgPool) {
 
     // Out-of-range limit is silently clamped to MAX_LIMIT.
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent?limit=10000"))
+        .oneshot(get("/api/v1/audit-events/recent?limit=10000", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6805,9 +7182,9 @@ async fn audit_events_recent_clamps_limit(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn audit_events_recent_empty_list_for_quiet_user(pool: PgPool) {
-    let (app, _user_id) = setup(pool.clone()).await;
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent"))
+        .oneshot(get("/api/v1/audit-events/recent", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6823,7 +7200,7 @@ async fn audit_events_recent_empty_list_for_quiet_user(pool: PgPool) {
 /// sanitizer drifts, the route still strips it" assertion.
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn audit_events_recent_redacts_secret_shaped_payload_fields(pool: PgPool) {
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let audit = PgAuditEventRepository::new(pool.clone());
     audit
         .create(CreateAuditEvent {
@@ -6851,7 +7228,7 @@ async fn audit_events_recent_redacts_secret_shaped_payload_fields(pool: PgPool) 
         .unwrap();
 
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent"))
+        .oneshot(get("/api/v1/audit-events/recent", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6870,7 +7247,7 @@ async fn audit_events_recent_unknown_kind_collapses_to_generic_summary(pool: PgP
     // A row whose kind doesn't have an explicit sanitizer (e.g.
     // `Other`) must surface as `summary.kind = "generic"` and MUST NOT
     // echo any of the row's payload fields.
-    let (app, user_id) = setup(pool.clone()).await;
+    let (app, user_id, cookie) = setup(pool.clone()).await;
     let audit = PgAuditEventRepository::new(pool.clone());
     audit
         .create(CreateAuditEvent {
@@ -6886,7 +7263,7 @@ async fn audit_events_recent_unknown_kind_collapses_to_generic_summary(pool: PgP
         .unwrap();
 
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent"))
+        .oneshot(get("/api/v1/audit-events/recent", &cookie))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -6901,10 +7278,10 @@ async fn audit_events_recent_unknown_kind_collapses_to_generic_summary(pool: PgP
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn audit_events_recent_unauthorized_when_dev_user_disabled(pool: PgPool) {
-    // When `dev_user_id = None` (and no real auth backend is wired
-    // yet), the DevUser extractor returns 401. The audit-events route
-    // MUST go through that gate.
+async fn audit_events_recent_unauthorized_without_session_cookie(pool: PgPool) {
+    // The audit-events route is auth-guarded. With no session cookie
+    // (and the dev-auth shim disabled) the AuthenticatedUser extractor
+    // short-circuits with 401 before any DB read.
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
     let __auth = test_auth(&db);
@@ -6923,7 +7300,7 @@ async fn audit_events_recent_unauthorized_when_dev_user_disabled(pool: PgPool) {
     let app = router(state);
 
     let resp = app
-        .oneshot(get("/api/v1/audit-events/recent"))
+        .oneshot(get_no_auth("/api/v1/audit-events/recent"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -7484,7 +7861,7 @@ async fn me_returns_user_for_valid_cookie(pool: PgPool) {
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn me_rejects_missing_cookie(pool: PgPool) {
     let (app, _user_id) = setup_with_first_user(pool.clone(), "missing@relayterm.local").await;
-    let resp = app.oneshot(get("/api/v1/auth/me")).await.unwrap();
+    let resp = app.oneshot(get_no_auth("/api/v1/auth/me")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -7789,7 +8166,7 @@ async fn me_does_not_require_origin(pool: PgPool) {
     // cookie it returns 401, not 403 — the auth check runs even with
     // no Origin header present.
     let (app, _user_id) = setup_with_first_user(pool.clone(), "noorigin@relayterm.local").await;
-    let resp = app.oneshot(get("/api/v1/auth/me")).await.unwrap();
+    let resp = app.oneshot(get_no_auth("/api/v1/auth/me")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -8011,15 +8388,4 @@ async fn me_response_does_not_leak_session_or_password_material(pool: PgPool) {
             "/me response must not contain field `{forbidden}`: {raw}",
         );
     }
-}
-
-#[sqlx::test(migrations = "../../apps/backend/migrations")]
-async fn dev_user_protected_routes_still_work_in_dev_mode(pool: PgPool) {
-    // The extractor migration is intentionally limited to /auth/me in
-    // this slice. `GET /api/v1/hosts` (DevUser-protected) MUST still
-    // return 200 with `dev_user_id = Some(...)` — proving the route
-    // migration has NOT happened yet and DevUser remains live.
-    let (app, _user_id) = setup(pool).await;
-    let resp = app.oneshot(get("/api/v1/hosts")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
 }

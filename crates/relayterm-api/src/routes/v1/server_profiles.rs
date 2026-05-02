@@ -6,7 +6,7 @@ use axum::{
 };
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::host::Host;
-use relayterm_core::ids::ServerProfileId;
+use relayterm_core::ids::{ServerProfileId, UserId};
 use relayterm_core::repository::{
     AuditEventRepository, CreateAuditEvent, CreateKnownHostEntry, HostRepository,
     KnownHostEntryRepository, ServerProfileRepository, SshIdentityRepository,
@@ -18,7 +18,7 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::AppState;
-use crate::dev_user::DevUser;
+use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::auth_check::{AuthCheckResponse, AuthCheckStatusWire};
 use crate::dto::preflight::{
     HostKeyPreflightResponse, HostKeyStatusWire, TrustHostKeyRequest, TrustHostKeyResponse,
@@ -40,29 +40,32 @@ pub(super) fn router() -> Router<AppState> {
 }
 
 async fn create(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Json(req): Json<CreateServerProfileRequest>,
 ) -> Result<(StatusCode, Json<ServerProfileResponse>), ApiError> {
-    let input = req.into_create(user)?;
+    let user_id = user.user_id();
+    let input = req.into_create(user_id)?;
 
     // Pre-flight checks so a missing reference returns a 404 the caller can
     // act on rather than the generic 500 a raw FK violation would yield.
-    // Both lookups are scoped to the dev user — referencing another user's
-    // host or identity is treated the same as "does not exist."
+    // Both lookups are scoped to the authenticated user — referencing
+    // another user's host or identity is treated the same as
+    // "does not exist."
     let host = state
         .db
         .hosts()
         .get(input.host_id)
         .await?
-        .filter(|h| h.owner_id == user.0)
+        .filter(|h| h.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: "host" })?;
     let identity = state
         .db
         .ssh_identities()
         .get(input.ssh_identity_id)
         .await?
-        .filter(|i| i.owner_id == user.0)
+        .filter(|i| i.owner_id == user_id)
         .ok_or(ApiError::NotFound {
             entity: "ssh_identity",
         })?;
@@ -81,16 +84,26 @@ async fn create(
     // mirrors the partial-success shape of `create_session` (see the
     // 2026-04-29 lesson in AGENTS.md). The orphan row is operator-visible
     // and can be reconciled, the audit gap cannot.
-    write_lifecycle_audit(&state, user, AuditEventKind::ServerProfileCreated, &profile).await?;
+    write_lifecycle_audit(
+        &state,
+        user_id,
+        AuditEventKind::ServerProfileCreated,
+        &profile,
+    )
+    .await?;
 
     Ok((StatusCode::CREATED, Json(profile.into())))
 }
 
 async fn list(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
 ) -> Result<Json<Vec<ServerProfileResponse>>, ApiError> {
-    let profiles = state.db.server_profiles().list_for_user(user.0).await?;
+    let profiles = state
+        .db
+        .server_profiles()
+        .list_for_user(user.user_id())
+        .await?;
     Ok(Json(
         profiles
             .into_iter()
@@ -100,8 +113,8 @@ async fn list(
 }
 
 async fn get_by_id(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<ServerProfileResponse>, ApiError> {
     let profile = state
@@ -109,7 +122,7 @@ async fn get_by_id(
         .server_profiles()
         .get(id)
         .await?
-        .filter(|p| p.owner_id == user.0)
+        .filter(|p| p.owner_id == user.user_id())
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok(Json(profile.into()))
 }
@@ -127,10 +140,12 @@ async fn get_by_id(
 /// unaffected — disable is a launch-time gate, not a runtime kill switch.
 /// See SPEC.md "Inventory lifecycle and destructive-action policy".
 async fn disable(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<ServerProfileResponse>, ApiError> {
+    let user_id = user.user_id();
     // Owner-scoped read first so the conflict / current-state check
     // collapses cross-user existence to 404 BEFORE the UPDATE runs.
     let current = state
@@ -138,7 +153,7 @@ async fn disable(
         .server_profiles()
         .get(id)
         .await?
-        .filter(|p| p.owner_id == user.0)
+        .filter(|p| p.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
 
     // Idempotency: if already disabled, return the existing row unchanged
@@ -165,7 +180,7 @@ async fn disable(
     let updated = state
         .db
         .server_profiles()
-        .set_disabled_at(id, user.0, Some(chrono::Utc::now()))
+        .set_disabled_at(id, user_id, Some(chrono::Utc::now()))
         .await?;
 
     // Audit only on the enabled -> disabled transition. The early-return
@@ -174,7 +189,7 @@ async fn disable(
     // Fail-closed: see `create` for the rationale.
     write_lifecycle_audit(
         &state,
-        user,
+        user_id,
         AuditEventKind::ServerProfileDisabled,
         &updated,
     )
@@ -190,16 +205,18 @@ async fn disable(
 /// row unchanged. Foreign-owned or missing ids collapse to the same 404
 /// as the rest of the route surface.
 async fn enable(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<ServerProfileResponse>, ApiError> {
+    let user_id = user.user_id();
     let current = state
         .db
         .server_profiles()
         .get(id)
         .await?
-        .filter(|p| p.owner_id == user.0)
+        .filter(|p| p.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
 
     if !current.is_disabled() {
@@ -209,12 +226,18 @@ async fn enable(
     let updated = state
         .db
         .server_profiles()
-        .set_disabled_at(id, user.0, None)
+        .set_disabled_at(id, user_id, None)
         .await?;
 
     // Audit only on the disabled -> enabled transition. Same fail-closed
     // policy as `create` / `disable`.
-    write_lifecycle_audit(&state, user, AuditEventKind::ServerProfileEnabled, &updated).await?;
+    write_lifecycle_audit(
+        &state,
+        user_id,
+        AuditEventKind::ServerProfileEnabled,
+        &updated,
+    )
+    .await?;
 
     Ok(Json(updated.into()))
 }
@@ -238,7 +261,7 @@ async fn enable(
 /// because they can't be reconstructed after the fact.
 async fn write_lifecycle_audit(
     state: &AppState,
-    actor: DevUser,
+    actor_id: UserId,
     kind: AuditEventKind,
     profile: &ServerProfile,
 ) -> Result<(), ApiError> {
@@ -253,7 +276,7 @@ async fn write_lifecycle_audit(
         .db
         .audit_events()
         .create(CreateAuditEvent {
-            actor_id: Some(actor.0),
+            actor_id: Some(actor_id),
             kind,
             payload,
             // Client IP / user-agent capture is deferred — see SPEC.md.
@@ -284,7 +307,7 @@ fn server_profile_disabled_conflict() -> ApiError {
 /// AGENTS.md (`API get_by_id ownership`).
 async fn resolve_owned_profile(
     state: &AppState,
-    user: DevUser,
+    user_id: UserId,
     profile_id: ServerProfileId,
 ) -> Result<(ServerProfile, Host, SshIdentity), ApiError> {
     let profile = state
@@ -292,21 +315,21 @@ async fn resolve_owned_profile(
         .server_profiles()
         .get(profile_id)
         .await?
-        .filter(|p| p.owner_id == user.0)
+        .filter(|p| p.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     let host = state
         .db
         .hosts()
         .get(profile.host_id)
         .await?
-        .filter(|h| h.owner_id == user.0)
+        .filter(|h| h.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     let identity = state
         .db
         .ssh_identities()
         .get(profile.ssh_identity_id)
         .await?
-        .filter(|i| i.owner_id == user.0)
+        .filter(|i| i.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok((profile, host, identity))
 }
@@ -333,11 +356,12 @@ fn decrypt_identity(
 /// [`HostKeyPreflightResponse`] for what this attests to and what it
 /// deliberately does NOT.
 async fn host_key_preflight(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<HostKeyPreflightResponse>, ApiError> {
-    let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    let (profile, host, identity) = resolve_owned_profile(&state, user.user_id(), id).await?;
     // Disabled profiles cannot be probed. Re-enabling is the documented
     // path back to a live setup surface — keeping preflight refuse-only
     // for now matches the launch / trust / auth-check guards and keeps
@@ -381,8 +405,9 @@ async fn host_key_preflight(
 }
 
 async fn trust_host_key(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<ServerProfileId>,
     Json(req): Json<TrustHostKeyRequest>,
 ) -> Result<Json<TrustHostKeyResponse>, ApiError> {
@@ -390,7 +415,7 @@ async fn trust_host_key(
     // garbage body shouldn't open a network connection.
     let expected = req.validated_expected_fingerprint()?.to_owned();
 
-    let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    let (profile, host, identity) = resolve_owned_profile(&state, user.user_id(), id).await?;
     // Disabled profiles cannot be trusted. The enable route is the
     // explicit return path; trust must not be a sneaky bypass.
     if profile.is_disabled() {
@@ -492,11 +517,12 @@ async fn trust_host_key(
 /// `host_key_changed` status WITHOUT attempting authentication, so no
 /// client signature is ever sent to an unverified peer.
 async fn auth_check(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<ServerProfileId>,
 ) -> Result<Json<AuthCheckResponse>, ApiError> {
-    let (profile, host, identity) = resolve_owned_profile(&state, user, id).await?;
+    let (profile, host, identity) = resolve_owned_profile(&state, user.user_id(), id).await?;
     // Disabled profiles cannot be auth-checked. Re-enable first.
     if profile.is_disabled() {
         return Err(server_profile_disabled_conflict());

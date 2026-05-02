@@ -1,11 +1,10 @@
 use chrono::{DateTime, Utc};
-use relayterm_core::ids::{HostId, ServerProfileId, SshIdentityId};
+use relayterm_core::ids::{HostId, ServerProfileId, SshIdentityId, UserId};
 use relayterm_core::repository::CreateServerProfile;
 use relayterm_core::server_profile::ServerProfile;
 use relayterm_core::validation::{validate_profile_name, validate_ssh_username, validate_tags};
 use serde::{Deserialize, Serialize};
 
-use crate::dev_user::DevUser;
 use crate::error::ApiError;
 
 #[derive(Debug, Deserialize)]
@@ -19,7 +18,7 @@ pub(crate) struct CreateServerProfileRequest {
 }
 
 impl CreateServerProfileRequest {
-    pub(crate) fn into_create(self, owner: DevUser) -> Result<CreateServerProfile, ApiError> {
+    pub(crate) fn into_create(self, owner_id: UserId) -> Result<CreateServerProfile, ApiError> {
         let name = validate_profile_name(&self.name)?;
         let username_override = self
             .username_override
@@ -29,7 +28,7 @@ impl CreateServerProfileRequest {
         let tag_refs: Vec<&str> = self.tags.iter().map(String::as_str).collect();
         let tags = validate_tags(&tag_refs)?;
         Ok(CreateServerProfile {
-            owner_id: owner.0,
+            owner_id,
             name,
             host_id: self.host_id,
             ssh_identity_id: self.ssh_identity_id,

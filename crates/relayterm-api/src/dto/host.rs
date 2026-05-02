@@ -1,13 +1,12 @@
 use chrono::{DateTime, Utc};
 use relayterm_core::host::Host;
-use relayterm_core::ids::HostId;
+use relayterm_core::ids::{HostId, UserId};
 use relayterm_core::repository::CreateHost;
 use relayterm_core::validation::{
     validate_host_display_name, validate_hostname, validate_ssh_port, validate_ssh_username,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::dev_user::DevUser;
 use crate::error::ApiError;
 
 /// Default SSH port applied when the request omits `port`.
@@ -24,13 +23,13 @@ pub(crate) struct CreateHostRequest {
 
 impl CreateHostRequest {
     /// Validate and convert into the repository-level input.
-    pub(crate) fn into_create(self, owner: DevUser) -> Result<CreateHost, ApiError> {
+    pub(crate) fn into_create(self, owner_id: UserId) -> Result<CreateHost, ApiError> {
         let display_name = validate_host_display_name(&self.display_name)?;
         let hostname = validate_hostname(&self.hostname)?;
         let port = validate_ssh_port(self.port.unwrap_or(DEFAULT_PORT))?;
         let default_username = validate_ssh_username(&self.default_username)?;
         Ok(CreateHost {
-            owner_id: owner.0,
+            owner_id,
             display_name,
             hostname,
             port,

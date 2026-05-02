@@ -15,7 +15,7 @@ use relayterm_core::ids::SshIdentityId;
 use relayterm_core::repository::{CreateSshIdentity, SshIdentityRepository};
 
 use crate::AppState;
-use crate::dev_user::DevUser;
+use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::ssh_identity::{CreateSshIdentityRequest, SshIdentityResponse};
 use crate::error::ApiError;
 
@@ -28,8 +28,9 @@ pub(super) fn router() -> Router<AppState> {
 }
 
 async fn create(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Json(req): Json<CreateSshIdentityRequest>,
 ) -> Result<(StatusCode, Json<SshIdentityResponse>), ApiError> {
     let validated = req.validate()?;
@@ -51,7 +52,7 @@ async fn create(
         .db
         .ssh_identities()
         .create(CreateSshIdentity {
-            owner_id: user.0,
+            owner_id: user.user_id(),
             name: validated.name,
             key_type: generated.key_type,
             public_key: generated.public_key_openssh,
@@ -64,10 +65,14 @@ async fn create(
 }
 
 async fn list(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
 ) -> Result<Json<Vec<SshIdentityResponse>>, ApiError> {
-    let identities = state.db.ssh_identities().list_for_user(user.0).await?;
+    let identities = state
+        .db
+        .ssh_identities()
+        .list_for_user(user.user_id())
+        .await?;
     Ok(Json(
         identities
             .into_iter()
@@ -77,8 +82,8 @@ async fn list(
 }
 
 async fn get_by_id(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<SshIdentityId>,
 ) -> Result<Json<SshIdentityResponse>, ApiError> {
     let identity = state
@@ -86,7 +91,7 @@ async fn get_by_id(
         .ssh_identities()
         .get(id)
         .await?
-        .filter(|i| i.owner_id == user.0)
+        .filter(|i| i.owner_id == user.user_id())
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok(Json(identity.into()))
 }

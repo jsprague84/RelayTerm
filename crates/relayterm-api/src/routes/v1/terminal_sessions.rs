@@ -7,13 +7,25 @@
 //! and on `STUB_PTY_NOT_IMPLEMENTED_MESSAGE` for the full contract.
 //!
 //! Ownership rules mirror the rest of the v1 API:
-//! - The caller's user is taken from the `DevUser` extractor.
+//! - The caller's user is taken from the `AuthenticatedUser` extractor
+//!   (cookie-backed; SPEC step 7 migrated this surface off `DevUser`).
 //! - `create` verifies the referenced server_profile, host, and identity
 //!   all belong to the caller; foreign-owned references collapse to the
 //!   same 404 the route would return for a missing resource.
 //! - `get_by_id`, `close`, the `list` filter, and the WebSocket attach
 //!   route all scope to the caller's user, so cross-user existence is
 //!   never leaked by id.
+//!
+//! ## CSRF
+//!
+//! State-changing browser-write routes (`create`, `close`) run the
+//! shared [`CsrfGuard`] extractor before any DB / auth / body work — a
+//! bad or missing `Origin` header is rejected with 403 before the
+//! request body is parsed. The WebSocket attach route is `GET` and
+//! therefore exempt; its auth check is the cookie-backed
+//! [`AuthenticatedUser`] extractor that runs before the upgrade
+//! handshake completes (so missing/invalid cookies surface as a clean
+//! HTTP 401, never an opened-then-closed socket).
 
 use axum::{
     Json, Router,
@@ -47,7 +59,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::AppState;
-use crate::dev_user::DevUser;
+use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::terminal_session::{
     CloseTerminalSessionResponse, CreateTerminalSessionRequest, CreateTerminalSessionResponse,
     TerminalSessionResponse,
@@ -92,10 +104,12 @@ pub(super) fn router() -> Router<AppState> {
 /// duration of the start call; the `Zeroizing` buffer wipes them on
 /// drop.
 async fn create(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Json(req): Json<CreateTerminalSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateTerminalSessionResponse>), ApiError> {
+    let user_id = user.user_id();
     // Resolve the (profile, host, identity) trio scoped to the caller.
     // Any miss — by id OR by ownership — collapses to a single 404 entity
     // ("terminal_session") so cross-user existence is never leaked.
@@ -104,7 +118,7 @@ async fn create(
         .server_profiles()
         .get(req.server_profile_id)
         .await?
-        .filter(|p| p.owner_id == user.0)
+        .filter(|p| p.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     // Disabled profiles refuse new launches. Existing live sessions
     // continue running — disable is a launch-time gate, not a runtime
@@ -121,14 +135,14 @@ async fn create(
         .hosts()
         .get(profile.host_id)
         .await?
-        .filter(|h| h.owner_id == user.0)
+        .filter(|h| h.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     let identity = state
         .db
         .ssh_identities()
         .get(profile.ssh_identity_id)
         .await?
-        .filter(|i| i.owner_id == user.0)
+        .filter(|i| i.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
 
     // Precondition: host key MUST already be pinned and trusted (and not
@@ -163,7 +177,7 @@ async fn create(
     let create_outcome = state
         .terminal_sessions
         .create_session(ManagerCreateRequest {
-            owner_id: user.0,
+            owner_id: user_id,
             server_profile_id: profile.id,
             cols: req.cols,
             rows: req.rows,
@@ -201,7 +215,7 @@ async fn create(
             let (api_err, category) = map_pty_start_error(&err);
             let _ = state
                 .terminal_sessions
-                .record_pty_start_failed(user.0, session_id, category)
+                .record_pty_start_failed(user_id, session_id, category)
                 .await;
             return Err(api_err);
         }
@@ -210,7 +224,7 @@ async fn create(
     // Bridge succeeded — promote the session to live.
     let session = state
         .terminal_sessions
-        .start_live_pty(user.0, session_id, started)
+        .start_live_pty(user_id, session_id, started)
         .await?;
 
     let body = CreateTerminalSessionResponse {
@@ -262,10 +276,14 @@ fn map_pty_start_error(err: &SshPtyError) -> (ApiError, &'static str) {
 }
 
 async fn list(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
 ) -> Result<Json<Vec<TerminalSessionResponse>>, ApiError> {
-    let sessions = state.db.terminal_sessions().list_for_user(user.0).await?;
+    let sessions = state
+        .db
+        .terminal_sessions()
+        .list_for_user(user.user_id())
+        .await?;
     Ok(Json(
         sessions
             .into_iter()
@@ -275,8 +293,8 @@ async fn list(
 }
 
 async fn get_by_id(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<TerminalSessionId>,
 ) -> Result<Json<TerminalSessionResponse>, ApiError> {
     let session = state
@@ -284,7 +302,7 @@ async fn get_by_id(
         .terminal_sessions()
         .get(id)
         .await?
-        .filter(|s| s.owner_id == user.0)
+        .filter(|s| s.owner_id == user.user_id())
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok(Json(session.into()))
 }
@@ -296,11 +314,15 @@ async fn get_by_id(
 /// foreign-owned ids surface as the same 404 the route would emit for a
 /// missing id.
 async fn close(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<TerminalSessionId>,
 ) -> Result<Json<CloseTerminalSessionResponse>, ApiError> {
-    let outcome = state.terminal_sessions.close_session(id, user.0).await?;
+    let outcome = state
+        .terminal_sessions
+        .close_session(id, user.user_id())
+        .await?;
     Ok(Json(CloseTerminalSessionResponse {
         session: outcome.session.into(),
         already_closed: outcome.already_closed,
@@ -321,12 +343,13 @@ async fn close(
 /// per-message handler comments in [`run_attached_socket`] for the
 /// exact behavior of each [`ClientMsg`] variant.
 async fn ws_attach(
+    user: AuthenticatedUser,
     State(state): State<AppState>,
-    user: DevUser,
     Path(id): Path<TerminalSessionId>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
+    let user_id = user.user_id();
     // Pre-upgrade ownership / lifecycle gate. We deliberately resolve the
     // session here (instead of inside `on_upgrade`) so a missing/foreign/
     // closed session produces an HTTP 404/409 response BEFORE the
@@ -337,7 +360,7 @@ async fn ws_attach(
         .terminal_sessions()
         .get(id)
         .await?
-        .filter(|s| s.owner_id == user.0)
+        .filter(|s| s.owner_id == user_id)
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     if session.status == TerminalSessionStatus::Closed {
         return Err(ApiError::Conflict {
@@ -362,7 +385,6 @@ async fn ws_attach(
         });
 
     let manager = state.terminal_sessions.clone();
-    let user_id = user.0;
     let session_id = session.id;
     Ok(ws.on_upgrade(move |socket| async move {
         run_attached_socket(socket, manager, user_id, session_id, client_info).await;
