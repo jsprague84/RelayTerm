@@ -614,6 +614,291 @@ the same MCP browser tools.
 7. `browser_console_messages level=error all=true`. As above, the
    favicon `404` is the only allowed error.
 
+### C. Auth flow smoke (browser, requires a live backend)
+
+This half exists because the SPA's auth surfaces (AuthGate, LoginView,
+BootstrapView, TopBar sign-out, Settings password panel, Settings session
+panel, Settings recent-activity panel, the protected app shell after
+login) do not render meaningfully without a live backend. The dev /
+production smokes above intentionally accept either a live backend OR an
+"error / empty" placeholder; this half assumes the backend is up AND
+configured (`docs/production-auth.md` § 2 envelope, OR a dev-mode boot
+with `RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN` set).
+
+The wire-side of these flows is covered in detail by
+`docs/auth-smoke.md` — this section verifies the SPA renders the right
+selectors at each gate transition, AND that the gate-flip logic works
+end-to-end. Run this only after the backend smoke has passed.
+
+Use a fresh browser profile (no prior cookies for the origin) so the
+AuthGate starts on `auth-loading` → `auth-login-screen` rather than
+straight into the production shell.
+
+1. **AuthGate loading splash.**
+   - `browser_navigate http://localhost:5173/` (dev) or the deployed
+     origin (production).
+   - Within the first frame the SPA mounts `AuthGate.svelte` and issues
+     `GET /api/v1/auth/me`. Race conditions matter here — capture both
+     the loading state AND the resolved gate state in a single snapshot:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         loadingPresent: has('[data-testid="auth-loading"]'),
+         loginPresent: has('[data-testid="auth-login-screen"]'),
+         shellPresent: has('[data-testid="app-shell-main"]'),
+         errorPresent: has('[data-testid="auth-error-screen"]'),
+       };
+     }
+     ```
+
+     Expected (with a live backend AND no cookie): exactly one of
+     `loadingPresent` / `loginPresent` is `true` — the loading splash is
+     short-lived and may have already resolved by the time the snapshot
+     runs. `errorPresent` is `false`. `shellPresent` is `false`.
+
+2. **First-time setup gate (only on a fresh database).**
+   - With `user_passwords` empty AND `auth.first_user_bootstrap_token`
+     configured, the login screen shows
+     `[data-testid="auth-login-bootstrap-link"]`. Click it.
+   - Assert `[data-testid="auth-bootstrap-screen"]` renders:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         bootstrapScreen: has('[data-testid="auth-bootstrap-screen"]'),
+         tokenField: has('[data-testid="auth-bootstrap-token"]'),
+         emailField: has('[data-testid="auth-bootstrap-email"]'),
+         displayNameField: has('[data-testid="auth-bootstrap-display-name"]'),
+         passwordField: has('[data-testid="auth-bootstrap-password"]'),
+         confirmField: has('[data-testid="auth-bootstrap-password-confirm"]'),
+         submit: has('[data-testid="auth-bootstrap-submit"]'),
+         backLink: has('[data-testid="auth-bootstrap-cancel"]'),
+       };
+     }
+     ```
+
+     Expected: every field `true`.
+   - Fill in the bootstrap form (test bootstrap token + a real email +
+     display name + a ≥ 12-char password, twice). Submit. Assert
+     `[data-testid="auth-bootstrap-success"]` renders. Bootstrap does
+     NOT auto-login; click `[data-testid="auth-bootstrap-back-to-login"]`
+     to return to the sign-in screen.
+   - **If the database already has a first user, skip this step.** The
+     bootstrap screen still renders if you click the link, but the
+     submit returns `409 already_bootstrapped` and
+     `[data-testid="auth-bootstrap-error"]` carries the safe-formatter
+     copy. That is the documented contract.
+
+3. **Login form happy path.**
+   - From the sign-in screen, fill the email + password fields:
+
+     ```text
+     browser_fill_form
+       [data-testid="auth-login-email"] = operator@example.com
+       [data-testid="auth-login-password"] = <password>
+     browser_click [data-testid="auth-login-submit"]
+     ```
+
+   - On success the gate flips to the production shell:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       const userLabel = document
+         .querySelector('[data-testid="auth-current-user"]')
+         ?.textContent?.trim();
+       return {
+         shellPresent: has('[data-testid="app-shell-main"]'),
+         loginGone: !has('[data-testid="auth-login-screen"]'),
+         signOutPresent: has('[data-testid="auth-sign-out"]'),
+         currentUserLabel: userLabel ?? null,
+       };
+     }
+     ```
+
+     Expected: `shellPresent`, `loginGone`, `signOutPresent` all `true`;
+     `currentUserLabel` matches the operator's display name.
+
+4. **Login form failure path.**
+   - Sign out (step 8 below, or use a fresh browser profile) and try a
+     deliberately wrong password.
+   - Assert `[data-testid="auth-login-error"]` renders the safe-formatter
+     copy. The text MUST be a stable function of the failure category —
+     it must NOT echo the wire `message`, the offered email, or any
+     transport detail. The login heading
+     (`[data-testid="auth-login-heading"]`) does NOT change to reveal
+     whether the email is known.
+   - The form fields are left populated so the operator can correct the
+     entry. The password field is NOT auto-cleared on failure (that is
+     the documented UX).
+
+5. **Reload preserves session.**
+   - After a successful sign-in (step 3), reload the page.
+   - The AuthGate flashes `auth-loading` again, issues `GET /auth/me`,
+     and resolves directly to the production shell — no password prompt.
+
+6. **Settings password panel.**
+   - `browser_click [data-testid="nav-settings"]`.
+   - Confirm the panel renders with all three password fields and the
+     submit button:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         panel: has('[data-testid="settings-password-panel"]'),
+         current: has('[data-testid="settings-password-current"]'),
+         newField: has('[data-testid="settings-password-new"]'),
+         confirm: has('[data-testid="settings-password-confirm"]'),
+         submit: has('[data-testid="settings-password-submit"]'),
+       };
+     }
+     ```
+
+     Expected: every field `true`.
+   - Fill in current + new + confirmation (≥ 12 chars; new ≠ current)
+     and submit.
+   - On success, `[data-testid="settings-password-status-success"]`
+     renders the safe-formatter string (e.g. `Password updated. N other
+     sessions were signed out.`). **Every password field is wiped** —
+     verify by reading the input values via `browser_evaluate`:
+
+     ```js
+     () => {
+       const get = (sel) => document.querySelector(sel)?.value ?? null;
+       return {
+         current: get('[data-testid="settings-password-current"]'),
+         newField: get('[data-testid="settings-password-new"]'),
+         confirm: get('[data-testid="settings-password-confirm"]'),
+       };
+     }
+     ```
+
+     Expected: every field is `""`.
+   - On failure (wrong current), `[data-testid="settings-password-status-failure"]`
+     renders the safe-formatter copy and the password fields are wiped
+     too — the panel does not preserve the offered current password.
+   - The current cookie stays valid: `[data-testid="auth-current-user"]`
+     in the top bar still shows the operator's display name; reloading
+     the page does not bounce to the login screen.
+
+7. **Settings session-management panel.**
+   - With Settings still selected, scroll to
+     `[data-testid="settings-auth-sessions"]`.
+   - Confirm the panel renders the row list and that the current row
+     carries the right markers:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       const rows = Array.from(
+         document.querySelectorAll('[data-testid="settings-auth-sessions-row"]'),
+       );
+       const currentRow = rows.find(
+         (r) => r.dataset.current === "true",
+       );
+       return {
+         panel: has('[data-testid="settings-auth-sessions"]'),
+         refresh: has('[data-testid="settings-auth-sessions-refresh"]'),
+         futureNote: has('[data-testid="settings-auth-sessions-future-note"]'),
+         rowCount: rows.length,
+         currentRowStatus: currentRow?.dataset.status ?? null,
+         currentRowHasBadge: !!currentRow?.querySelector(
+           '[data-testid="settings-auth-sessions-current-badge"]',
+         ),
+         currentRowRevokeButton: !!currentRow?.querySelector(
+           '[data-testid="settings-auth-sessions-revoke-current"]',
+         ),
+       };
+     }
+     ```
+
+     Expected: `panel`, `refresh`, `futureNote`,
+     `currentRowHasBadge`, `currentRowRevokeButton` all `true`.
+     `rowCount >= 1`. `currentRowStatus === "active"`.
+   - Optional (only if there is more than one active session): click a
+     non-current row's `[data-testid="settings-auth-sessions-revoke"]`
+     button, confirm the dialog, and assert
+     `[data-testid="settings-auth-sessions-success"]` renders. Confirm
+     the row's `data-status` flips to `revoked` after the next refresh.
+   - DO NOT click `[data-testid="settings-auth-sessions-revoke-all"]`
+     unless you want to invalidate every other session for the
+     operator — the action is real.
+   - Hard rule: the panel must NOT display any of the following — cookie
+     token, token hash, `remote_addr`, `user_agent`, device-name. The
+     `data-testid="settings-auth-sessions-future-note"` line is the
+     honest disclaimer that pins this contract.
+
+8. **Recent-activity panel (current-user audit feed).**
+   - Still on the Settings view, scroll to
+     `[data-testid="settings-recent-activity"]`.
+   - Confirm the panel renders the list state (assuming the smoke has
+     been generating events: `first_user_created`, `login_succeeded`,
+     `password_changed`, `session_revoked`, …):
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       const rows = Array.from(
+         document.querySelectorAll('[data-testid="settings-recent-activity-row"]'),
+       );
+       return {
+         panel: has('[data-testid="settings-recent-activity"]'),
+         refresh: has('[data-testid="settings-recent-activity-refresh"]'),
+         rowCount: rows.length,
+         kinds: rows.map((r) => r.dataset.kind),
+       };
+     }
+     ```
+
+     Expected: `panel`, `refresh` both `true`. `rowCount >= 1`.
+     `kinds` contains a public-taxonomy label per row (`login_succeeded`,
+     `password_changed`, etc.) — the data-attribute is a STABLE wire
+     enum, not free-form text.
+   - The panel renders empty / error / loading states equivalently — see
+     the Settings dev smoke in §A step 5a. This step assumes the loaded
+     state because the smoke has been generating events.
+   - Hard rule: NO row's text contains the cookie token, token hash,
+     plaintext / hashed password, bootstrap token, raw DB error text,
+     terminal I/O, or peer banner. NULL-actor rows (failed-login probes)
+     are filtered out by the route — they do NOT appear here.
+   - Optional: navigate to the Dashboard via
+     `[data-testid="nav-dashboard"]` and confirm the parallel surface
+     (`[data-testid="dashboard-recent-activity"]`,
+     `[data-testid="dashboard-recent-activity-row"]`) renders the same
+     event taxonomy capped at 5 rows.
+
+9. **TopBar sign-out.**
+   - From any view, click `[data-testid="auth-sign-out"]`.
+   - The SPA POSTs `/api/v1/auth/logout`, drops the local active-launch
+     state, and flips the gate back to `auth-login-screen` regardless of
+     the wire outcome (a transport failure during sign-out still flips
+     the gate locally — the server-side cleanup happens on the next
+     login).
+   - Assert:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         loginPresent: has('[data-testid="auth-login-screen"]'),
+         shellGone: !has('[data-testid="app-shell-main"]'),
+         currentUserGone: !has('[data-testid="auth-current-user"]'),
+       };
+     }
+     ```
+
+     Expected: every field `true`.
+   - Reloading the page does not bounce back into the shell — the cookie
+     is cleared.
+
+10. **Console errors.** As with sections A and B,
+    `browser_console_messages level=error all=true` should report the
+    favicon `404` only.
+
 ## What this smoke does NOT cover
 
 - A real SSH end-to-end browser test (no PTY bytes flow; no backend is

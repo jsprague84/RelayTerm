@@ -256,6 +256,7 @@ Production auth is the floor, not the ceiling. The deliberate v1 cuts:
 
   **Deferred to follow-up slices:** admin / cross-user session view (this surface is current-user only by design); `remote_addr` / `user_agent` capture and device naming (the columns aren't populated yet — adding them with the listing surface in place is strictly additive); and password-reset / passkey flows.
 - **No admin / RBAC model.** RelayTerm is single-user / self-hosted in v1; there is no concept of an admin user, an operator role, or per-user permissions. The first user owns everything.
+- **No post-auth credential-abuse audit / throttling.** A holder of a valid session cookie can spend `change-password` Argon2id verifies without a counter — a wrong-current-password attempt collapses to a static `401`, leaves the password row untouched, revokes nothing, and writes NO audit row. The login throttler is keyed at the unauthenticated login route only; an attacker holding a valid cookie (XSS, leaked cookie, physical access) can probe the verify path freely. The trade-off is intentional for v1: the `password_changed` audit kind is scoped to real rotations, and a separate "post-auth credential abuse" kind + a per-session attempt counter is its own slice. If your deployment treats cookie capture as in-scope, sit behind a reverse-proxy WAF that can rate-limit the route by IP independently of the in-app throttle.
 
 What this means operationally:
 
@@ -265,6 +266,10 @@ What this means operationally:
 ---
 
 ## 9. Verifying a deploy
+
+The expanded operator-side smoke procedure — bootstrap, login, `/me`, protected route access, password change, session management, logout, every negative case (missing / bad `Origin`, missing cookie, throttle trip, bootstrap-after-first-user, bootstrap-disabled), and audit-row verification — lives in [`docs/auth-smoke.md`](./auth-smoke.md). Use it for fresh deploys and release smokes; it is the deployment-time companion to this configuration guide.
+
+The short checklist below is the minimum acceptance criterion. If anything fails, cross-reference §7 above before continuing to the smoke guide.
 
 After standing up production auth, verify:
 
@@ -285,6 +290,7 @@ If any step fails, cross-reference §7 (startup failure modes) and the relevant 
 ## See also
 
 - `SPEC.md` → "Production authentication architecture" — normative spec.
+- [`docs/auth-smoke.md`](./auth-smoke.md) — operator-side end-to-end smoke procedure (bootstrap, login, password change, session management, logout, negative cases, audit verification).
 - `AGENTS.md` → "Decision tables" rows on `AuthenticatedUser`, `CsrfGuard`, and `SessionToken` — load-bearing rules for any future auth slice.
 - `apps/backend/src/config.rs` — the validator and the redaction posture.
 - `crates/relayterm-api/src/auth/` — extractors, cookie helper, CSRF guard.
