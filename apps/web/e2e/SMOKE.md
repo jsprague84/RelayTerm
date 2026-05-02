@@ -731,9 +731,12 @@ straight into the production shell.
      transport detail. The login heading
      (`[data-testid="auth-login-heading"]`) does NOT change to reveal
      whether the email is known.
-   - The form fields are left populated so the operator can correct the
-     entry. The password field is NOT auto-cleared on failure (that is
-     the documented UX).
+   - The email field is left populated so the operator can correct the
+     entry. The password field IS auto-cleared on failure so a retry
+     starts from a fresh field — the LoginView wipes `password` after
+     `loginApi` returns a non-`ok` result. Confirm with
+     `browser_evaluate` that the `[data-testid="auth-login-password"]`
+     input value is `""`.
 
 5. **Reload preserves session.**
    - After a successful sign-in (step 3), reload the page.

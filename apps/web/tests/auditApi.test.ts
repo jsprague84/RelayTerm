@@ -198,6 +198,18 @@ describe("describeAuditEventKind", () => {
     );
   });
 
+  it("labels current-user auth lifecycle kinds", () => {
+    expect(describeAuditEventKind("first_user_created")).toBe(
+      "First user created",
+    );
+    expect(describeAuditEventKind("session_revoked")).toBe(
+      "Browser session revoked",
+    );
+    expect(describeAuditEventKind("sessions_revoked")).toBe(
+      "Other browser sessions revoked",
+    );
+  });
+
   it("falls through to a generic label for unknown kinds", () => {
     expect(describeAuditEventKind("future_kind")).toBe("Audit event");
     expect(describeAuditEventKind("other")).toBe("Audit event");

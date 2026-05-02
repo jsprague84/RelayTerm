@@ -21,8 +21,13 @@ If anything below disagrees with the code, the code wins. File a doc fix.
   Caddy, nginx, Cloudflare, …). The smoke commands assume `https://` —
   the cookie carries the `Secure` flag and browsers refuse to send it
   over plain HTTP.
-- Postgres reachable and migrations applied (`cargo sqlx migrate run` /
-  the backend's startup migration runs both work).
+- Postgres reachable and migrations applied. The backend does NOT
+  auto-run sqlx migrations on startup — apply them explicitly with
+  `cargo sqlx migrate run` from `apps/backend/` (or from a CI step)
+  before the first boot. A backend started against a database with no
+  schema will appear healthy on `GET /healthz` and then return
+  `500 internal_error` on the first `POST /api/v1/auth/bootstrap`
+  because the `user_passwords` table does not exist yet.
 - The configuration envelope from `docs/production-auth.md` § 2 is
   satisfied. The backend MUST have started cleanly — check the log for
   `auth_mode = production` and no `bail!` lines.
@@ -697,7 +702,7 @@ After the smoke is complete:
   if they leaked into history (`history -c` for bash; `history clear`
   for fish).
 - Confirm `auth.first_user_bootstrap_token` is unset on the running
-  backend (`docs/production-auth.md` § 4 step 7).
+  backend (`docs/production-auth.md` § 4 step 8).
 
 The deployment is now in its steady-state production posture.
 

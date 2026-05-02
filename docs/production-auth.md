@@ -98,12 +98,13 @@ There is no "default user". On a fresh database the only path to mint the first 
 The order of operations:
 
 1. Configure the production env (signing key, allowed origins, `cookie_secure = true`, bootstrap token, vault master key, database URL, …).
-2. Start the backend. It connects to Postgres, runs migrations, and listens.
-3. Call `POST /api/v1/auth/bootstrap` exactly once with the bootstrap token, your operator email, display name, and password. The response is `201 Created` with the user record. **Bootstrap does not log you in.**
-4. Call `POST /api/v1/auth/login` with your email + password. The response is `200 OK` with the user record and a `Set-Cookie: relayterm_session=…; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure` header.
-5. Call `GET /api/v1/auth/me` with the cookie to confirm.
-6. Call `POST /api/v1/auth/logout` to revoke the session and clear the cookie.
-7. **Unset `RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN` and restart the backend.** Subsequent bootstrap calls return `409 already_bootstrapped` whether the token is set or not, but unsetting it is good hygiene.
+2. Apply schema migrations (`cargo sqlx migrate run` from `apps/backend/`, or your CI equivalent). The backend does NOT auto-run sqlx migrations on startup — a missing schema will surface as `500 internal_error` on the first `/auth/bootstrap` call.
+3. Start the backend. It connects to Postgres and listens.
+4. Call `POST /api/v1/auth/bootstrap` exactly once with the bootstrap token, your operator email, display name, and password. The response is `201 Created` with the user record. **Bootstrap does not log you in.**
+5. Call `POST /api/v1/auth/login` with your email + password. The response is `200 OK` with the user record and a `Set-Cookie: relayterm_session=…; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure` header.
+6. Call `GET /api/v1/auth/me` with the cookie to confirm.
+7. Call `POST /api/v1/auth/logout` to revoke the session and clear the cookie.
+8. **Unset `RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN` and restart the backend.** Subsequent bootstrap calls return `409 already_bootstrapped` whether the token is set or not, but unsetting it is good hygiene.
 
 `curl` smoke commands. Replace `https://relay.example.com` with your own origin, and replace the placeholders with real values. Every POST sends an `Origin` header because the CSRF guard requires one — this is what your browser does automatically; `curl` does not, so you must add it.
 
