@@ -27,13 +27,17 @@ use relayterm_core::ids::UserSessionId;
 use relayterm_core::repository::{
     AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry,
     CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
-    CreateTerminalSession, CreateTerminalSessionAttachment, CreateUser, CreateUserSession,
-    HostRepository, KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
+    CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, CreateTerminalSession,
+    CreateTerminalSessionAttachment, CreateUser, CreateUserSession, HostRepository,
+    KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
     ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
-    TerminalSessionRepository, UserRepository, UserSessionRepository,
+    TerminalRecordingRepository, TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
+use relayterm_core::terminal_recording::{
+    TerminalRecordingCompression, TerminalRecordingMarkerKind, TerminalRecordingPayloadEncryption,
+};
 use relayterm_core::terminal_session::TerminalSessionStatus;
 use relayterm_core::validation::{
     validate_host_display_name, validate_hostname, validate_profile_name, validate_ssh_port,
@@ -42,8 +46,8 @@ use relayterm_core::validation::{
 use relayterm_db::{
     PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
     PgPasswordCredentialRepository, PgServerProfileRepository, PgSessionEventRepository,
-    PgSshIdentityRepository, PgTerminalSessionRepository, PgUserRepository,
-    PgUserSessionRepository,
+    PgSshIdentityRepository, PgTerminalRecordingRepository, PgTerminalSessionRepository,
+    PgUserRepository, PgUserSessionRepository,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -117,6 +121,23 @@ async fn make_profile(
         })
         .await
         .expect("create server_profile")
+}
+
+async fn make_terminal_session(
+    pool: &PgPool,
+    owner: &relayterm_core::user::User,
+    profile: &relayterm_core::server_profile::ServerProfile,
+) -> relayterm_core::terminal_session::TerminalSession {
+    PgTerminalSessionRepository::new(pool.clone())
+        .create(CreateTerminalSession {
+            owner_id: owner.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect("create terminal_session")
 }
 
 // ----------------------------------------------------------------------
@@ -1703,4 +1724,541 @@ async fn user_session_redaction_sentinels(pool: PgPool) {
         !input_dbg.contains("187, 187, 187"),
         "CreateUserSession Debug leaked token_hash bytes: {input_dbg}"
     );
+}
+
+// ----------------------------------------------------------------------
+// TerminalRecording — chunks
+// ----------------------------------------------------------------------
+
+const RECORDING_CHUNK_PAYLOAD_SENTINEL: &[u8] = b"PTY-OUTPUT-SENTINEL-31C";
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_round_trip(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let payload = b"\x1b[2J\x1b[H$ ls\r\nfoo bar baz\r\n".to_vec();
+    let byte_len = payload.len() as i32;
+    let created = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 4,
+            byte_len,
+            payload: payload.clone(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect("append chunk");
+
+    assert_eq!(created.terminal_session_id, session.id);
+    assert_eq!(created.seq_start, 1);
+    assert_eq!(created.seq_end, 4);
+    assert_eq!(created.byte_len, byte_len);
+    // Bytes round-trip exactly through the domain field — repository is
+    // the only path that surfaces them.
+    assert_eq!(created.payload, payload);
+    assert_eq!(created.encryption, TerminalRecordingPayloadEncryption::None,);
+    assert_eq!(created.compression, TerminalRecordingCompression::None);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunks_list_ordered_by_seq_start(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    // Insert in non-monotonic order; list MUST come back ordered.
+    for &(seq_start, seq_end) in &[(50_i64, 60_i64), (1, 10), (200, 210), (100, 110)] {
+        repo.append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start,
+            seq_end,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let listed = repo.list_chunks(session.id, 1, 100).await.unwrap();
+    assert_eq!(listed.len(), 4);
+    let starts: Vec<i64> = listed.iter().map(|c| c.seq_start).collect();
+    assert_eq!(starts, vec![1, 50, 100, 200]);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunks_list_filters_from_seq(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    for start in [1_i64, 100, 200, 300] {
+        repo.append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: start,
+            seq_end: start + 9,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    }
+
+    // from_seq=150 should exclude (1, 100) and include (200, 300).
+    let listed = repo.list_chunks(session.id, 150, 100).await.unwrap();
+    let starts: Vec<i64> = listed.iter().map(|c| c.seq_start).collect();
+    assert_eq!(starts, vec![200, 300]);
+
+    // limit=1 still returns the smallest matching.
+    let limited = repo.list_chunks(session.id, 150, 1).await.unwrap();
+    let starts_lim: Vec<i64> = limited.iter().map(|c| c.seq_start).collect();
+    assert_eq!(starts_lim, vec![200]);
+
+    // Unknown session id returns empty, never errors.
+    let bogus = relayterm_core::ids::TerminalSessionId::new();
+    let empty = repo.list_chunks(bogus, 1, 100).await.unwrap();
+    assert!(empty.is_empty());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_duplicate_seq_start_is_conflict(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    repo.append_chunk(CreateTerminalRecordingChunk {
+        terminal_session_id: session.id,
+        seq_start: 5,
+        seq_end: 10,
+        byte_len: 4,
+        payload: b"data".to_vec(),
+        encryption: TerminalRecordingPayloadEncryption::None,
+        compression: TerminalRecordingCompression::None,
+    })
+    .await
+    .unwrap();
+
+    let err = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 5,
+            seq_end: 12,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect_err("duplicate seq_start must conflict");
+    match err {
+        RepositoryError::Conflict { entity, constraint } => {
+            assert_eq!(entity, "terminal_recording_chunk");
+            assert!(
+                constraint.contains("session_seq_start"),
+                "unexpected constraint name: {constraint}"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_invalid_seq_start_rejected(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let err = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 0,
+            seq_end: 0,
+            byte_len: RECORDING_CHUNK_PAYLOAD_SENTINEL.len() as i32,
+            payload: RECORDING_CHUNK_PAYLOAD_SENTINEL.to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect_err("seq_start=0 must violate CHECK");
+    assert!(matches!(err, RepositoryError::Database(_)));
+    let err_str = err.to_string();
+    assert!(
+        !err_str.contains("PTY-OUTPUT-SENTINEL"),
+        "constraint error must not echo payload bytes: {err_str}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_byte_len_zero_rejected(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let err = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: 0,
+            payload: Vec::new(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect_err("byte_len=0 must violate CHECK");
+    assert!(matches!(err, RepositoryError::Database(_)));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_byte_len_payload_mismatch_rejected(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    // payload is 4 bytes but byte_len declares 5 — schema CHECK pins this.
+    let err = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: 5,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect_err("byte_len/payload mismatch must violate CHECK");
+    assert!(matches!(err, RepositoryError::Database(_)));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_unknown_session_fk_violation(pool: PgPool) {
+    let bogus = relayterm_core::ids::TerminalSessionId::new();
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let err = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: bogus,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: RECORDING_CHUNK_PAYLOAD_SENTINEL.len() as i32,
+            payload: RECORDING_CHUNK_PAYLOAD_SENTINEL.to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect_err("unknown session_id must FK-fail");
+    assert!(matches!(err, RepositoryError::Database(_)));
+    let err_str = err.to_string();
+    assert!(
+        !err_str.contains("PTY-OUTPUT-SENTINEL"),
+        "FK error must not echo payload bytes: {err_str}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunk_payload_not_in_error_or_debug(pool: PgPool) {
+    // The bytes are reachable ONLY via the parsed domain field. They must
+    // never appear in repository errors, in `Debug` formatting of the
+    // domain struct, or in `Debug` formatting of the input struct.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let payload = RECORDING_CHUNK_PAYLOAD_SENTINEL.to_vec();
+    let chunk = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: payload.len() as i32,
+            payload: payload.clone(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(chunk.payload, payload);
+
+    let dbg = format!("{chunk:?}");
+    assert!(
+        !dbg.contains("PTY-OUTPUT-SENTINEL-31C"),
+        "TerminalRecordingChunk Debug leaked payload sentinel: {dbg}",
+    );
+
+    // A failed insert (FK violation here, since the session_id is bogus)
+    // must NOT echo the bytes back through the error.
+    let bogus = relayterm_core::ids::TerminalSessionId::new();
+    let err = repo
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: bogus,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: payload.len() as i32,
+            payload: payload.clone(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .expect_err("FK violation must error");
+    let err_str = err.to_string();
+    let err_dbg = format!("{err:?}");
+    assert!(
+        !err_str.contains("PTY-OUTPUT-SENTINEL-31C"),
+        "RepositoryError Display leaked payload sentinel: {err_str}",
+    );
+    assert!(
+        !err_dbg.contains("PTY-OUTPUT-SENTINEL-31C"),
+        "RepositoryError Debug leaked payload sentinel: {err_dbg}",
+    );
+}
+
+// ----------------------------------------------------------------------
+// TerminalRecording — markers
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_marker_round_trip(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let created = repo
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Resized,
+            seq: 17,
+            payload: json!({ "cols": 132, "rows": 40 }),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(created.kind, TerminalRecordingMarkerKind::Resized);
+    assert_eq!(created.seq, 17);
+    assert_eq!(created.payload, json!({ "cols": 132, "rows": 40 }));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_marker_started_allows_seq_zero(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let started = repo
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Started,
+            seq: 0,
+            payload: json!({}),
+        })
+        .await
+        .expect("started must allow seq=0");
+    assert_eq!(started.kind, TerminalRecordingMarkerKind::Started);
+    assert_eq!(started.seq, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_marker_seq_zero_rejected_for_other_kinds(pool: PgPool) {
+    // The schema CHECK only allows seq=0 for the 'started' kind. Pin the
+    // rejection for every other kind in one test so a future migration
+    // that loosens the check surfaces here.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    for kind in [
+        TerminalRecordingMarkerKind::Attached,
+        TerminalRecordingMarkerKind::Detached,
+        TerminalRecordingMarkerKind::Reattached,
+        TerminalRecordingMarkerKind::Resized,
+        TerminalRecordingMarkerKind::Closed,
+        TerminalRecordingMarkerKind::ReplayGap,
+    ] {
+        let err = repo
+            .append_marker(CreateTerminalRecordingMarker {
+                terminal_session_id: session.id,
+                kind,
+                seq: 0,
+                payload: json!({}),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RepositoryError::Database(_)),
+            "expected Database error for {kind:?} at seq=0, got {err:?}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_marker_seq_zero_rejected_resized(pool: PgPool) {
+    // Focused expect_err on the single most-likely real-world misuse, in
+    // case the multi-kind variant above changes shape.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let err = repo
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Resized,
+            seq: 0,
+            payload: json!({ "cols": 80, "rows": 24 }),
+        })
+        .await
+        .expect_err("seq=0 must violate CHECK for Resized");
+    assert!(matches!(err, RepositoryError::Database(_)));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_markers_list_ordered_and_filtered(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    repo.append_marker(CreateTerminalRecordingMarker {
+        terminal_session_id: session.id,
+        kind: TerminalRecordingMarkerKind::Started,
+        seq: 0,
+        payload: json!({}),
+    })
+    .await
+    .unwrap();
+    for (kind, seq) in [
+        (TerminalRecordingMarkerKind::Attached, 1_i64),
+        (TerminalRecordingMarkerKind::Resized, 17),
+        (TerminalRecordingMarkerKind::Detached, 200),
+        (TerminalRecordingMarkerKind::Closed, 500),
+    ] {
+        repo.append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind,
+            seq,
+            payload: json!({}),
+        })
+        .await
+        .unwrap();
+    }
+
+    let listed = repo.list_markers(session.id, 0, 100).await.unwrap();
+    let seqs: Vec<i64> = listed.iter().map(|m| m.seq).collect();
+    assert_eq!(seqs, vec![0, 1, 17, 200, 500]);
+
+    let filtered = repo.list_markers(session.id, 18, 100).await.unwrap();
+    let seqs_f: Vec<i64> = filtered.iter().map(|m| m.seq).collect();
+    assert_eq!(seqs_f, vec![200, 500]);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_marker_unknown_session_fk_violation(pool: PgPool) {
+    let bogus = relayterm_core::ids::TerminalSessionId::new();
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let err = repo
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: bogus,
+            kind: TerminalRecordingMarkerKind::Started,
+            seq: 0,
+            payload: json!({}),
+        })
+        .await
+        .expect_err("unknown session_id must FK-fail");
+    assert!(matches!(err, RepositoryError::Database(_)));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_repository_is_session_scoped_only(pool: PgPool) {
+    // The repository surface is session-scoped, NOT owner-scoped: foreign
+    // ownership is entirely the route layer's job. This test pins that
+    // contract by verifying that two users' sessions are isolated by
+    // `terminal_session_id` alone, with no `owner_id` filter inside the
+    // repository.
+    let alice = make_user(&pool).await;
+    let bob = make_user(&pool).await;
+    let host_a = make_host(&pool, &alice).await;
+    let identity_a = make_identity(&pool, &alice).await;
+    let profile_a = make_profile(&pool, &alice, &host_a, &identity_a).await;
+    let host_b = make_host(&pool, &bob).await;
+    let identity_b = make_identity(&pool, &bob).await;
+    let profile_b = make_profile(&pool, &bob, &host_b, &identity_b).await;
+
+    let session_a = make_terminal_session(&pool, &alice, &profile_a).await;
+    let session_b = make_terminal_session(&pool, &bob, &profile_b).await;
+
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+    repo.append_chunk(CreateTerminalRecordingChunk {
+        terminal_session_id: session_a.id,
+        seq_start: 1,
+        seq_end: 1,
+        byte_len: 4,
+        payload: b"data".to_vec(),
+        encryption: TerminalRecordingPayloadEncryption::None,
+        compression: TerminalRecordingCompression::None,
+    })
+    .await
+    .unwrap();
+    repo.append_chunk(CreateTerminalRecordingChunk {
+        terminal_session_id: session_b.id,
+        seq_start: 1,
+        seq_end: 1,
+        byte_len: 4,
+        payload: b"data".to_vec(),
+        encryption: TerminalRecordingPayloadEncryption::None,
+        compression: TerminalRecordingCompression::None,
+    })
+    .await
+    .unwrap();
+
+    let alices = repo.list_chunks(session_a.id, 1, 100).await.unwrap();
+    let bobs = repo.list_chunks(session_b.id, 1, 100).await.unwrap();
+    assert_eq!(alices.len(), 1);
+    assert_eq!(bobs.len(), 1);
+    assert_eq!(alices[0].terminal_session_id, session_a.id);
+    assert_eq!(bobs[0].terminal_session_id, session_b.id);
 }

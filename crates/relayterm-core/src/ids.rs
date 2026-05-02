@@ -104,6 +104,14 @@ define_id!(
     /// is a separate 32-byte random secret hashed into `token_hash`.
     UserSessionId
 );
+define_id!(
+    /// Identifies a [`TerminalRecordingChunk`](crate::terminal_recording::TerminalRecordingChunk).
+    TerminalRecordingChunkId
+);
+define_id!(
+    /// Identifies a [`TerminalRecordingMarker`](crate::terminal_recording::TerminalRecordingMarker).
+    TerminalRecordingMarkerId
+);
 
 #[cfg(test)]
 mod tests {

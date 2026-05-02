@@ -25,6 +25,10 @@ use crate::password_credential::PasswordCredential;
 use crate::server_profile::ServerProfile;
 use crate::session_event::{SessionEvent, SessionEventKind};
 use crate::ssh_identity::{SshIdentity, SshKeyType};
+use crate::terminal_recording::{
+    TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
+    TerminalRecordingMarkerKind, TerminalRecordingPayloadEncryption,
+};
 use crate::terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 use crate::user::User;
 use crate::user_session::UserSession;
@@ -222,6 +226,59 @@ impl fmt::Debug for CreateUserSession {
             .field("expires_at", &self.expires_at)
             .finish()
     }
+}
+
+/// Repository input for appending one chunk of recorded PTY OUTPUT bytes.
+///
+/// `Debug` is implemented manually so [`Self::payload`] never leaks into
+/// tracing logs or error messages — the bytes are sensitive PTY output
+/// (see `crate::terminal_recording` module docs).
+///
+/// `seq_start`/`seq_end` are `i64` so the binding to Postgres `BIGINT` is
+/// trivial; the schema CHECKs (`seq_start >= 1`, `seq_end >= seq_start`,
+/// `byte_len > 0 AND byte_len <= 2 MiB`, `octet_length(payload) =
+/// byte_len`) are the load-bearing validations. `byte_len` is `i32` for
+/// the same reason `BYTEA` length stays an `INTEGER` column.
+#[derive(Clone)]
+pub struct CreateTerminalRecordingChunk {
+    pub terminal_session_id: TerminalSessionId,
+    pub seq_start: i64,
+    pub seq_end: i64,
+    pub byte_len: i32,
+    pub payload: Vec<u8>,
+    pub encryption: TerminalRecordingPayloadEncryption,
+    pub compression: TerminalRecordingCompression,
+}
+
+impl fmt::Debug for CreateTerminalRecordingChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateTerminalRecordingChunk")
+            .field("terminal_session_id", &self.terminal_session_id)
+            .field("seq_start", &self.seq_start)
+            .field("seq_end", &self.seq_end)
+            .field("byte_len", &self.byte_len)
+            .field(
+                "payload",
+                &format_args!("<redacted: {} bytes>", self.payload.len()),
+            )
+            .field("encryption", &self.encryption)
+            .field("compression", &self.compression)
+            .finish()
+    }
+}
+
+/// Repository input for appending one recording marker row.
+///
+/// `payload` is metadata-only by contract — see
+/// `crate::terminal_recording` module docs. The repository implementation
+/// does NOT inspect the JSON for sentinels; the writer above is
+/// responsible for building objects field-by-field.
+#[derive(Debug, Clone)]
+pub struct CreateTerminalRecordingMarker {
+    pub terminal_session_id: TerminalSessionId,
+    pub kind: TerminalRecordingMarkerKind,
+    pub seq: i64,
+    pub payload: JsonValue,
 }
 
 // ----------------------------------------------------------------------
@@ -562,4 +619,125 @@ pub trait UserSessionRepository: Send + Sync {
         at: DateTime<Utc>,
         reason: Option<&str>,
     ) -> Result<u64, RepositoryError>;
+}
+
+/// Durable terminal-recording persistence.
+///
+/// Methods are session-scoped, NOT owner-scoped. Owner-scoping happens at
+/// the API layer (an `AuthenticatedUser` route resolves the
+/// `terminal_sessions.owner_id` BEFORE calling any method here). This
+/// matches the existing pattern for `SessionEventRepository` /
+/// `TerminalSessionRepository::list_attachments` — the repository takes a
+/// session id, the route is responsible for proving the caller owns it.
+///
+/// Privacy contract:
+/// - Implementations MUST NOT echo chunk `payload` bytes back through any
+///   error path, log line, panic, or `Debug` impl.
+/// - Marker `payload` is metadata-only by contract; implementations do
+///   not inspect / sanitise it. Construction discipline lives at the
+///   writer layer.
+/// - `limit` is bounded by the caller. Implementations MAY clamp at a
+///   sane upper bound; this slice ships with a fixed 1024 ceiling
+///   enforced inside the Postgres impl so no caller can accidentally
+///   pull a whole session's worth of chunks in one query. Bound is
+///   defence-in-depth; the API layer adds its own pagination cap.
+#[async_trait]
+pub trait TerminalRecordingRepository: Send + Sync {
+    /// Insert one chunk row.
+    ///
+    /// Maps schema constraint failures into typed errors:
+    /// - duplicate `(terminal_session_id, seq_start)` →
+    ///   [`RepositoryError::Conflict`] with constraint
+    ///   `terminal_recording_chunks_session_seq_start_uq`.
+    /// - missing `terminal_sessions(id)` (FK violation) →
+    ///   [`RepositoryError::Database`] (no such session — the writer
+    ///   above is expected to ensure the row exists).
+    /// - any CHECK violation (seq, byte_len, payload-length, encryption,
+    ///   compression) → [`RepositoryError::Database`] tagged with the
+    ///   constraint name. The error MUST NOT echo `payload` bytes.
+    async fn append_chunk(
+        &self,
+        input: CreateTerminalRecordingChunk,
+    ) -> Result<TerminalRecordingChunk, RepositoryError>;
+
+    /// Insert one marker row. Constraint mapping mirrors
+    /// [`Self::append_chunk`].
+    async fn append_marker(
+        &self,
+        input: CreateTerminalRecordingMarker,
+    ) -> Result<TerminalRecordingMarker, RepositoryError>;
+
+    /// List chunks for a session ordered by `seq_start ASC`, starting at
+    /// `from_seq` (inclusive against `seq_start`) and capped at `limit`
+    /// rows. Returns an empty Vec for an unknown session id (a foreign
+    /// session is the route layer's concern).
+    ///
+    /// `limit` is clamped to the implementation's configured ceiling
+    /// (currently 1024).
+    async fn list_chunks(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        from_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<TerminalRecordingChunk>, RepositoryError>;
+
+    /// List markers for a session ordered by `(seq ASC, created_at ASC)`,
+    /// starting at `from_seq` (inclusive) and capped at `limit` rows.
+    /// Same clamping rules as [`Self::list_chunks`].
+    async fn list_markers(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        from_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<TerminalRecordingMarker>, RepositoryError>;
+}
+
+#[cfg(test)]
+mod recording_input_tests {
+    use super::*;
+    use crate::ids::TerminalSessionId;
+    use crate::terminal_recording::{
+        TerminalRecordingCompression, TerminalRecordingMarkerKind,
+        TerminalRecordingPayloadEncryption,
+    };
+
+    const SENTINEL: &[u8] = b"CREATE-CHUNK-SENTINEL-7E";
+
+    #[test]
+    fn create_chunk_input_redacts_payload_in_debug() {
+        let input = CreateTerminalRecordingChunk {
+            terminal_session_id: TerminalSessionId::new(),
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: SENTINEL.len() as i32,
+            payload: SENTINEL.to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        };
+        let dbg = format!("{input:?}");
+        assert!(
+            !dbg.contains("CREATE-CHUNK-SENTINEL-7E"),
+            "payload sentinel leaked into CreateTerminalRecordingChunk Debug: {dbg}",
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "Debug output should mention redaction: {dbg}",
+        );
+    }
+
+    #[test]
+    fn create_marker_input_debug_renders_metadata() {
+        // Markers are metadata-only by contract — Debug should faithfully
+        // reflect the JSON the caller supplied (no redaction needed).
+        let input = CreateTerminalRecordingMarker {
+            terminal_session_id: TerminalSessionId::new(),
+            kind: TerminalRecordingMarkerKind::Resized,
+            seq: 7,
+            payload: serde_json::json!({ "cols": 132, "rows": 40 }),
+        };
+        let dbg = format!("{input:?}");
+        assert!(dbg.contains("Resized"));
+        assert!(dbg.contains("132"));
+        assert!(dbg.contains("40"));
+    }
 }

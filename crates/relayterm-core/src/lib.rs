@@ -14,6 +14,7 @@ pub mod repository;
 pub mod server_profile;
 pub mod session_event;
 pub mod ssh_identity;
+pub mod terminal_recording;
 pub mod terminal_session;
 pub mod user;
 pub mod user_session;
@@ -23,21 +24,27 @@ pub use audit_event::{AuditEvent, AuditEventKind};
 pub use host::Host;
 pub use ids::{
     AuditEventId, HostId, KnownHostEntryId, ServerProfileId, SessionEventId, SshIdentityId,
-    TerminalSessionAttachmentId, TerminalSessionId, UserId, UserSessionId,
+    TerminalRecordingChunkId, TerminalRecordingMarkerId, TerminalSessionAttachmentId,
+    TerminalSessionId, UserId, UserSessionId,
 };
 pub use known_host::KnownHostEntry;
 pub use password_credential::PasswordCredential;
 pub use repository::{
     AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry,
     CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
-    CreateTerminalSession, CreateTerminalSessionAttachment, CreateUser, CreateUserSession,
-    HostRepository, KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
+    CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, CreateTerminalSession,
+    CreateTerminalSessionAttachment, CreateUser, CreateUserSession, HostRepository,
+    KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
     ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
-    TerminalSessionRepository, UserRepository, UserSessionRepository,
+    TerminalRecordingRepository, TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 pub use server_profile::ServerProfile;
 pub use session_event::{SessionEvent, SessionEventKind};
 pub use ssh_identity::{SshIdentity, SshKeyType};
+pub use terminal_recording::{
+    TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
+    TerminalRecordingMarkerKind, TerminalRecordingPayloadEncryption,
+};
 pub use terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 pub use user::User;
 pub use user_session::UserSession;

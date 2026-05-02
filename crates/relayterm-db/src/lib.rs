@@ -24,8 +24,8 @@ pub use error::map_sqlx_error;
 pub use repositories::{
     PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
     PgPasswordCredentialRepository, PgServerProfileRepository, PgSessionEventRepository,
-    PgSshIdentityRepository, PgTerminalSessionRepository, PgUserRepository,
-    PgUserSessionRepository,
+    PgSshIdentityRepository, PgTerminalRecordingRepository, PgTerminalSessionRepository,
+    PgUserRepository, PgUserSessionRepository,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -115,5 +115,10 @@ impl Db {
     #[must_use]
     pub fn user_sessions(&self) -> PgUserSessionRepository {
         PgUserSessionRepository::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn terminal_recordings(&self) -> PgTerminalRecordingRepository {
+        PgTerminalRecordingRepository::new(self.pool.clone())
     }
 }

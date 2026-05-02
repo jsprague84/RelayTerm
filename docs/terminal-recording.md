@@ -234,39 +234,59 @@ To make the boundary explicit:
 
 ## 5. Schema sketch
 
-This is a **sketch**. The migration slice (Section 13 step 2) is the
-binding contract; this section names the columns the migration must
-have, the FKs that must hold, and the rules the schema must enforce.
+The migrations
+`apps/backend/migrations/20260502000018_terminal_recording_chunks.sql`
+and
+`apps/backend/migrations/20260502000019_terminal_recording_markers.sql`
+are the binding contract; the columns / CHECKs / indexes they create
+are documented below.
 
-### 5.1 `terminal_recording_chunks` (tentative)
+**Note on `encryption` / `compression` typing.** The original sketch
+used `SMALLINT` enums; the landed migrations use `TEXT` enums
+(`'none'`, future `'recording_v1'` / `'zstd'`). TEXT keeps the column
+self-describing in `psql` and matches the
+`session_events_kind_chk` / `audit_events_kind_chk` /
+`terminal_recording_markers_kind_chk` pattern already in use across
+the rest of the schema. Future encryption / compression schemes are
+added by extending the existing CHECK in a follow-up migration; the
+default for new rows stays `'none'`.
+
+### 5.1 `terminal_recording_chunks` (landed)
 
 | column                | type          | notes                                                                 |
 |-----------------------|---------------|-----------------------------------------------------------------------|
 | `id`                  | `UUID PK`     | server-assigned                                                       |
 | `terminal_session_id` | `UUID NN FK` | `REFERENCES terminal_sessions(id) ON DELETE RESTRICT` (see 5.4)        |
-| `seq_start`           | `BIGINT NN`  | inclusive lowest seq covered by this chunk                            |
-| `seq_end`             | `BIGINT NN`  | inclusive highest seq covered by this chunk                           |
-| `byte_len`            | `INTEGER NN` | length of `payload` AFTER any compression / encryption                |
-| `payload`             | `BYTEA NN`   | the raw stored bytes (see Section 6)                                  |
-| `compression`         | `SMALLINT NN`| `0 = none` (v1). `1 = zstd` reserved for later (Section 6.2)         |
-| `encryption`          | `SMALLINT NN`| `0 = plaintext-at-rest` (v1, opt-in). `1 = vault envelope` (Section 6.3) |
+| `seq_start`           | `BIGINT NN`  | inclusive lowest seq covered by this chunk; `>= 1`                    |
+| `seq_end`             | `BIGINT NN`  | inclusive highest seq covered by this chunk; `>= seq_start`           |
+| `byte_len`            | `INTEGER NN` | length of `payload` AFTER any compression / encryption; `>0 AND <= 2 MiB` |
+| `payload`             | `BYTEA NN`   | the raw stored bytes (see Section 6); `octet_length(payload) = byte_len` |
+| `compression`         | `TEXT NN`    | `'none'` (v1). Future `'zstd'` extends the CHECK (Section 6.2)        |
+| `encryption`          | `TEXT NN`    | `'none'` (v1, opt-in). Future `'recording_v1'` extends the CHECK (Section 6.3) |
 | `created_at`          | `TIMESTAMPTZ NN DEFAULT NOW()` |                                                              |
 
-Constraints / indexes:
-- `CHECK (seq_start >= 1 AND seq_end >= seq_start)`.
-- `CHECK (byte_len >= 0 AND byte_len <= <BYTE_LEN_HARD_CAP>)` —
-  defence-in-depth against a runaway chunk row. `BYTE_LEN_HARD_CAP`
-  MUST be at least the worst-case single-frame size after envelope
-  overhead (see Section 6.4 — recommended starting value `2 MiB`).
-  Section 6.1 fixes the chunk *target*; the CHECK is the *hard
-  upper bound*.
-- `UNIQUE (terminal_session_id, seq_start)` — chunks are seq-aligned,
-  one writer per session, no two chunks share a starting seq.
-- Index on `(terminal_session_id, seq_start)` for `from_seq` reads;
-  the `UNIQUE` covers this on PostgreSQL but spell it out so the
-  migration slice does not "optimise" it away.
+Constraints actually enforced (see migration):
+- `terminal_recording_chunks_seq_start_chk`
+- `terminal_recording_chunks_seq_end_chk`
+- `terminal_recording_chunks_byte_len_chk`
+- `terminal_recording_chunks_payload_len_chk`
+- `terminal_recording_chunks_encryption_chk`
+- `terminal_recording_chunks_compression_chk`
+- `terminal_recording_chunks_session_seq_start_uq` (unique)
+- index `terminal_recording_chunks_session_seq_idx` on
+  `(terminal_session_id, seq_start)` for `from_seq` reads.
 
-### 5.2 `terminal_recording_markers` (tentative)
+Notes on the cap rationale: `byte_len <= 2 MiB` is defence-in-depth
+against a runaway chunk row. The chunk writer (a future slice) is the
+primary bound; the CHECK is the hard upper bound. 2 MiB covers the
+worst-case single 1 MiB binary-envelope `Output` frame plus envelope
+overhead from a future encrypted-row scheme (Section 6.3 — XChaCha20
+nonce + Poly1305 tag + magic + version ≈ 41 bytes), with comfortable
+TOAST headroom. Lowering this CHECK below 1 MiB + envelope overhead
+would create a write surface that silently fails for legitimate
+workloads.
+
+### 5.2 `terminal_recording_markers` (landed)
 
 | column                | type          | notes                                                  |
 |-----------------------|---------------|--------------------------------------------------------|
@@ -291,7 +311,10 @@ Constraints / indexes:
   it brackets and therefore satisfies `seq >= 1`. The migration slice
   pins this with a paired test: the only kind allowed at `seq = 0`
   is `started`.
-- Index on `(terminal_session_id, seq)`.
+- Index `terminal_recording_markers_session_seq_idx` on
+  `(terminal_session_id, seq, created_at)` — the `created_at` tail is
+  the tiebreaker for the `ORDER BY seq ASC, created_at ASC` shape used
+  by `list_markers`.
 
 ### 5.3 `terminal_vt_snapshots` (deferred to a later slice)
 
@@ -870,18 +893,61 @@ posture (Section 7) defensible at every stop.
      `terminal_recording.enabled = true` today changes no runtime
      behaviour — it only causes production validation to require a
      separate master key.
-2. **Schema + repository for output chunks and markers**.
-   - One sqlx migration adding `terminal_recording_chunks` and
-     `terminal_recording_markers` per Section 5; commit `.sqlx/`
-     offline metadata.
-   - `crates/relayterm-db/src/repositories/recording.rs`
-     (to be created) with bounded-input insert/list helpers;
-     redaction-aware Debug impls.
-   - Unit tests covering: insert + list happy path, FK refusal on
-     a missing session, byte-cap CHECK refusal, marker enum
-     validation.
+2. **Schema + repository for output chunks and markers** (landed).
+   - Two sqlx migrations:
+     `20260502000018_terminal_recording_chunks.sql` and
+     `20260502000019_terminal_recording_markers.sql`. Both tables
+     reference `terminal_sessions(id) ON DELETE RESTRICT` per
+     Section 5.4. The chunk table enforces
+     `seq_start >= 1`, `seq_end >= seq_start`,
+     `byte_len > 0 AND byte_len <= 2 MiB`,
+     `octet_length(payload) = byte_len`,
+     `encryption IN ('none')`, `compression IN ('none')`, and
+     `UNIQUE (terminal_session_id, seq_start)`. The marker table
+     enforces `seq >= 0`, `kind` in the seven-element set
+     (`started`, `attached`, `detached`, `reattached`, `resized`,
+     `closed`, `replay_gap`), the seq=0-only-for-`started`
+     constraint per Section 5.2, and a JSON-object check on
+     `payload`. Indexes: chunks on
+     `(terminal_session_id, seq_start)`; markers on
+     `(terminal_session_id, seq, created_at)`.
+   - Domain types in `crates/relayterm-core/src/terminal_recording.rs`:
+     `TerminalRecordingChunk` (manual `Debug` redacts `payload` to
+     length-only; deliberately NOT `Serialize`), `TerminalRecordingMarker`
+     (metadata-only `payload`, `Debug` derived),
+     `TerminalRecordingMarkerKind`,
+     `TerminalRecordingPayloadEncryption`, and
+     `TerminalRecordingCompression` (each enum with
+     `as_str` / `from_str_tag`, mirroring the schema CHECKs).
+   - Repository trait `TerminalRecordingRepository` in
+     `relayterm_core::repository` (session-scoped; owner-scoping
+     happens at the API layer) with bounded-input helpers:
+     `append_chunk`, `append_marker`, `list_chunks(session, from_seq, limit)`,
+     `list_markers(session, from_seq, limit)`. `CreateTerminalRecordingChunk`
+     redacts `payload` in `Debug`; `CreateTerminalRecordingMarker`
+     stores metadata-only JSON.
+   - Postgres impl in `crates/relayterm-db/src/repositories/terminal_recording.rs`,
+     reachable as `Db::terminal_recordings()`. Lists clamp `limit`
+     to `[1, 1024]` defence-in-depth on top of any future API
+     pagination cap.
+   - Unit tests in `relayterm-core` cover marker-kind round-trip,
+     unknown-tag rejection, allows-seq-zero-only-for-started,
+     chunk Debug redaction, create-chunk-input Debug redaction,
+     and marker Debug formatting. Postgres-tests in
+     `crates/relayterm-db/tests/repositories.rs` cover insert +
+     list happy path, ordered listing, `from_seq` filtering,
+     duplicate `seq_start` Conflict, byte_len/payload mismatch
+     rejection, byte_len=0 rejection, seq_start=0 rejection,
+     unknown-session FK rejection, error-and-Debug redaction
+     against a sentinel byte string, marker round-trip,
+     `started`-allows-seq=0, seq=0-rejected-for-other-kinds,
+     marker filtering, and session-scoped isolation between users.
    - **No writes from the orchestrator yet**. Repository is dead
-     code for now; the next slice wires it.
+     code for now; the next slice wires it. No durable replay API,
+     no replay-only frontend, no startup reconciliation, no
+     retention worker, no encryption / compression implementation,
+     no `recording_purged` audit kind, no VT snapshot observer,
+     and no export endpoint exist yet.
 3. **Orchestrator writes chunks + markers**.
    - Tee from the PTY forwarder into a bounded async chunk
      writer; flush on size / frame-count / time deadline.

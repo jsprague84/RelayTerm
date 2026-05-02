@@ -16,7 +16,8 @@ use relayterm_core::audit_event::{AuditEvent, AuditEventKind};
 use relayterm_core::host::Host;
 use relayterm_core::ids::{
     AuditEventId, HostId, KnownHostEntryId, ServerProfileId, SessionEventId, SshIdentityId,
-    TerminalSessionAttachmentId, TerminalSessionId, UserId, UserSessionId,
+    TerminalRecordingChunkId, TerminalRecordingMarkerId, TerminalSessionAttachmentId,
+    TerminalSessionId, UserId, UserSessionId,
 };
 use relayterm_core::known_host::KnownHostEntry;
 use relayterm_core::password_credential::PasswordCredential;
@@ -24,6 +25,10 @@ use relayterm_core::repository::RepositoryError;
 use relayterm_core::server_profile::ServerProfile;
 use relayterm_core::session_event::{SessionEvent, SessionEventKind};
 use relayterm_core::ssh_identity::{SshIdentity, SshKeyType};
+use relayterm_core::terminal_recording::{
+    TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
+    TerminalRecordingMarkerKind, TerminalRecordingPayloadEncryption,
+};
 use relayterm_core::terminal_session::{
     TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
@@ -384,6 +389,88 @@ impl AuditEventRow {
             payload: self.payload,
             remote_addr: self.remote_addr,
             recorded_at: self.recorded_at,
+        })
+    }
+}
+
+/// SQLx row for `terminal_recording_chunks`.
+///
+/// `Debug` is intentionally NOT derived — the row carries opaque PTY
+/// output bytes. Convert to [`TerminalRecordingChunk`] (redacting
+/// `Debug`) before any formatter exposure.
+#[derive(FromRow)]
+pub(crate) struct TerminalRecordingChunkRow {
+    pub id: Uuid,
+    pub terminal_session_id: Uuid,
+    pub seq_start: i64,
+    pub seq_end: i64,
+    pub byte_len: i32,
+    pub payload: Vec<u8>,
+    pub encryption: String,
+    pub compression: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TerminalRecordingChunkRow {
+    pub(crate) fn try_into_domain(self) -> Result<TerminalRecordingChunk, RepositoryError> {
+        let encryption = TerminalRecordingPayloadEncryption::from_str_tag(&self.encryption)
+            .ok_or_else(|| {
+                RepositoryError::Database(format!(
+                    "row integrity: terminal_recording_chunk.encryption unknown ({})",
+                    self.encryption
+                ))
+            })?;
+        let compression = TerminalRecordingCompression::from_str_tag(&self.compression)
+            .ok_or_else(|| {
+                RepositoryError::Database(format!(
+                    "row integrity: terminal_recording_chunk.compression unknown ({})",
+                    self.compression
+                ))
+            })?;
+        Ok(TerminalRecordingChunk {
+            id: TerminalRecordingChunkId::from_uuid(self.id),
+            terminal_session_id: TerminalSessionId::from_uuid(self.terminal_session_id),
+            seq_start: self.seq_start,
+            seq_end: self.seq_end,
+            byte_len: self.byte_len,
+            payload: self.payload,
+            encryption,
+            compression,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// SQLx row for `terminal_recording_markers`.
+///
+/// Markers are metadata-only by contract; `Debug` is safe to derive on
+/// the row, but we keep symmetry with the chunk row by routing through
+/// the typed conversion before any formatter exposure.
+#[derive(Debug, FromRow)]
+pub(crate) struct TerminalRecordingMarkerRow {
+    pub id: Uuid,
+    pub terminal_session_id: Uuid,
+    pub kind: String,
+    pub seq: i64,
+    pub payload: JsonValue,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TerminalRecordingMarkerRow {
+    pub(crate) fn try_into_domain(self) -> Result<TerminalRecordingMarker, RepositoryError> {
+        let kind = TerminalRecordingMarkerKind::from_str_tag(&self.kind).ok_or_else(|| {
+            RepositoryError::Database(format!(
+                "row integrity: terminal_recording_marker.kind unknown ({})",
+                self.kind
+            ))
+        })?;
+        Ok(TerminalRecordingMarker {
+            id: TerminalRecordingMarkerId::from_uuid(self.id),
+            terminal_session_id: TerminalSessionId::from_uuid(self.terminal_session_id),
+            kind,
+            seq: self.seq,
+            payload: self.payload,
+            created_at: self.created_at,
         })
     }
 }
