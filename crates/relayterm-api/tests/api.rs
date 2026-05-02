@@ -9338,3 +9338,585 @@ async fn login_throttle_is_keyed_on_normalized_email(pool: PgPool) {
         .unwrap();
     assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
 }
+
+// ----------------------------------------------------------------------
+// Current-user session management (`/api/v1/auth/sessions`)
+// ----------------------------------------------------------------------
+
+/// Log the bootstrap user in and return the cookie token. The two-step
+/// bootstrap-then-login dance mirrors what the SPA does and produces a
+/// real `relayterm_session` cookie that the protected routes accept.
+async fn login_and_get_token(app: &Router, email: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": email,
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = extract_set_cookie(&resp).expect("login Set-Cookie");
+    cookie_token_from_set_cookie(&cookie).to_owned()
+}
+
+/// Build a `POST` to a session-management route with a session cookie
+/// and an empty body, allow-listed `Origin` so the `CsrfGuard` passes.
+fn session_post_with_cookie(uri: &str, cookie_value: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .header(header::COOKIE, format!("relayterm_session={cookie_value}"))
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_sessions_returns_only_callers_sessions_marks_current(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "list@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "list@relayterm.local").await;
+
+    // Mint a second session for the same user via AuthService so we
+    // can confirm the listing surfaces both rows and the response
+    // marks only the current session.
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create second session");
+    let other_id = other.session.id;
+    drop(other);
+
+    // Mint a third session belonging to a DIFFERENT user — must NOT
+    // appear in the response (cross-user redaction in SQL).
+    let foreign_user = create_user(&pool, "foreign-list").await;
+    let foreign = auth
+        .create_session(foreign_user, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create foreign session");
+    let foreign_id = foreign.session.id;
+    drop(foreign);
+
+    let resp = app
+        .oneshot(auth_get_with_cookie(
+            "/api/v1/auth/sessions",
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let arr = body["sessions"].as_array().expect("sessions array");
+    assert_eq!(arr.len(), 2, "must include only caller's sessions: {body}");
+
+    let foreign_id_str = foreign_id.to_string();
+    assert!(
+        !body.to_string().contains(&foreign_id_str),
+        "foreign session id must not leak into wire body: {body}"
+    );
+
+    // Wire shape: token-redacted by construction; check explicitly.
+    for forbidden in [
+        "token_hash",
+        "session_token",
+        "password",
+        "password_hash",
+        "bootstrap_token",
+    ] {
+        assert!(
+            !body.to_string().contains(forbidden),
+            "session list must not expose `{forbidden}`: {body}"
+        );
+    }
+
+    // Exactly one row is `current = true` and it is the caller's
+    // current session (i.e. NOT the second-session id we minted).
+    let other_id_str = other_id.to_string();
+    let mut current_count = 0;
+    let mut saw_current_marker_on_other = false;
+    for item in arr {
+        if item["current"].as_bool().unwrap() {
+            current_count += 1;
+            if item["id"].as_str().unwrap() == other_id_str {
+                saw_current_marker_on_other = true;
+            }
+        }
+        // Every item carries the SessionStatus discriminator.
+        assert!(item["status"].is_string(), "missing status: {item}");
+    }
+    assert_eq!(current_count, 1, "exactly one current=true row");
+    assert!(
+        !saw_current_marker_on_other,
+        "second-session id must not be marked current",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_sessions_requires_authentication(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "anon@relayterm.local").await;
+    let resp = app
+        .oneshot(get_no_auth("/api/v1/auth/sessions"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_other_session_returns_204_does_not_clear_cookie_and_audits(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "revoke@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "revoke@relayterm.local").await;
+
+    // Mint another session owned by the same user.
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create second session");
+    let other_id = other.session.id;
+    drop(other);
+
+    let resp = app
+        .clone()
+        .oneshot(session_post_with_cookie(
+            &format!("/api/v1/auth/sessions/{other_id}/revoke"),
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // No cookie clear because the revoked session is not the current one.
+    assert!(
+        extract_set_cookie(&resp).is_none(),
+        "non-current revoke must not clear cookie",
+    );
+
+    // Caller's cookie still works after revoking a different session.
+    let me = app
+        .clone()
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &current_token))
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+
+    // Audit row written — payload must redact and mark current_session=false.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let event = recent
+        .iter()
+        .find(|e| e.kind == AuditEventKind::SessionRevoked)
+        .expect("session_revoked audit row");
+    assert_eq!(event.actor_id, Some(user_id));
+    assert_eq!(
+        event.payload["session_id"].as_str().unwrap(),
+        other_id.to_string(),
+    );
+    assert_eq!(event.payload["current_session"], false);
+    assert_audit_payload_redacted(&event.payload, AuditEventKind::SessionRevoked);
+    // Token plaintext MUST NOT survive into the audit payload.
+    assert!(
+        !event.payload.to_string().contains(&current_token),
+        "audit payload must not echo cookie token",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_current_session_returns_204_clears_cookie_and_invalidates(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "self@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "self@relayterm.local").await;
+
+    // Discover the current session's id from the listing response.
+    let listed = app
+        .clone()
+        .oneshot(auth_get_with_cookie(
+            "/api/v1/auth/sessions",
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    let body = read_body(listed).await;
+    let current_session_id = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["current"].as_bool().unwrap())
+        .expect("current session present")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = app
+        .clone()
+        .oneshot(session_post_with_cookie(
+            &format!("/api/v1/auth/sessions/{current_session_id}/revoke"),
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let clear = extract_set_cookie(&resp).expect("Set-Cookie present");
+    assert!(clear.contains("Max-Age=0"), "cookie cleared: {clear}");
+    assert!(clear.contains("HttpOnly"));
+    assert!(clear.contains("SameSite=Strict"));
+
+    // The same cookie is now revoked — /me MUST 401.
+    let me = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &current_token))
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+
+    // Audit payload marks current_session=true.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let event = recent
+        .iter()
+        .find(|e| e.kind == AuditEventKind::SessionRevoked)
+        .expect("session_revoked audit row");
+    assert_eq!(event.actor_id, Some(user_id));
+    assert_eq!(event.payload["current_session"], true);
+    assert_audit_payload_redacted(&event.payload, AuditEventKind::SessionRevoked);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_foreign_session_returns_404_writes_no_audit(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "owner@relayterm.local").await;
+    let token = login_and_get_token(&app, "owner@relayterm.local").await;
+
+    // Mint a session that belongs to a DIFFERENT user.
+    let foreign_user = create_user(&pool, "foreign-revoke").await;
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let foreign = auth
+        .create_session(foreign_user, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create foreign session");
+    let foreign_id = foreign.session.id;
+    drop(foreign);
+
+    let resp = app
+        .oneshot(session_post_with_cookie(
+            &format!("/api/v1/auth/sessions/{foreign_id}/revoke"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "foreign session id must collapse to 404"
+    );
+
+    // Foreign row must NOT have transitioned.
+    let row = relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .get(foreign_id)
+        .await
+        .unwrap()
+        .expect("foreign row still present");
+    assert!(
+        row.revoked_at.is_none(),
+        "foreign session must not be revoked",
+    );
+    assert!(row.revoked_reason.is_none());
+
+    // No session_revoked audit row written.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    assert!(
+        !recent
+            .iter()
+            .any(|e| e.kind == AuditEventKind::SessionRevoked),
+        "no session_revoked audit row should be written for a 404",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_session_idempotent_call_writes_no_duplicate_audit(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "idem@relayterm.local").await;
+    let token = login_and_get_token(&app, "idem@relayterm.local").await;
+
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create second session");
+    let other_id = other.session.id;
+    drop(other);
+
+    // First revoke — transitions, writes one audit row.
+    let r1 = app
+        .clone()
+        .oneshot(session_post_with_cookie(
+            &format!("/api/v1/auth/sessions/{other_id}/revoke"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::NO_CONTENT);
+
+    // Second revoke — already-revoked, no-op, no new audit row.
+    let r2 = app
+        .clone()
+        .oneshot(session_post_with_cookie(
+            &format!("/api/v1/auth/sessions/{other_id}/revoke"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::NO_CONTENT);
+
+    let count = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::SessionRevoked)
+        .count();
+    assert_eq!(
+        count, 1,
+        "redundant revoke must not write a second audit row",
+    );
+}
+
+/// `POST /api/v1/auth/sessions/:id/revoke` with a disallowed `Origin`
+/// MUST 403 and MUST NOT mutate the targeted row. Note: this handler
+/// has no body extractor (no `Json<...>`), so the canonical
+/// "malformed JSON + bad Origin → 403 not 400" form of the
+/// pre-body-parse test (see `bad_origin_rejects_before_body_parsing`)
+/// does not apply — there is no body-parse path to race the guard
+/// against. The invariant pinned here is the lifecycle one: a
+/// rejected request leaves the addressed row in `revoked_at IS NULL`.
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_session_bad_origin_returns_403_before_db_mutation(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "csrf@relayterm.local").await;
+    let token = login_and_get_token(&app, "csrf@relayterm.local").await;
+
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create second session");
+    let other_id = other.session.id;
+    drop(other);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/auth/sessions/{other_id}/revoke"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={token}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+
+    // Row must NOT have been touched by the rejected request.
+    let row = relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .get(other_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.revoked_at.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_all_except_current_revokes_others_keeps_current_returns_count(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "all@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "all@relayterm.local").await;
+
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other_a = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create other_a");
+    let other_a_id = other_a.session.id;
+    drop(other_a);
+    let other_b = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create other_b");
+    let other_b_id = other_b.session.id;
+    drop(other_b);
+
+    // Foreign user with their own session.
+    let foreign_user = create_user(&pool, "foreign-revoke-all").await;
+    let foreign = auth
+        .create_session(foreign_user, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create foreign session");
+    let foreign_id = foreign.session.id;
+    drop(foreign);
+
+    let resp = app
+        .clone()
+        .oneshot(session_post_with_cookie(
+            "/api/v1/auth/sessions/revoke-all-except-current",
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Cookie stays — the user wants to keep the current session.
+    assert!(
+        extract_set_cookie(&resp).is_none(),
+        "revoke-all-except-current must not clear current cookie",
+    );
+    let body = read_body(resp).await;
+    assert_eq!(body["revoked_count"], 2);
+
+    // Token redaction sentinels.
+    for forbidden in ["token_hash", "session_token", "password_hash"] {
+        assert!(
+            !body.to_string().contains(forbidden),
+            "response must not expose `{forbidden}`: {body}"
+        );
+    }
+
+    // Caller's current session still works.
+    let me = app
+        .clone()
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &current_token))
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+
+    // Other sessions are revoked.
+    let repo = relayterm_db::PgUserSessionRepository::new(pool.clone());
+    for id in [other_a_id, other_b_id] {
+        let row = repo.get(id).await.unwrap().unwrap();
+        assert!(row.revoked_at.is_some(), "{id} must be revoked");
+    }
+    // Foreign user's session untouched.
+    let f_row = repo.get(foreign_id).await.unwrap().unwrap();
+    assert!(f_row.revoked_at.is_none(), "foreign session untouched");
+
+    // Single sessions_revoked audit row.
+    let events = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.kind == AuditEventKind::SessionsRevoked)
+        .expect("sessions_revoked audit row");
+    assert_eq!(event.actor_id, Some(user_id));
+    assert_eq!(event.payload["revoked_count"], 2);
+    assert_audit_payload_redacted(&event.payload, AuditEventKind::SessionsRevoked);
+    // Per-row session ids must NOT appear in the payload.
+    for id in [other_a_id, other_b_id] {
+        assert!(
+            !event.payload.to_string().contains(&id.to_string()),
+            "sessions_revoked payload must not carry per-row ids",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_all_except_current_with_no_others_writes_no_audit(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "noop@relayterm.local").await;
+    let token = login_and_get_token(&app, "noop@relayterm.local").await;
+
+    // Caller's current session is the only one. The call must succeed
+    // with `revoked_count: 0` and write zero audit rows.
+    let resp = app
+        .oneshot(session_post_with_cookie(
+            "/api/v1/auth/sessions/revoke-all-except-current",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["revoked_count"], 0);
+
+    let events = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == AuditEventKind::SessionsRevoked),
+        "no-op call must not write a sessions_revoked audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn revoke_all_except_current_bad_origin_returns_403_before_mutation(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "csrf2@relayterm.local").await;
+    let token = login_and_get_token(&app, "csrf2@relayterm.local").await;
+
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create second session");
+    let other_id = other.session.id;
+    drop(other);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/sessions/revoke-all-except-current")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={token}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let row = relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .get(other_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.revoked_at.is_none(),
+        "rejected request must not have revoked anything",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn session_management_routes_require_authentication(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "anon2@relayterm.local").await;
+
+    // GET /sessions
+    let resp = app
+        .clone()
+        .oneshot(get_no_auth("/api/v1/auth/sessions"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // POST /sessions/:id/revoke
+    let resp = app
+        .clone()
+        .oneshot(json_post_no_auth(
+            &format!("/api/v1/auth/sessions/{}/revoke", uuid::Uuid::new_v4()),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // POST /sessions/revoke-all-except-current
+    let resp = app
+        .oneshot(json_post_no_auth(
+            "/api/v1/auth/sessions/revoke-all-except-current",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

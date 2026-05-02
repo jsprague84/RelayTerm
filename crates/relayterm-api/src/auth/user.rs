@@ -56,7 +56,7 @@ use axum::{
     http::request::Parts,
 };
 use chrono::Utc;
-use relayterm_core::ids::UserId;
+use relayterm_core::ids::{UserId, UserSessionId};
 use relayterm_core::repository::{UserRepository, UserSessionRepository};
 use relayterm_core::user::User;
 
@@ -73,6 +73,7 @@ use super::cookie::extract_session_cookie;
 /// ```ignore
 /// async fn handler(user: AuthenticatedUser) -> Result<..., ApiError> {
 ///     let _: UserId = user.user_id();
+///     let _: UserSessionId = user.session_id();
 ///     let _: &User = user.user();
 ///     ...
 /// }
@@ -81,9 +82,18 @@ use super::cookie::extract_session_cookie;
 /// The wrapped [`User`] is loaded once at extraction time. A handler
 /// that needs the freshest copy (e.g. after a self-edit) re-reads via
 /// the repository — this struct deliberately does NOT auto-refresh.
+///
+/// The current session's id is exposed via [`Self::session_id`] so
+/// handlers that need to mark the caller's own session (e.g. the
+/// current-user session-management routes) can do so without going
+/// back to the cookie. **The token plaintext and the token-hash
+/// digest are NOT exposed** — the extractor never widens the redaction
+/// surface beyond what the underlying [`UserSession`](relayterm_core::user_session::UserSession)
+/// row already offers (which is itself `Debug`/`serde`-redacted).
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
     user: User,
+    session_id: UserSessionId,
 }
 
 impl AuthenticatedUser {
@@ -93,6 +103,23 @@ impl AuthenticatedUser {
     #[must_use]
     pub fn user_id(&self) -> UserId {
         self.user.id
+    }
+
+    /// The id of the session row that authenticated this request.
+    ///
+    /// This is the stable database key referenced by audit-event
+    /// payloads — NOT the cookie value, NOT the token hash. Used by
+    /// the current-user session-management routes to mark the
+    /// caller's own session in list responses, decide whether a
+    /// revoke targets the current session (and therefore needs a
+    /// `Set-Cookie` clear), and scope the "revoke all except current"
+    /// surface in SQL. Exposing the id is safe: it appears verbatim
+    /// in the listing response and in the audit feed for the
+    /// caller's own user, and it is unguessable (UUIDv4) by anyone
+    /// who does not already hold a valid cookie.
+    #[must_use]
+    pub fn session_id(&self) -> UserSessionId {
+        self.session_id
     }
 
     /// Borrow the loaded [`User`] row.
@@ -162,6 +189,9 @@ where
             );
         }
 
-        Ok(Self { user })
+        Ok(Self {
+            user,
+            session_id: session.id,
+        })
     }
 }

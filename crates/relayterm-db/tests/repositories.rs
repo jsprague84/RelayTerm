@@ -1403,6 +1403,271 @@ async fn user_session_revoke_all_for_unknown_user_returns_zero(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_list_for_user_only_returns_owned_rows_newest_first(pool: PgPool) {
+    let user_a = make_user(&pool).await;
+    let user_b = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let expires = Utc::now() + Duration::days(30);
+
+    // Insert in deliberate order; the list ordering is `created_at
+    // DESC` so the second row comes first.
+    let a1 = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x11; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    // A small spin to make sure created_at is strictly later.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let a2 = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x12; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    let _b1 = repo
+        .create(CreateUserSession {
+            user_id: user_b.id,
+            token_hash: vec![0x13; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+
+    let listed = repo.list_for_user(user_a.id).await.unwrap();
+    assert_eq!(listed.len(), 2, "list must include only user_a's rows");
+    assert_eq!(listed[0].id, a2.id, "newest row first by created_at DESC");
+    assert_eq!(listed[1].id, a1.id);
+    // Cross-user redaction at the SQL boundary.
+    assert!(listed.iter().all(|r| r.user_id == user_a.id));
+
+    // Unknown user returns empty Vec, not NotFound.
+    let empty = repo
+        .list_for_user(relayterm_core::ids::UserId::new())
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_for_user_owned_transitions_then_idempotent(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: vec![0x21; 32],
+            expires_at: Utc::now() + Duration::days(30),
+        })
+        .await
+        .unwrap();
+
+    // First call returns true (transition).
+    let first = repo
+        .revoke_for_user(user.id, session.id, Utc::now(), Some("user_revoke"))
+        .await
+        .unwrap();
+    assert!(first, "first revoke_for_user must transition");
+
+    let after_first = repo.get(session.id).await.unwrap().unwrap();
+    let original_revoked_at = after_first.revoked_at;
+    assert!(original_revoked_at.is_some());
+    assert_eq!(after_first.revoked_reason.as_deref(), Some("user_revoke"));
+
+    // Second call returns false (idempotent no-op) and preserves the
+    // original revoked_at and reason.
+    let later = Utc::now() + Duration::seconds(60);
+    let second = repo
+        .revoke_for_user(user.id, session.id, later, Some("admin_revoke"))
+        .await
+        .unwrap();
+    assert!(!second, "second revoke_for_user must be a no-op");
+
+    let after_second = repo.get(session.id).await.unwrap().unwrap();
+    assert_eq!(after_second.revoked_at, original_revoked_at);
+    assert_eq!(after_second.revoked_reason.as_deref(), Some("user_revoke"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_for_user_foreign_user_collapses_to_not_found(pool: PgPool) {
+    let user_a = make_user(&pool).await;
+    let user_b = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+
+    // Session belongs to user_a.
+    let session = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x31; 32],
+            expires_at: Utc::now() + Duration::days(30),
+        })
+        .await
+        .unwrap();
+
+    // user_b attempts to revoke user_a's session — must surface as
+    // NotFound, not as a silent success and not as a typed
+    // ownership-mismatch error. This is the probe-resistance contract.
+    let err = repo
+        .revoke_for_user(user_b.id, session.id, Utc::now(), Some("user_revoke"))
+        .await
+        .expect_err("foreign user must not revoke user_a's session");
+    match err {
+        RepositoryError::NotFound { entity } => assert_eq!(entity, "user_session"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+
+    // Row stays untouched.
+    let row = repo.get(session.id).await.unwrap().unwrap();
+    assert!(row.revoked_at.is_none());
+    assert!(row.revoked_reason.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_for_user_unknown_id_returns_not_found(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+
+    let err = repo
+        .revoke_for_user(user.id, UserSessionId::new(), Utc::now(), None)
+        .await
+        .expect_err("unknown id must surface NotFound");
+    match err {
+        RepositoryError::NotFound { entity } => assert_eq!(entity, "user_session"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_all_except_only_touches_other_active_rows(pool: PgPool) {
+    let user_a = make_user(&pool).await;
+    let user_b = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let expires = Utc::now() + Duration::days(30);
+
+    // user_a has three sessions: current + two others. user_b has one,
+    // which must remain untouched.
+    let current = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x41; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    let other1 = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x42; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    let other2 = repo
+        .create(CreateUserSession {
+            user_id: user_a.id,
+            token_hash: vec![0x43; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    let foreign = repo
+        .create(CreateUserSession {
+            user_id: user_b.id,
+            token_hash: vec![0x44; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+
+    // Pre-revoke other1 to confirm idempotency: the sweep does NOT
+    // count an already-revoked row.
+    repo.revoke(other1.id, Utc::now(), Some("logout"))
+        .await
+        .unwrap();
+
+    let count = repo
+        .revoke_all_except(user_a.id, current.id, Utc::now(), Some("user_revoke_all"))
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "only the still-active other row transitions");
+
+    // current is untouched.
+    let current_after = repo.get(current.id).await.unwrap().unwrap();
+    assert!(current_after.revoked_at.is_none());
+    assert!(current_after.revoked_reason.is_none());
+
+    // other1 keeps its original logout timestamp/reason (idempotency).
+    let other1_after = repo.get(other1.id).await.unwrap().unwrap();
+    assert_eq!(other1_after.revoked_reason.as_deref(), Some("logout"));
+
+    // other2 is now revoked with the new reason.
+    let other2_after = repo.get(other2.id).await.unwrap().unwrap();
+    assert!(other2_after.revoked_at.is_some());
+    assert_eq!(
+        other2_after.revoked_reason.as_deref(),
+        Some("user_revoke_all"),
+    );
+
+    // Cross-user row untouched.
+    let foreign_after = repo.get(foreign.id).await.unwrap().unwrap();
+    assert!(foreign_after.revoked_at.is_none());
+    assert!(foreign_after.revoked_reason.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_all_except_unknown_user_returns_zero(pool: PgPool) {
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let count = repo
+        .revoke_all_except(
+            relayterm_core::ids::UserId::new(),
+            UserSessionId::new(),
+            Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn user_session_revoke_all_except_does_not_touch_already_revoked_except(pool: PgPool) {
+    // Even if the `except_id` row is itself already revoked, the
+    // call must NOT toggle it. The revoke-all-except surface is for
+    // "kill every OTHER session"; the except row is a passive marker.
+    let user = make_user(&pool).await;
+    let repo = PgUserSessionRepository::new(pool.clone());
+    let expires = Utc::now() + Duration::days(30);
+
+    let except = repo
+        .create(CreateUserSession {
+            user_id: user.id,
+            token_hash: vec![0x51; 32],
+            expires_at: expires,
+        })
+        .await
+        .unwrap();
+    repo.revoke(except.id, Utc::now(), Some("logout"))
+        .await
+        .unwrap();
+    let except_before = repo.get(except.id).await.unwrap().unwrap();
+
+    let count = repo
+        .revoke_all_except(user.id, except.id, Utc::now(), Some("user_revoke_all"))
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    let except_after = repo.get(except.id).await.unwrap().unwrap();
+    assert_eq!(except_after.revoked_at, except_before.revoked_at);
+    assert_eq!(except_after.revoked_reason, except_before.revoked_reason);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn user_session_redaction_sentinels(pool: PgPool) {
     let user = make_user(&pool).await;
     let repo = PgUserSessionRepository::new(pool.clone());

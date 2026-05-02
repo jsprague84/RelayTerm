@@ -334,6 +334,72 @@ impl AuthService {
             .revoke_all_for_user(user_id, now, reason)
             .await?)
     }
+
+    /// List every browser-session row owned by `user_id`, newest
+    /// first by `created_at`.
+    ///
+    /// Includes revoked AND expired rows so the route layer can
+    /// surface "active / revoked / expired" states in the
+    /// session-management UI. Ownership scoping happens in the SQL
+    /// `WHERE user_id = $1` of the underlying repository — a route
+    /// that forgot to re-check the owner cannot leak cross-user rows.
+    /// Plaintext tokens never crossed this layer; only the persisted
+    /// digest is on each row, and `UserSession`'s `Debug`/`serde`
+    /// already redact it.
+    pub async fn list_sessions_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<UserSession>, AuthServiceError> {
+        Ok(self.sessions.list_for_user(user_id).await?)
+    }
+
+    /// Revoke a single session by primary key, scoped to `user_id`.
+    ///
+    /// Returns `Ok(true)` on a real non-revoked → revoked transition,
+    /// `Ok(false)` when the row was already revoked (idempotent
+    /// no-op). A row owned by a different user OR a row that doesn't
+    /// exist both surface as
+    /// [`AuthServiceError::SessionInvalid`] — collapsing the two is
+    /// the probe-resistance contract for the revoke route, mirroring
+    /// the existing `revoke_session` shape.
+    pub async fn revoke_session_for_user(
+        &self,
+        user_id: UserId,
+        session_id: UserSessionId,
+        now: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<bool, AuthServiceError> {
+        match self
+            .sessions
+            .revoke_for_user(user_id, session_id, now, reason)
+            .await
+        {
+            Ok(transitioned) => Ok(transitioned),
+            Err(RepositoryError::NotFound { .. }) => Err(AuthServiceError::SessionInvalid),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Revoke every non-revoked session for `user_id` EXCEPT
+    /// `except_id`.
+    ///
+    /// Used by `POST /api/v1/auth/sessions/revoke-all-except-current`.
+    /// Returns the number of rows transitioned from non-revoked to
+    /// revoked so the caller can decide whether to write a
+    /// `sessions_revoked` audit row (no transitions ⇒ no audit
+    /// event). An unknown `user_id` returns `0`.
+    pub async fn revoke_all_sessions_except(
+        &self,
+        user_id: UserId,
+        except_id: UserSessionId,
+        now: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<u64, AuthServiceError> {
+        Ok(self
+            .sessions
+            .revoke_all_except(user_id, except_id, now, reason)
+            .await?)
+    }
 }
 
 /// Manual `Debug` so the password hasher's parameters never get
@@ -496,6 +562,65 @@ mod tests {
             let mut count = 0_u64;
             for row in rows.iter_mut() {
                 if row.user_id == user_id && row.revoked_at.is_none() {
+                    row.revoked_at = Some(at);
+                    row.revoked_reason = reason.map(str::to_owned);
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+
+        async fn list_for_user(
+            &self,
+            user_id: UserId,
+        ) -> Result<Vec<UserSession>, RepositoryError> {
+            let rows = self.rows.lock().expect("rows lock");
+            let mut out: Vec<UserSession> = rows
+                .iter()
+                .filter(|r| r.user_id == user_id)
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+            Ok(out)
+        }
+
+        async fn revoke_for_user(
+            &self,
+            user_id: UserId,
+            session_id: UserSessionId,
+            at: DateTime<Utc>,
+            reason: Option<&str>,
+        ) -> Result<bool, RepositoryError> {
+            let mut rows = self.rows.lock().expect("rows lock");
+            let Some(row) = rows.iter_mut().find(|r| r.id == session_id) else {
+                return Err(RepositoryError::NotFound {
+                    entity: "user_session",
+                });
+            };
+            if row.user_id != user_id {
+                return Err(RepositoryError::NotFound {
+                    entity: "user_session",
+                });
+            }
+            if row.revoked_at.is_some() {
+                return Ok(false);
+            }
+            row.revoked_at = Some(at);
+            row.revoked_reason = reason.map(str::to_owned);
+            Ok(true)
+        }
+
+        async fn revoke_all_except(
+            &self,
+            user_id: UserId,
+            except_id: UserSessionId,
+            at: DateTime<Utc>,
+            reason: Option<&str>,
+        ) -> Result<u64, RepositoryError> {
+            let mut rows = self.rows.lock().expect("rows lock");
+            let mut count = 0_u64;
+            for row in rows.iter_mut() {
+                if row.user_id == user_id && row.id != except_id && row.revoked_at.is_none() {
                     row.revoked_at = Some(at);
                     row.revoked_reason = reason.map(str::to_owned);
                     count += 1;

@@ -513,4 +513,53 @@ pub trait UserSessionRepository: Send + Sync {
         at: DateTime<Utc>,
         reason: Option<&str>,
     ) -> Result<u64, RepositoryError>;
+
+    /// List every session row owned by `user_id`, newest first by
+    /// `created_at`. Includes revoked AND expired rows — the route
+    /// layer decides which states to surface and how to label them so
+    /// the user-facing UI can show "active / revoked / expired" without
+    /// the repository encoding presentation policy. An unknown
+    /// `user_id` simply returns an empty Vec.
+    async fn list_for_user(&self, user_id: UserId) -> Result<Vec<UserSession>, RepositoryError>;
+
+    /// Revoke a single session by primary key, scoped to `user_id` in
+    /// SQL.
+    ///
+    /// The `(id, user_id)` filter makes ownership a database-level
+    /// guarantee, not a route-level one — a route that forgot to
+    /// re-check the owner cannot leak a cross-user revoke. A row
+    /// addressed by id but owned by a different user, OR a row that
+    /// does not exist at all, both surface as
+    /// [`RepositoryError::NotFound`] so a probe cannot distinguish the
+    /// two cases through the wire response.
+    ///
+    /// Idempotent: a second call against an already-revoked row owned
+    /// by `user_id` is a no-op (Ok(`false`)) and the original
+    /// `revoked_at` / `revoked_reason` are preserved. Returns
+    /// `Ok(true)` when the row transitioned from non-revoked to
+    /// revoked, so the caller can decide whether to write an audit
+    /// event.
+    async fn revoke_for_user(
+        &self,
+        user_id: UserId,
+        session_id: UserSessionId,
+        at: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<bool, RepositoryError>;
+
+    /// Stamp `revoked_at` on every non-revoked session for a user
+    /// EXCEPT the one identified by `except_id`.
+    ///
+    /// `except_id` is typically the caller's current session — this is
+    /// the "log out everywhere else" surface. The except row is
+    /// untouched whether it is revoked or not; only OTHER rows for the
+    /// user can transition. Returns the count of rows transitioned
+    /// from non-revoked to revoked. An unknown `user_id` returns `0`.
+    async fn revoke_all_except(
+        &self,
+        user_id: UserId,
+        except_id: UserSessionId,
+        at: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<u64, RepositoryError>;
 }

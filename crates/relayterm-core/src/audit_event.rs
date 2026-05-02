@@ -21,6 +21,19 @@ pub enum AuditEventKind {
     LoginFailed,
     LogoutSucceeded,
     FirstUserCreated,
+    /// One specific browser session was explicitly revoked through the
+    /// current-user `POST /api/v1/auth/sessions/:id/revoke` route. Fires
+    /// only on a non-revoked → revoked transition; idempotent re-revoke
+    /// is a no-op and writes no audit row. The payload carries the
+    /// revoked session id and a `current_session: bool` marker.
+    SessionRevoked,
+    /// `POST /api/v1/auth/sessions/revoke-all-except-current` transitioned
+    /// one or more sessions for the caller from non-revoked to revoked.
+    /// Fires at most once per call, and only when `revoked_count > 0`.
+    /// The payload carries the count — never per-row session ids — so a
+    /// future audit search by session id stays scoped to the
+    /// `session_revoked` kind.
+    SessionsRevoked,
     KeyVaultAccess,
     KeyVaultDecryptFailed,
     HostKeyAccepted,
@@ -46,6 +59,8 @@ impl AuditEventKind {
             Self::LoginFailed => "login_failed",
             Self::LogoutSucceeded => "logout_succeeded",
             Self::FirstUserCreated => "first_user_created",
+            Self::SessionRevoked => "session_revoked",
+            Self::SessionsRevoked => "sessions_revoked",
             Self::KeyVaultAccess => "key_vault_access",
             Self::KeyVaultDecryptFailed => "key_vault_decrypt_failed",
             Self::HostKeyAccepted => "host_key_accepted",
@@ -72,6 +87,8 @@ impl AuditEventKind {
             "login_failed" => Self::LoginFailed,
             "logout_succeeded" => Self::LogoutSucceeded,
             "first_user_created" => Self::FirstUserCreated,
+            "session_revoked" => Self::SessionRevoked,
+            "sessions_revoked" => Self::SessionsRevoked,
             "key_vault_access" => Self::KeyVaultAccess,
             "key_vault_decrypt_failed" => Self::KeyVaultDecryptFailed,
             "host_key_accepted" => Self::HostKeyAccepted,

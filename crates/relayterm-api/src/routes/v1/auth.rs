@@ -1,9 +1,11 @@
-//! `/api/v1/auth/*` — bootstrap, login, logout, current-user.
+//! `/api/v1/auth/*` — bootstrap, login, logout, current-user, current-
+//! user session management.
 //!
-//! These four routes are the auth surface for the SPA. Bootstrap is
-//! one-shot (creates the first user only); login mints the session
-//! cookie; logout revokes; `me` reports the current user via the
-//! cookie-backed [`AuthenticatedUser`] extractor.
+//! These routes are the auth surface for the SPA. Bootstrap is one-
+//! shot (creates the first user only); login mints the session cookie;
+//! logout revokes; `me` reports the current user via the cookie-backed
+//! [`AuthenticatedUser`] extractor; the `/auth/sessions` family lets a
+//! signed-in user list and revoke their own browser sessions.
 //!
 //! ## Cookie
 //!
@@ -38,6 +40,14 @@
 //! - failed login (bad creds OR unknown email) → `login_failed`
 //!   (`actor_id = NULL`, `reason = "bad_credentials"`)
 //! - successful logout → `logout_succeeded` (`actor_id = user_id`)
+//! - session revoke transition (`POST /auth/sessions/:id/revoke`) →
+//!   `session_revoked` (`actor_id = user_id`, payload carries the
+//!   session id and `current_session: bool`). An idempotent re-revoke
+//!   writes no audit row.
+//! - revoke-all-except transition (`POST /auth/sessions/revoke-all-
+//!   except-current`) → `sessions_revoked` (`actor_id = user_id`,
+//!   payload carries `revoked_count` only). A no-op call (zero
+//!   transitions) writes no audit row.
 //!
 //! Audit payloads carry public metadata only. The
 //! `AUDIT_FORBIDDEN_SUBSTRINGS` sentinel test in
@@ -47,7 +57,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,7 +65,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use relayterm_auth::{ThrottleDecision, normalize_login_identifier};
 use relayterm_core::audit_event::AuditEventKind;
-use relayterm_core::ids::UserId;
+use relayterm_core::ids::{UserId, UserSessionId};
 use relayterm_core::repository::{
     AuditEventRepository, CreateAuditEvent, CreateUser, PasswordCredentialRepository,
     UserRepository,
@@ -66,7 +76,10 @@ use zeroize::Zeroizing;
 use crate::AppState;
 use crate::auth::cookie::{SESSION_COOKIE_NAME, extract_session_cookie};
 use crate::auth::{AuthenticatedUser, CsrfGuard};
-use crate::dto::auth::{BootstrapRequest, LoginRequest, UserResponse};
+use crate::dto::auth::{
+    BootstrapRequest, LoginRequest, RevokeAllExceptCurrentResponse, SessionListItem,
+    SessionsListResponse, UserResponse,
+};
 use crate::error::ApiError;
 
 /// Session TTL. Currently a constant; promotable to `AuthRoutesConfig`
@@ -120,6 +133,12 @@ pub(super) fn router() -> Router<AppState> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/me", get(me))
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/{id}/revoke", post(revoke_session))
+        .route(
+            "/sessions/revoke-all-except-current",
+            post(revoke_all_except_current),
+        )
 }
 
 // ---------------------------------------------------------------------
@@ -444,6 +463,168 @@ async fn logout(
 /// `warn!` line in `error.rs::IntoResponse`.
 async fn me(user: AuthenticatedUser) -> Json<UserResponse> {
     Json(user.into_user().into())
+}
+
+// ---------------------------------------------------------------------
+// Current-user session management
+// ---------------------------------------------------------------------
+
+/// `GET /api/v1/auth/sessions`.
+///
+/// List the caller's own browser sessions, newest first by
+/// `created_at`. Includes revoked AND expired rows so the UI can label
+/// them; the response status (`active` / `revoked` / `expired`) is
+/// computed in the DTO and collapses "revoked AND expired" to
+/// `revoked` to match the [`AuthService::validate_session_token`]
+/// priority.
+///
+/// Ownership scoping happens in SQL on the underlying repository
+/// (`WHERE user_id = $1`), not in a `.filter(...)` here — a route
+/// that forgot to re-check the owner cannot leak cross-user rows.
+/// `current` on each item is `true` for the session row that
+/// authenticated this request, derived from
+/// [`AuthenticatedUser::session_id`].
+///
+/// **Token redaction.** The wire shape is hand-rolled
+/// [`SessionListItem`] so a future column on
+/// [`UserSession`](relayterm_core::user_session::UserSession) cannot
+/// widen the response by accident. `token_hash` never reaches this
+/// layer in any human-readable form — `serde(skip)` on the domain
+/// row is the redaction backstop. Sentinel-redaction tests in the
+/// API test crate pin the contract.
+async fn list_sessions(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<Json<SessionsListResponse>, ApiError> {
+    let user_id = user.user_id();
+    let current_id = user.session_id();
+    let now = Utc::now();
+    let rows = state.auth.list_sessions_for_user(user_id).await?;
+    let sessions = rows
+        .iter()
+        .map(|row| SessionListItem::from_row(row, now, current_id))
+        .collect();
+    Ok(Json(SessionsListResponse { sessions }))
+}
+
+/// `POST /api/v1/auth/sessions/:id/revoke`.
+///
+/// Revoke a single session owned by the caller. Idempotent: a
+/// revoke against an already-revoked row owned by the caller returns
+/// 204 with no audit row written. A row owned by a different user OR
+/// a row that doesn't exist BOTH collapse to the same 404 — the
+/// probe-resistance contract for this surface, mirroring
+/// `AuthService::validate_session_token`.
+///
+/// When the targeted row is the caller's CURRENT session, the
+/// response carries the same `Set-Cookie: relayterm_session=; Max-
+/// Age=0` clear used by `/auth/logout` so the browser drops the
+/// cookie. Revoking the current session is intentionally allowed —
+/// it is the same effect as logout, just initiated from the session-
+/// management surface — and the audit row carries
+/// `current_session: true` so an operator review can distinguish
+/// self-revoke from "revoked another browser".
+async fn revoke_session(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(id): Path<UserSessionId>,
+) -> Result<Response, ApiError> {
+    let user_id = user.user_id();
+    let current_id = user.session_id();
+    let now = Utc::now();
+    let is_current = id == current_id;
+
+    let transitioned = match state
+        .auth
+        .revoke_session_for_user(user_id, id, now, Some("user_revoke"))
+        .await
+    {
+        Ok(t) => t,
+        // Foreign or missing → byte-identical 404 (probe resistance).
+        Err(relayterm_auth::AuthServiceError::SessionInvalid) => {
+            return Err(ApiError::NotFound {
+                entity: "user_session",
+            });
+        }
+        Err(other) => return Err(other.into()),
+    };
+
+    // Audit only on the real transition. A redundant revoke (already
+    // revoked) writes zero audit rows — same idempotency posture as
+    // the server-profile lifecycle. Failure of the audit append on
+    // the success path mirrors `write_lifecycle_audit`'s fail-closed
+    // policy: the revoke row is already committed; surfacing the
+    // audit failure as 500 keeps the gap visible to operators.
+    if transitioned {
+        state
+            .db
+            .audit_events()
+            .create(CreateAuditEvent {
+                actor_id: Some(user_id),
+                kind: AuditEventKind::SessionRevoked,
+                payload: json!({
+                    "session_id": id,
+                    "current_session": is_current,
+                    "revoked_at": now,
+                }),
+                remote_addr: None,
+            })
+            .await?;
+    }
+
+    if is_current {
+        let clear = build_clear_cookie(&state.auth_routes);
+        Ok(no_content_with_cookie(clear))
+    } else {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
+}
+
+/// `POST /api/v1/auth/sessions/revoke-all-except-current`.
+///
+/// Revoke every non-revoked session owned by the caller EXCEPT the
+/// caller's current session. Returns the count of rows transitioned
+/// from non-revoked to revoked. A user with no other sessions returns
+/// `revoked_count: 0` and writes no audit row — same idempotency
+/// posture as `revoke_session`.
+///
+/// The current cookie is intentionally NOT cleared: the request
+/// itself proves the caller wants to KEEP the current session. The
+/// response carries no per-row session ids — only the count — so the
+/// audit row, the wire response, and the absence of a token-bearing
+/// payload all stay aligned.
+async fn revoke_all_except_current(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<Json<RevokeAllExceptCurrentResponse>, ApiError> {
+    let user_id = user.user_id();
+    let current_id = user.session_id();
+    let now = Utc::now();
+
+    let revoked_count = state
+        .auth
+        .revoke_all_sessions_except(user_id, current_id, now, Some("user_revoke_all"))
+        .await?;
+
+    if revoked_count > 0 {
+        state
+            .db
+            .audit_events()
+            .create(CreateAuditEvent {
+                actor_id: Some(user_id),
+                kind: AuditEventKind::SessionsRevoked,
+                payload: json!({
+                    "revoked_count": revoked_count,
+                    "revoked_at": now,
+                }),
+                remote_addr: None,
+            })
+            .await?;
+    }
+
+    Ok(Json(RevokeAllExceptCurrentResponse { revoked_count }))
 }
 
 // ---------------------------------------------------------------------

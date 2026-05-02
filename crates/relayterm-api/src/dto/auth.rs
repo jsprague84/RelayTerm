@@ -15,8 +15,9 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use relayterm_core::ids::UserId;
+use relayterm_core::ids::{UserId, UserSessionId};
 use relayterm_core::user::User;
+use relayterm_core::user_session::UserSession;
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
@@ -147,6 +148,99 @@ impl From<User> for UserResponse {
             last_login_at: user.last_login_at,
         }
     }
+}
+
+/// Stable presentation status for a session row in the listing
+/// response.
+///
+/// Hand-rolled (not [`UserSession`]) so the wire surface is fixed:
+/// `active` / `expired` / `revoked`. The route layer collapses a
+/// "revoked AND expired" row into `revoked` because revocation is the
+/// deliberate-action signal and expiry is a passive timestamp; this
+/// matches the `validate_session_token` priority pinned by
+/// `service::validate_session_token_prefers_revoked_over_expired`.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionStatus {
+    Active,
+    Expired,
+    Revoked,
+}
+
+/// Wire shape for one session in the current-user list response.
+///
+/// **Token-redacted.** This DTO deliberately omits `token_hash` and
+/// has no plaintext-token field — the only public reference to a
+/// session is its `id`, the same one that appears on
+/// [`UserSession`](relayterm_core::user_session::UserSession) and in
+/// audit-event payloads. `serde_skip` on `UserSession::token_hash` is
+/// the redaction backstop one layer down; this DTO is hand-rolled so
+/// a future field on the domain row cannot widen the wire surface by
+/// accident. Audit-redaction sentinel tests in
+/// `crates/relayterm-api/tests/api.rs` pin this contract.
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionListItem {
+    pub(crate) id: UserSessionId,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) last_seen_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) revoked_at: Option<DateTime<Utc>>,
+    /// `true` when this row is the session that authenticated the
+    /// request producing the listing — i.e. the cookie the caller is
+    /// holding right now.
+    pub(crate) current: bool,
+    pub(crate) status: SessionStatus,
+}
+
+impl SessionListItem {
+    /// Build a listing item from a domain [`UserSession`] row.
+    ///
+    /// Status is derived from `(revoked_at, now, expires_at)` with
+    /// `revoked` winning over `expired` when both are true. `current`
+    /// is supplied by the caller — the DTO does not know which
+    /// session id the request came in on.
+    pub(crate) fn from_row(
+        row: &UserSession,
+        now: DateTime<Utc>,
+        current_id: UserSessionId,
+    ) -> Self {
+        let status = if row.revoked_at.is_some() {
+            SessionStatus::Revoked
+        } else if row.is_expired_at(now) {
+            SessionStatus::Expired
+        } else {
+            SessionStatus::Active
+        };
+        Self {
+            id: row.id,
+            created_at: row.created_at,
+            last_seen_at: row.last_seen_at,
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
+            current: row.id == current_id,
+            status,
+        }
+    }
+}
+
+/// Wire envelope for the session list. A struct (not a bare array)
+/// so a future addition (page cursor, total count) does not break
+/// existing clients.
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionsListResponse {
+    pub(crate) sessions: Vec<SessionListItem>,
+}
+
+/// Wire shape for the `revoke-all-except-current` response.
+///
+/// Carries only the count — never per-row session ids — so the audit
+/// row and the wire response stay byte-aligned and a future caller
+/// can't accidentally tee per-row information out of the response
+/// envelope. The count is the number of rows transitioned from
+/// non-revoked to revoked; an idempotent re-call returns `0`.
+#[derive(Debug, Serialize)]
+pub(crate) struct RevokeAllExceptCurrentResponse {
+    pub(crate) revoked_count: u64,
 }
 
 fn validate_password(value: &str) -> Result<(), ApiError> {
