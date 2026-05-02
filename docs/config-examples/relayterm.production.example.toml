@@ -1,0 +1,102 @@
+# RelayTerm production config example.
+#
+# Copy this file to `config/relayterm.toml` (or point `RELAYTERM_CONFIG`
+# at the path you choose) and fill in real values. Every key here can
+# also be supplied as an environment variable — env vars override the
+# TOML file. The env name is the TOML key path, all-caps, with `__`
+# (double underscore) as the section separator: `auth.cookie_secure`
+# becomes `RELAYTERM_AUTH__COOKIE_SECURE`.
+#
+# See `docs/production-auth.md` for the operational guide:
+#   - secret generation
+#   - first-user bootstrap flow
+#   - reverse-proxy / HTTPS notes
+#   - startup failure modes and recovery paths.
+
+[server]
+# Bind address. Behind a TLS-terminating reverse proxy, keep this on
+# loopback. The proxy is responsible for HTTPS; the backend speaks
+# plain HTTP upstream.
+bind = "127.0.0.1:8080"
+
+[database]
+# Postgres connection string. The password segment is masked in the
+# `Debug` output that lands in tracing logs, but it is still on disk in
+# this file — protect the file accordingly (`chmod 0600` and own it as
+# the backend user). `DATABASE_URL` is also honoured for sqlx-cli
+# parity if you prefer the env form.
+url = "postgres://relayterm:CHANGE_ME@127.0.0.1:5432/relayterm"
+max_connections = 10
+
+[auth]
+# Production mode enforces the strict boot-time envelope:
+#   - exactly one session signing key source
+#   - non-empty allowed_origins
+#   - cookie_secure = true
+# A misconfiguration refuses to start; the backend never opens its
+# listener with a half-valid auth posture.
+mode = "production"
+
+# Session signing key — 32 bytes, base64. Generate with:
+#   openssl rand -base64 32
+#
+# Pick exactly one source. Setting both is rejected at boot as
+# ambiguous; setting neither is rejected as missing. The key is
+# currently reserved (the v1 session model uses opaque hashed tokens),
+# but it is required so that the rotation/redaction discipline is in
+# place when the signed-CSRF / signed-cookie variants land.
+#
+# Recommended: keep the value out of this file. Set the env var on the
+# process — `RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64` or
+# `RELAYTERM_AUTH__SESSION_SIGNING_KEY_FILE` — and leave the keys
+# below commented out. If you do put it in TOML, `chmod 0600` the
+# file.
+# session_signing_key_b64  = "REPLACE_ME_WITH_BASE64_32_BYTES"
+# session_signing_key_file = "/etc/relayterm/session-signing-key"
+
+# CSRF / Origin allow-list. Each entry is an exact `scheme://host[:port]`
+# string — no trailing slash, no path. Comparison is case-sensitive
+# byte-equality against the browser's `Origin` header. Empty list is
+# rejected at boot in production. Multiple values become a TOML array.
+allowed_origins = ["https://relay.example.com"]
+
+# `Set-Cookie: ...; Secure` flag. MUST be true in production. The
+# browser will refuse to send the session cookie over plain HTTP, which
+# is what you want — the reverse proxy terminates TLS and the browser
+# always sees HTTPS.
+cookie_secure = true
+
+# Optional `Set-Cookie: ...; Domain=` attribute. Omit for a host-only
+# cookie (the recommended default). Set this only if you need to share
+# the session across subdomains and you understand the implications.
+# cookie_domain = "relay.example.com"
+
+# First-user bootstrap token. Required at startup IFF no row exists in
+# `user_passwords` (i.e. no user has ever finished the bootstrap flow).
+# After the first user is created, unset this and restart — `POST
+# /api/v1/auth/bootstrap` returns 409 once a password row exists, but
+# unsetting the token is good operational hygiene.
+#
+# Generate with: openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+#
+# Recommended: keep the value out of this file. Set
+# `RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN` on the process for the
+# bootstrap window only.
+# first_user_bootstrap_token = "REPLACE_ME_FOR_FIRST_BOOT_THEN_UNSET"
+
+[vault]
+# The vault master key is a SEPARATE secret from the session signing
+# key. It is the symmetric AEAD key used to encrypt SSH private keys
+# stored by the backend. Disable with `enabled = false` if you do not
+# want backend-generated SSH identities; in that mode `POST
+# /api/v1/ssh-identities` returns 503.
+enabled = true
+
+# 32 bytes, base64. Generate with:
+#   openssl rand -base64 32
+#
+# As with the session signing key, prefer setting this via the env var
+# `RELAYTERM_VAULT__MASTER_KEY_B64` or `RELAYTERM_VAULT__MASTER_KEY_FILE`
+# rather than committing it here.
+# master_key_b64  = "REPLACE_ME_WITH_BASE64_32_BYTES"
+# master_key_file = "/etc/relayterm/vault-master-key"
