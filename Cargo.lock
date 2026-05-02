@@ -1854,9 +1854,16 @@ dependencies = [
 name = "relayterm-auth"
 version = "0.0.0"
 dependencies = [
+ "argon2",
+ "async-trait",
+ "base64",
+ "chrono",
+ "rand 0.8.6",
  "relayterm-core",
- "relayterm-db",
+ "sha2",
  "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
