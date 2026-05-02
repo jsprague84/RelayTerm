@@ -1497,6 +1497,8 @@ The currently-missing kinds are:
 - `host_deleted` — required when host delete lands.
 - (`host_key_revoked` already exists; reuse it for the revoke route.)
 
+The auth-related kinds `login_succeeded`, `login_failed`, and `logout_succeeded` ARE already present in `audit_events_kind_chk` (per the original `20260428000009_audit_events.sql` migration) but no route emits them today. The forthcoming auth slice MUST NOT add a duplicate migration for these names. The auth slice DOES add new kinds (`first_user_created`, `password_changed`, `session_revoked`) — see "Production authentication architecture" → "Audit events" for the full list and the paired migration requirement.
+
 Rules every destructive lifecycle action MUST follow:
 
 1. **Successful destructive action writes exactly one audit event** with `actor_id = caller`, an appropriate `kind`, and a payload containing the target id and target kind. The `target_id` field on the payload is required so cross-entity audit queries are tractable.
@@ -1681,6 +1683,240 @@ This is the recommended staged plan. Each item is its own slice; do not bundle. 
 
 Each step's "definition of done" inherits the standard checklist (tests, sqlx prepare on schema change, audit event reachable, owner-scoping, redaction posture). When the first destructive route lands, append an "Encountered Lessons" entry in AGENTS.md if any non-obvious gotcha emerged (FK ordering, audit-payload surface, dialog redaction).
 
+## Production authentication architecture
+
+This section is normative. It defines the production authentication model, the migration plan from the `DevUser` stopgap to real auth, and the security invariants every future auth slice MUST satisfy. Drift from these rules is a spec bug, not an implementation freedom.
+
+**Status today (load-bearing — read before adding any auth code).** No production authentication exists. The API surface is gated by the `DevUser` extractor (`crates/relayterm-api/src/dev_user.rs`); when `dev_auth.enabled = true` (the default) every request is attributed to a single hardcoded user (`dev@relayterm.local`) bootstrapped at startup by `bootstrap_dev_user_for_unimplemented_auth` in `apps/backend/src/main.rs`. When `dev_auth.enabled = false` the extractor 401s every protected route. The `users` table exists and carries `id`, `email`, `display_name`, `created_at`, `last_login_at`; no password hash, passkey, or session columns are present yet. The `audit_events_kind_chk` CHECK already lists `login_succeeded`, `login_failed`, `logout_succeeded` so the audit surface is pre-wired for auth events that no route emits today. The `relayterm-auth` crate exists as a placeholder with a single `AuthError::NotImplemented`.
+
+This section defines what MUST be true before the first real-auth slice lands; it does NOT itself add migrations, routes, middleware, or UI.
+
+### Current auth state (what must change)
+
+- **Single-user-by-default.** Every request maps to one hardcoded `UserId` via `AppState::dev_user_id: Option<UserId>`. There is no concept of "logged-in user" — only "the dev user" or "no user."
+- **No credential primitives.** No password hash storage, no passkey storage, no session table, no token issuance. The `audit_events.kind` allow-list reserves the slots; the backing infrastructure does not exist.
+- **Ownership filtering depends on `DevUser`.** Every `/api/v1/*` route extracts `DevUser`, takes `UserId` from it, and scopes repository queries by `owner_id = caller`. The pattern is uniform — see `routes/v1/{hosts,ssh_identities,server_profiles,terminal_sessions,audit_events}.rs`. Any auth migration MUST keep the `owner_id` filter shape unchanged; only the SOURCE of `UserId` changes.
+- **Frontend assumes always-authed.** `apps/web/src/lib/app/AppShell.svelte` renders inventory and terminal views without a login gate. Same-origin fetches inherit no auth header today; under real auth they will inherit the session cookie automatically. There is no current-user endpoint, no logout affordance, no session-expired handling.
+- **Risk profile of leaving this in production.** The dev shim deployed to a public network is a full-takeover bug — every request is the same user, every secret is reachable. Production deployments MUST run with `dev_auth.enabled = false` AND a real auth path wired BEFORE accepting non-loopback traffic. There is no middle ground; "log in as the dev user" is a development affordance only.
+
+### Auth mode model
+
+The backend runs in exactly one of two modes at any time. The mode is decided at boot from typed config and is fail-fast if misconfigured.
+
+| Mode | `dev_auth.enabled` | `auth.mode` (future) | Behavior |
+|---|---|---|---|
+| `dev` | `true` | `dev` | `DevUser` extractor stamps every request with the bootstrapped `dev@relayterm.local`. `auth.mode = production` config is rejected at boot. Logs a loud `warn!` on every startup. |
+| `production` | `false` | `production` | `DevUser` extractor 401s. The `AuthenticatedUser` extractor (defined below) is the sole identity source. `dev_auth.enabled = true` config is rejected at boot. |
+
+Rules every auth-mode change MUST follow:
+
+1. **Production mode never silently falls back to `DevUser`.** A request that fails real-auth MUST return 401 — never a `DevUser`-stamped fallback. The `Option<UserId>` shape on `AppState` continues to mean "dev user id for dev-mode routes," nothing else.
+2. **Startup is fail-fast.** `auth.mode = production` with no session-signing key, no migration applied, or no first user configured MUST refuse to boot. The error message names which input is missing but never echoes a value (same redaction posture as the vault master key — see `apps/backend/src/config.rs`).
+3. **Mode misconfiguration is loud.** Booting in `dev` mode logs a `warn!` with the exact "AUTH NOT IMPLEMENTED" wording the existing shim uses. Booting in `production` with `dev_auth.enabled = true` is a config error; the backend refuses to start. The two flags MUST be mutually exclusive at boot.
+4. **Config keys follow the existing convention.** New keys are nested under `auth` and read from `RELAYTERM_AUTH__*` env vars (double-underscore = nesting), matching `RELAYTERM_VAULT__*` and `RELAYTERM_DEV_AUTH__*`. Reserved names: `auth.mode`, `auth.session_signing_key_b64`, `auth.session_signing_key_file`, `auth.first_user_bootstrap_token`, `auth.cookie_secure`, `auth.cookie_domain`. None of these are wired today; the names are reserved so future PRs use them consistently.
+5. **`Debug` for any new auth config struct redacts secret-shaped fields.** `session_signing_key_*` and `first_user_bootstrap_token` MUST be `Debug`-redacted to `_set: bool` markers, mirroring `VaultConfig` and `FileVaultConfig`.
+
+A `disabled` / `maintenance` third mode is intentionally NOT introduced. If maintenance is needed, the existing operator path (stop the process, run migrations, restart) is sufficient and avoids a third code path.
+
+### User model and first-user bootstrap
+
+- **Existing `users` table is sufficient as the identity row.** Auth credentials are layered on top in additional tables (`user_passwords`, `user_passkeys`, `user_sessions`). The `users` row is referenced by `owner_id` from every inventory entity AND from `audit_events.actor_id` (SET NULL on delete). New auth tables MUST reference `users(id)` with `ON DELETE CASCADE` so a user delete (admin-only, future) cleans up their credentials atomically. The session table CASCADEs as well — orphan sessions after user delete would be a logout-bypass.
+- **First-user bootstrap is required and one-shot.** A self-hosted deployment MUST be able to create its first user without an existing user to authenticate as. The chosen mechanism is a one-shot bootstrap token: the operator supplies `auth.first_user_bootstrap_token` (env or config); the backend prints / logs nothing about its value but exposes `POST /api/v1/auth/bootstrap` accepting `{ token, email, display_name, password }`. The route succeeds exactly once — once any row exists in `users` AND a corresponding `user_passwords` row exists, the bootstrap route returns `409 conflict { entity: "user", reason: "already_bootstrapped" }`.
+- **The first-user record is a normal user row.** No `is_admin` column, no role table in v1. RelayTerm is single-user/self-hosted first; multi-user invites and admin/operator roles are deferred. The bootstrap user owns every subsequently-created inventory entity (one-user model) until multi-user lands.
+- **Bootstrap path writes audit events.** The first-user bootstrap success appends one `audit_events` row with a NEW kind `first_user_created` (paired migration to extend the `audit_events_kind_chk` CHECK and the `AuditEventKind` enum). The bootstrap row's `actor_id` MUST be the newly-created user's id (NOT NULL), since the user IS the actor. A failed bootstrap (wrong token, malformed input) writes a `login_failed` row with `actor_id = NULL` and a payload that names ONLY the failure category (`bad_token`, `invalid_email`, `weak_password`) — no token bytes, no email if it was rejected as malformed, no password material at all.
+- **Relationship to `dev@relayterm.local`.** The dev fixture is bootstrapped without a password and is reachable only via the `DevUser` shim. When real auth lands, the dev fixture stays unchanged and stays dev-mode-only. Setting a password on it is NOT supported — operators who want a real user use the bootstrap route. A future migration MAY drop the dev fixture entirely once `DevUser` retires (see "Implementation order" step 9).
+- **Multi-user / team support is explicitly out of scope for the first auth milestone.** No invite flow, no admin role, no per-user permissions table. The single-user model lets the first auth slice land without RBAC scope creep.
+
+### Password authentication (v1)
+
+The first auth milestone uses password authentication. Passkeys/WebAuthn are deferred — see "Passkey/WebAuthn stance."
+
+- **Hashing.** Argon2id with parameters chosen for ~250 ms verify on a typical server (`m=19456` (kibibytes, ~19 MiB — the Argon2 `m` parameter is *already* expressed in kibibytes; do NOT multiply by 1024), `t=2`, `p=1` is the OWASP 2023 minimum and a sane v1 default). Parameters live in a typed config struct so they can be tuned without a migration. Hashes are stored in a new `user_passwords` table — not as a column on `users` — so the password row CASCADEs cleanly with the user, and so future credential variants (one-time-recovery, passkey) can sit alongside without bloating `users`.
+- **Schema sketch (NOT TO BE IMPLEMENTED IN THIS SLICE).**
+  ```sql
+  CREATE TABLE user_passwords (
+      user_id        UUID        PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      hash           TEXT        NOT NULL,            -- PHC string (`$argon2id$...`)
+      algo_version   SMALLINT    NOT NULL,            -- bump on parameter change
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  ```
+  PHC-string storage means future parameter upgrades verify the old hash, then re-hash and update on next successful login. No bespoke salt column; the salt is part of the PHC string.
+- **Password policy.** v1 enforces only a minimum length (12 chars). Maximum length (e.g. 1024) is enforced at the boundary so a maliciously huge password cannot DoS the hasher. No mandatory complexity rules (a length floor + Argon2id is more effective). A future password-reset flow MAY introduce additional rules; the boundary parser is the single place to extend.
+- **Throttling.** Login attempts are rate-limited per `(remote_addr, email)` AND per `email` (so a botnet hitting one account from many IPs is still throttled). The first slice ships an in-memory leaky-bucket; a Redis-backed shared limiter is a follow-up. A successful login MUST clear the bucket for the user to avoid lockouts after a typo'd attempt.
+- **Recovery.** No password reset / "forgot password" flow in the first milestone. A self-hosted operator who locks themselves out has DB-level recourse (admin command-line tool, future). Building email-based reset is its own slice and would drag in mail transport scope. Documented as deferred in "Out of scope (v1)."
+- **Login-event audit.**
+  - Successful login → `login_succeeded` with payload `{ user_id, login_at, method: "password" }`. `actor_id = user_id`.
+  - Failed login (wrong password, unknown email, throttled) → `login_failed` with `actor_id = NULL`, payload `{ method: "password", reason: "bad_credentials" | "throttled" }`. The reason set is exactly these two values for v1 — `"bad_credentials"` covers wrong-password AND unknown-email AND any other authentication-time refusal so a probe cannot distinguish "user does not exist" from "user exists but password is wrong" via the audit row OR the wire response. The payload MUST NOT carry the attempted email, the password, the password hash, or the request body. NULL-actor exclusion (see "Current-user audit events read API") keeps these rows out of any user-facing audit feed; an admin surface that wants them uses the unscoped `recent` query.
+  - Password change → `password_changed` (NEW kind, paired migration). Payload: `{ user_id, changed_at }`. Never the new or old hash, never the new or old password.
+- **Logging prohibitions.** Plaintext passwords MUST NEVER appear in any log line, error message, audit payload, panic message, span field, or HTTP response body. Argon2id hashes MUST NEVER appear in any audit payload, log line, or HTTP response body. The session-signing key MUST NEVER appear in any log line or `Debug` output. Every new module that handles password material grows a sentinel-string redaction test mirroring `AUDIT_FORBIDDEN_SUBSTRINGS` (see `crates/relayterm-api/tests/api.rs`).
+
+### Passkey/WebAuthn stance
+
+- **Deferred to a later milestone.** v1 ships password-only. The decision is pragmatic: passkeys-only would require a working multi-factor recovery story for a self-hosted deployment, and a passkey-or-password implementation doubles the surface of the first auth slice for marginal benefit on a single-user product.
+- **Forward compatibility.** The `users` table and `user_sessions` table (defined below) are passkey-ready: the session is independent of the credential mechanism that minted it. A future `user_passkeys` table sits alongside `user_passwords`; a future login route variant accepts a WebAuthn assertion and (on success) issues the same opaque session cookie shape password login does.
+- **What a future passkey slice would add.** (Sketch, NOT load-bearing.) `user_passkeys (user_id, credential_id, public_key, sign_count, transports, friendly_name, created_at, last_used_at)`; relying-party-id config under `auth.webauthn.rp_id`; a registration challenge endpoint; an authentication challenge endpoint. The session and audit shapes do not change. `login_succeeded.payload.method` becomes `"passkey"`; everything else flows through unchanged.
+- **Anti-goal.** Do not introduce a passkey extractor or shim before the password milestone is green. Mixing the two in the first slice is how scope dies.
+
+### Session model
+
+Sessions are server-side opaque tokens persisted in Postgres and bound to an HTTP-only cookie. JWTs are NOT used for the browser surface. This matches the existing rule in `AGENTS.md`: "Sessions over JWTs."
+
+- **`user_sessions` table sketch (NOT IN THIS SLICE).**
+  ```sql
+  CREATE TABLE user_sessions (
+      id               UUID        PRIMARY KEY,         -- not the cookie value
+      user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash       BYTEA       NOT NULL UNIQUE,      -- SHA-256 of the cookie token
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at       TIMESTAMPTZ NOT NULL,
+      last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked_at       TIMESTAMPTZ,
+      remote_addr      TEXT,                             -- last-seen, NOT join condition
+      user_agent       TEXT                              -- last-seen, NOT join condition
+  );
+  CREATE INDEX user_sessions_user_id_idx ON user_sessions (user_id);
+  CREATE INDEX user_sessions_expires_at_idx ON user_sessions (expires_at);
+  ```
+  - **Token generation.** 32 bytes from `rand::rngs::OsRng`, base64url-encoded for the cookie value. The DB stores ONLY `token_hash = SHA-256(token_bytes)` — never the plaintext token, never an HMAC keyed with a per-server key (a non-keyed hash is sufficient when tokens are 32 random bytes; a keyed MAC adds key-rotation cost without security benefit). A DB dump never contains a usable token.
+  - **Lookup is constant-time-ish.** Indexed `UNIQUE` on `token_hash`. Token comparison happens via the index; an attacker cannot time-side-channel which `(prefix)` matches because the index lookup is on the full hash.
+  - **Expiry.** Default `expires_at = created_at + 30 days`. A single-purpose `last_seen_at` column tracks idle activity; the expiry sliding-window policy (re-issue on activity? hard expire?) is `hard_expire` for v1 — simpler, no rolling-expiry edge cases — and revisited if UX demands it. The login route refuses to reuse expired rows.
+  - **Logout / revoke.** `POST /api/v1/auth/logout` stamps `revoked_at = NOW()` on the matching row (looked up by `token_hash` from the cookie) AND returns a `Set-Cookie` that immediately expires the cookie. A revoked or expired row 401s every subsequent request. Revoked rows are kept for audit / "active sessions" listing; a sweeper deletes them after `expires_at + 30 days` (sweeper is future-only — see Implementation order).
+  - **Active sessions list (later).** `GET /api/v1/auth/sessions` returns the caller's non-revoked, non-expired rows with `id`, `created_at`, `last_seen_at`, `remote_addr`, `user_agent` (sanitised). The user can revoke a specific session id from the list. The plaintext token is NEVER returned. Out of scope for the first milestone — listed here so the schema accommodates it.
+  - **`remote_addr` / `user_agent`.** Stored last-seen for the session list. They are NEVER used as a join / equality predicate for auth (an IP change does not invalidate the session — that breaks mobile networks, see the project's reconnect rules). Do NOT add `WHERE user_agent = $1` or `WHERE remote_addr = $1` predicates anywhere — they are display metadata, not auth inputs. The auth extractor does NOT consult them; lookup goes through `token_hash` only.
+- **Cookie configuration.**
+  - **Name.** `relayterm_session`. Stable wire name; clients (the Tauri shells) MUST NOT depend on the name being changeable per environment.
+  - **Flags.** `HttpOnly; Secure; SameSite=Strict; Path=/`. `Domain` is omitted by default (host-only cookie); a deploy that runs the API and the SPA on different subdomains MUST set `auth.cookie_domain` and accept the cross-subdomain SameSite implications.
+  - **Lifetime.** Cookie `Max-Age` matches `user_sessions.expires_at`. The session is the source of truth; the cookie is a hint. A user clearing cookies invalidates their browser session immediately; the DB row stays until the sweeper runs.
+  - **Dev-mode exception.** `auth.cookie_secure = false` is permitted ONLY when `auth.mode = dev` AND `RELAYTERM_DEV_INSECURE_COOKIE = 1` is set in the environment. The startup log emits a loud `warn!` when this combination is in effect. Production mode rejects `cookie_secure = false` at boot.
+  - **Rotation on login.** Every successful login mints a fresh `user_sessions` row and a fresh cookie value. The previous cookie/session of the same user is NOT revoked automatically — multiple devices coexist. A "log out everywhere" affordance is future work.
+  - **No rotation on each request.** v1 does not rotate the session token on activity. Rotation introduces a race window where the old cookie is briefly valid; the marginal benefit is small for a 30-day expiry and the implementation complexity is real.
+- **Session-signing key.** Reserved as `auth.session_signing_key_b64` / `auth.session_signing_key_file` for future use (e.g. signed CSRF tokens, signed cookies if the model changes). NOT used in the v1 hashed-opaque-token model — the random 32 bytes are their own entropy source. The key is loaded at boot using the same fail-fast / no-silent-fallback discipline as `vault.master_key_*` (see `Config::vault_master_key`); in v1 the key is simply unused.
+- **Boundaries.** `user_sessions` rows live in the same Postgres database as inventory. No Redis dependency in v1. The sqlx repository for `user_sessions` follows the existing repository pattern (`relayterm-core::repository`).
+
+### CSRF posture
+
+Cookie-bearing browser requests are vulnerable to CSRF. v1 defends in three layers:
+
+1. **`SameSite=Strict` on the session cookie.** First line of defense. Strict means the cookie is not sent on cross-site requests AT ALL — including top-level navigations from third-party sites. This blocks the classic CSRF vectors (image src, form post, top-frame nav). Strict is acceptable for RelayTerm because there is no "click a link from gmail and stay logged in" UX expectation; the user opens the SPA tab directly.
+2. **`Origin` header validation on every state-changing request.** Every non-GET / non-HEAD / non-OPTIONS request MUST carry an `Origin` header that matches the configured `auth.allowed_origins` list (single entry by default — the SPA's own origin). A missing or mismatched `Origin` returns `403 forbidden { code: "csrf_origin_mismatch" }` BEFORE the auth extractor runs. This catches misconfigured browsers and (more importantly) SOPped XHR from third parties that forget to set `Origin`.
+3. **Double-submit token for the SPA (added once a non-same-origin client lands).** A short-lived CSRF token is issued in a non-`HttpOnly` cookie + a header on every state-changing request; the middleware checks they match. v1 ships ONLY layers 1 and 2 — same-origin SPA + Strict cookie is sufficient. Layer 3 lands when the Tauri shells move to a different origin from the API, or when an admin embeds RelayTerm somewhere.
+- **Exempt routes.** GET/HEAD/OPTIONS are exempt from CSRF middleware (idempotent reads, browser preflight). The login, logout, and bootstrap routes are NOT exempt — they require `Origin` to match. The WebSocket upgrade route is NOT exempt; the upgrade handshake carries `Origin` and the middleware enforces it BEFORE the upgrade completes (a same-origin SameSite-Strict cookie is the only way the cookie reaches the upgrade in the first place, but defense in depth costs nothing here).
+- **API-client / non-browser clients.** A future API token surface (e.g. for CI / scripts) issues a separate `Authorization: Bearer <token>` mechanism with its own table; bearer tokens are not subject to CSRF (no ambient credential). Out of scope for v1; named here so the v1 CSRF layer doesn't block its design.
+- **No CSRF cookie in v1.** Avoiding the second cookie keeps the cookie surface small and the headers minimal. The Origin-header check is sufficient given Strict.
+
+### Auth extractor and route migration
+
+- **New extractor: `AuthenticatedUser`.** Lives in `crates/relayterm-auth/` (graduates the placeholder crate). Same shape as `DevUser`: a tuple wrapper around `UserId`, an `axum::extract::FromRequestParts` impl, and an `ApiError::Unauthorized` rejection.
+  ```rust,ignore
+  pub struct AuthenticatedUser(pub UserId);
+
+  impl<S> FromRequestParts<S> for AuthenticatedUser
+  where
+      S: Send + Sync,
+      Arc<dyn SessionRepository>: FromRef<S>,
+  {
+      type Rejection = ApiError;
+      async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+          // 1. Pull the cookie value; missing → 401.
+          // 2. SHA-256 it; look up by token_hash.
+          // 3. Reject if revoked_at IS NOT NULL or expires_at <= NOW().
+          // 4. Update last_seen_at (best-effort, error-tolerant — the
+          //    update MUST follow AGENTS.md's concurrency rules: a managed
+          //    `JoinSet` handle owned by the auth service, NOT a bare
+          //    `tokio::spawn`-and-forget. A failure to update last_seen
+          //    is logged at `warn!` and otherwise ignored — it does NOT
+          //    fail the request.).
+          // 5. Return AuthenticatedUser(row.user_id).
+      }
+  }
+  ```
+  Failures collapse to a single `ApiError::Unauthorized("session invalid")` — a missing cookie, a revoked row, an expired row, and a malformed token are byte-identical on the wire. The operator-side detail names the category (logged at `warn!`) but never the token bytes or hash.
+- **Route migration shape.** Every existing handler that takes `DevUser` parameter migrates to `AuthenticatedUser`. The handler body changes ONLY where the `UserId` is bound — the `owner_id = caller` repository filter, the `into_create(owner)` DTO method, and the audit `actor_id` are all already factored to take a `UserId` and stay unchanged.
+- **Transition strategy (two-phase, no big-bang).**
+  1. **Phase A — coexistence.** Land `AuthenticatedUser` AND keep `DevUser`. Both extractors live in the codebase. Routes still use `DevUser`. `dev_auth.enabled` defaults stay `true`. The auth crate ships, schema migrations land, the login/logout/bootstrap routes land, but no production handler references the new extractor yet. This phase exists so a misbehaving auth layer can be reverted by un-pointing routes WITHOUT a schema rollback.
+  2. **Phase B — cutover.** Replace `DevUser` with `AuthenticatedUser` route-by-route, in dependency order: `/api/v1/auth/*` (already uses no extractor on bootstrap; uses `AuthenticatedUser` on logout/me) → audit-events read → ssh-identities → hosts → server-profiles → terminal-sessions. Each route's switch is its own commit so a regression bisect is cheap. After every route is migrated AND `dev_auth.enabled = false` runs cleanly in CI, retire `DevUser`.
+  3. **Phase C — retirement.** Delete `crates/relayterm-api/src/dev_user.rs`, drop `AppState::dev_user_id`, drop `DevAuthConfig`, drop the `bootstrap_dev_user_for_unimplemented_auth` call site. The dev fixture user (`dev@relayterm.local`) is dropped by a follow-up migration OR re-purposed as an integration-test-only user accessible only via a test-side login; the choice is deferred to the slice that retires the shim.
+- **Test fakes.** Integration tests today inject `AppState.dev_user_id = Some(test_user)` directly. After cutover, tests inject a session row via the repository AND set the cookie on the test client request. A small `tests/auth_helpers.rs` module wraps "create-test-user-and-cookie" so individual tests do not duplicate the boilerplate. No DEV-only `bypass_auth = true` test mode — the production path is the test path.
+- **Boundary discipline (re-affirmed).** Every protected handler MUST take the auth extractor as a parameter, not pull the user out of state inside the handler body. The extractor IS the gate; a handler that "guards itself" is a future bug.
+
+### Frontend authentication UI plan
+
+The frontend gains a login surface. The terminal renderer surface and the WebSocket reconnect contract do NOT change — auth lives in the AppShell, not in `terminal-core` or any renderer adapter.
+
+- **Phase 1 — gate the AppShell on `getCurrentUser()`.** Add `apps/web/src/lib/api/auth.ts` exposing `getCurrentUser()` that calls `GET /api/v1/auth/me`. `AppShell.svelte` short-circuits to a `LoadingSplash` while the call is in flight, to a `LoginView` on 401, and to the existing nav+view tree on 200. While in dev mode, `/auth/me` returns the dev user and the existing UX is unchanged.
+- **Phase 2 — `LoginView` (password).** New `apps/web/src/lib/app/views/LoginView.svelte`. Single form: `email`, `password`, submit. Submits to `POST /api/v1/auth/login` with `credentials: "include"` and an explicit `Content-Type: application/json`. On 200, calls `getCurrentUser()` and (on success) re-renders the AppShell. On 401, shows a generic "sign-in failed" message — never echoes the wire `message` of the response. On 5xx / network failure, formats via the existing `describeLoadError("sign in", err)` helper. Adds stable selectors `auth-login-form`, `auth-login-email`, `auth-login-password`, `auth-login-submit`, `auth-login-error`.
+- **Phase 3 — `BootstrapView` (first user).** Reachable only when `GET /api/v1/auth/me` returns `409 conflict { entity: "user", reason: "not_bootstrapped" }`. Form: `bootstrap_token`, `email`, `display_name`, `password`. Submits to `POST /api/v1/auth/bootstrap`. The bootstrap route's job is **user creation only — it does NOT mint a session or set a cookie**. On 200, the SPA immediately POSTs the same `email` + `password` to `/api/v1/auth/login` to obtain the session cookie, then re-renders the AppShell. Splitting bootstrap and login keeps session minting on a single route (the login route) — bootstrapping does not become a second unauthenticated session-issuing surface. Selectors: `auth-bootstrap-*`. The bootstrap form's `bootstrap_token` field is a normal `<input type="password">` — never logged, never echoed, never persisted to local storage.
+- **Phase 4 — logout.** Add a "Sign out" affordance to the existing `Settings` view (or the AppShell header). Submits `POST /api/v1/auth/logout`; on 200 (or 401 — already invalidated is fine) the SPA re-renders to `LoginView`. **Active terminal state MUST be preserved across the wire only.** On logout, the SPA closes any open terminal WebSocket, clears any in-memory terminal-renderer state, AND clears the local-storage `active_terminal_session_id` recovery pointer (the existing `apps/web/src/lib/app/views/active terminal local recovery` slice). The backend `terminal_sessions` row stays in `detached` until the TTL expires or an explicit close — that is the existing contract; logout does NOT auto-close sessions, and re-login within the TTL CAN re-attach. Documenting this is the load-bearing part: an operator who logs out and back in within 30s of detach SHOULD recover their terminal.
+- **Phase 5 — session-expired handling.** Any `/api/v1/*` response with status `401` that is NOT itself the auth surface MUST cause the SPA to drop to `LoginView`. The error envelope's `code: "unauthorized"` is the trigger; transient network errors do NOT trigger logout (they re-render the existing per-view error state). A small `lib/api/authState.ts` store holds the current-user resource; the 401 handler in `fetchJson` notifies it.
+- **Phase 6 — route guarding.** URL-driven views (the existing `lib/app/navigation.ts` machinery) MUST refuse to render the inventory/terminal routes when `currentUser` is null. The router shows `LoginView` regardless of the URL path until login succeeds; the originally-requested path is preserved in component state and restored after login. This avoids a flash of empty inventory between login complete and `currentUser` resolved.
+- **No client-side persistence of auth material.** The session cookie is the only auth state the SPA holds. Local storage MUST NOT carry the session token, the password, the bootstrap token, or any decoded session payload. Stable selector and redaction-sentinel tests pin this — `apps/web/tests/authPersistence.test.ts` (NEW) asserts no auth-shaped string ever reaches `localStorage` or `sessionStorage`.
+- **Tauri shells.** Desktop and mobile shells inherit the cookie via the WebView. Production deploys MUST configure `auth.allowed_origins` to include the Tauri custom scheme (`tauri://localhost` or the platform-specific equivalent) — otherwise the Origin-header CSRF check rejects the SPA's writes. Mobile-network reconnects continue to work because the session is server-side; a flaky network just retries the request, the cookie travels with it.
+
+### Audit events
+
+The auth surface emits exactly the kinds enumerated in `audit_events_kind_chk`. New kinds REQUIRE a paired migration extending the CHECK + the `AuditEventKind` Rust enum in lockstep (see "Audit-event expectations").
+
+| Event | Kind | `actor_id` | Allowed payload fields |
+|---|---|---|---|
+| Successful password login | `login_succeeded` | logged-in `user_id` | `user_id`, `method: "password"`, `login_at` |
+| Failed login (any reason) | `login_failed` | `NULL` | `method: "password"`, `reason: "bad_credentials" \| "throttled"` |
+| Logout | `logout_succeeded` | logged-out `user_id` | `user_id`, `session_id` (= `user_sessions.id`, the UUID primary key — NEVER the cookie token bytes or its hash), `logout_at` |
+| Session revoked (admin / list-revoke) | `session_revoked` (NEW) | revoking `user_id` | `user_id`, `revoked_session_id` (= `user_sessions.id`, NOT the cookie token), `reason` |
+| First user created | `first_user_created` (NEW) | the new `user_id` | `user_id`, `created_at` (`email` and `display_name` are deliberately excluded — they are PII reachable via a normal `users` query scoped to `actor_id`, and including them in audit `payload` would survive the `audit_events.actor_id ON DELETE SET NULL` anonymisation contract from "Reference / integrity policy") |
+| Password changed | `password_changed` (NEW) | changing `user_id` | `user_id`, `changed_at` |
+| Bootstrap-token misuse | `login_failed` | `NULL` | `method: "bootstrap"`, `reason: "bad_token" \| "already_bootstrapped"` |
+
+Forbidden in EVERY auth payload (per the existing audit redaction contract): plaintext passwords, password hashes, session tokens, session token hashes, bootstrap token bytes, the session-signing key, the `client_info` blob, raw russh / DB error text, peer banners. Sentinel-string tests in `crates/relayterm-api/tests/api.rs` MUST extend `AUDIT_FORBIDDEN_SUBSTRINGS` with the new auth-shaped names (`bootstrap_token`, `password_hash`, `session_token`, `argon2id`).
+
+NULL-actor exclusion (see "Current-user audit events read API") keeps `login_failed` rows (which always carry `actor_id = NULL`) out of the per-user audit feed; admin tooling that wants them uses the unscoped `recent` query when it lands.
+
+User-visibility of auth events on the `recent_for_actor` feed:
+
+- `login_succeeded`, `logout_succeeded`, `password_changed`, and `first_user_created` carry the user's own id as `actor_id` and ARE visible on the per-user feed. A user seeing their own sign-ins is the load-bearing UX of an audit feed.
+- `session_revoked` carries the revoking user's id as `actor_id`. When a user revokes one of their OWN sessions from the (future) active-sessions list, the row IS visible on their feed (they are both actor and target). When an admin (future) revokes another user's session, the `actor_id` is the admin's id and the target user does NOT see the row on their per-user feed — that is the intended NULL-actor-style isolation. A future "events about me" admin surface (`target_user_id` audit query) is its own slice and is NOT mixed into `recent_for_actor`.
+- `login_failed` is `actor_id = NULL` and never appears on any per-user feed.
+
+The frontend `parseAuditEvent` already collapses unknown summary kinds to `generic`, so the new kinds are forward-compatible — the per-kind sanitizer arms can land in a follow-up without breaking the frontend.
+
+### Security properties to test
+
+The first auth slice MUST ship with tests covering each property below. Tests are the spec's enforcement; a property without a test is a property that drifts.
+
+1. **Boot fail-fast.** `auth.mode = production` with `dev_auth.enabled = true` refuses to start. `auth.mode = production` with no `session_signing_key_*` source ALWAYS refuses to start, regardless of whether a first user already exists — a missing key is a misconfiguration, not a transient state. Additionally, `auth.mode = production` with no first user AND no `auth.first_user_bootstrap_token` configured refuses to start (the operator has no path to create a user). `auth.mode = dev` with `dev_auth.enabled = false` is allowed but logs a warning that the API is unprotected. Mode-mismatch errors name the failing input but never echo a value.
+2. **Password verify is correct.** Argon2id parameters round-trip: a hash produced at parameter `v1` verifies at parameter `v1`; on a successful verify under an older `algo_version` the hash is re-issued at the current parameters.
+3. **Session token storage is hashed.** A direct `SELECT * FROM user_sessions WHERE token_hash = $1` with the plaintext token in `$1` returns zero rows. Only `SHA-256(token)` matches. A cookie-replay test confirms the plaintext token cookie still authenticates.
+4. **Cookie flags are set.** `Set-Cookie` from a successful login carries `HttpOnly`, `Secure`, `SameSite=Strict`, and a `Max-Age` matching `expires_at`. Production-mode test asserts `Secure`; dev-insecure-mode test asserts `Secure` is absent AND that the dev warning was logged.
+5. **CSRF rejects bad Origin.** A POST with a missing `Origin` header → 403. A POST with an `Origin` outside `auth.allowed_origins` → 403. A POST with an exact match → passes the CSRF gate (whether it then 200s or 401s depends on auth, which is a separate test). GETs are exempt.
+6. **Every protected route requires auth.** A direct GET / POST to every `/api/v1/*` route WITHOUT a session cookie returns `401 unauthorized` with the static `unauthorized` body. The list of routes is enumerated explicitly in the test so a future route is forced to opt in.
+7. **Cross-user isolation.** User A's session cookie cannot read User B's hosts, profiles, identities, terminal sessions, or audit events. A foreign id collapses to `404 not_found` byte-identical to a genuine 404 (the existing `get_by_id` ownership-filter rule, see AGENTS.md "Encountered Lessons" 2026-04-28).
+8. **Logout invalidates.** A logout response stamps `revoked_at`; the next request with the same cookie returns 401. A second logout with the same cookie ALSO returns 401 (idempotent — a revoked session is indistinguishable from a missing one).
+9. **Audit redaction.** A login attempt whose payload would otherwise smuggle a password, hash, or session token into `login_succeeded` / `login_failed` finds none of those substrings in the persisted row OR in the `audit_events_recent` response. Sentinel tests at the route layer AND the DTO layer.
+10. **DevUser is unreachable in production.** With `auth.mode = production` and `dev_auth.enabled = false`, every route that USED to take `DevUser` now takes `AuthenticatedUser` and returns 401 to a missing cookie; no path can produce a `DevUser`-stamped request.
+11. **Throttling triggers and clears.** N+1 failed logins from the same IP for the same email return `429 too_many_requests` (NEW status code on `ApiError::TooManyRequests`); a successful login clears the bucket. The exact threshold is config-driven so the test can run with a tight bucket.
+12. **Bootstrap is one-shot.** A successful bootstrap flips the route to `409 conflict { entity: "user", reason: "already_bootstrapped" }` for every subsequent attempt, including with the same token, a different token, and a malformed token.
+
+### Implementation order
+
+This is the recommended staged plan. Each item is its own slice; do not bundle. Earlier items unblock later items and the cutover to production auth.
+
+1. **Auth-mode + config plumbing.** Add `auth.mode`, `auth.session_signing_key_*`, `auth.cookie_secure`, `auth.cookie_domain`, `auth.first_user_bootstrap_token`, `auth.allowed_origins` to `apps/backend/src/config.rs` with the same redaction posture as `VaultConfig`. Add boot-time fail-fast for the mutually-exclusive flag combinations. No routes; no migrations. Tests for property 1 above.
+2. **Schema migrations.** `user_passwords`, `user_sessions`, the new audit kinds (`first_user_created`, `password_changed`, `session_revoked`). Run `cargo sqlx prepare --workspace`. No routes yet; the schema is reachable only via the repositories.
+3. **Repositories + auth service.** `relayterm-core::repository::{UserPasswordRepository, UserSessionRepository}` traits + sqlx impls. `relayterm-auth::AuthService` with `bootstrap`, `login`, `logout`, `lookup_session` methods. Argon2id wrapped behind `PasswordHasher` so tests can inject a fast/test-only variant. Tests for properties 2 and 3 (the service-level shape — round-trip hash, hashed-at-rest tokens). Property 8 (logout invalidates) is a route-level test that lands with step 4.
+4. **Login / logout / bootstrap / me API plus inline CSRF guard.** `POST /api/v1/auth/bootstrap`, `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`. Cookie set / clear in `axum`. Audit-event emission. **Because step 6 has not landed yet, every state-changing auth route in this step MUST carry an INLINE Origin-header check (a small per-route helper, not the shared middleware) so login/logout/bootstrap are not CSRF-vulnerable in the gap between steps 4 and 6.** When step 6 lands, the inline check is removed in the same commit that wires the shared middleware so there is no gap and no double-check. Tests for properties 4, 6 (partial — for the new auth routes), 8 (logout invalidates), 9, 12.
+5. **`AuthenticatedUser` extractor.** Lands but no production handler uses it yet (Phase A). Tests cover the extractor's 401 cases against a fake repo. The auth crate graduates from `NotImplemented`.
+6. **CSRF middleware.** Replaces the per-route Origin-header helper from step 4 with shared middleware applied to every state-changing route, including login/logout/bootstrap. The migration commit removes the inline checks. Tests for property 5.
+7. **Route migration (Phase B).** Replace `DevUser` with `AuthenticatedUser` route-by-route, smallest blast radius first (audit-events → ssh-identities → hosts → server-profiles → terminal-sessions). Each route's switch is its own commit. Tests cover property 7 cross-user-isolation per route AND property 10 dev-disabled-in-production globally after the last route migrates.
+8. **Throttling.** In-memory leaky bucket, per-`(remote_addr, email)` and per-`email`. New `ApiError::TooManyRequests` variant + `429 too_many_requests` wire code. Tests for property 11.
+9. **Frontend auth phases 1–6.** `getCurrentUser()` gate, `LoginView`, `BootstrapView`, logout affordance, session-expired handling, route guarding. Smoke selectors added to `apps/web/e2e/SMOKE.md` for the manual Playwright run.
+10. **DevUser retirement (Phase C).** Delete `crates/relayterm-api/src/dev_user.rs`, drop `AppState::dev_user_id`, drop `DevAuthConfig`, drop the `bootstrap_dev_user_for_unimplemented_auth` call. Decide dev-fixture-user fate (keep for tests, or drop). This slice MUST NOT land until every route migration is green AND CI runs in `auth.mode = production`.
+11. **Optional: passkeys.** New `user_passkeys` table, registration / authentication endpoints, `LoginView` adds the alternate path. Same session shape, same audit shape. Out of scope for the first milestone.
+12. **Optional: active sessions list.** `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/:id/revoke`. Same session table, no schema change. Useful once a deployment has multiple devices per user.
+13. **Optional: password reset.** Email transport scope; deliberately deferred. Self-hosted operators have DB-level recovery in v1.
+14. **Optional: admin / multi-user.** Roles table, invite flow, per-route role check. Deliberately deferred — single-user/self-hosted is the v1 target.
+
+Each step's "definition of done" inherits the standard checklist (tests, sqlx prepare on schema change, audit event reachable, owner-scoping, redaction posture). When the first auth route lands, append an "Encountered Lessons" entry in AGENTS.md if any non-obvious gotcha emerged (cookie flag interaction, middleware ordering, CSRF preflight surprises).
+
 ## Integration points
 
 - **PostgreSQL** — primary store for users, sessions, audit log, key vault. sqlx connection pool; `runtime-tokio-rustls`.
@@ -1688,7 +1924,7 @@ Each step's "definition of done" inherits the standard checklist (tests, sqlx pr
 - **Traefik** — reverse proxy in front of the backend; terminates TLS; routes `/api/*` and `/ws/*`.
 - **WireGuard** (optional) — used only when the backend lives on a remote box and SSH targets are reachable only via the WireGuard mesh.
 - **Object storage** — TODO if the project ever needs file upload/download via SCP/SFTP. Out of scope for v1.
-- **Passkeys / WebAuthn** — TODO future phase; v1 uses opaque session cookies issued after dev-mode password login.
+- **Passkeys / WebAuthn** — deferred. v1 ships password-only authentication with opaque server-side sessions in Postgres bound to an `HttpOnly; Secure; SameSite=Strict` cookie. Today the API runs behind the `DevUser` stopgap (`dev_auth.enabled = true` bootstraps `dev@relayterm.local`); see "Production authentication architecture" above for the migration plan from `DevUser` to real auth, the v1 password milestone, and the forward-compatible session shape that lets passkeys land later without a session-shape change.
 
 ## Out of scope (v1)
 
@@ -1699,6 +1935,10 @@ TODO — explicit list of features deferred so the agent doesn't "helpfully" imp
 - Public-cloud-hosted multi-tenant deployment (v1 is single-tenant Docker Compose).
 - iOS Tauri build (Android first; iOS later).
 - libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) and the experimental ghostty-web (`@relayterm/terminal-ghostty-web`), restty (`@relayterm/terminal-restty`), and wterm (`@relayterm/terminal-wterm`) adapters have all landed under `packages/terminal-<name>/`.
+- Multi-user / team authentication, role-based access control, and an admin / operator surface. v1 is single-user self-hosted; see "Production authentication architecture" for the rationale.
+- Email-based password reset / "forgot password" flow. Self-hosted operators have DB-level recovery in v1; mail transport is its own scope.
+- Passkey / WebAuthn registration and authentication. Forward-compatible with the v1 session shape; deliberately deferred.
+- Active sessions list and per-session revoke UI. Schema accommodates it; no route or UI in v1.
 
 ## Open questions
 
@@ -1707,6 +1947,8 @@ TODO — known ambiguities for the owner to resolve. Each: question, options con
 - Replay buffer policy: fixed bytes vs fixed events vs time-window? Default: TODO.
 - How long does a `detached` session linger before auto-close? **Default**: `relayterm_terminal::DETACHED_LIVE_PTY_TTL = 30s`. In-memory only (lost on backend restart). See "Detached-session TTL contract" for the full lifecycle.
 - Should the renderer choice be per-session or per-device? Default: per-device.
+- Session expiry policy: hard-expire vs sliding-window? **Default (v1)**: `hard_expire` at `created_at + 30 days`. Reconsider only if UX demands it; sliding-window introduces a re-issue race for marginal benefit. See "Production authentication architecture" → "Session model".
+- Login throttle thresholds: bucket size and refill rate per `(remote_addr, email)` and per `email`. Default: TODO — pick numbers when the throttling slice lands; the test rig must be able to drive a tight bucket independently of the production default.
 
 ---
 
