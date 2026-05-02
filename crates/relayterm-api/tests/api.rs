@@ -7662,3 +7662,216 @@ async fn login_validation_rejects_short_password(pool: PgPool) {
     let body = read_body(resp).await;
     assert_eq!(body["error"]["code"], "invalid_input");
 }
+
+// ----------------------------------------------------------------------
+// AuthenticatedUser extractor (cookie-backed) — exercised today only
+// via `GET /api/v1/auth/me`. The remaining protected app routes still
+// go through `DevUser` until the route-migration slice (SPEC step 5).
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_rejects_expired_session_via_extractor(pool: PgPool) {
+    // Insert a session row with `expires_at` already in the past,
+    // then drive `/auth/me` with the matching plaintext cookie. The
+    // extractor's `validate_session_token` MUST surface
+    // `SessionExpired` and the route MUST collapse to 401 on the
+    // wire.
+    let (app, user_id) = setup_with_first_user(pool.clone(), "expired@relayterm.local").await;
+    let token = relayterm_auth::SessionToken::generate();
+    let token_hash = token.hash().into_bytes();
+    let already_expired = chrono::Utc::now() - chrono::Duration::seconds(60);
+    relayterm_db::PgUserSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateUserSession {
+            user_id,
+            token_hash,
+            expires_at: already_expired,
+        })
+        .await
+        .expect("insert pre-expired session");
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", token.expose()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_rejects_revoked_session_via_extractor(pool: PgPool) {
+    // Mint a real session via /login, revoke its row, then drive
+    // /me. The extractor MUST see `SessionRevoked` and return 401.
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "revoked@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "revoked@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    // Revoke the underlying session row directly.
+    let token_hash = relayterm_auth::hash_session_token(&token).into_bytes();
+    let sessions = relayterm_db::PgUserSessionRepository::new(pool.clone());
+    let row = sessions
+        .get_by_token_hash(&token_hash)
+        .await
+        .expect("lookup session row")
+        .expect("session row exists");
+    sessions
+        .revoke(row.id, chrono::Utc::now(), Some("test-revoke"))
+        .await
+        .expect("revoke");
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_rejects_prefix_named_cookie_via_extractor(pool: PgPool) {
+    // A cookie named `relayterm_session_other` shares a prefix with
+    // the real session cookie. The exact-match parser in the
+    // extractor MUST NOT pick it up — the route MUST surface 401 as
+    // if no cookie were present at all.
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "prefix@relayterm.local").await;
+
+    // First mint a real session, then attempt to reuse its token
+    // value under the wrong cookie name.
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "prefix@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/auth/me")
+        .header(header::COOKIE, format!("relayterm_session_other={token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_rejects_suffix_named_cookie_via_extractor(pool: PgPool) {
+    // Sibling of the prefix test: a `fake_relayterm_session=<real-token>`
+    // cookie shares a suffix with the real session cookie. The
+    // exact-match parser MUST NOT pick it up — the route MUST 401.
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "suffix@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "suffix@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/auth/me")
+        .header(header::COOKIE, format!("fake_relayterm_session={token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_response_does_not_leak_session_or_password_material(pool: PgPool) {
+    // The /me JSON body MUST NOT contain the cookie token, the
+    // password, the bootstrap token, or any Argon2id PHC marker.
+    // Sentinel-shaped strings make the assertion exhaustive against
+    // a future field-rename that re-introduces the leak.
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "leak@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "leak@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let raw = body.to_string();
+    for sentinel in [
+        token.as_str(),
+        TEST_AUTH_PASSWORD,
+        TEST_BOOTSTRAP_TOKEN,
+        "$argon2id$",
+    ] {
+        assert!(
+            !raw.contains(sentinel),
+            "/me response must not contain `{sentinel}`: {raw}",
+        );
+    }
+    // No secret-shaped names should appear either, even if a future
+    // rename collides.
+    for forbidden in [
+        "password",
+        "password_hash",
+        "session_token",
+        "token_hash",
+        "bootstrap_token",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "/me response must not contain field `{forbidden}`: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn dev_user_protected_routes_still_work_in_dev_mode(pool: PgPool) {
+    // The extractor migration is intentionally limited to /auth/me in
+    // this slice. `GET /api/v1/hosts` (DevUser-protected) MUST still
+    // return 200 with `dev_user_id = Some(...)` — proving the route
+    // migration has NOT happened yet and DevUser remains live.
+    let (app, _user_id) = setup(pool).await;
+    let resp = app.oneshot(get("/api/v1/hosts")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

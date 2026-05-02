@@ -16,11 +16,13 @@ use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
 use tower_http::trace::TraceLayer;
 
+mod auth;
 mod dev_user;
 mod dto;
 mod error;
 mod routes;
 
+pub use auth::AuthenticatedUser;
 pub use dev_user::DevUser;
 pub use error::ApiError;
 pub use routes::v1::auth::AuthRoutesConfig;
@@ -84,9 +86,11 @@ pub struct AppState {
     /// `AppState` stays `Clone`.
     ///
     /// **Scope**: this slice exposes login, logout, bootstrap, and
-    /// `/auth/me`. The `AuthenticatedUser` extractor migration (SPEC
-    /// step 5) is a future slice; production-auth enablement still
-    /// fails fast at boot.
+    /// `/auth/me`. As of SPEC step 5, the [`AuthenticatedUser`]
+    /// extractor (`crate::auth`) has landed and `GET /auth/me`
+    /// consumes it; the broad route migration off [`DevUser`] is
+    /// SPEC step 7. Production-auth enablement still fails fast at
+    /// boot.
     pub auth: Arc<AuthService>,
     /// Cookie / Origin / bootstrap-token policy for the auth routes.
     /// Shared via `Arc` so secret-shaped fields are not cloned on every

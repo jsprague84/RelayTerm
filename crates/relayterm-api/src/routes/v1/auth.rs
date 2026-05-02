@@ -3,8 +3,9 @@
 //! The four routes here are the first real-auth surface (SPEC.md
 //! "Production authentication architecture" → "Implementation order"
 //! step 4). Existing app routes still go through [`crate::DevUser`];
-//! production-auth enablement still fails fast at boot. The
-//! `AuthenticatedUser` extractor migration is a future slice.
+//! production-auth enablement still fails fast at boot. As of step 5,
+//! [`AuthenticatedUser`] has landed (`crate::auth`) and `GET /me` is
+//! the first consumer; broad route migration is the next slice.
 //!
 //! ## Cookie
 //!
@@ -61,14 +62,10 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::AppState;
+use crate::auth::AuthenticatedUser;
+use crate::auth::cookie::{SESSION_COOKIE_NAME, extract_session_cookie};
 use crate::dto::auth::{BootstrapRequest, LoginRequest, UserResponse};
 use crate::error::ApiError;
-
-/// Browser session cookie name. Stable wire identifier — clients (the
-/// Tauri shells, future API integration tests) MUST NOT depend on this
-/// being changeable per environment. Pin at SPEC.md "Session model →
-/// Cookie configuration".
-pub(crate) const SESSION_COOKIE_NAME: &str = "relayterm_session";
 
 /// Session TTL. Currently a constant; promotable to `AuthRoutesConfig`
 /// the moment a deploy needs to tune it. SPEC.md "Session model" pins
@@ -434,29 +431,15 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
 /// `unauthorized` body — the operator-side detail (`session invalid`
 /// vs `session expired` vs `missing cookie`) lives in the existing
 /// `warn!` line in `error.rs::IntoResponse`.
-async fn me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<UserResponse>, ApiError> {
-    let token = extract_session_cookie(&headers)
-        .ok_or_else(|| ApiError::Unauthorized("missing session cookie".to_owned()))?;
-
-    let now = Utc::now();
-    let session = state.auth.validate_session_token(token, now).await?;
-
-    let user = state
-        .db
-        .users()
-        .get(session.user_id)
-        .await?
-        .ok_or_else(|| {
-            // The session row references a user that no longer exists.
-            // The DB FK should make this unreachable (CASCADE drops the
-            // session when the user is deleted), but if it ever happens
-            // we surface as 401 — the cookie is no longer authoritative.
-            ApiError::Unauthorized("session references missing user".to_owned())
-        })?;
-    Ok(Json(user.into()))
+///
+/// First production consumer of [`AuthenticatedUser`]. The remaining
+/// protected app routes (`hosts`, `server-profiles`, `ssh-identities`,
+/// `terminal-sessions`, `audit-events`) still go through
+/// [`crate::DevUser`] until the route-migration slice — SPEC.md
+/// "Production authentication architecture → Implementation order"
+/// step 7.
+async fn me(user: AuthenticatedUser) -> Json<UserResponse> {
+    Json(user.into_user().into())
 }
 
 // ---------------------------------------------------------------------
@@ -524,29 +507,6 @@ fn build_clear_cookie(cfg: &Arc<AuthRoutesConfig>) -> String {
         s.push_str(d);
     }
     s
-}
-
-/// Pull the session token value out of the `Cookie:` header.
-///
-/// Hand-rolled rather than via `axum-extra` to avoid a workspace
-/// dependency and to keep redaction posture local: the token never
-/// reaches a typed wrapper — the caller owns the &str borrow for the
-/// lifetime of the request.
-fn extract_session_cookie(headers: &HeaderMap) -> Option<&str> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for pair in raw.split(';') {
-        let pair = pair.trim();
-        let Some(eq) = pair.find('=') else {
-            continue;
-        };
-        let (name, rest) = pair.split_at(eq);
-        // `rest` includes the leading '='; skip it.
-        let value = &rest[1..];
-        if name == SESSION_COOKIE_NAME {
-            return Some(value);
-        }
-    }
-    None
 }
 
 /// Constant-time byte-compare. Prevents a timing-side-channel on the
@@ -683,29 +643,6 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Path=/"));
         assert!(cookie.starts_with("relayterm_session=;"));
-    }
-
-    #[test]
-    fn extract_cookie_finds_session_among_many() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            header::COOKIE,
-            HeaderValue::from_static("foo=bar; relayterm_session=abc-def; baz=qux"),
-        );
-        assert_eq!(extract_session_cookie(&h), Some("abc-def"));
-    }
-
-    #[test]
-    fn extract_cookie_returns_none_when_absent() {
-        let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, HeaderValue::from_static("foo=bar; baz=qux"));
-        assert_eq!(extract_session_cookie(&h), None);
-    }
-
-    #[test]
-    fn extract_cookie_returns_none_when_no_cookie_header() {
-        let h = HeaderMap::new();
-        assert_eq!(extract_session_cookie(&h), None);
     }
 
     #[test]
