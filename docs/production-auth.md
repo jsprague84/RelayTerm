@@ -16,7 +16,7 @@ If anything in this guide drifts from the code, the code wins. File a doc fix.
 - Browser-write routes additionally enforce a CSRF / `Origin`-header allow-list. A POST/PATCH/DELETE without a matching `Origin` returns `403 csrf_origin_mismatch` *before* the request body is parsed.
 - RelayTerm assumes it sits behind a TLS-terminating reverse proxy (Traefik, nginx, Caddy, …) on production deployments. The backend speaks plain HTTP on `127.0.0.1:8080` by default; the proxy is responsible for HTTPS.
 
-What is **not** covered by v1 production auth and is documented as deferred work in §8 below: login throttling, password reset, passkeys/WebAuthn, a session-management UI, the `last_seen_at` touch on the auth extractor, and admin/RBAC tooling.
+What is **not** covered by v1 production auth and is documented as deferred work in §8 below: IP-aware / distributed login throttling (the email-keyed in-app throttle has landed), password reset, passkeys/WebAuthn, a session-management UI, the `last_seen_at` touch on the auth extractor, and admin/RBAC tooling.
 
 ---
 
@@ -243,7 +243,7 @@ Recovery for the "I locked myself out" cases:
 
 Production auth is the floor, not the ceiling. The deliberate v1 cuts:
 
-- **No login throttling.** The plan in SPEC.md "Password authentication (v1) → Throttling" is per-`(remote_addr, email)` plus per-`email` leaky-buckets. Until that ships, do **not** expose the bare backend to the open internet. Sit behind a TLS-terminating reverse proxy that can rate-limit by IP (Traefik middleware, nginx `limit_req`, Cloudflare, …) or restrict access to a VPN / WireGuard mesh.
+- **Login throttling is local-process only.** `POST /api/v1/auth/login` runs an in-memory `LoginThrottler` keyed on the **normalized email** (lower-cased + trimmed). Default policy: 5 failures inside a 15-minute sliding window trip a 15-minute block. A throttled attempt returns `429 too_many_requests` with the static body `{"error":{"code":"too_many_requests","message":"too many requests"}}` — no `Retry-After` header (intentional in v1; exposing the remaining countdown would leak throttle-key telemetry). A successful login clears the bucket. Unknown-email and wrong-password share the same bucket so a probe cannot use the throttle channel to enumerate users. CSRF-rejected attempts (bad `Origin`) do NOT touch the throttle map. **What is missing in v1:** IP-aware keying (deferred until `ConnectInfo` is plumbed), distributed / Redis-backed limiter (a multi-instance deploy resets the bucket on each instance independently), and password reset / unlock paths. **Operational guidance:** if you expose the backend to the open internet, sit behind a TLS-terminating reverse proxy that can rate-limit by IP (Traefik middleware, nginx `limit_req`, Cloudflare, …) — the in-app throttle is a defense-in-depth layer, not a substitute. Restarting the backend resets the throttle state (state is in-memory only); operators recovering from a lockout caused by a typo can simply restart, but a deployment under sustained attack should rely on the upstream limiter for survival.
 - **No password reset / "forgot password" flow.** Recovery is DB-level today (§7).
 - **No passkeys / WebAuthn.** The session shape is forward-compatible with passkey login, but the registration and authentication routes are deferred.
 - **No session-management UI.** `user_sessions` is queryable, but there is no per-session revoke surface. `POST /api/v1/auth/logout` revokes the *current* session only.
@@ -252,7 +252,7 @@ Production auth is the floor, not the ceiling. The deliberate v1 cuts:
 
 What this means operationally:
 
-- Treat the deployment as you would a single-user SSH bastion: behind a trusted reverse proxy, behind a VPN if exposed off-LAN, with off-band rate limiting until throttling lands. The ops surface is small on purpose; it does not yet have the in-app defences a public-internet auth surface needs.
+- Treat the deployment as you would a single-user SSH bastion: behind a trusted reverse proxy, behind a VPN if exposed off-LAN, with reverse-proxy IP rate-limiting layered on top of the in-app email-keyed throttle. The ops surface is small on purpose; the in-app throttle slows brute-force against a known account but does not replace network-layer defences for a public-internet exposure.
 - The redaction discipline is load-bearing. Plaintext passwords, password hashes, session tokens, token hashes, bootstrap tokens, raw audit blobs, peer banners, raw DB errors, and terminal I/O **must not** appear in frontend responses, public errors, log lines, `Debug` output, serde output, or audit payloads. The `AuthConfig` / `AuthRoutesConfig` `Debug` impls render secret-shaped fields as boolean presence markers (`session_signing_key_b64_set: true`, `first_user_bootstrap_token_set: true`, …) so a `tracing` log at debug level cannot leak the value. The `AUDIT_FORBIDDEN_SUBSTRINGS` sentinel test in `crates/relayterm-api/tests/api.rs` plus the `Debug` redaction tests are the backstop. If you find a leak, treat it as a security regression.
 
 ---
@@ -268,7 +268,8 @@ After standing up production auth, verify:
 5. **`POST /api/v1/auth/logout`** with the cookie returns `204` and a `Max-Age=0` clearing cookie. A subsequent `me` call returns `401`.
 6. **`POST /api/v1/auth/login` without `Origin`** returns `403 csrf_origin_mismatch`.
 7. **Any protected route without a cookie** returns `401 unauthorized`.
-8. **The bootstrap token has been unset and the backend restarted.** A subsequent `POST /api/v1/auth/bootstrap` then returns `503 service_unavailable` ("bootstrap is disabled" — the route key is gone). If you skipped the unset-and-restart step, the response is `409 already_bootstrapped` instead, which is also fine; the 503 is just the cleaner end state.
+8. **Login throttling.** Send 6 wrong-password `POST /api/v1/auth/login` requests in quick succession from the allowlisted Origin against a real email — the first 5 return `401 unauthorized`, the 6th returns `429 too_many_requests` with body `{"error":{"code":"too_many_requests","message":"too many requests"}}` and no `Set-Cookie`. Wait for the 15-minute block to expire (or restart the backend, which clears in-memory state) before testing the recovery path. A correct password during the block continues to return 429; a correct password after the block returns 200 and clears the bucket.
+9. **The bootstrap token has been unset and the backend restarted.** A subsequent `POST /api/v1/auth/bootstrap` then returns `503 service_unavailable` ("bootstrap is disabled" — the route key is gone). If you skipped the unset-and-restart step, the response is `409 already_bootstrapped` instead, which is also fine; the 503 is just the cleaner end state.
 
 If any step fails, cross-reference §7 (startup failure modes) and the relevant integration test in `crates/relayterm-api/tests/api.rs`. The integration tests are the executable spec for these contracts; if behaviour drifts from this guide, the tests pin the truth.
 

@@ -53,6 +53,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{Duration, Utc};
+use relayterm_auth::{ThrottleDecision, normalize_login_identifier};
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
@@ -223,12 +224,40 @@ async fn bootstrap(
 /// Verifies the password and mints a fresh session cookie. Wrong-
 /// password / unknown-email collapse to the same 401 + the same
 /// `login_failed` audit row so a probe cannot distinguish the two.
+///
+/// The login throttler runs BEFORE the user lookup so a throttled
+/// request never spends an Argon2id verify or a DB query. The throttle
+/// key is the normalized email (case-folded + trimmed); unknown-email
+/// AND wrong-password failures both increment the same key, so a
+/// probe cannot distinguish the two through the throttle channel
+/// either. See SPEC.md "Password authentication (v1)" → "Throttling".
 async fn login(
     _csrf: CsrfGuard,
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
     let req = req.validated()?;
+
+    let throttle_key = normalize_login_identifier(&req.email);
+    let now = Utc::now();
+    if let ThrottleDecision::Throttled { .. } = state.login_throttler.check(&throttle_key, now) {
+        // Audit the throttled attempt so an operator can see the
+        // pattern — best-effort, mirroring the bad-credentials path.
+        // Payload carries the static `reason = "throttled"` per
+        // SPEC.md "Audit events"; the throttle key, the offered
+        // email, and the offered password are NEVER persisted.
+        write_audit_best_effort(
+            &state,
+            None,
+            AuditEventKind::LoginFailed,
+            json!({"method": "password", "reason": "throttled"}),
+        )
+        .await;
+        // Operator-side detail names the category but not the key.
+        return Err(ApiError::TooManyRequests(
+            "login throttled by failed-attempts policy".to_owned(),
+        ));
+    }
 
     // Look up the user by email. A miss is collapsed to the same
     // `InvalidCredentials` path a wrong-password verify would take —
@@ -264,6 +293,12 @@ async fn login(
             }
             other => ApiError::from(other),
         };
+        // Throttle bookkeeping. Unknown-email and wrong-password
+        // failures both land here and BOTH must record against the
+        // same key — that is the probe-resistance contract for the
+        // throttle channel (see SPEC.md "Password authentication
+        // (v1)" → "Throttling").
+        state.login_throttler.record_failure(&throttle_key, now);
         // login_failed audit. Failure to record the audit row here is
         // best-effort — a transient DB failure on the audit append
         // should not turn a 401 into a 500.
@@ -279,7 +314,10 @@ async fn login(
 
     let user = user.expect("user present after verify_password ok");
 
-    let now = Utc::now();
+    // Successful login: clear any prior throttle state for this key
+    // so a typo'd attempt under threshold does not linger.
+    state.login_throttler.record_success(&throttle_key);
+
     let created = state.auth.create_session(user.id, SESSION_TTL, now).await?;
 
     // Best-effort `last_login_at` update. A failure here is logged but

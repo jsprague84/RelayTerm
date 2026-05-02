@@ -30,6 +30,7 @@ pub enum ErrorCode {
     CsrfOriginMismatch,
     NotFound,
     Conflict,
+    TooManyRequests,
     BadGateway,
     ServiceUnavailable,
     InternalError,
@@ -43,6 +44,7 @@ impl ErrorCode {
             Self::CsrfOriginMismatch => "csrf_origin_mismatch",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
+            Self::TooManyRequests => "too_many_requests",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
             Self::InternalError => "internal_error",
@@ -96,6 +98,17 @@ pub enum ApiError {
         reason: Option<&'static str>,
     },
 
+    /// 429 — request rejected because the caller is rate-limited.
+    /// Currently emitted only by the login throttler at
+    /// `POST /api/v1/auth/login` (SPEC.md "Password authentication
+    /// (v1)" → "Throttling"). The wrapped detail is operator-facing
+    /// only; the wire body collapses to the static `too many requests`
+    /// message so the throttle key and timing telemetry stay
+    /// server-side. The route layer is responsible for any
+    /// `Retry-After` header — it is not derived from this variant.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
     /// 502 — an upstream system the request depends on (e.g. an SSH peer
     /// during preflight) failed in a way that's not the client's fault.
     /// The wrapped detail is operator-facing only; the wire body collapses
@@ -147,6 +160,11 @@ impl ApiError {
                     None => format!("{entity} conflict"),
                 },
             ),
+            Self::TooManyRequests(_) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManyRequests,
+                "too many requests".to_owned(),
+            ),
             Self::BadGateway(_) => (
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::BadGateway,
@@ -186,6 +204,7 @@ impl IntoResponse for ApiError {
             Self::Internal(detail) => error!(detail = %detail, "internal API error"),
             Self::Unauthorized(detail) => warn!(detail = %detail, "unauthorized request"),
             Self::CsrfOriginMismatch(detail) => warn!(detail = %detail, "csrf origin mismatch"),
+            Self::TooManyRequests(detail) => warn!(detail = %detail, "too many requests"),
             Self::BadGateway(detail) => warn!(detail = %detail, "bad gateway"),
             Self::ServiceUnavailable(detail) => {
                 warn!(detail = %detail, "service unavailable");

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use relayterm_auth::AuthService;
+use relayterm_auth::{AuthService, LoginThrottler};
 use relayterm_db::Db;
 use relayterm_ssh::{HostKeyPreflightService, SshAuthCheckService, SshPtyBridge};
 use relayterm_terminal::TerminalSessionManager;
@@ -85,6 +85,12 @@ pub struct AppState {
     /// Shared via `Arc` so secret-shaped fields are not cloned on every
     /// request and so `AppState` stays cheap to clone.
     pub auth_routes: Arc<AuthRoutesConfig>,
+    /// In-memory login throttler. Consumed only by
+    /// `POST /api/v1/auth/login`. Local-process state — a multi-instance
+    /// deployment SHOULD also rate-limit at the reverse proxy layer per
+    /// `docs/production-auth.md`. Held behind `Arc` so `AppState` stays
+    /// `Clone`.
+    pub login_throttler: Arc<LoginThrottler>,
 }
 
 /// Build the top-level router.

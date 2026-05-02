@@ -40,10 +40,15 @@
 pub mod password;
 pub mod service;
 pub mod session_token;
+pub mod throttle;
 
 pub use password::{PasswordHasher, PasswordHasherConfig, PasswordHashingError};
 pub use service::{AuthService, AuthServiceError};
 pub use session_token::{SessionToken, SessionTokenHash, hash_session_token};
+pub use throttle::{
+    LoginThrottleConfig, LoginThrottler, MAX_TRACKED_KEYS, ThrottleDecision,
+    normalize_login_identifier,
+};
 
 /// Legacy placeholder kept so external consumers that only matched on
 /// `AuthError::NotImplemented` continue to compile. New code should

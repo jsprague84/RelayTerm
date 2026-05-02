@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use relayterm_api::{AppState, AuthRoutesConfig, router};
-use relayterm_auth::{AuthService, PasswordHasher};
+use relayterm_auth::{AuthService, LoginThrottleConfig, LoginThrottler, PasswordHasher};
 use relayterm_core::repository::{
     PasswordCredentialRepository, SessionEventRepository, TerminalSessionRepository,
     UserSessionRepository,
@@ -148,6 +148,14 @@ async fn main() -> anyhow::Result<()> {
             .map(Zeroizing::new),
     });
 
+    // Login throttler. v1 ships an in-memory leaky bucket keyed on
+    // the normalized email; SPEC.md "Password authentication (v1)" →
+    // "Throttling" pins the policy. State is local to this process —
+    // a multi-instance deploy SHOULD layer reverse-proxy rate-limiting
+    // on top until a distributed limiter lands. See
+    // `docs/production-auth.md` for the operator-facing caveat.
+    let login_throttler = Arc::new(LoginThrottler::new(LoginThrottleConfig::V1_DEFAULT));
+
     let state = AppState {
         db,
         vault,
@@ -157,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         terminal_sessions,
         auth,
         auth_routes,
+        login_throttler,
     };
     let app = router(state);
 

@@ -27,7 +27,9 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt as _;
 use relayterm_api::{AppState, AuthRoutesConfig, router};
-use relayterm_auth::{AuthService, PasswordHasher, PasswordHasherConfig};
+use relayterm_auth::{
+    AuthService, LoginThrottleConfig, LoginThrottler, PasswordHasher, PasswordHasherConfig,
+};
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
@@ -85,6 +87,14 @@ fn test_auth(db: &Db) -> Arc<AuthService> {
         })
         .expect("fast hasher params are valid"),
     ))
+}
+
+/// Default login throttler for fixtures that don't care about
+/// throttling. The policy mirrors production (`V1_DEFAULT`); tests that
+/// drive the throttle deliberately build their own with a tighter
+/// bucket via `LoginThrottler::new(...)` and inject it explicitly.
+fn test_login_throttler() -> Arc<LoginThrottler> {
+    Arc::new(LoginThrottler::new(LoginThrottleConfig::V1_DEFAULT))
 }
 
 fn test_auth_routes() -> Arc<AuthRoutesConfig> {
@@ -188,6 +198,7 @@ async fn setup_with_full_state(
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     (router(state), user_id, cookie)
 }
@@ -217,6 +228,7 @@ async fn setup_with_full_state_short_ttl(
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     (router(state), user_id, cookie)
 }
@@ -937,6 +949,7 @@ async fn protected_hosts_routes_return_401_without_session_cookie(pool: PgPool) 
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -1198,6 +1211,7 @@ async fn post_ssh_identity_returns_401_without_session_cookie(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -1238,6 +1252,7 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -2008,6 +2023,7 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -2598,6 +2614,7 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
     let profile_id = make_owned_profile(
@@ -2647,6 +2664,7 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -2714,6 +2732,7 @@ async fn auth_check_returns_401_without_session_cookie(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
     let bogus = uuid::Uuid::new_v4();
@@ -2807,6 +2826,7 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -2876,6 +2896,7 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -3661,6 +3682,7 @@ async fn terminal_session_routes_return_401_without_session_cookie(pool: PgPool)
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -4035,6 +4057,7 @@ async fn ws_attach_returns_401_without_session_cookie(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
     let addr = spawn_app(app).await;
@@ -4186,6 +4209,7 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
         terminal_sessions: terminal_sessions.clone(),
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -4861,6 +4885,7 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7070,6 +7095,7 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7268,6 +7294,7 @@ async fn audit_events_recent_unauthorized_without_session_cookie(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7371,6 +7398,7 @@ async fn bootstrap_creates_first_user_and_does_not_set_cookie(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7458,6 +7486,7 @@ async fn bootstrap_rejects_wrong_token_without_echo(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7513,6 +7542,7 @@ async fn bootstrap_rejects_when_already_bootstrapped(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7586,6 +7616,7 @@ async fn bootstrap_returns_503_when_no_token_configured(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7620,6 +7651,7 @@ async fn setup_with_first_user(pool: PgPool, email: &str) -> (Router, UserId) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -7667,6 +7699,7 @@ async fn setup_production_first_user(pool: PgPool, email: &str) -> (Router, User
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes,
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -8243,6 +8276,7 @@ async fn bad_origin_bootstrap_does_not_create_user_or_audit(pool: PgPool) {
         terminal_sessions,
         auth: __auth.clone(),
         auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
     };
     let app = router(state);
 
@@ -8525,4 +8559,532 @@ async fn me_response_does_not_leak_session_or_password_material(pool: PgPool) {
             "/me response must not contain field `{forbidden}`: {raw}",
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// Login throttling (SPEC.md "Password authentication (v1)" → Throttling)
+// ----------------------------------------------------------------------
+
+/// Build an app with a router that uses a tight in-memory login
+/// throttler so the test rig can drive the bucket in three calls
+/// instead of five. Returns the same `(app, user_id)` shape as
+/// `setup_with_first_user` for symmetry with the existing tests.
+///
+/// The throttler is keyed exclusively on the normalized email — there
+/// is no IP-aware key in v1, so a per-test override is sufficient to
+/// exercise every property in SPEC.md "Security properties to test"
+/// → property 11.
+async fn setup_with_first_user_and_tight_throttler(
+    pool: PgPool,
+    email: &str,
+    throttler: Arc<LoginThrottler>,
+) -> (Router, UserId) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+        login_throttler: throttler,
+    };
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+                "email": email,
+                "display_name": "Operator",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let user_id: UserId = serde_json::from_value(body["id"].clone()).unwrap();
+    (app, user_id)
+}
+
+/// Throttler tuned so the route trips after 3 failures, with a long
+/// block window so the test does not need to wait on wall-clock time.
+fn tight_throttler() -> Arc<LoginThrottler> {
+    Arc::new(LoginThrottler::new(LoginThrottleConfig {
+        max_failures: 3,
+        window: chrono::Duration::minutes(15),
+        block: chrono::Duration::minutes(15),
+    }))
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_throttle_blocks_after_threshold_with_safe_response(pool: PgPool) {
+    // Three wrong-password attempts trip the threshold; the fourth
+    // returns a safe 429 with the static `too_many_requests` body.
+    // The throttle key is the normalized email; the wire body must
+    // never echo it, must never echo the offered password, and must
+    // never carry timing/throttle telemetry.
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "throttle@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    let bad_password = "WRONG-THROTTLE-PASSWORD-DO-NOT-LEAK-9999";
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": "throttle@relayterm.local",
+                    "password": bad_password,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Fourth attempt is throttled.
+    let throttled = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "throttle@relayterm.local",
+                "password": bad_password,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(throttled.headers().get(header::SET_COOKIE).is_none());
+    let body = read_body(throttled).await;
+    assert_eq!(body["error"]["code"], "too_many_requests");
+    assert_eq!(body["error"]["message"], "too many requests");
+    let raw = body.to_string();
+    assert!(
+        !raw.contains("throttle@relayterm.local"),
+        "throttled response must not echo the identifier: {raw}",
+    );
+    assert!(
+        !raw.contains(bad_password),
+        "throttled response must not echo the offered password: {raw}",
+    );
+    assert!(
+        !raw.contains("retry"),
+        "v1 throttled response intentionally omits Retry-After detail: {raw}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_throttle_unknown_email_path_records_into_the_throttler(pool: PgPool) {
+    // SPEC.md probe-resistance contract: the `unknown-email` branch of
+    // the login route MUST call `record_failure` against the same
+    // throttle key the `wrong-password` branch uses. The wire shape of
+    // both branches is already byte-identical (collapsed to 401 with
+    // `bad_credentials`); this test pins that the throttle channel
+    // does not become a side-channel.
+    //
+    // Note on test shape: a single email address is either known OR
+    // unknown — we cannot exercise BOTH branches against the SAME
+    // normalized key in one test. The shared-key invariant is enforced
+    // at the code level (the route uses one `throttle_key` local for
+    // both branches). This test exercises the unknown-email branch
+    // end-to-end as the missing half — the wrong-password branch is
+    // exercised by `login_throttle_blocks_after_threshold_with_safe_response`.
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "shared-known@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    let unknown_email = "shared-unknown@relayterm.local";
+    let bad_password = "WRONG-PROBE-PASSWORD-DO-NOT-LEAK";
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": unknown_email,
+                    "password": bad_password,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "unknown-email failure should still be 401 below threshold",
+        );
+    }
+
+    // Fourth unknown-email attempt is throttled with the same wire
+    // shape a wrong-password throttle would produce.
+    let throttled = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": unknown_email,
+                "password": bad_password,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = read_body(throttled).await;
+    assert_eq!(body["error"]["code"], "too_many_requests");
+
+    // The known user (different normalized key) is unaffected — the
+    // throttle is per-key, not global.
+    let unrelated = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "shared-known@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unrelated.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn correct_password_during_active_block_returns_429(pool: PgPool) {
+    // Pins the operator-side expectation documented in
+    // `docs/production-auth.md` "Verifying a deploy" step 8: a correct
+    // password attempted DURING an active block must continue to
+    // return 429 (not 200). Without this guarantee an operator who
+    // triggers their own throttle by typing could "talk past" the
+    // block by submitting the right password — which would defeat the
+    // throttle for any attacker who happens to guess correctly while
+    // the bucket is open.
+    //
+    // Distinct from `successful_login_clears_throttle_bucket`, which
+    // exercises the under-threshold path (success clears the bucket
+    // BEFORE the block engages).
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "block-correct@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    // Trip the threshold (max_failures = 3 in tight_throttler).
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": "block-correct@relayterm.local",
+                    "password": "definitely-not-the-password",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Correct password during the block: still 429, not 200. No cookie
+    // is minted; the password verify never runs (the throttle check
+    // short-circuits before the user lookup).
+    let blocked = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "block-correct@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers().get(header::SET_COOKIE).is_none());
+    let body = read_body(blocked).await;
+    assert_eq!(body["error"]["code"], "too_many_requests");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_failed_audit_reasons_split_bad_credentials_and_throttled(pool: PgPool) {
+    // The route emits `login_failed` with `reason = "bad_credentials"`
+    // for the under-threshold failures AND with `reason = "throttled"`
+    // once the bucket trips. Both are best-effort but must reach the
+    // persisted feed under normal operation. Audit payload redaction is
+    // re-checked against `AUDIT_FORBIDDEN_SUBSTRINGS` for both reasons.
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "audit-throttle@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    // Per-test `#[sqlx::test]` databases start empty and the bootstrap
+    // helper above does NOT emit any `LoginFailed` rows on success
+    // (only `first_user_created`). So the post-test counts are the
+    // ground truth — no baseline subtraction needed.
+
+    let bad_password = "WRONG-AUDIT-PASSWORD-DO-NOT-LEAK-1234";
+    for _ in 0..3 {
+        let _ = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": "audit-throttle@relayterm.local",
+                    "password": bad_password,
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+    // One throttled attempt past the threshold.
+    let throttled = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "audit-throttle@relayterm.local",
+                "password": bad_password,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let rows = PgAuditEventRepository::new(pool.clone())
+        .recent(200)
+        .await
+        .unwrap();
+    let failed: Vec<_> = rows
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::LoginFailed)
+        .collect();
+    assert_eq!(
+        failed.len(),
+        4,
+        "expected 3 bad_credentials + 1 throttled rows; got {}: {failed:?}",
+        failed.len(),
+    );
+    let bad_count = failed
+        .iter()
+        .filter(|e| {
+            e.payload
+                .to_string()
+                .contains("\"reason\":\"bad_credentials\"")
+        })
+        .count();
+    let throttled_count = failed
+        .iter()
+        .filter(|e| e.payload.to_string().contains("\"reason\":\"throttled\""))
+        .count();
+    assert_eq!(bad_count, 3, "expected 3 bad_credentials rows");
+    assert_eq!(throttled_count, 1, "expected 1 throttled row");
+
+    for row in &failed {
+        assert!(row.actor_id.is_none(), "login_failed actor_id must be NULL");
+        let raw = row.payload.to_string();
+        assert!(
+            !raw.contains(bad_password),
+            "audit payload must not echo offered password: {raw}",
+        );
+        assert!(
+            !raw.contains("audit-throttle@relayterm.local"),
+            "audit payload must not echo identifier: {raw}",
+        );
+        assert_audit_payload_redacted(&row.payload, AuditEventKind::LoginFailed);
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn successful_login_clears_throttle_bucket(pool: PgPool) {
+    // A correct-password login must clear the throttle bucket so a
+    // legitimate user who typo'd two attempts under the threshold can
+    // log in successfully on the third try and not be locked out on
+    // the fourth typo. With max_failures = 3 we record two failures,
+    // then succeed, then record three more — only the three "after
+    // success" failures should count, leaving the next attempt still
+    // allowed (but failing for bad credentials, NOT for throttle).
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "clear@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    // Two wrong attempts (under threshold).
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": "clear@relayterm.local",
+                    "password": "definitely-not-the-password",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Successful login MUST clear the bucket.
+    let success = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "clear@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(success.status(), StatusCode::OK);
+    assert_eq!(throttler.tracked_keys(), 0, "success must drop the entry");
+
+    // Three more failures bring the bucket right to threshold.
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": "clear@relayterm.local",
+                    "password": "still-not-the-password",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // The fourth wrong attempt is now throttled (threshold tripped on
+    // the third post-success failure).
+    let throttled = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "clear@relayterm.local",
+                "password": "still-not-the-password",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bad_origin_login_does_not_engage_throttler(pool: PgPool) {
+    // A CSRF-rejected login must NOT increment the throttle bucket —
+    // the request is dropped before the route logic runs. Without this
+    // guarantee an attacker on a third-party origin could lock out a
+    // legitimate user by triggering 403s against their email.
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "csrf-throttle@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    for _ in 0..10 {
+        let resp = app
+            .clone()
+            .oneshot(auth_post_with_origin(
+                "/api/v1/auth/login",
+                json!({
+                    "email": "csrf-throttle@relayterm.local",
+                    "password": "any-wrong-password",
+                }),
+                "https://evil.example.com",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        throttler.tracked_keys(),
+        0,
+        "CSRF-rejected login must NOT touch the throttle map",
+    );
+
+    // A legitimate login from the allow-listed origin still works.
+    let success = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "csrf-throttle@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(success.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_throttle_is_keyed_on_normalized_email(pool: PgPool) {
+    // Casing variants of the same email MUST share the throttle key;
+    // a probe cannot work around the bucket by alternating capitalization.
+    let throttler = tight_throttler();
+    let (app, _) = setup_with_first_user_and_tight_throttler(
+        pool.clone(),
+        "norm@relayterm.local",
+        throttler.clone(),
+    )
+    .await;
+
+    for email in [
+        "Norm@relayterm.local",
+        "NORM@RELAYTERM.LOCAL",
+        "norm@relayterm.local",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/auth/login",
+                json!({
+                    "email": email,
+                    "password": "wrong-password-here",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Threshold tripped — even the canonical lower-case form is now
+    // throttled because the bucket is shared.
+    let throttled = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "norm@relayterm.local",
+                "password": "wrong-password-here",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
 }
