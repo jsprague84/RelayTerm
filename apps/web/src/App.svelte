@@ -1,5 +1,6 @@
 <script lang="ts">
   import AppShell from "./lib/app/AppShell.svelte";
+  import AuthGate from "./lib/app/auth/AuthGate.svelte";
   import DevTerminalWorkbench from "./lib/dev/DevTerminalWorkbench.svelte";
   import TerminalProtocolLab from "./lib/dev/TerminalProtocolLab.svelte";
 
@@ -18,15 +19,19 @@
   const isDev = import.meta.env.DEV;
 </script>
 
-{#if isDev}
-  <AppShell devMode>
-    {#snippet devTools()}
-      <div class="flex flex-col gap-4">
-        <TerminalProtocolLab />
-        <DevTerminalWorkbench />
-      </div>
-    {/snippet}
-  </AppShell>
-{:else}
-  <AppShell />
-{/if}
+<AuthGate>
+  {#snippet children({ user, signOut })}
+    {#if isDev}
+      <AppShell devMode {user} {signOut}>
+        {#snippet devTools()}
+          <div class="flex flex-col gap-4">
+            <TerminalProtocolLab />
+            <DevTerminalWorkbench />
+          </div>
+        {/snippet}
+      </AppShell>
+    {:else}
+      <AppShell {user} {signOut} />
+    {/if}
+  {/snippet}
+</AuthGate>

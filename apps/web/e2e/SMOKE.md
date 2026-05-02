@@ -26,6 +26,35 @@ update this file in the same change.
 
 | Selector                                          | Surface                                                       |
 |---------------------------------------------------|---------------------------------------------------------------|
+| `[data-testid="auth-loading"]`                    | Auth-gate loading splash (shown while `getCurrentUser()` is in flight at app start; replaced by either `auth-login-screen`, `auth-bootstrap-screen`, `auth-error-screen`, or the production shell). |
+| `[data-testid="auth-error-screen"]`               | Auth-gate error surface (rendered on transport / 5xx / malformed `getCurrentUser()` outcomes; carries an explicit `auth-error-retry` button — the SPA does NOT auto-retry). |
+| `[data-testid="auth-error-message"]`              | One-line operator-facing message inside `auth-error-screen` (safe formatter only — never echoes wire `message` or transport detail). |
+| `[data-testid="auth-error-retry"]`                | Retry button inside `auth-error-screen` (re-runs `getCurrentUser()`). |
+| `[data-testid="auth-login-screen"]`               | Sign-in screen root (rendered when `getCurrentUser()` returns 401 OR after sign-out). |
+| `[data-testid="auth-login-heading"]`              | Static "Sign in to RelayTerm" heading (does NOT reveal whether the offered email belongs to a known account). |
+| `[data-testid="auth-login-form"]`                 | Sign-in form root.                                            |
+| `[data-testid="auth-login-email"]`                | Sign-in email input.                                          |
+| `[data-testid="auth-login-password"]`             | Sign-in password input.                                       |
+| `[data-testid="auth-login-submit"]`               | Sign-in submit button.                                        |
+| `[data-testid="auth-login-form-error"]`           | Client-side validation error inside the sign-in form (safe formatter only — function of the reason enum). |
+| `[data-testid="auth-login-error"]`                | Wire-side sign-in error inside the sign-in form (safe formatter only — collapses 401 to "invalid credentials" without revealing whether the offered email is known). |
+| `[data-testid="auth-login-bootstrap-link"]`       | "First-time setup" link inside the sign-in screen (switches the unauthenticated screen to `auth-bootstrap-screen`). |
+| `[data-testid="auth-bootstrap-screen"]`           | First-time setup screen root (creates the first user via `POST /api/v1/auth/bootstrap`; does NOT mint a session). |
+| `[data-testid="auth-bootstrap-heading"]`          | Static "First-time setup" heading.                            |
+| `[data-testid="auth-bootstrap-form"]`             | First-time setup form root.                                   |
+| `[data-testid="auth-bootstrap-token"]`            | Bootstrap-token input (`<input type="password">`; never logged, never echoed, never persisted to local storage). |
+| `[data-testid="auth-bootstrap-email"]`            | First-time setup email input.                                 |
+| `[data-testid="auth-bootstrap-display-name"]`     | First-time setup display-name input.                          |
+| `[data-testid="auth-bootstrap-password"]`         | First-time setup password input.                              |
+| `[data-testid="auth-bootstrap-password-confirm"]` | First-time setup password confirmation input (frontend-only typo guard; the backend does not see the confirmation field). |
+| `[data-testid="auth-bootstrap-submit"]`           | First-time setup submit button.                               |
+| `[data-testid="auth-bootstrap-form-error"]`       | Client-side validation error inside the bootstrap form (safe formatter only — function of the reason enum; never echoes the offered token / password). |
+| `[data-testid="auth-bootstrap-error"]`            | Wire-side bootstrap error inside the bootstrap form (safe formatter only — never echoes the wire `message`, transport detail, or any request input). |
+| `[data-testid="auth-bootstrap-cancel"]`           | "Back to sign in" link inside the bootstrap form.             |
+| `[data-testid="auth-bootstrap-success"]`          | Bootstrap success card ("Account created. Please sign in."; bootstrap does NOT auto-login). |
+| `[data-testid="auth-bootstrap-back-to-login"]`    | "Back to sign in" button inside the bootstrap success card.   |
+| `[data-testid="auth-current-user"]`               | Top-bar display-name label (visible at sm breakpoint and up; rendered only when an authenticated user is present). |
+| `[data-testid="auth-sign-out"]`                   | Top-bar sign-out button (POSTs `/api/v1/auth/logout` AND clears local active-terminal state regardless of the wire outcome; the gate flips to `auth-login-screen` on completion). |
 | `[data-testid="app-shell-main"]`                  | Production shell main pane (visible in dev AND prod).         |
 | `[data-testid="top-bar-title"]`                   | Shell top bar title (mirrors selected nav item).              |
 | `[data-testid="nav-dashboard"]`                   | Sidebar nav button — Dashboard (default-selected).            |

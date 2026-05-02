@@ -33,6 +33,7 @@
     pathForView,
     viewForPath,
   } from "./routing.js";
+  import { logout as logoutApi, type CurrentUser } from "../api/auth.js";
   import type { Snippet } from "svelte";
 
   interface Props {
@@ -42,9 +43,16 @@
      * snippet that's only constructed when `import.meta.env.DEV` is true,
      * keeping dev code out of the production bundle. */
     devTools?: Snippet;
+    /** Authenticated user resolved by `AuthGate`. Optional so existing
+     * tests that mount `AppShell` directly do not have to fabricate a
+     * user; in production `AuthGate` always supplies it. */
+    user?: CurrentUser | null;
+    /** Reset the auth gate to the login screen. Invoked after the
+     * `POST /auth/logout` round-trip AND after local cleanup. */
+    signOut?: () => void;
   }
 
-  let { devMode = false, devTools }: Props = $props();
+  let { devMode = false, devTools, user = null, signOut }: Props = $props();
 
   // Initial view comes from the URL, with unknown paths collapsing to
   // the default. Production deployments must serve `index.html` for
@@ -153,6 +161,31 @@
     // TTL expired) and the operator does not want to retry.
     clearActiveSession();
   }
+
+  let signingOut = $state(false);
+
+  async function handleSignOut() {
+    if (signingOut) return;
+    signingOut = true;
+    try {
+      // Best-effort wire revocation. The backend is idempotent (missing
+      // / unknown / already-revoked cookies all return 204), so a wire
+      // failure here does NOT trap the user — local cleanup still runs
+      // and the gate flips to the login screen. The auth crate's
+      // sweeper (future work) reaps any orphan row.
+      await logoutApi();
+    } finally {
+      // Local cleanup ALWAYS runs, regardless of the wire outcome.
+      // SPEC.md "Frontend authentication UI plan" Phase 4 pins the
+      // active-terminal pointer drop on logout — re-login within the
+      // detached-TTL window does not get to silently reattach to a
+      // session belonging to (now-revoked) credentials.
+      clearActiveSession();
+      activeLaunch = null;
+      signingOut = false;
+      signOut?.();
+    }
+  }
 </script>
 
 <div class="flex h-full min-h-screen bg-zinc-900 text-zinc-100">
@@ -164,7 +197,13 @@
     onToggleDevTools={() => (devToolsOpen = !devToolsOpen)}
   />
   <div class="flex min-w-0 flex-1 flex-col">
-    <TopBar {current} {devMode} />
+    <TopBar
+      {current}
+      {devMode}
+      {user}
+      onSignOut={signOut ? handleSignOut : undefined}
+      signingOut={signingOut}
+    />
     <main
       class="flex-1 overflow-y-auto px-6 py-6"
       data-testid="app-shell-main"
