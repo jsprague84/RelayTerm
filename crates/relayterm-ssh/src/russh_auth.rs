@@ -90,6 +90,12 @@ impl SshAuthChecker for RusshAuthChecker {
             accept_pins: target.accept_pins.clone(),
         };
 
+        // Auth-check is short-lived: connect, attempt public-key auth,
+        // disconnect. The russh session-level `inactivity_timeout` IS
+        // appropriate here because the transport is torn down within the
+        // outer `tokio::time::timeout(connect_timeout, ...)` budget. The
+        // long-lived PTY bridge in `russh_pty.rs` deliberately leaves
+        // this unset for the opposite reason — see the comment there.
         let config = Arc::new(russh::client::Config {
             inactivity_timeout: Some(self.connect_timeout),
             ..Default::default()

@@ -412,10 +412,26 @@
   }
 
   function detachClicked() {
+    // Drop any pending / blocked paste alongside the wire `Detach` frame.
+    // The Send-paste button is already disabled in `detached` because
+    // `enablement.detach` flips false, but leaving the panel up is
+    // misleading and contradicts the closure-scope contract documented
+    // on `pendingPasteText` ("Cleared on send / cancel / detach /
+    // disconnect / unmount"). The renderer + client stay alive so a
+    // reconnect inside the detached-TTL window can resume.
+    pendingPasteText = null;
+    pendingPasteDecision = null;
+    blockedPasteDecision = null;
     client?.detach();
   }
 
   function closeClicked() {
+    // Same redaction posture as `detachClicked`: clear the pending paste
+    // state first, then send the wire `Close` frame. The session row is
+    // about to terminate, so any held paste content has nowhere to go.
+    pendingPasteText = null;
+    pendingPasteDecision = null;
+    blockedPasteDecision = null;
     closedExplicitly = true;
     client?.close();
   }

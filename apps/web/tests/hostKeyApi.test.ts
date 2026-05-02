@@ -487,9 +487,12 @@ describe("hostKeyStatusLabel + description copy", () => {
     expect(desc.toLowerCase()).not.toContain("logged in");
   });
 
-  it("describes the trusted status without claiming auth or terminal readiness", () => {
+  it("describes the trusted status without claiming auth has happened yet", () => {
     const desc = hostKeyStatusDescription("trusted");
-    expect(desc.toLowerCase()).toContain("future work");
+    expect(desc.toLowerCase()).toContain("matches");
+    expect(desc.toLowerCase()).toContain("auth-check");
+    // Trust is KEX-only — must not imply public-key auth has been verified.
+    expect(desc.toLowerCase()).not.toContain("authenticated successfully");
   });
 
   it("describes the changed status as a refusal that needs investigation", () => {

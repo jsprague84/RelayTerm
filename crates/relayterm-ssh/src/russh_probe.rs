@@ -69,6 +69,12 @@ impl SshHostKeyProbe for RusshHostKeyProbe {
 
         // Conservative russh client config — no auth retries, modest
         // keepalives, inactivity timeout aligned with our connect budget.
+        // Probe is short-lived (connect, capture host key, disconnect),
+        // so the session-level `inactivity_timeout` is fine — the outer
+        // `tokio::time::timeout(self.connect_timeout, ...)` tears the
+        // transport down well before that fires. The long-lived PTY
+        // bridge in `russh_pty.rs` deliberately leaves this unset for
+        // the opposite reason — see the comment there.
         let config = Arc::new(russh::client::Config {
             inactivity_timeout: Some(self.connect_timeout),
             ..Default::default()

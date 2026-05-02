@@ -642,112 +642,164 @@ viewport has focus.
 Note on clipboard access: the snippets below use `navigator.clipboard.writeText`
 from `browser_evaluate`. Many browser configurations (including some
 Playwright MCP setups) gate clipboard-write behind a permission grant.
-If `writeText` rejects, fall back to typing directly into the viewport
-via `browser_type` against the `[data-testid="production-terminal-viewport"]`
-element — `evaluatePaste` runs on the same `onInput` payload regardless
-of paste source, so the policy outcomes are identical.
+If `writeText` rejects, fall back to dispatching a synthetic
+`ClipboardEvent('paste', { clipboardData: dt, bubbles: true })` against
+`document.querySelector('.xterm-helper-textarea')` after focusing it —
+xterm subscribes to that element's `paste` event and `evaluatePaste`
+runs on the same `onInput` payload regardless of paste source, so the
+policy outcomes are identical.
 
-1. **Single-line safe paste — no panel.**
-   - Programmatically dispatch a paste of `"echo hello"` against the
-     viewport (or use `browser_press_key` to type it; the goal is to
-     verify the safe path forwards silently). Use `browser_evaluate`:
+**Bracketed-paste reality.** Once the remote shell turns on bracketed
+paste mode (DECSET 2004) — fish, bash with readline, and zsh all do
+this on startup — xterm wraps EVERY paste payload it forwards to
+`onData` with the bracketed-paste markers `\x1b[200~ ... \x1b[201~`.
+The pastePolicy classifies any paste containing those markers as
+`confirm` with `reasonCode = "bracketed_paste_markers"`. That priority
+sits above `multiline`, `control_chars`, and `large_payload` (see
+`decidePaste` in `pastePolicy.ts`), so the panel reason for the
+multiline / large / single-line payloads below will be
+`bracketed_paste_markers` whenever the shell has bracketed paste on.
+This is intentional — a paste against a non-bracketed-paste shell
+(say, a raw `cat` redirecting stdin) returns to the `multiline` /
+`large_payload` reasons. The smoke verifies the integration shape
+(panel renders with the right reason for the wrapped payload, content
+NOT surfaced, send/cancel/dismiss all wire correctly), not the
+specific reason string for each paste size.
+
+1. **Single-line paste — confirm panel renders, content redacted.**
+   - Programmatically dispatch a paste of
+     `"echo relayterm-single-line-smoke"` against the xterm helper
+     textarea. Use `browser_evaluate`:
 
      ```js
      async () => {
-       const term = document.querySelector(
-         '[data-testid="production-terminal-viewport"]',
-       );
-       term?.focus();
-       await navigator.clipboard.writeText("echo hello");
-       // Trigger xterm's clipboard read via Ctrl+Shift+V using the
-       // browser_press_key tool below.
+       const ta = document.querySelector('.xterm-helper-textarea');
+       ta.focus();
+       const dt = new DataTransfer();
+       dt.setData('text/plain', 'echo relayterm-single-line-smoke');
+       ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
      }
      ```
 
-   - `browser_press_key Control+Shift+V` (or use `browser_type` on the
-     viewport for a deterministic alternative).
-   - Assert the confirm and blocked panels are NOT present:
+   - Assert the confirm panel renders with reason
+     `bracketed_paste_markers` (the single-line payload is
+     bracketed-paste-wrapped by xterm before reaching `evaluatePaste`),
+     no blocked panel is present, and the sentinel string does NOT
+     appear anywhere in the panel:
 
      ```js
      () => {
-       const has = (sel) => !!document.querySelector(sel);
-       return {
-         confirmAbsent: !has('[data-testid="production-terminal-paste-confirm"]'),
-         blockedAbsent: !has('[data-testid="production-terminal-paste-blocked"]'),
-       };
-     }
-     ```
-
-     Expected: both `true`. The remote shell received `echo hello`
-     (visible as terminal output the next frame).
-
-2. **Multiline confirm — content NOT displayed; cancel does not send.**
-   - Write a multi-line string to the clipboard:
-     `await navigator.clipboard.writeText("echo first\necho second\n")`.
-   - `browser_press_key Control+Shift+V`.
-   - Assert the confirm panel renders with `data-paste-reason="multiline"`
-     AND that the panel text does NOT contain the paste body:
-
-     ```js
-     () => {
-       const panel = document.querySelector(
-         '[data-testid="production-terminal-paste-confirm"]',
-       );
-       const heading = document.querySelector(
-         '[data-testid="production-terminal-paste-confirm-heading"]',
-       );
-       const meta = document.querySelector(
-         '[data-testid="production-terminal-paste-confirm-meta"]',
-       );
-       const sentinel = "echo first";
+       const panel = document.querySelector('[data-testid="production-terminal-paste-confirm"]');
+       const sentinel = 'relayterm-single-line-smoke';
        return {
          present: !!panel,
          reason: panel?.dataset.pasteReason,
-         headingText: heading?.textContent ?? "",
-         metaText: meta?.textContent ?? "",
          contentLeak:
-           (heading?.textContent ?? "").includes(sentinel) ||
-           (meta?.textContent ?? "").includes(sentinel) ||
-           (panel?.textContent ?? "").includes(sentinel),
+           (panel?.textContent ?? '').includes(sentinel) ||
+           (panel?.innerHTML ?? '').includes(sentinel),
+         blockedAbsent: !document.querySelector('[data-testid="production-terminal-paste-blocked"]'),
        };
      }
      ```
 
-     Expected: `present: true`, `reason: "multiline"`, `contentLeak:
-     false`. The heading is the static `Multiline paste detected.`
-     string; the meta carries `2 lines, ` plus a byte count; the body
-     `echo first` / `echo second` is NOT present anywhere in the panel.
+     Expected: `present: true`, `reason: "bracketed_paste_markers"`,
+     `contentLeak: false`, `blockedAbsent: true`. The heading is the
+     static `Paste contains bracketed-paste markers.`, the meta carries
+     a 1-line + byte-count line.
 
+2. **Multiline paste — confirm panel renders with metadata only.**
+   - Dispatch a paste of `"echo relayterm-multi-a\necho relayterm-multi-b\n"`
+     the same way (synthetic ClipboardEvent against
+     `.xterm-helper-textarea`).
+   - Assert the confirm panel renders, the meta line shows the line
+     count + byte length, and neither sentinel (`relayterm-multi-a`,
+     `relayterm-multi-b`) appears anywhere in the panel `textContent`
+     or `innerHTML`. (The reason will be `bracketed_paste_markers`
+     when the remote shell has bracketed paste on; the panel renders
+     identically either way.)
    - `browser_click [data-testid="production-terminal-paste-confirm-cancel"]`.
-   - Re-snapshot: confirm panel is gone, no `echo first` text appeared
-     in the terminal viewport (it would render as terminal output if
-     sent — observe the viewport before and after Cancel). Expected:
-     panel absent, viewport unchanged.
+   - Re-snapshot: confirm panel is gone, neither sentinel appears in
+     the terminal viewport rows (a confirmed send would render the
+     pasted text as terminal echo).
 
-3. **Multiline confirm — Send paste forwards exactly the original.**
-   - Trigger the same multiline paste again.
+3. **Multiline paste — Send forwards exactly once.**
+   - Dispatch the same multiline paste again.
    - `browser_click [data-testid="production-terminal-paste-confirm-send"]`.
-   - Observe the terminal viewport: the remote shell should receive the
-     full multiline payload exactly once (visible as `echo first`,
-     newline, `echo second`, newline). The confirm panel disappears.
+   - Press Enter (`browser_press_key Enter`) and observe the viewport:
+     the remote shell echoes the pasted text exactly once and the
+     confirm panel disappears.
 
-4. **Blocked paste — drops content; Dismiss clears the panel.**
-   - Construct a paste candidate that exceeds the hard cap (64 KiB):
-     `await navigator.clipboard.writeText("a".repeat(65 * 1024))`.
-   - `browser_press_key Control+Shift+V`.
-   - Assert the blocked panel renders with
-     `data-paste-reason="exceeds_hard_cap"` and the dropped byte count
-     in its meta line. The body `aaaa...` content is NOT in the panel
-     (only the size metadata).
+4. **Large paste — confirm panel renders with metadata only.**
+   - Dispatch a paste of `'a'.repeat(5000)` (above the 4 KiB confirm
+     threshold, below the 64 KiB hard cap).
+   - Assert the confirm panel renders, the meta line shows the byte
+     length (≥ 5012 bytes once xterm's bracketed-paste markers are
+     counted), and a long run of `a`s is NOT in the panel
+     (`(panel.textContent ?? '').includes('aaaaaaaaaaaaaaaa')` must
+     be `false`).
+   - `browser_click [data-testid="production-terminal-paste-confirm-cancel"]`.
+
+5. **Blocked paste — exceeds_hard_cap; Dismiss clears the panel.**
+   - Dispatch a paste of `'a'.repeat(65 * 1024)` (above the 64 KiB
+     hard cap; the hard cap rule sits ABOVE the bracketed-paste rule
+     in `decidePaste`, so the reason here is `exceeds_hard_cap`).
+   - Assert the BLOCKED panel renders with
+     `data-paste-reason="exceeds_hard_cap"`, the meta line shows the
+     dropped byte count, and the long run of `a`s is NOT in the panel.
+     Confirm panel must be absent.
    - `browser_click [data-testid="production-terminal-paste-blocked-dismiss"]`.
    - Re-snapshot: blocked panel is gone. Terminal viewport is
      unchanged — nothing was sent to the remote shell.
 
-5. **Console redaction.**
+6. **Blocked paste — nul_byte; same redaction posture.**
+   - Dispatch a paste of `'echo relayterm-nul-paste\x00more'` — the
+     embedded NUL byte (`\x00`) is what trips the rule, NOT the
+     visible "nul" in the sentinel string. The `nul_byte` rule sits
+     AHEAD of `bracketed_paste_markers` in `decidePaste`, so the
+     reason here is `nul_byte` regardless of xterm wrapping. Assert
+     the blocked panel renders with `data-paste-reason="nul_byte"`,
+     the `relayterm-nul-paste` sentinel does NOT appear in the panel,
+     and the meta line shows the dropped byte count.
+   - `browser_click [data-testid="production-terminal-paste-blocked-dismiss"]`.
+
+7. **Lifecycle teardown — pending paste clears on detach / close /
+   disconnect / unmount.**
+   - Trigger any confirm-risk paste (e.g. multiline) so a panel is
+     present.
+   - Click `[data-testid="production-terminal-detach"]` (or
+     `-close` / `-dispose`). Assert the confirm panel is gone
+     immediately. Reconnect (within `DETACHED_TTL_MS`) — the prior
+     paste content must NOT auto-render in the viewport.
+
+8. **Logout cleanup — workspace unmounts, no paste content survives.**
+   - Trigger any confirm-risk paste so a panel is present.
+   - `browser_click [data-testid="auth-sign-out"]`. Assert
+     `[data-testid="auth-login-screen"]` re-renders, the production
+     terminal element is gone, `document.cookie` no longer carries the
+     session cookie, and `localStorage` / `sessionStorage` carry no
+     paste sentinels.
+
+9. **Console redaction.**
    - `browser_console_messages level=error all=true`.
-   - Expected: no entries containing the paste body sentinels (`echo
-     first`, `echo second`, the 65 KiB filler character runs). The
-     favicon `404` (if present) is the only allowed entry.
+   - Expected: no entries containing any paste body sentinel
+     (`relayterm-single-line-smoke`, `relayterm-multi-*`,
+     `relayterm-nul-paste`, the long `a` runs from steps 4–5). The
+     favicon `404`, the initial `/api/v1/auth/me` 401 (pre-login), and
+     a Vite WebSocket reconnect note are the only allowed entries.
+
+10. **Audit-events redaction (backend cross-check).** Query the
+    `audit_events` table directly and confirm no row carries any paste
+    sentinel in `payload`:
+
+    ```sql
+    SELECT count(*) FROM audit_events
+     WHERE payload::text ILIKE '%relayterm-multi%'
+        OR payload::text ILIKE '%relayterm-nul%'
+        OR payload::text ILIKE '%relayterm-single-line%';
+    ```
+
+    Expected: `0`. Matches the canonical rule in AGENTS.md "Don't put
+    paste content in `audit_events.payload`".
 
 If a live SSH target is unavailable, skip this section and re-run
 after the backend gains one. The `pastePolicy.test.ts` unit tests pin

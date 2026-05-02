@@ -104,7 +104,16 @@ impl SshPtyBridge for RusshPtyBridge {
         };
 
         let russh_config = Arc::new(russh::client::Config {
-            inactivity_timeout: Some(self.inner_timeout),
+            // `inner_timeout` is the per-step budget for `connect` /
+            // `authenticate_publickey` (enforced via `tokio::time::timeout`
+            // below). It must NOT also be used as russh's session-level
+            // `inactivity_timeout`, which kills the SSH transport after
+            // that many seconds of no traffic — a 10s cap silently tears
+            // down every interactive shell as soon as the operator pauses
+            // typing. Keep the long-lived session inactivity-cap unset
+            // here; the application-layer detached-TTL plus the channel
+            // EOF / Close events drive lifecycle for the PTY bridge.
+            inactivity_timeout: None,
             ..Default::default()
         });
 
