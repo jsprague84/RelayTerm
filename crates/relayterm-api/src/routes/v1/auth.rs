@@ -19,13 +19,16 @@
 //!
 //! ## CSRF
 //!
-//! Every state-changing route in this module runs an inline `Origin`
-//! guard before any DB or auth work. A missing or non-allowlisted
-//! `Origin` returns 403 `csrf_origin_mismatch` per SPEC.md "CSRF
-//! posture". GETs (`/auth/me`) are exempt — they are idempotent reads
-//! and (when the shared middleware lands in step 6) GETs stay exempt
-//! there too. The inline guard is removed in the same commit that
-//! wires the shared middleware.
+//! Every state-changing route in this module runs the shared
+//! [`CsrfGuard`] extractor (`crate::auth::csrf`) before any DB or auth
+//! work. A missing or non-allowlisted `Origin` returns 403
+//! `csrf_origin_mismatch` per SPEC.md "CSRF posture". GETs
+//! (`/auth/me`) are exempt — they are idempotent reads and the same
+//! exemption holds when the guard is rolled out across the rest of
+//! the protected app routes (SPEC step 7). The extractor is placed
+//! AHEAD of `Json<...>` so the rejection happens before request
+//! bytes are parsed; the per-route inline check that lived here in
+//! step 4 is gone.
 //!
 //! ## Audit
 //!
@@ -62,8 +65,8 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::AppState;
-use crate::auth::AuthenticatedUser;
 use crate::auth::cookie::{SESSION_COOKIE_NAME, extract_session_cookie};
+use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::auth::{BootstrapRequest, LoginRequest, UserResponse};
 use crate::error::ApiError;
 
@@ -89,10 +92,10 @@ pub struct AuthRoutesConfig {
     /// Optional `Set-Cookie` `Domain` attribute. None means a
     /// host-only cookie (the default).
     pub cookie_domain: Option<String>,
-    /// Allow-listed `Origin` values for the inline CSRF guard. Empty
-    /// means every `POST /auth/*` is rejected — that is the secure
-    /// default; tests and dev environments must populate it
-    /// explicitly.
+    /// Allow-listed `Origin` values for the shared CSRF guard
+    /// ([`crate::auth::csrf`]). Empty means every state-changing
+    /// browser-write route is rejected — that is the secure default;
+    /// tests and dev environments must populate it explicitly.
     pub allowed_origins: Vec<String>,
     /// Bootstrap token configured at boot. `None` means the bootstrap
     /// route is disabled (returns 503). The plaintext is held in
@@ -109,37 +112,6 @@ impl std::fmt::Debug for AuthRoutesConfig {
             .field("allowed_origins", &self.allowed_origins)
             .field("bootstrap_token_set", &self.bootstrap_token.is_some())
             .finish()
-    }
-}
-
-impl AuthRoutesConfig {
-    /// Inline CSRF Origin guard. Called before any DB or auth work on
-    /// every state-changing auth route.
-    ///
-    /// Policy (matches SPEC.md "CSRF posture"):
-    /// * Missing `Origin` → 403 `csrf_origin_mismatch`.
-    /// * `Origin` not in `allowed_origins` → 403 `csrf_origin_mismatch`.
-    /// * Match → continue.
-    ///
-    /// Empty `allowed_origins` rejects every write. That is the secure
-    /// default; tests / dev set the allow-list explicitly.
-    pub(crate) fn check_origin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        let Some(value) = headers.get(header::ORIGIN) else {
-            return Err(ApiError::CsrfOriginMismatch(
-                "missing Origin header".to_owned(),
-            ));
-        };
-        let Ok(origin) = value.to_str() else {
-            return Err(ApiError::CsrfOriginMismatch(
-                "Origin header is not valid UTF-8".to_owned(),
-            ));
-        };
-        if !self.allowed_origins.iter().any(|allowed| allowed == origin) {
-            return Err(ApiError::CsrfOriginMismatch(
-                "Origin not in allowed_origins".to_owned(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -163,11 +135,10 @@ pub(super) fn router() -> Router<AppState> {
 /// bootstrap"). Does NOT mint a session; the SPA calls `/auth/login`
 /// next.
 async fn bootstrap(
+    _csrf: CsrfGuard,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(req): Json<BootstrapRequest>,
 ) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
-    state.auth_routes.check_origin(&headers)?;
     let req = req.validated()?;
 
     // Per SPEC: failure modes (bad token, already-bootstrapped) emit
@@ -255,11 +226,10 @@ async fn bootstrap(
 /// password / unknown-email collapse to the same 401 + the same
 /// `login_failed` audit row so a probe cannot distinguish the two.
 async fn login(
+    _csrf: CsrfGuard,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    state.auth_routes.check_origin(&headers)?;
     let req = req.validated()?;
 
     // Look up the user by email. A miss is collapsed to the same
@@ -360,9 +330,14 @@ async fn login(
 /// revoked cookies all return 204 with a clear-cookie header. The
 /// `logout_succeeded` audit row is appended only on a real revocation
 /// transition so the audit feed reflects intent, not noise.
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    state.auth_routes.check_origin(&headers)?;
-
+async fn logout(
+    _csrf: CsrfGuard,
+    State(state): State<AppState>,
+    // `headers` here is for `extract_session_cookie` only — NOT a
+    // duplicate of the `CsrfGuard` check above (the guard reads its
+    // own copy via `Parts::headers` internally).
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     // Always-clear cookie. Built first so the success / no-op paths
     // share the same exit shape.
     let clear_cookie = build_clear_cookie(&state.auth_routes);
@@ -533,8 +508,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Origin-guard policy tests live in
+    //! [`crate::auth::csrf::tests`] alongside the shared helper. The
+    //! tests below cover the bits this module owns end-to-end:
+    //! `AuthRoutesConfig::Debug` redaction, the cookie-builder shape,
+    //! and the bootstrap-token constant-time compare.
+
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue};
 
     fn cfg(allowed: &[&str], bootstrap_token: Option<&str>) -> Arc<AuthRoutesConfig> {
         Arc::new(AuthRoutesConfig {
@@ -543,57 +523,6 @@ mod tests {
             allowed_origins: allowed.iter().map(|s| (*s).to_owned()).collect(),
             bootstrap_token: bootstrap_token.map(|t| Zeroizing::new(t.to_owned())),
         })
-    }
-
-    fn headers_with_origin(value: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(header::ORIGIN, HeaderValue::from_str(value).unwrap());
-        h
-    }
-
-    #[test]
-    fn origin_guard_allows_match() {
-        let c = cfg(&["https://relay.example.com"], None);
-        c.check_origin(&headers_with_origin("https://relay.example.com"))
-            .unwrap();
-    }
-
-    #[test]
-    fn origin_guard_rejects_mismatch() {
-        let c = cfg(&["https://relay.example.com"], None);
-        let err = c
-            .check_origin(&headers_with_origin("https://evil.example.com"))
-            .unwrap_err();
-        assert!(matches!(err, ApiError::CsrfOriginMismatch(_)));
-    }
-
-    #[test]
-    fn origin_guard_rejects_missing_origin() {
-        let c = cfg(&["https://relay.example.com"], None);
-        let err = c.check_origin(&HeaderMap::new()).unwrap_err();
-        assert!(matches!(err, ApiError::CsrfOriginMismatch(_)));
-    }
-
-    #[test]
-    fn origin_guard_rejects_when_allowlist_empty() {
-        let c = cfg(&[], None);
-        let err = c
-            .check_origin(&headers_with_origin("https://relay.example.com"))
-            .unwrap_err();
-        assert!(matches!(err, ApiError::CsrfOriginMismatch(_)));
-    }
-
-    #[test]
-    fn origin_guard_rejects_non_utf8_origin() {
-        let c = cfg(&["https://relay.example.com"], None);
-        let mut h = HeaderMap::new();
-        // Non-UTF-8 byte triggers `to_str().is_err()`.
-        h.insert(
-            header::ORIGIN,
-            HeaderValue::from_bytes(&[0xff, 0xfe, 0xfd]).unwrap(),
-        );
-        let err = c.check_origin(&h).unwrap_err();
-        assert!(matches!(err, ApiError::CsrfOriginMismatch(_)));
     }
 
     #[test]

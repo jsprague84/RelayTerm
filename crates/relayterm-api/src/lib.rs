@@ -22,7 +22,7 @@ mod dto;
 mod error;
 mod routes;
 
-pub use auth::AuthenticatedUser;
+pub use auth::{AuthenticatedUser, CsrfGuard};
 pub use dev_user::DevUser;
 pub use error::ApiError;
 pub use routes::v1::auth::AuthRoutesConfig;

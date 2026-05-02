@@ -7636,8 +7636,156 @@ async fn auth_post_routes_reject_disallowed_origin(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bad_origin_rejects_before_body_parsing(pool: PgPool) {
+    // The `CsrfGuard` extractor runs AHEAD of `Json<...>` in the
+    // bootstrap / login / logout signatures. A malformed body paired
+    // with a disallowed Origin must therefore return 403 (the guard's
+    // verdict), NOT 400 (the body parser's verdict). If this test
+    // ever sees a 400 it means the guard moved behind body parsing —
+    // which would let an unauthenticated probe parse-bomb the JSON
+    // path before the Origin check fires.
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "csrforder@relayterm.local").await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .body(Body::from("{not-json"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bad_origin_login_does_not_write_login_failed_audit(pool: PgPool) {
+    // A disallowed-Origin login must NOT touch the password verifier
+    // OR write a `login_failed` audit row — the request is rejected
+    // before any auth work runs. SPEC.md "CSRF posture" pins the
+    // pre-auth-check ordering and the redaction tests rely on it
+    // (a `login_failed` row from a CSRF-rejected probe would expose
+    // login-throttle telemetry to whichever Origin showed up).
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "noaudit@relayterm.local").await;
+
+    // Snapshot pre-existing `login_failed` rows so the assertion is
+    // robust against the bootstrap-helper's own audit emissions.
+    let before = PgAuditEventRepository::new(pool.clone())
+        .recent(200)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == AuditEventKind::LoginFailed)
+        .count();
+
+    let resp = app
+        .oneshot(auth_post_with_origin(
+            "/api/v1/auth/login",
+            json!({
+                "email": "noaudit@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+            "https://evil.example.com",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let after = PgAuditEventRepository::new(pool.clone())
+        .recent(200)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == AuditEventKind::LoginFailed)
+        .count();
+    assert_eq!(
+        after, before,
+        "CSRF-rejected login MUST NOT emit a login_failed audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bad_origin_bootstrap_does_not_create_user_or_audit(pool: PgPool) {
+    // Bootstrap is the first-user-creation surface. A disallowed-Origin
+    // bootstrap must NOT create a user row, MUST NOT emit any audit
+    // row (no `first_user_created`, no `login_failed` with a probe
+    // reason), and MUST collapse to the same 403 / `csrf_origin_mismatch`
+    // wire shape the other auth routes use.
+    //
+    // Builds `AppState` by hand instead of using `setup_with_first_user`
+    // because the assertion needs the pool to start with zero users and
+    // zero auth-shaped audit rows — the helper bootstraps a user, which
+    // would pollute the audit-row count this test verifies.
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(auth_post_with_origin(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+                "email": "blocked@relayterm.local",
+                "display_name": "Blocked",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+            "https://evil.example.com",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+
+    // No matching user.
+    let user = PgUserRepository::new(pool.clone())
+        .get_by_email("blocked@relayterm.local")
+        .await
+        .unwrap();
+    assert!(
+        user.is_none(),
+        "CSRF-rejected bootstrap MUST NOT create a user",
+    );
+
+    // Zero auth-related audit rows.
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(200)
+        .await
+        .unwrap();
+    let auth_rows = audit
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AuditEventKind::FirstUserCreated
+                    | AuditEventKind::LoginSucceeded
+                    | AuditEventKind::LoginFailed
+                    | AuditEventKind::LogoutSucceeded
+            )
+        })
+        .count();
+    assert_eq!(
+        auth_rows, 0,
+        "CSRF-rejected bootstrap MUST NOT emit any auth audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn me_does_not_require_origin(pool: PgPool) {
-    // GET /auth/me is exempt from the inline CSRF guard. Without a
+    // GET /auth/me is exempt from the shared CSRF guard. Without a
     // cookie it returns 401, not 403 — the auth check runs even with
     // no Origin header present.
     let (app, _user_id) = setup_with_first_user(pool.clone(), "noorigin@relayterm.local").await;
