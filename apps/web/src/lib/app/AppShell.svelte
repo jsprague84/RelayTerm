@@ -164,6 +164,20 @@
 
   let signingOut = $state(false);
 
+  /**
+   * Local cleanup shared between the explicit "Sign out" button and
+   * the Settings panel's "revoke current session" path. The active-
+   * terminal pointer drop pins SPEC.md "Frontend authentication UI
+   * plan" Phase 4: re-login within the detached-TTL window does not
+   * get to silently reattach to a session belonging to (now-revoked)
+   * credentials.
+   */
+  function performLocalSignOut() {
+    clearActiveSession();
+    activeLaunch = null;
+    signOut?.();
+  }
+
   async function handleSignOut() {
     if (signingOut) return;
     signingOut = true;
@@ -176,15 +190,20 @@
       await logoutApi();
     } finally {
       // Local cleanup ALWAYS runs, regardless of the wire outcome.
-      // SPEC.md "Frontend authentication UI plan" Phase 4 pins the
-      // active-terminal pointer drop on logout — re-login within the
-      // detached-TTL window does not get to silently reattach to a
-      // session belonging to (now-revoked) credentials.
-      clearActiveSession();
-      activeLaunch = null;
       signingOut = false;
-      signOut?.();
+      performLocalSignOut();
     }
+  }
+
+  /**
+   * Hand-off from the Settings session-management panel after a
+   * successful current-session revoke. The backend has already cleared
+   * the cookie via the revoke route's `Set-Cookie` header, so we skip
+   * `POST /auth/logout` and run only local cleanup + gate flip — no
+   * duplicated logout logic.
+   */
+  function handleCurrentSessionRevoked() {
+    performLocalSignOut();
   }
 </script>
 
@@ -232,7 +251,11 @@
         {:else if selected === "identities"}
           <IdentitiesView />
         {:else if selected === "settings"}
-          <SettingsView />
+          <SettingsView
+            onCurrentSessionRevoked={signOut
+              ? handleCurrentSessionRevoked
+              : undefined}
+          />
         {/if}
 
         {#if devMode && devTools && devToolsOpen}

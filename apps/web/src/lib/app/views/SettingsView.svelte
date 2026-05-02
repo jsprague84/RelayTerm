@@ -38,7 +38,21 @@
     findThemePreset,
   } from "../settings/themePresets.js";
   import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
+  import AuthSessionsPanel from "./AuthSessionsPanel.svelte";
   import RecentActivityPanel from "./RecentActivityPanel.svelte";
+
+  interface Props {
+    /**
+     * Forwarded to {@link AuthSessionsPanel}. When the user revokes
+     * their CURRENT session from the panel, the backend has already
+     * cleared the cookie via the revoke route's `Set-Cookie` header;
+     * AppShell runs local cleanup + auth-gate flip via this callback
+     * so we do not re-POST `/auth/logout`.
+     */
+    onCurrentSessionRevoked?: () => void;
+  }
+
+  let { onCurrentSessionRevoked }: Props = $props();
 
   type SaveState =
     | { kind: "idle" }
@@ -379,6 +393,8 @@ Last login: Mon May  1 14:02:51
     mobile/Tauri settings are deliberate later slices. Today's settings
     are stored locally in this browser only.
   </p>
+
+  <AuthSessionsPanel {onCurrentSessionRevoked} />
 
   <RecentActivityPanel />
 </section>

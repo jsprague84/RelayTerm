@@ -21,6 +21,11 @@
  *    `code` only — it never echoes the wire `message` of an HTTP error,
  *    the thrown `Error.message` of a transport failure, the offered
  *    plaintext password / bootstrap token, or any other request input.
+ *    The session-management formatter {@link describeAuthSessionsError}
+ *    is strictly tighter (function of `kind` + `status` only — `code`
+ *    is dropped entirely) because the session surface has no
+ *    per-`code` UI branching today; both formatters preserve the
+ *    same redaction posture.
  *  - No path here logs, throws, or formats raw response bodies.
  *  - Login validation copy never reveals whether the offered email
  *    belongs to a known account ("invalid credentials" only).
@@ -599,6 +604,336 @@ export function describeAuthGateError(err: AuthError): string {
     return "Cannot reach the backend.";
   }
   return "Cannot reach the backend: malformed response.";
+}
+
+// ---------------------------------------------------------------------
+// Current-user session management (`/api/v1/auth/sessions`)
+// ---------------------------------------------------------------------
+
+/**
+ * Wire-side status discriminator for one session row. Mirrors the
+ * backend's `SessionStatus` enum (`crates/relayterm-api/src/dto/auth.rs`).
+ *
+ * The backend collapses "revoked AND expired" to `revoked` because
+ * revocation is the deliberate-action signal and expiry is a passive
+ * timestamp; the SPA just renders whatever the backend says.
+ */
+export type AuthSessionStatus = "active" | "expired" | "revoked";
+
+/**
+ * Public-safe session DTO. Mirrors the backend's `SessionListItem`.
+ *
+ * **Token-redacted by construction.** This interface deliberately omits
+ * `token_hash` and has no plaintext-token field — the only public
+ * reference to a session is its `id`. {@link parseAuthSession} builds
+ * the object field-by-field, so a stray `token_hash` / `session_token`
+ * / `password_hash` / `bootstrap_token` / `private_key` /
+ * `encrypted_private_key` / `access_token` / `session_output` on the
+ * wire CANNOT smuggle onto the parsed object — sentinel-string tests in
+ * `tests/authSessionsApi.test.ts` pin this.
+ */
+export interface AuthSession {
+  id: string;
+  /** RFC 3339 timestamp. */
+  created_at: string;
+  /** RFC 3339 timestamp. */
+  last_seen_at: string;
+  /** RFC 3339 timestamp. */
+  expires_at: string;
+  /** RFC 3339 timestamp; null when the session has not been revoked. */
+  revoked_at: string | null;
+  /** True for the row that authenticated THIS request. */
+  current: boolean;
+  status: AuthSessionStatus;
+}
+
+/**
+ * Build an {@link AuthSession} from an unknown wire object. Returns
+ * `null` for any missing or wrong-typed required field. Field-by-field
+ * construction is the redaction backstop: secret-shaped properties on
+ * the input cannot reach the returned object because no path here
+ * copies them.
+ *
+ * The `status` discriminator is validated against the closed
+ * {@link AuthSessionStatus} union; an unknown status value collapses
+ * the row to `null` so the loader treats it as a malformed response
+ * rather than displaying an unmapped state.
+ */
+export function parseAuthSession(raw: unknown): AuthSession | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.id !== "string" ||
+    typeof r.created_at !== "string" ||
+    typeof r.last_seen_at !== "string" ||
+    typeof r.expires_at !== "string" ||
+    typeof r.current !== "boolean" ||
+    typeof r.status !== "string"
+  ) {
+    return null;
+  }
+  if (r.revoked_at !== null && typeof r.revoked_at !== "string") {
+    return null;
+  }
+  if (
+    r.status !== "active" &&
+    r.status !== "expired" &&
+    r.status !== "revoked"
+  ) {
+    return null;
+  }
+  return {
+    id: r.id,
+    created_at: r.created_at,
+    last_seen_at: r.last_seen_at,
+    expires_at: r.expires_at,
+    revoked_at: (r.revoked_at as string | null) ?? null,
+    current: r.current,
+    status: r.status,
+  };
+}
+
+export interface AuthSessionsListResponse {
+  sessions: AuthSession[];
+}
+
+function parseAuthSessionsListResponse(
+  raw: unknown,
+): AuthSessionsListResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.sessions)) return null;
+  const sessions: AuthSession[] = [];
+  for (const item of r.sessions) {
+    const parsed = parseAuthSession(item);
+    if (parsed === null) return null;
+    sessions.push(parsed);
+  }
+  return { sessions };
+}
+
+export interface RevokeAllAuthSessionsResponse {
+  revoked_count: number;
+}
+
+function parseRevokeAllResponse(
+  raw: unknown,
+): RevokeAllAuthSessionsResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.revoked_count !== "number") return null;
+  if (!Number.isFinite(r.revoked_count) || r.revoked_count < 0) return null;
+  return { revoked_count: r.revoked_count };
+}
+
+export type ListAuthSessionsResult =
+  | { ok: true; sessions: AuthSession[] }
+  | { ok: false; error: AuthError };
+
+export interface ListAuthSessionsOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to `/api/v1/auth/sessions`. */
+  endpoint?: string;
+}
+
+/**
+ * `GET /api/v1/auth/sessions`. Returns the caller's own browser
+ * sessions; the wire shape is current-user-scoped in SQL on the
+ * backend and the response carries `current: true` exactly once (the
+ * row that authenticated this request).
+ *
+ * Cookie-bearing GET like {@link getCurrentUser} — `credentials:
+ * "include"` so the browser ships the session cookie. The helper
+ * does NOT throw, does NOT log, and does NOT echo response detail.
+ */
+export async function listAuthSessions(
+  options: ListAuthSessionsOptions = {},
+): Promise<ListAuthSessionsResult> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return { ok: false, error: { kind: "transport" } };
+  }
+  const endpoint = options.endpoint ?? "/api/v1/auth/sessions";
+
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, authFetchInit("GET", undefined));
+  } catch {
+    return { ok: false, error: { kind: "transport" } };
+  }
+
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const list = parseAuthSessionsListResponse(parsed);
+  if (list === null) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, sessions: list.sessions };
+}
+
+export type RevokeAuthSessionResult =
+  | { ok: true; current: boolean }
+  | { ok: false; error: AuthError };
+
+export interface RevokeAuthSessionOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to a builder that path-encodes
+   * the session id into `/api/v1/auth/sessions/:id/revoke`. */
+  endpoint?: (sessionId: string) => string;
+  /**
+   * Whether the targeted row is the caller's CURRENT session. The
+   * backend always clears the cookie on a current-session revoke
+   * regardless; this flag is just plumbed back to the result so the
+   * UI can drive the appropriate sign-out flow.
+   */
+  current?: boolean;
+}
+
+/**
+ * `POST /api/v1/auth/sessions/:id/revoke`. Idempotent on the backend:
+ * a 204 means "revoked OR already-revoked", and a 404 means the row
+ * either does not exist OR belongs to a different user (probe
+ * resistance — both cases collapse to the same status). The helper
+ * surfaces the typed error for the UI to format via
+ * {@link describeAuthError}.
+ *
+ * The session id is path-encoded via {@link encodeURIComponent} so a
+ * pathological id (slashes, percent characters) cannot escape the
+ * route.
+ */
+export async function revokeAuthSession(
+  sessionId: string,
+  options: RevokeAuthSessionOptions = {},
+): Promise<RevokeAuthSessionResult> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return { ok: false, error: { kind: "transport" } };
+  }
+  const buildEndpoint =
+    options.endpoint ??
+    ((id: string) =>
+      `/api/v1/auth/sessions/${encodeURIComponent(id)}/revoke`);
+
+  let response: Response;
+  try {
+    response = await fetchImpl(buildEndpoint(sessionId), authFetchInit("POST", undefined));
+  } catch {
+    return { ok: false, error: { kind: "transport" } };
+  }
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+  return { ok: true, current: options.current ?? false };
+}
+
+export type RevokeAllAuthSessionsResult =
+  | { ok: true; revoked_count: number }
+  | { ok: false; error: AuthError };
+
+export interface RevokeAllAuthSessionsOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/auth/sessions/revoke-all-except-current`. */
+  endpoint?: string;
+}
+
+/**
+ * `POST /api/v1/auth/sessions/revoke-all-except-current`. Revokes every
+ * non-revoked session owned by the caller EXCEPT the caller's current
+ * session. Returns `revoked_count` — never per-row session ids — so the
+ * audit row, the wire response, and the response shape stay aligned.
+ *
+ * The current cookie is intentionally NOT cleared on the backend: the
+ * request itself proves the caller wants to keep the current session.
+ */
+export async function revokeAllAuthSessionsExceptCurrent(
+  options: RevokeAllAuthSessionsOptions = {},
+): Promise<RevokeAllAuthSessionsResult> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return { ok: false, error: { kind: "transport" } };
+  }
+  const endpoint =
+    options.endpoint ?? "/api/v1/auth/sessions/revoke-all-except-current";
+
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, authFetchInit("POST", undefined));
+  } catch {
+    return { ok: false, error: { kind: "transport" } };
+  }
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const result = parseRevokeAllResponse(parsed);
+  if (result === null) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, revoked_count: result.revoked_count };
+}
+
+/**
+ * One-line UI summary for an {@link AuthError} produced by the session-
+ * management helpers. Stays a function of `kind` + `status` only —
+ * never echoes the wire `message`, the wire `code`, or transport
+ * detail.
+ */
+export function describeAuthSessionsError(err: AuthError): string {
+  if (err.kind === "http") {
+    if (err.status === 401) {
+      return "Your session has ended. Please sign in again.";
+    }
+    if (err.status === 403) {
+      return "Cannot manage sessions: request blocked by browser security policy.";
+    }
+    if (err.status === 404) {
+      return "That session is no longer available.";
+    }
+    return `Cannot manage sessions: HTTP ${err.status}`;
+  }
+  if (err.kind === "transport") {
+    return "Cannot reach the backend.";
+  }
+  return "Cannot manage sessions: malformed response.";
+}
+
+/**
+ * Human-facing label for an {@link AuthSessionStatus}. Pure function
+ * of the closed enum; no wire detail leaks through.
+ */
+export function describeAuthSessionStatus(status: AuthSessionStatus): string {
+  switch (status) {
+    case "active":
+      return "Active";
+    case "expired":
+      return "Expired";
+    case "revoked":
+      return "Revoked";
+  }
 }
 
 /**
