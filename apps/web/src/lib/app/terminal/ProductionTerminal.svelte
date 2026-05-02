@@ -60,6 +60,10 @@
     loadTerminalSettings,
     settingsToRendererOptions,
   } from "../settings/terminalSettings.js";
+  import {
+    evaluatePaste,
+    type PasteDecision,
+  } from "./pastePolicy.js";
 
   interface Props {
     sessionId: string;
@@ -140,9 +144,31 @@
    * not in TTL.
    */
   let closedExplicitly = $state(false);
+  /**
+   * Decision metadata for a paste that triggered the confirm panel.
+   * The actual paste content is held in the closure-scoped
+   * {@link pendingPasteText} (not in `$state`) so it never enters the
+   * reactive graph, never reaches `JSON.stringify(component state)`,
+   * and never appears in any rendered DOM beyond the metadata fields
+   * the panel exposes (line count, byte length, reason).
+   */
+  let pendingPasteDecision = $state<PasteDecision | null>(null);
+  /**
+   * Decision metadata for the most recent blocked paste. Same redaction
+   * posture as {@link pendingPasteDecision}: metadata only, content is
+   * dropped before this state writes.
+   */
+  let blockedPasteDecision = $state<PasteDecision | null>(null);
 
   let client: TerminalSessionClient | null = null;
   let renderer: XtermRenderer | null = null;
+  /**
+   * Plaintext paste content held between `evaluatePaste` returning a
+   * `confirm` decision and the operator confirming/cancelling. Lives at
+   * script scope deliberately — never `$state`, never persisted, never
+   * logged. Cleared on send / cancel / detach / disconnect / unmount.
+   */
+  let pendingPasteText: string | null = null;
   let unsubInput: (() => void) | null = null;
   let unsubResize: (() => void) | null = null;
   let mountTarget: HTMLDivElement | null = null;
@@ -283,9 +309,28 @@
       // `RendererInput` neutral type allows `Uint8Array` so a future
       // adapter (or a binary IME path) is already handled. The
       // payload bytes are NEVER logged or surfaced.
-      next.sendInput(
-        typeof data === "string" ? data : new TextDecoder().decode(data),
-      );
+      const text =
+        typeof data === "string" ? data : new TextDecoder().decode(data);
+      const decision = evaluatePaste(text);
+      if (decision.risk === "safe") {
+        next.sendInput(text);
+        return;
+      }
+      if (decision.risk === "blocked") {
+        // Drop the paste; surface metadata only. A pending confirm
+        // (if any) is dismissed — the operator's last clipboard
+        // action takes precedence.
+        pendingPasteText = null;
+        pendingPasteDecision = null;
+        blockedPasteDecision = decision;
+        return;
+      }
+      // confirm: hold the original text in the closure variable until
+      // the operator confirms or cancels. Replaces any prior pending
+      // paste so a quick double-paste doesn't strand the first one.
+      pendingPasteText = text;
+      pendingPasteDecision = decision;
+      blockedPasteDecision = null;
     });
     // `XtermRenderer.onResize` is always defined; the optional chain is
     // defensive coding against the renderer-neutral interface, which
@@ -337,6 +382,33 @@
       renderer?.dispose();
       renderer = null;
     }
+    // Drop any pending paste content along with the client — without
+    // a live client there is nowhere to send it. Cleared regardless of
+    // `keepRenderer` since the wire send target is the client, not the
+    // renderer.
+    pendingPasteText = null;
+    pendingPasteDecision = null;
+    blockedPasteDecision = null;
+  }
+
+  function pasteConfirmClicked() {
+    // Snapshot + immediately null out the closure variable so a re-
+    // entry (panic-click double-tap) cannot send twice. The decision
+    // metadata clears too — the panel hides on the next render.
+    const text = pendingPasteText;
+    pendingPasteText = null;
+    pendingPasteDecision = null;
+    if (text === null || !client) return;
+    client.sendInput(text);
+  }
+
+  function pasteCancelClicked() {
+    pendingPasteText = null;
+    pendingPasteDecision = null;
+  }
+
+  function pasteBlockedDismissClicked() {
+    blockedPasteDecision = null;
   }
 
   function detachClicked() {
@@ -566,6 +638,94 @@
     >
       {lastError}
     </p>
+  {/if}
+
+  {#if pendingPasteDecision}
+    <div
+      class="flex flex-col gap-2 rounded-md border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-100"
+      data-testid="production-terminal-paste-confirm"
+      data-paste-reason={pendingPasteDecision.reasonCode}
+      role="dialog"
+      aria-labelledby="production-terminal-paste-confirm-heading"
+    >
+      <p
+        id="production-terminal-paste-confirm-heading"
+        class="font-medium text-amber-100"
+        data-testid="production-terminal-paste-confirm-heading"
+      >
+        {pendingPasteDecision.safeUserMessage}
+      </p>
+      <p
+        class="text-amber-200/80"
+        data-testid="production-terminal-paste-confirm-meta"
+      >
+        {pendingPasteDecision.lineCount} line{pendingPasteDecision.lineCount === 1 ? "" : "s"},
+        {pendingPasteDecision.byteLength} byte{pendingPasteDecision.byteLength === 1 ? "" : "s"}.
+      </p>
+      <p class="text-amber-200/70">
+        This will send text directly to the remote shell. Review the source
+        before continuing — RelayTerm does not inspect the paste content.
+      </p>
+      <div class="flex flex-wrap gap-2">
+        <!--
+          `enablement.detach` is `true` exactly when the session is live
+          and can receive input (`attached` or `replaying`); the
+          Send-paste button shares that predicate by design. If the
+          workspace detaches / closes / errors mid-confirm, the
+          affordance disables. `pasteConfirmClicked` also defensively
+          re-checks `client` before calling `sendInput`.
+        -->
+        <button
+          type="button"
+          class="rounded-md border border-amber-600 bg-amber-800/60 px-3 py-1 text-xs text-amber-50 transition hover:border-amber-500 hover:bg-amber-700/60 disabled:cursor-not-allowed disabled:opacity-50"
+          onclick={pasteConfirmClicked}
+          disabled={!enablement.detach}
+          data-testid="production-terminal-paste-confirm-send"
+        >
+          Send paste
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+          onclick={pasteCancelClicked}
+          data-testid="production-terminal-paste-confirm-cancel"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  {#if blockedPasteDecision}
+    <div
+      class="flex flex-col gap-2 rounded-md border border-rose-800/60 bg-rose-950/30 px-3 py-2 text-xs text-rose-100"
+      data-testid="production-terminal-paste-blocked"
+      data-paste-reason={blockedPasteDecision.reasonCode}
+      role="alert"
+    >
+      <p
+        class="font-medium text-rose-100"
+        data-testid="production-terminal-paste-blocked-heading"
+      >
+        {blockedPasteDecision.safeUserMessage}
+      </p>
+      <p
+        class="text-rose-200/80"
+        data-testid="production-terminal-paste-blocked-meta"
+      >
+        {blockedPasteDecision.byteLength} byte{blockedPasteDecision.byteLength === 1 ? "" : "s"} dropped. Nothing was sent to the remote shell.
+      </p>
+      <div class="flex flex-wrap gap-2">
+        <button
+          type="button"
+          class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+          onclick={pasteBlockedDismissClicked}
+          data-testid="production-terminal-paste-blocked-dismiss"
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
   {/if}
 
   <div

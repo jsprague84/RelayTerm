@@ -164,6 +164,15 @@ update this file in the same change.
 | `[data-testid="production-terminal-clear"]`       | "Clear local viewport" button (renderer-only; never sends a wire frame, never mutates backend replay buffer, never asks the remote shell to run `clear`). |
 | `[data-testid="production-terminal-settings-note"]` | Inline workspace note: "Appearance settings apply to new terminal sessions." (sourced from `TERMINAL_UX_COPY`). |
 | `[data-testid="production-terminal-copy-paste-note"]` | Inline workspace note: browser-shortcut copy/paste guidance with bracketed-paste / OSC 52 flagged as future work (sourced from `TERMINAL_UX_COPY`). |
+| `[data-testid="production-terminal-paste-confirm"]` | Paste-confirm panel (rendered only when `evaluatePaste` returned a `confirm` decision for a paste-candidate input; carries `data-paste-reason` ∈ `multiline`/`large_payload`/`control_chars`/`bracketed_paste_markers`). The full paste content is NEVER displayed; the panel renders metadata (line count, byte length) and a static disclaimer only. |
+| `[data-testid="production-terminal-paste-confirm-heading"]` | Static heading inside the confirm panel (sourced from `describePasteDecision(reasonCode)`). |
+| `[data-testid="production-terminal-paste-confirm-meta"]` | Metadata line inside the confirm panel ("X line(s), Y byte(s)"). |
+| `[data-testid="production-terminal-paste-confirm-send"]` | "Send paste" button inside the confirm panel (snapshots the closure-scoped pending paste text, clears it, then calls `client.sendInput` exactly once). |
+| `[data-testid="production-terminal-paste-confirm-cancel"]` | "Cancel" button inside the confirm panel (clears the closure-scoped pending paste text without sending). |
+| `[data-testid="production-terminal-paste-blocked"]` | Paste-blocked panel (rendered only when `evaluatePaste` returned a `blocked` decision; carries `data-paste-reason` ∈ `nul_byte`/`exceeds_hard_cap`). The blocked content is dropped before the panel renders; only metadata reaches the DOM. |
+| `[data-testid="production-terminal-paste-blocked-heading"]` | Static heading inside the blocked panel (sourced from `describePasteDecision(reasonCode)`). |
+| `[data-testid="production-terminal-paste-blocked-meta"]` | Metadata line inside the blocked panel ("Y byte(s) dropped. Nothing was sent to the remote shell."). |
+| `[data-testid="production-terminal-paste-blocked-dismiss"]` | "Dismiss" button inside the blocked panel. |
 | `[data-testid="terminal-empty-settings-note"]`    | Empty-state Terminal view inline copy mirroring `production-terminal-settings-note`. |
 | `[data-testid="terminal-empty-copy-paste-note"]`  | Empty-state Terminal view inline copy mirroring `production-terminal-copy-paste-note`. |
 | `[data-testid="terminal-empty-saved"]`            | Empty-state "Reconnect last session" affordance card (rendered only when the local active-session pointer carries a record AND the mount-time backend validation has not classified it as stale; carries `data-saved-session-id` and `data-validation` (`idle` / `checking` / `reconnectable` / `uncertain`)). |
@@ -615,6 +624,134 @@ the same MCP browser tools.
 
 7. `browser_console_messages level=error all=true`. As above, the
    favicon `404` is the only allowed error.
+
+### B.1. Production terminal paste safety smoke (requires a live backend with a launchable session)
+
+This step verifies the paste-safety policy in
+`apps/web/src/lib/app/terminal/pastePolicy.ts` (the unit tests pin the
+policy itself; this smoke verifies the integration in
+`ProductionTerminal.svelte`). It is **not** part of the production
+prod-build smoke above because it requires a launched terminal session,
+which in turn requires a live backend AND a trusted host-key + working
+auth identity. Skip if the local backend has no SSH target available.
+
+Pre-conditions: a launched terminal session is mounted under
+`[data-testid="production-terminal"]`, `data-phase="attached"`, the
+viewport has focus.
+
+Note on clipboard access: the snippets below use `navigator.clipboard.writeText`
+from `browser_evaluate`. Many browser configurations (including some
+Playwright MCP setups) gate clipboard-write behind a permission grant.
+If `writeText` rejects, fall back to typing directly into the viewport
+via `browser_type` against the `[data-testid="production-terminal-viewport"]`
+element — `evaluatePaste` runs on the same `onInput` payload regardless
+of paste source, so the policy outcomes are identical.
+
+1. **Single-line safe paste — no panel.**
+   - Programmatically dispatch a paste of `"echo hello"` against the
+     viewport (or use `browser_press_key` to type it; the goal is to
+     verify the safe path forwards silently). Use `browser_evaluate`:
+
+     ```js
+     async () => {
+       const term = document.querySelector(
+         '[data-testid="production-terminal-viewport"]',
+       );
+       term?.focus();
+       await navigator.clipboard.writeText("echo hello");
+       // Trigger xterm's clipboard read via Ctrl+Shift+V using the
+       // browser_press_key tool below.
+     }
+     ```
+
+   - `browser_press_key Control+Shift+V` (or use `browser_type` on the
+     viewport for a deterministic alternative).
+   - Assert the confirm and blocked panels are NOT present:
+
+     ```js
+     () => {
+       const has = (sel) => !!document.querySelector(sel);
+       return {
+         confirmAbsent: !has('[data-testid="production-terminal-paste-confirm"]'),
+         blockedAbsent: !has('[data-testid="production-terminal-paste-blocked"]'),
+       };
+     }
+     ```
+
+     Expected: both `true`. The remote shell received `echo hello`
+     (visible as terminal output the next frame).
+
+2. **Multiline confirm — content NOT displayed; cancel does not send.**
+   - Write a multi-line string to the clipboard:
+     `await navigator.clipboard.writeText("echo first\necho second\n")`.
+   - `browser_press_key Control+Shift+V`.
+   - Assert the confirm panel renders with `data-paste-reason="multiline"`
+     AND that the panel text does NOT contain the paste body:
+
+     ```js
+     () => {
+       const panel = document.querySelector(
+         '[data-testid="production-terminal-paste-confirm"]',
+       );
+       const heading = document.querySelector(
+         '[data-testid="production-terminal-paste-confirm-heading"]',
+       );
+       const meta = document.querySelector(
+         '[data-testid="production-terminal-paste-confirm-meta"]',
+       );
+       const sentinel = "echo first";
+       return {
+         present: !!panel,
+         reason: panel?.dataset.pasteReason,
+         headingText: heading?.textContent ?? "",
+         metaText: meta?.textContent ?? "",
+         contentLeak:
+           (heading?.textContent ?? "").includes(sentinel) ||
+           (meta?.textContent ?? "").includes(sentinel) ||
+           (panel?.textContent ?? "").includes(sentinel),
+       };
+     }
+     ```
+
+     Expected: `present: true`, `reason: "multiline"`, `contentLeak:
+     false`. The heading is the static `Multiline paste detected.`
+     string; the meta carries `2 lines, ` plus a byte count; the body
+     `echo first` / `echo second` is NOT present anywhere in the panel.
+
+   - `browser_click [data-testid="production-terminal-paste-confirm-cancel"]`.
+   - Re-snapshot: confirm panel is gone, no `echo first` text appeared
+     in the terminal viewport (it would render as terminal output if
+     sent — observe the viewport before and after Cancel). Expected:
+     panel absent, viewport unchanged.
+
+3. **Multiline confirm — Send paste forwards exactly the original.**
+   - Trigger the same multiline paste again.
+   - `browser_click [data-testid="production-terminal-paste-confirm-send"]`.
+   - Observe the terminal viewport: the remote shell should receive the
+     full multiline payload exactly once (visible as `echo first`,
+     newline, `echo second`, newline). The confirm panel disappears.
+
+4. **Blocked paste — drops content; Dismiss clears the panel.**
+   - Construct a paste candidate that exceeds the hard cap (64 KiB):
+     `await navigator.clipboard.writeText("a".repeat(65 * 1024))`.
+   - `browser_press_key Control+Shift+V`.
+   - Assert the blocked panel renders with
+     `data-paste-reason="exceeds_hard_cap"` and the dropped byte count
+     in its meta line. The body `aaaa...` content is NOT in the panel
+     (only the size metadata).
+   - `browser_click [data-testid="production-terminal-paste-blocked-dismiss"]`.
+   - Re-snapshot: blocked panel is gone. Terminal viewport is
+     unchanged — nothing was sent to the remote shell.
+
+5. **Console redaction.**
+   - `browser_console_messages level=error all=true`.
+   - Expected: no entries containing the paste body sentinels (`echo
+     first`, `echo second`, the 65 KiB filler character runs). The
+     favicon `404` (if present) is the only allowed entry.
+
+If a live SSH target is unavailable, skip this section and re-run
+after the backend gains one. The `pastePolicy.test.ts` unit tests pin
+the underlying classification rules without a backend.
 
 ### C. Auth flow smoke (browser, requires a live backend)
 

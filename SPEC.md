@@ -945,7 +945,59 @@ Polish slice that layers small UX affordances onto the existing production termi
 
 **Future work (explicit out-of-scope for this slice).**
 
-Production renderer selector; ghostty-web / restty / wterm in production; multi-tab workspace; durable session recording UI; backend VT observer / `libghostty-vt` snapshot; profile-specific terminal preferences; live hot-reload of font / theme on a mounted xterm; mobile / Tauri keyboard UI; custom keybinding editor; OSC 52 clipboard automation; bracketed-paste confirmation / multiline-paste preview; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI. Each is a separate slice.
+Production renderer selector; ghostty-web / restty / wterm in production; multi-tab workspace; durable session recording UI; backend VT observer / `libghostty-vt` snapshot; profile-specific terminal preferences; live hot-reload of font / theme on a mounted xterm; mobile / Tauri keyboard UI; custom keybinding editor; OSC 52 clipboard automation; password bootstrap / `ssh-copy-id`; private-key import UI; real auth UI. Each is a separate slice. (Bracketed-paste confirmation / multiline-paste preview is now wired — see "Production terminal paste safety" below.)
+
+### Production terminal paste safety
+
+A frontend-only paste-safety policy that intercepts paste-candidate input at the renderer-input boundary and gates risky pastes behind explicit operator confirmation. The slice adds NO backend changes, NO new wire messages, NO renderer-interface additions, and NO durable storage of paste content. It is purely a UI gate between `XtermRenderer.onInput` and `client.sendInput`.
+
+**Scope (load-bearing — this slice).**
+
+1. **Pure paste policy module** — `apps/web/src/lib/app/terminal/pastePolicy.ts`. Exports the closed types `PasteRisk` (`safe` | `confirm` | `blocked`) and `PasteReasonCode` (`ok_empty` | `ok_keystroke` | `ok_single_line` | `multiline` | `large_payload` | `control_chars` | `bracketed_paste_markers` | `nul_byte` | `exceeds_hard_cap`); the public surface `isLikelyKeystroke`, `decidePaste`, `evaluatePaste`, `describePasteDecision`, `pasteByteLength`, `pasteLineCount`; and the threshold constants `KEYSTROKE_MAX_LENGTH = 8`, `PASTE_CONFIRM_BYTES = 4096` (4 KiB), `PASTE_HARD_CAP_BYTES = 65536` (64 KiB). The module is renderer-neutral (no `xterm` / `terminal-core` imports) and does no I/O. Tests live in `apps/web/tests/pastePolicy.test.ts`.
+2. **`PasteDecision` shape (load-bearing redaction).** `{ risk, reasonCode, lineCount, byteLength, hasControlChars, hasBracketedPasteMarkers, safeUserMessage }`. The decision is METADATA only — it NEVER carries the original paste text or any fragment of it. `safeUserMessage` is a static string keyed off `reasonCode` (the `describePasteDecision` table). The decision is safe to put in Svelte state, JSON-stringify, or render to the DOM. Sentinel-string tests pin that no field of the decision (and no JSON / String form of it) contains a sentinel even when the input string carries one.
+3. **Risk classification rules** (in `decidePaste` evaluation order):
+   1. NUL byte present → `blocked`, reason `nul_byte`.
+   2. `byteLength > PASTE_HARD_CAP_BYTES` → `blocked`, reason `exceeds_hard_cap`.
+   3. Bracketed-paste markers (`ESC[200~` / `ESC[201~`) present in the text → `confirm`, reason `bracketed_paste_markers`.
+   4. `lineCount > 1` → `confirm`, reason `multiline`.
+   5. Risky control chars (any ASCII control < 0x20 except tab / LF / CR; or DEL 0x7f) → `confirm`, reason `control_chars`.
+   6. `byteLength > PASTE_CONFIRM_BYTES` → `confirm`, reason `large_payload`.
+   7. Otherwise → `safe`, reason `ok_single_line`.
+4. **Keystroke short-circuit.** `isLikelyKeystroke(text)` returns `true` for empty strings, single characters (covers `\r` Enter, ESC, every printable), and 2..`KEYSTROKE_MAX_LENGTH`-char strings with no `\r` / `\n`. `evaluatePaste` applies this short-circuit FIRST and returns a `safe` decision with `reasonCode = "ok_keystroke"` for keystroke-likely input — bypassing the strict control-char check so arrow keys (`ESC[A`), function keys (`ESC OP`), and short IME commits do not trigger confirm UI. Empty strings get `reasonCode = "ok_empty"` for symmetry.
+5. **ProductionTerminal integration** — `apps/web/src/lib/app/terminal/ProductionTerminal.svelte`. The `XtermRenderer.onInput` callback decodes the input to a string, calls `evaluatePaste`, and dispatches:
+   - `safe` → forward immediately to `client.sendInput(text)` (the prior path).
+   - `confirm` → hold the original text in a script-scoped `pendingPasteText` variable (NOT `$state`, NOT logged, NOT persisted), set `pendingPasteDecision` to the metadata-only decision, render the confirm panel.
+   - `blocked` → drop the text, set `blockedPasteDecision` to the metadata-only decision, render the blocked panel.
+6. **Confirm panel** (`production-terminal-paste-confirm`). Carries `data-paste-reason` plus a heading (the static `safeUserMessage`), a metadata line ("X line(s), Y byte(s)"), a static disclaimer ("This will send text directly to the remote shell. Review the source before continuing — RelayTerm does not inspect the paste content."), a "Send paste" button, and a "Cancel" button. The full pasted content is NEVER displayed; only the metadata. "Send paste" snapshots and immediately clears the `pendingPasteText` closure variable, then forwards the snapshot via `client.sendInput`. "Cancel" clears the closure variable and dismisses the panel.
+7. **Blocked panel** (`production-terminal-paste-blocked`). Heading (the static `safeUserMessage`), metadata line ("Y byte(s) dropped. Nothing was sent to the remote shell."), and a "Dismiss" button. Same redaction posture as the confirm panel — no paste content reaches the DOM.
+8. **Pending-paste teardown.** `teardownLocal` clears `pendingPasteText`, `pendingPasteDecision`, and `blockedPasteDecision` along with the client/renderer. This covers detach, dispose, reconnect (which calls teardown first), and `onDestroy`. A pending paste cannot survive a navigation away from the workspace.
+9. **Wire-frame contract preserved.** `client.sendInput` is the only outbound surface. The Send-paste button calls it with the snapshotted text exactly once. The Cancel and Dismiss buttons NEVER call it. The blocked path NEVER calls it. The keystroke / safe-paste path is byte-identical to the prior implementation.
+
+**No backend changes.** The slice is purely frontend. No new routes, no schema, no new wire messages, no protocol changes. The backend has no knowledge that paste safety happened — `client.sendInput` carries the same payload it always would, just gated on operator confirmation when risky.
+
+**Architecture rule preserved.** The production shell still imports only `@relayterm/terminal-core` and `@relayterm/terminal-xterm`; the experimental adapters remain dev-lab-only. `appShellIsolation.test.ts` is unchanged. The `TerminalRenderer` interface in `terminal-core` is unchanged — paste interception lives entirely above the renderer at the `onInput → sendInput` boundary inside the production component.
+
+**Redaction posture (load-bearing).**
+
+- Paste content lives at exactly one place outside the input event: the script-scoped `pendingPasteText` variable on the workspace component, between `evaluatePaste` returning `confirm` and the operator's confirm/cancel click. It is NEVER assigned to `$state`, NEVER passed to `console.*`, NEVER serialized into a `data-*` attribute, NEVER persisted to localStorage / sessionStorage, NEVER routed through the audit-log surface, NEVER included in a thrown `Error.message`.
+- The confirm panel and the blocked panel render METADATA only (line count, byte length, reason code, the static `safeUserMessage`). The full paste content is never displayed.
+- `evaluatePaste` / `decidePaste` / `describePasteDecision` perform no I/O. They do not log, throw with payload bytes in the message, or persist anything. Sentinel tests in `pastePolicy.test.ts` pin that the decision object — across `safe` / `confirm` / `blocked` outcomes — never carries a sentinel string from its input through any field, JSON form, or String() form.
+
+**Limitations and what this slice is NOT (load-bearing).**
+
+- Frontend-only. The backend does not see the policy. A different client (or a future programmatic surface) that goes around the production component is not protected.
+- No backend command inspection. RelayTerm does NOT parse or interpret the pasted text in any way. The policy is shape-based (newlines, size, control chars), not semantics-based. There is no allow-list, no deny-list, no shell-aware analysis.
+- No durable terminal recording. The pending paste content is held only between `evaluatePaste` and the next confirm / cancel / teardown.
+- No bracketed-paste-mode protocol handshake. The policy detects bracketed-paste markers in the text as a `confirm` signal; it does NOT track whether the remote shell enabled bracketed paste mode.
+- No clipboard API access. The policy operates on whatever the renderer hands to `onInput`. The keystroke vs paste distinction is heuristic (length / newlines) rather than browser-paste-event-based; an explicit programmatic paste API (or OSC 52) is future work.
+- No keybinding editor, no command palette, no global shortcut manager. Ctrl+Shift+V (or whatever the browser maps to paste) flows through xterm's `onData` and lands in the same `evaluatePaste` path as right-click paste; the policy's behaviour is paste-source-agnostic.
+- The renderer-neutral `TerminalRenderer` interface is unchanged. A future adapter can plug into the same boundary without changes.
+
+**Stable selectors (additions only).** `production-terminal-paste-confirm`, `production-terminal-paste-confirm-heading`, `production-terminal-paste-confirm-meta`, `production-terminal-paste-confirm-send`, `production-terminal-paste-confirm-cancel`, `production-terminal-paste-blocked`, `production-terminal-paste-blocked-heading`, `production-terminal-paste-blocked-meta`, `production-terminal-paste-blocked-dismiss`. The confirm/blocked panel containers also carry `data-paste-reason="<reasonCode>"` for smoke selectors to assert risk classification without depending on copy text.
+
+**Future work (explicit out-of-scope for this slice).**
+
+OSC 52 clipboard automation; right-click context menu with paste / paste-as-line / paste-without-newlines variants; programmatic paste API on the renderer adapter; bracketed-paste-mode protocol awareness (knowing when the remote shell enabled bracketed paste so the policy can present a richer UI); shell-aware command inspection / allow-list / deny-list; mobile-keyboard-specific paste UX; durable terminal recording / replay UI; backend-side paste inspection or audit; per-profile paste policy overrides; full keybinding editor; production renderer selector. Each is a separate slice.
 
 ### Production active terminal local recovery
 
