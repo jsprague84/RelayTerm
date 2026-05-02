@@ -9920,3 +9920,356 @@ async fn session_management_routes_require_authentication(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ----------------------------------------------------------------------
+// Current-user password change (`POST /api/v1/auth/change-password`)
+// ----------------------------------------------------------------------
+
+const TEST_AUTH_NEW_PASSWORD: &str = "TEST-AUTH-NEW-PASSWORD-DO-NOT-LEAK-9876";
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn change_password_succeeds_revokes_other_sessions_and_audits(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "rotate@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "rotate@relayterm.local").await;
+
+    // Mint two extra browser sessions for the same user via AuthService —
+    // they should be revoked as part of the rotation while the current
+    // cookie keeps working.
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other_a = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create other session A");
+    let other_a_id = other_a.session.id;
+    drop(other_a);
+    let other_b = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create other session B");
+    let other_b_id = other_b.session.id;
+    drop(other_b);
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/auth/change-password",
+            json!({
+                "current_password": TEST_AUTH_PASSWORD,
+                "new_password": TEST_AUTH_NEW_PASSWORD,
+            }),
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["revoked_other_sessions"], 2);
+
+    // Wire body must not echo any password material or token shapes.
+    let body_str = body.to_string();
+    for forbidden in [
+        TEST_AUTH_PASSWORD,
+        TEST_AUTH_NEW_PASSWORD,
+        "current_password",
+        "new_password",
+        "password_hash",
+        "session_token",
+        "token_hash",
+        "argon2id",
+    ] {
+        assert!(
+            !body_str.contains(forbidden),
+            "change-password response must not contain `{forbidden}`: {body_str}"
+        );
+    }
+
+    // Current cookie is still valid — /me succeeds.
+    let me = app
+        .clone()
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &current_token))
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+
+    // Old password no longer works.
+    let stale = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "rotate@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+
+    // New password DOES work.
+    let fresh = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "rotate@relayterm.local",
+                "password": TEST_AUTH_NEW_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::OK);
+
+    // Both other sessions now revoked.
+    let session_repo = relayterm_db::PgUserSessionRepository::new(pool.clone());
+    for id in [other_a_id, other_b_id] {
+        let row = session_repo.get(id).await.unwrap().expect("session row");
+        assert!(
+            row.revoked_at.is_some(),
+            "other session {id} must be revoked",
+        );
+        assert_eq!(row.revoked_reason.as_deref(), Some("password_changed"));
+    }
+
+    // Single password_changed audit row, payload carries only the count.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let event = recent
+        .iter()
+        .find(|e| e.kind == AuditEventKind::PasswordChanged)
+        .expect("password_changed audit row");
+    assert_eq!(event.actor_id, Some(user_id));
+    assert_eq!(event.payload["revoked_other_sessions"], 2);
+    assert!(
+        event.payload.get("changed_at").is_some(),
+        "audit payload should carry `changed_at`",
+    );
+    assert_audit_payload_redacted(&event.payload, AuditEventKind::PasswordChanged);
+
+    // Token plaintext + password material MUST NOT survive into audit.
+    let raw = event.payload.to_string();
+    assert!(!raw.contains(&current_token));
+    assert!(!raw.contains(TEST_AUTH_PASSWORD));
+    assert!(!raw.contains(TEST_AUTH_NEW_PASSWORD));
+    // Per-session ids never appear — the count is the only payload field
+    // with cardinality.
+    assert!(!raw.contains(&other_a_id.to_string()));
+    assert!(!raw.contains(&other_b_id.to_string()));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn change_password_with_no_other_sessions_returns_zero_count(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "solo@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "solo@relayterm.local").await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/auth/change-password",
+            json!({
+                "current_password": TEST_AUTH_PASSWORD,
+                "new_password": TEST_AUTH_NEW_PASSWORD,
+            }),
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["revoked_other_sessions"], 0);
+
+    // Audit row IS still written — the password change itself is the
+    // signal worth logging — and carries the honest zero count.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let event = recent
+        .iter()
+        .find(|e| e.kind == AuditEventKind::PasswordChanged)
+        .expect("password_changed audit row");
+    assert_eq!(event.actor_id, Some(user_id));
+    assert_eq!(event.payload["revoked_other_sessions"], 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn change_password_wrong_current_returns_401_does_not_mutate(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "wrong@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "wrong@relayterm.local").await;
+
+    // Mint another session. It must NOT be revoked when the rotation
+    // fails on a wrong current password.
+    let auth = test_auth(&Db::from_pool(pool.clone()));
+    let other = auth
+        .create_session(user_id, chrono::Duration::days(30), chrono::Utc::now())
+        .await
+        .expect("create other session");
+    let other_id = other.session.id;
+    drop(other);
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/auth/change-password",
+            json!({
+                "current_password": "definitely-not-the-real-password",
+                "new_password": TEST_AUTH_NEW_PASSWORD,
+            }),
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+
+    // Old password STILL works — the password row was not touched.
+    let still_old = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "wrong@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(still_old.status(), StatusCode::OK);
+
+    // New password DOES NOT work — it was never persisted.
+    let new_rejected = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "wrong@relayterm.local",
+                "password": TEST_AUTH_NEW_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new_rejected.status(), StatusCode::UNAUTHORIZED);
+
+    // Other session still active — wrong-current must NOT cascade revoke.
+    let session_repo = relayterm_db::PgUserSessionRepository::new(pool.clone());
+    let row = session_repo
+        .get(other_id)
+        .await
+        .unwrap()
+        .expect("session row");
+    assert!(
+        row.revoked_at.is_none(),
+        "wrong-current must not revoke other sessions",
+    );
+
+    // No password_changed audit row.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    assert!(
+        !recent
+            .iter()
+            .any(|e| e.kind == AuditEventKind::PasswordChanged),
+        "wrong-current attempt must not write a password_changed audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn change_password_short_new_password_returns_400(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "short@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "short@relayterm.local").await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/auth/change-password",
+            json!({
+                "current_password": TEST_AUTH_PASSWORD,
+                "new_password": "tiny",
+            }),
+            &current_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // No password_changed audit row.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    assert!(
+        !recent
+            .iter()
+            .any(|e| e.kind == AuditEventKind::PasswordChanged),
+        "validation failure must not write a password_changed audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn change_password_requires_authentication(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "anon3@relayterm.local").await;
+
+    let resp = app
+        .oneshot(json_post_no_auth(
+            "/api/v1/auth/change-password",
+            json!({
+                "current_password": TEST_AUTH_PASSWORD,
+                "new_password": TEST_AUTH_NEW_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn change_password_bad_origin_returns_403_before_verify(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "csrf3@relayterm.local").await;
+    let current_token = login_and_get_token(&app, "csrf3@relayterm.local").await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post_with_origin(
+            "/api/v1/auth/change-password",
+            json!({
+                "current_password": TEST_AUTH_PASSWORD,
+                "new_password": TEST_AUTH_NEW_PASSWORD,
+            }),
+            &current_token,
+            "https://evil.example.com",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The CSRF rejection happens BEFORE the password verify and BEFORE
+    // any DB write. Old password must STILL work, new password must
+    // NOT, and no audit row was written.
+    let still_old = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "csrf3@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(still_old.status(), StatusCode::OK);
+
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    assert!(
+        !recent
+            .iter()
+            .any(|e| e.kind == AuditEventKind::PasswordChanged),
+        "CSRF-rejected request must not write a password_changed audit row",
+    );
+}

@@ -1,11 +1,13 @@
 //! `/api/v1/auth/*` — bootstrap, login, logout, current-user, current-
-//! user session management.
+//! user password change, current-user session management.
 //!
 //! These routes are the auth surface for the SPA. Bootstrap is one-
 //! shot (creates the first user only); login mints the session cookie;
 //! logout revokes; `me` reports the current user via the cookie-backed
-//! [`AuthenticatedUser`] extractor; the `/auth/sessions` family lets a
-//! signed-in user list and revoke their own browser sessions.
+//! [`AuthenticatedUser`] extractor; `change-password` rotates the
+//! caller's own password and revokes every OTHER session; the
+//! `/auth/sessions` family lets a signed-in user list and revoke their
+//! own browser sessions.
 //!
 //! ## Cookie
 //!
@@ -40,6 +42,9 @@
 //! - failed login (bad creds OR unknown email) → `login_failed`
 //!   (`actor_id = NULL`, `reason = "bad_credentials"`)
 //! - successful logout → `logout_succeeded` (`actor_id = user_id`)
+//! - successful password change → `password_changed` (`actor_id = user_id`,
+//!   payload carries `revoked_other_sessions: u64` only). Wrong-current-
+//!   password attempts write no audit row at this kind.
 //! - session revoke transition (`POST /auth/sessions/:id/revoke`) →
 //!   `session_revoked` (`actor_id = user_id`, payload carries the
 //!   session id and `current_session: bool`). An idempotent re-revoke
@@ -77,8 +82,8 @@ use crate::AppState;
 use crate::auth::cookie::{SESSION_COOKIE_NAME, extract_session_cookie};
 use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::auth::{
-    BootstrapRequest, LoginRequest, RevokeAllExceptCurrentResponse, SessionListItem,
-    SessionsListResponse, UserResponse,
+    BootstrapRequest, ChangePasswordRequest, ChangePasswordResponse, LoginRequest,
+    RevokeAllExceptCurrentResponse, SessionListItem, SessionsListResponse, UserResponse,
 };
 use crate::error::ApiError;
 
@@ -133,6 +138,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/me", get(me))
+        .route("/change-password", post(change_password))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}/revoke", post(revoke_session))
         .route(
@@ -463,6 +469,145 @@ async fn logout(
 /// `warn!` line in `error.rs::IntoResponse`.
 async fn me(user: AuthenticatedUser) -> Json<UserResponse> {
     Json(user.into_user().into())
+}
+
+// ---------------------------------------------------------------------
+// Change password
+// ---------------------------------------------------------------------
+
+/// `POST /api/v1/auth/change-password`.
+///
+/// Authenticated user rotates their own password after proving
+/// knowledge of the current one. Steps:
+///
+/// 1. CSRF Origin guard, then `AuthenticatedUser` extractor
+///    (`last_seen_at` is touched as part of the extractor — same
+///    posture as every other protected route).
+/// 2. Validate the request shape (length floor on `new_password`,
+///    bounded length on `current_password`).
+/// 3. Verify `current_password` against the stored Argon2id hash.
+///    On mismatch, return a generic `unauthorized` body, write NO
+///    audit row, and do NOT touch the password row or revoke any
+///    sessions. The bootstrap-token / login probe-resistance contract
+///    applies here too: a wrong-current-password attempt must not
+///    leak whether a credential row even existed for the caller —
+///    `verify_password` already collapses "no row" and "wrong
+///    password" into the same `InvalidCredentials` shape.
+/// 4. Hash + persist the new password via `set_password` (a per-call
+///    random salt; the stored hash is fresh even if old == new).
+/// 5. Revoke every OTHER session for the caller, preserving the
+///    current session. The current cookie stays valid — a successful
+///    rotation is intentionally NOT a sign-out.
+/// 6. Append `password_changed` audit row with public metadata only:
+///    `revoked_other_sessions: u64`. Never the offered passwords,
+///    never the new hash, never per-session ids.
+///
+/// ## Failure modes
+///
+/// | Outcome | Wire status | Audit |
+/// |---|---|---|
+/// | Bad / missing cookie | 401 (extractor) | none |
+/// | Bad Origin | 403 (CSRF guard) | none |
+/// | Validation fail (short new pw, etc.) | 400 | none |
+/// | Wrong current password | 401 `unauthorized` | none |
+/// | DB fault on set / revoke / audit | 500 | partial — see below |
+///
+/// ## Partial-success posture (audit failure)
+///
+/// The route writes three things in order: (a) the new password row,
+/// (b) the `revoke_all_except` count, (c) the audit row. (a) and (b)
+/// are committed by the time (c) runs. If (c) fails, the route returns
+/// 500 — the password rotation IS already in effect (the user can sign
+/// in again with the new password) and the other sessions ARE revoked.
+/// Surfacing the audit failure as 500 keeps the gap visible to
+/// operators rather than silently swallowing it. This mirrors the
+/// fail-closed posture of `write_lifecycle_audit` in
+/// `routes/v1/server_profiles.rs` and the existing `revoke_session` /
+/// `revoke_all_except_current` paths.
+async fn change_password(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<ChangePasswordResponse>, ApiError> {
+    let req = req.validated()?;
+    let user_id = user.user_id();
+    let current_session_id = user.session_id();
+    // Captured once at request start. Used for the `revoke_all_except`
+    // timestamp and the `changed_at` audit field. Approximately the
+    // rotation moment — there is some clock drift between this
+    // binding and the actual DB commit, which is acceptable for an
+    // audit-shaped human-readable timestamp.
+    let now = Utc::now();
+
+    // Verify the offered current password. The unified
+    // `InvalidCredentials` shape collapses "no password row" and
+    // "wrong password" — neither branch leaks structural detail to
+    // the wire. No audit row on the failure path: this slice scopes
+    // the `password_changed` kind to a real rotation, and a wrong-
+    // current attempt against an already-authenticated session is a
+    // *post-auth* signal that does not fit the unauthenticated
+    // `login_failed` feed (different actor_id shape, different probe
+    // surface). A future "post-auth credential abuse" audit kind can
+    // land in its own slice — tracked under SPEC.md "Out of scope
+    // (v1)". The login throttler is keyed at the unauthenticated
+    // login route only; an attacker holding a valid session cookie
+    // (XSS / leaked cookie / physical access) can spend Argon2id
+    // verifies here without a counter, which is the same trade-off
+    // every authenticated re-prompt makes.
+    state
+        .auth
+        .verify_password(user_id, &req.current_password)
+        .await
+        .map_err(|err| match err {
+            relayterm_auth::AuthServiceError::InvalidCredentials => {
+                ApiError::Unauthorized("invalid current password".to_owned())
+            }
+            other => ApiError::from(other),
+        })?;
+
+    // Persist the new password. Argon2id with a per-call random salt —
+    // calling `set_password` with `current == new` still produces a
+    // fresh PHC string, so the password-history check (if/when it
+    // lands) cannot be defeated by the stored-hash equality test.
+    state.auth.set_password(user_id, &req.new_password).await?;
+
+    // Drop the request explicitly so the heap copies of
+    // `current_password` / `new_password` zeroize as soon as the
+    // password rotation is committed — `Zeroizing<String>` already
+    // wipes on every drop path, including a panic or early return
+    // from `set_password`, so this is documentation intent rather
+    // than a load-bearing wipe; it makes the "secrets are not used
+    // below" boundary explicit at the call site.
+    drop(req);
+
+    // Revoke every OTHER session for the caller. The current session
+    // stays active. An empty result (no other sessions) returns 0 and
+    // still emits the audit row — the password change itself is the
+    // signal worth logging, and `revoked_other_sessions: 0` is the
+    // honest count.
+    let revoked_other_sessions = state
+        .auth
+        .revoke_all_sessions_except(user_id, current_session_id, now, Some("password_changed"))
+        .await?;
+
+    state
+        .db
+        .audit_events()
+        .create(CreateAuditEvent {
+            actor_id: Some(user_id),
+            kind: AuditEventKind::PasswordChanged,
+            payload: json!({
+                "revoked_other_sessions": revoked_other_sessions,
+                "changed_at": now,
+            }),
+            remote_addr: None,
+        })
+        .await?;
+
+    Ok(Json(ChangePasswordResponse {
+        revoked_other_sessions,
+    }))
 }
 
 // ---------------------------------------------------------------------

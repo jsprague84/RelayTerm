@@ -896,6 +896,200 @@ export async function revokeAllAuthSessionsExceptCurrent(
   return { ok: true, revoked_count: result.revoked_count };
 }
 
+// ---------------------------------------------------------------------
+// Current-user password change (`/api/v1/auth/change-password`)
+// ---------------------------------------------------------------------
+
+export interface ChangePasswordRequest {
+  current_password: string;
+  new_password: string;
+}
+
+/**
+ * Wire shape for a successful change-password response. Mirrors the
+ * backend's `ChangePasswordResponse`.
+ *
+ * Carries the count of OTHER sessions revoked as part of the rotation.
+ * Never carries per-row session ids, never carries any token-bearing
+ * payload — `revoked_other_sessions` is the only field. The audit row
+ * payload mirrors this shape so wire and audit stay byte-aligned.
+ */
+export interface ChangePasswordResponse {
+  revoked_other_sessions: number;
+}
+
+/**
+ * Build a {@link ChangePasswordResponse} from an unknown wire object.
+ * Returns `null` for any missing or wrong-typed required field, or for
+ * a non-finite / negative count.
+ *
+ * Field-by-field construction is the redaction backstop: a stray
+ * secret-shaped property on the input cannot reach the returned object
+ * because no path here copies it. The count is bounded to a non-
+ * negative finite number so a hostile fixture cannot smuggle `Infinity`,
+ * `NaN`, or a negative value into the UI.
+ */
+export function parseChangePasswordResponse(
+  raw: unknown,
+): ChangePasswordResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.revoked_other_sessions !== "number") return null;
+  if (
+    !Number.isFinite(r.revoked_other_sessions) ||
+    r.revoked_other_sessions < 0
+  ) {
+    return null;
+  }
+  return { revoked_other_sessions: r.revoked_other_sessions };
+}
+
+export type ChangePasswordResult =
+  | { ok: true; response: ChangePasswordResponse }
+  | { ok: false; error: AuthError };
+
+export interface ChangePasswordOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to `/api/v1/auth/change-password`. */
+  endpoint?: string;
+}
+
+/**
+ * `POST /api/v1/auth/change-password`. The caller must already be
+ * authenticated (`credentials: "include"` ships the session cookie).
+ * The current cookie stays valid on success — a rotation is NOT a sign-
+ * out — but every OTHER session for the caller is revoked server-side.
+ *
+ * Both passwords are passed straight to the wire body and never echoed
+ * into any error / log path. `describeChangePasswordError` is the
+ * single formatter that reaches the UI.
+ */
+export async function changePassword(
+  request: ChangePasswordRequest,
+  options: ChangePasswordOptions = {},
+): Promise<ChangePasswordResult> {
+  const result = await authPost<ChangePasswordResponse>({
+    endpoint: options.endpoint ?? "/api/v1/auth/change-password",
+    fetchImpl: options.fetchImpl,
+    body: {
+      current_password: request.current_password,
+      new_password: request.new_password,
+    },
+    parse: parseChangePasswordResponse,
+  });
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, response: result.data };
+}
+
+/**
+ * Client-side validation reasons for the change-password form. Mirrors
+ * the backend's `ChangePasswordRequest::validated` plus a frontend-only
+ * confirmation-match check (the backend does not see the confirmation
+ * field).
+ */
+export type ChangePasswordFormError =
+  | "missing_current_password"
+  | "missing_new_password"
+  | "new_password_too_short"
+  | "new_password_too_long"
+  | "new_password_same_as_current"
+  | "confirmation_mismatch";
+
+export interface ChangePasswordFormDraft {
+  current_password: string;
+  new_password: string;
+  new_password_confirmation: string;
+}
+
+export function validateChangePasswordForm(
+  raw: ChangePasswordFormDraft,
+): { ok: true } | { ok: false; reason: ChangePasswordFormError } {
+  if (!raw.current_password || raw.current_password.length === 0) {
+    return { ok: false, reason: "missing_current_password" };
+  }
+  if (!raw.new_password || raw.new_password.length === 0) {
+    return { ok: false, reason: "missing_new_password" };
+  }
+  if (raw.new_password.length < PASSWORD_MIN_LEN) {
+    return { ok: false, reason: "new_password_too_short" };
+  }
+  if (raw.new_password.length > PASSWORD_MAX_LEN) {
+    return { ok: false, reason: "new_password_too_long" };
+  }
+  if (raw.new_password === raw.current_password) {
+    return { ok: false, reason: "new_password_same_as_current" };
+  }
+  if (raw.new_password !== raw.new_password_confirmation) {
+    return { ok: false, reason: "confirmation_mismatch" };
+  }
+  return { ok: true };
+}
+
+export function describeChangePasswordFormError(
+  reason: ChangePasswordFormError,
+): string {
+  switch (reason) {
+    case "missing_current_password":
+      return "Enter your current password.";
+    case "missing_new_password":
+      return "Enter a new password.";
+    case "new_password_too_short":
+      return `New password must be at least ${PASSWORD_MIN_LEN} characters.`;
+    case "new_password_too_long":
+      return `New password must be at most ${PASSWORD_MAX_LEN} characters.`;
+    case "new_password_same_as_current":
+      return "New password must be different from your current password.";
+    case "confirmation_mismatch":
+      return "New passwords do not match.";
+  }
+}
+
+/**
+ * One-line UI summary for an {@link AuthError} produced by
+ * {@link changePassword}. Stays a function of `kind` + `status` only —
+ * never echoes the wire `message`, the wire `code`, the offered current
+ * or new password, or transport detail.
+ *
+ * The 401 collapses to a generic "current password is incorrect" string
+ * so a probe via this endpoint cannot distinguish "wrong password" from
+ * "session expired" beyond the status code itself; the same probe-
+ * resistance posture login uses applies here.
+ */
+export function describeChangePasswordError(err: AuthError): string {
+  if (err.kind === "http") {
+    if (err.status === 401) {
+      return "Current password is incorrect, or your session has ended.";
+    }
+    if (err.status === 400) {
+      return "New password did not meet the password policy.";
+    }
+    if (err.status === 403) {
+      return "Cannot change password: request blocked by browser security policy.";
+    }
+    return `Cannot change password: HTTP ${err.status}`;
+  }
+  if (err.kind === "transport") {
+    return "Cannot reach the backend.";
+  }
+  return "Cannot change password: malformed response.";
+}
+
+/**
+ * One-line UI summary for a successful change-password call. Pure
+ * function of the count — does NOT touch error formatting and does NOT
+ * echo any request input.
+ */
+export function describeChangePasswordSuccess(
+  response: ChangePasswordResponse,
+): string {
+  if (response.revoked_other_sessions === 0) {
+    return "Password updated.";
+  }
+  if (response.revoked_other_sessions === 1) {
+    return "Password updated. 1 other session was signed out.";
+  }
+  return `Password updated. ${response.revoked_other_sessions} other sessions were signed out.`;
+}
+
 /**
  * One-line UI summary for an {@link AuthError} produced by the session-
  * management helpers. Stays a function of `kind` + `status` only —

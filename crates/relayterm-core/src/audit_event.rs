@@ -21,6 +21,14 @@ pub enum AuditEventKind {
     LoginFailed,
     LogoutSucceeded,
     FirstUserCreated,
+    /// `POST /api/v1/auth/change-password` succeeded for the caller.
+    /// Fires only on a real password rotation — a wrong-current-password
+    /// attempt writes no audit row at this kind. The payload carries
+    /// `revoked_other_sessions: u64` only (the count of other sessions
+    /// revoked as part of the rotation); never the offered current or
+    /// new password, never any password hash, never session token bytes
+    /// or token-hash bytes, never per-session ids.
+    PasswordChanged,
     /// One specific browser session was explicitly revoked through the
     /// current-user `POST /api/v1/auth/sessions/:id/revoke` route. Fires
     /// only on a non-revoked → revoked transition; idempotent re-revoke
@@ -59,6 +67,7 @@ impl AuditEventKind {
             Self::LoginFailed => "login_failed",
             Self::LogoutSucceeded => "logout_succeeded",
             Self::FirstUserCreated => "first_user_created",
+            Self::PasswordChanged => "password_changed",
             Self::SessionRevoked => "session_revoked",
             Self::SessionsRevoked => "sessions_revoked",
             Self::KeyVaultAccess => "key_vault_access",
@@ -87,6 +96,7 @@ impl AuditEventKind {
             "login_failed" => Self::LoginFailed,
             "logout_succeeded" => Self::LogoutSucceeded,
             "first_user_created" => Self::FirstUserCreated,
+            "password_changed" => Self::PasswordChanged,
             "session_revoked" => Self::SessionRevoked,
             "sessions_revoked" => Self::SessionsRevoked,
             "key_vault_access" => Self::KeyVaultAccess,

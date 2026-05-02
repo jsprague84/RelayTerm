@@ -189,6 +189,8 @@ export function describeAuditEventKind(kind: AuditEventKindTag): string {
       return "Sign-in failed";
     case "logout_succeeded":
       return "Signed out";
+    case "password_changed":
+      return "Password changed";
     case "host_key_accepted":
       return "Host key trusted";
     case "host_key_mismatch":

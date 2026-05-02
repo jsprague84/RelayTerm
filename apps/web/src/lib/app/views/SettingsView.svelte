@@ -39,6 +39,7 @@
   } from "../settings/themePresets.js";
   import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
   import AuthSessionsPanel from "./AuthSessionsPanel.svelte";
+  import PasswordPanel from "./PasswordPanel.svelte";
   import RecentActivityPanel from "./RecentActivityPanel.svelte";
 
   interface Props {
@@ -393,6 +394,8 @@ Last login: Mon May  1 14:02:51
     mobile/Tauri settings are deliberate later slices. Today's settings
     are stored locally in this browser only.
   </p>
+
+  <PasswordPanel />
 
   <AuthSessionsPanel {onCurrentSessionRevoked} />
 

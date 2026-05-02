@@ -127,6 +127,77 @@ impl LoginRequest {
     }
 }
 
+/// `POST /api/v1/auth/change-password` request body.
+///
+/// Both passwords are wrapped in `Zeroizing<String>` so the heap copies
+/// wipe themselves when this DTO drops. `Debug` redacts both fields to
+/// length-only markers; serde re-deserialization is the only legitimate
+/// writer. Validation lives on [`ChangePasswordRequest::validated`] —
+/// length bounds match `BootstrapRequest` / `LoginRequest` so the same
+/// password policy applies across every credential-setting surface.
+#[derive(Deserialize)]
+pub(crate) struct ChangePasswordRequest {
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    pub(crate) current_password: Zeroizing<String>,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    pub(crate) new_password: Zeroizing<String>,
+}
+
+impl fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChangePasswordRequest")
+            .field(
+                "current_password",
+                &format_args!("<redacted: {} chars>", self.current_password.len()),
+            )
+            .field(
+                "new_password",
+                &format_args!("<redacted: {} chars>", self.new_password.len()),
+            )
+            .finish()
+    }
+}
+
+impl ChangePasswordRequest {
+    pub(crate) fn validated(self) -> Result<Self, ApiError> {
+        // The current password is NOT length-floor-checked here: it
+        // is checked against the stored hash and any rejection
+        // collapses to `InvalidCredentials` regardless of length.
+        // Floor-checking would let a probe distinguish "too short for
+        // our policy" from "wrong password" if the policy floor ever
+        // moved between rotations — the wrong-password path is the
+        // single legitimate failure shape.
+        //
+        // The upper bound IS enforced as a 400, mirroring the same
+        // upper bound `LoginRequest::validated` enforces on
+        // `password`: a malicious 10MB current_password would
+        // otherwise hold a hash thread for minutes. This is DoS
+        // hygiene, not a credential probe — a real password will
+        // never approach `PASSWORD_MAX_LEN`, so the 400/401 asymmetry
+        // is observable only by an attacker who is already crossing
+        // the abuse boundary on input shape rather than guessing
+        // credentials.
+        if self.current_password.is_empty() || self.current_password.len() > PASSWORD_MAX_LEN {
+            return Err(ApiError::Validation(
+                "current_password is invalid".to_owned(),
+            ));
+        }
+        validate_password(&self.new_password)?;
+        Ok(self)
+    }
+}
+
+/// `POST /api/v1/auth/change-password` response body.
+///
+/// Carries the count of OTHER sessions revoked as part of the rotation.
+/// Never carries per-session ids, never carries token-bearing payloads.
+/// The audit row payload mirrors this shape (`revoked_other_sessions`)
+/// so wire and audit stay byte-aligned.
+#[derive(Debug, Serialize)]
+pub(crate) struct ChangePasswordResponse {
+    pub(crate) revoked_other_sessions: u64,
+}
+
 /// Wire shape for a user record. Hand-rolled so a future column on
 /// [`User`] cannot widen the wire surface by accident.
 #[derive(Debug, Serialize)]
@@ -389,6 +460,84 @@ mod tests {
             assert!(
                 matches!(err, ApiError::Validation(_)),
                 "expected validation error for `{bad}`",
+            );
+        }
+    }
+
+    #[test]
+    fn change_password_request_debug_redacts_secrets() {
+        let req = ChangePasswordRequest {
+            current_password: Zeroizing::new("AAAA-CURRENT-MARKER-AAAA".to_owned()),
+            new_password: Zeroizing::new("AAAA-NEW-MARKER-AAAA".to_owned()),
+        };
+        let dbg = format!("{req:?}");
+        assert!(!dbg.contains("AAAA-CURRENT-MARKER-AAAA"));
+        assert!(!dbg.contains("AAAA-NEW-MARKER-AAAA"));
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn change_password_rejects_short_new_password() {
+        let req = ChangePasswordRequest {
+            current_password: Zeroizing::new("anything-non-empty".to_owned()),
+            new_password: Zeroizing::new("short".to_owned()),
+        };
+        let err = req.validated().unwrap_err();
+        assert!(matches!(err, ApiError::Validation(_)));
+    }
+
+    #[test]
+    fn change_password_rejects_huge_new_password() {
+        let req = ChangePasswordRequest {
+            current_password: Zeroizing::new("anything-non-empty".to_owned()),
+            new_password: Zeroizing::new("x".repeat(PASSWORD_MAX_LEN + 1)),
+        };
+        let err = req.validated().unwrap_err();
+        assert!(matches!(err, ApiError::Validation(_)));
+    }
+
+    #[test]
+    fn change_password_rejects_empty_current_password() {
+        let req = ChangePasswordRequest {
+            current_password: Zeroizing::new(String::new()),
+            new_password: Zeroizing::new("password-meets-min".to_owned()),
+        };
+        let err = req.validated().unwrap_err();
+        assert!(matches!(err, ApiError::Validation(_)));
+    }
+
+    #[test]
+    fn change_password_validation_error_does_not_echo_passwords() {
+        // `new_password = "tiny"` forces the length-floor branch.
+        let req = ChangePasswordRequest {
+            current_password: Zeroizing::new("AAAA-CURRENT-LEAK-AAAA".to_owned()),
+            new_password: Zeroizing::new("tiny".to_owned()),
+        };
+        let err = req.validated().unwrap_err();
+        let rendered = err.to_string();
+        assert!(!rendered.contains("AAAA-CURRENT-LEAK-AAAA"));
+        assert!(!rendered.contains("tiny"));
+    }
+
+    #[test]
+    fn change_password_response_serialization_is_safe() {
+        let resp = ChangePasswordResponse {
+            revoked_other_sessions: 3,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"revoked_other_sessions\":3"));
+        for forbidden in [
+            "current_password",
+            "new_password",
+            "password_hash",
+            "session_token",
+            "token_hash",
+            "bootstrap_token",
+            "argon2id",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "ChangePasswordResponse must not serialize `{forbidden}`: {json}"
             );
         }
     }

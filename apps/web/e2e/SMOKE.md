@@ -273,6 +273,13 @@ update this file in the same change.
 | `[data-testid="settings-auth-sessions-revoke"]`   | Per-row Revoke button for a non-current active session (POSTs `/api/v1/auth/sessions/:id/revoke`; confirms before mutating). |
 | `[data-testid="settings-auth-sessions-revoke-current"]` | Per-row "Sign out this browser" button for the current active session (revokes + runs local sign-out cleanup; the gate flips to `auth-login-screen` afterwards). |
 | `[data-testid="settings-auth-sessions-future-note"]` | Footer note explicitly disclaiming `remote_addr` / `user_agent` / device-name / password-reset / passkeys / admin views as deferred work. |
+| `[data-testid="settings-password-panel"]`         | Settings password-change panel root (current-user only; rotates the password after verifying the current one; revokes every OTHER session and keeps the current cookie valid). |
+| `[data-testid="settings-password-current"]`       | Current-password input (`<input type="password">`; `autocomplete="current-password"`; never logged, never echoed). |
+| `[data-testid="settings-password-new"]`           | New-password input (`<input type="password">`; `autocomplete="new-password"`; client-side length floor mirrors the backend `PASSWORD_MIN_LEN` / `PASSWORD_MAX_LEN`). |
+| `[data-testid="settings-password-confirm"]`       | Confirmation input for the new password (frontend-only typo guard; the backend does not see the confirmation field). |
+| `[data-testid="settings-password-submit"]`        | "Update password" submit button (POSTs `/api/v1/auth/change-password`; disabled while the request is in flight; copy switches to "Updating…"). |
+| `[data-testid="settings-password-status-success"]` | Success status text (renders the safe formatter only — e.g. "Password updated. N other sessions were signed out."; never echoes wire `message`, `code`, or any password input). |
+| `[data-testid="settings-password-status-failure"]` | Failure status text (safe formatter only; collapses 401 to a generic "current password is incorrect or your session has ended" string; clears every password field on the failure path). |
 | `[data-testid="dev-mode-badge"]`                  | "dev build" badge in top bar (only visible under `vite dev`). |
 | `[data-testid="nav-devtools-toggle"]`             | Sidebar dev-tools toggle (only visible under `vite dev`).     |
 | `[data-testid="dev-tools-panel"]`                 | Dev tools panel rendered when toggle is open (dev only).      |
