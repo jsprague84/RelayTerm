@@ -123,7 +123,7 @@ update this file in the same change.
 | `[data-testid="profile-detail-id"]`               | Truncated profile id (UUID prefix) inside the detail panel.   |
 | `[data-testid="profile-detail-readiness"]`        | Advisory readiness line inside the profile detail panel; never claims "ready", "trusted", "verified", or "passed" — names host-key trust + auth-check as still-required steps. |
 | `[data-testid="profile-detail-hidden-by-filter"]` | Profile detail panel banner rendered when the selected profile is currently hidden by the Servers filter. |
-| `[data-testid="profile-launch-terminal"]`         | Per-profile "Launch terminal" button on the Servers view (creates a session and navigates to the Terminal workspace). Disabled (and copy switches to "Re-enable this profile…") when the row's profile is disabled. |
+| `[data-testid="profile-launch-terminal"]`         | Per-profile "Launch terminal" button on the Servers view (creates a session and navigates to the Terminal workspace). The button label stays "Launch terminal" (or "Launching…" while submitting); when the row's profile is disabled the button is rendered disabled and a sibling hint reads "Re-enable this profile to start a new terminal session." |
 | `[data-testid="profile-launch-error"]`            | Per-row launch error summary (safe formatter only — never echoes wire `message` or transport detail). |
 | `[data-testid="profile-launch-error-dismiss"]`    | Dismiss button inside `profile-launch-error`.                 |
 | `[data-testid="profile-lifecycle-badge"]`         | Inline `disabled` badge next to a profile's name in the row (rendered only when the profile is disabled; carries `data-lifecycle="disabled"`). |
@@ -146,8 +146,8 @@ update this file in the same change.
 | `[data-testid="profile-detail-lifecycle-badge"]`  | Inline lifecycle badge inside the detail panel (`enabled` / `disabled`). |
 | `[data-testid="profile-detail-disabled-note"]`    | Inline disabled-profile note inside the detail panel (rendered only when the profile is disabled). |
 | `[data-testid="production-view-terminal"]`        | Terminal workspace empty state (rendered when there is no active launch). |
-| `[data-testid="production-terminal"]`             | Production terminal workspace root (one per active session; carries `data-session-id` and `data-phase`). |
-| `[data-testid="production-terminal-phase"]`       | Workspace phase label (`creating`/`connecting`/`live`/`replaying`/`detached`/`closed`/`error`). |
+| `[data-testid="production-terminal"]`             | Production terminal workspace root (one per active session; carries `data-session-id` and `data-phase`; `data-phase` ∈ `idle`/`creating`/`connecting`/`attached`/`replaying`/`detached`/`closed`/`error`). |
+| `[data-testid="production-terminal-phase"]`       | Workspace phase **label** rendered to the operator (`idle`/`creating session…`/`connecting…`/`live`/`replaying`/`detached (TTL window)`/`closed`/`error`); the label string is a function of the canonical `data-phase` value above. |
 | `[data-testid="production-terminal-detach"]`      | "Detach" button (sends wire `Detach`; PTY enters TTL window).  |
 | `[data-testid="production-terminal-close"]`       | "End session" button (sends wire `Close`; PTY ends immediately). |
 | `[data-testid="production-terminal-reconnect"]`   | "Reconnect" button (re-attaches with `last_seen_seq`; disabled until the bookmark is positive). |

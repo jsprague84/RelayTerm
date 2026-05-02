@@ -110,4 +110,4 @@ export const AUTH_CHECK_DISCLAIMER =
  * phrasing — auth-check must not imply terminal readiness.
  */
 export const AUTH_CHECK_SUCCESS_FOOTNOTE =
-  "Credentials worked for SSH authentication. Terminal launch is still a separate action and is not yet implemented in the production shell.";
+  "Credentials worked for SSH authentication. Terminal launch is a separate action — start it from the profile row.";
