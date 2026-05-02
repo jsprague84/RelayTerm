@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 relayterm-api = { workspace = true }
+relayterm-auth = { workspace = true }
 relayterm-core = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-observability = { workspace = true }

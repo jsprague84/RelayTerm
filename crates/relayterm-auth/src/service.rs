@@ -124,22 +124,66 @@ pub struct AuthService {
     passwords: Arc<dyn PasswordCredentialRepository>,
     sessions: Arc<dyn UserSessionRepository>,
     hasher: PasswordHasher,
+    /// Cached Argon2id PHC string for [`Self::anti_timing_verify`].
+    /// Hashed once at construction with the SAME `hasher` parameters
+    /// the production path uses, so a verify against this hash takes
+    /// the same wall clock as a real wrong-password verify. See the
+    /// docs on [`Self::anti_timing_verify`] for the full contract.
+    anti_timing_hash: String,
 }
 
 impl AuthService {
     /// Build a service from concrete repositories and a configured
     /// password hasher.
+    ///
+    /// Pre-computes the anti-timing PHC string at the configured
+    /// parameters. The plaintext is a fixed marker — the hash is used
+    /// only as a target for [`Self::anti_timing_verify`], never as a
+    /// real credential. `expect` is acceptable: `Params` are validated
+    /// at [`PasswordHasher::new`], so hashing a 24-character ASCII
+    /// string cannot fail at runtime; a panic here would mean a build
+    /// shipped with broken Argon2id parameters.
     #[must_use]
     pub fn new(
         passwords: Arc<dyn PasswordCredentialRepository>,
         sessions: Arc<dyn UserSessionRepository>,
         hasher: PasswordHasher,
     ) -> Self {
+        let anti_timing_hash = hasher
+            .hash_password("anti-timing-marker-x")
+            .expect("anti-timing hash with valid params cannot fail");
         Self {
             passwords,
             sessions,
             hasher,
+            anti_timing_hash,
         }
+    }
+
+    /// Argon2id verify against a baked-in dummy PHC string. The result
+    /// is intentionally discarded.
+    ///
+    /// Called by the login route on the unknown-email branch so the
+    /// total wall-clock cost matches the wrong-password branch — without
+    /// it, an attacker can time-side-channel which emails exist by
+    /// noticing that the unknown-email response returns ~150 ms faster
+    /// than the wrong-password response. See SPEC.md "Password
+    /// authentication (v1)" → probe-resistance contract.
+    pub fn anti_timing_verify(&self, plaintext: &str) {
+        // The result is intentionally discarded; the side-effect we
+        // care about is the constant-time work the hasher does. A
+        // failure here (e.g. a corrupt cached hash, which the
+        // constructor proves cannot happen) collapses to "no work" —
+        // which would re-introduce the timing channel — so a debug
+        // assertion catches a regression in dev/test builds.
+        let res = self
+            .hasher
+            .verify_password(plaintext, &self.anti_timing_hash);
+        debug_assert!(
+            res.is_ok(),
+            "anti-timing verify must succeed structurally so the wall-clock cost is incurred",
+        );
+        let _ = res;
     }
 
     /// Hash and store a password for an existing user.
@@ -356,6 +400,11 @@ mod tests {
         ) -> Result<Option<PasswordCredential>, RepositoryError> {
             let rows = self.rows.lock().expect("rows lock");
             Ok(rows.iter().find(|r| r.user_id == user_id).cloned())
+        }
+
+        async fn any_exists(&self) -> Result<bool, RepositoryError> {
+            let rows = self.rows.lock().expect("rows lock");
+            Ok(!rows.is_empty())
         }
     }
 

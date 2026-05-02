@@ -71,4 +71,23 @@ impl PasswordCredentialRepository for PgPasswordCredentialRepository {
 
         Ok(row.map(PasswordCredentialRow::into_domain))
     }
+
+    async fn any_exists(&self) -> Result<bool, RepositoryError> {
+        // `SELECT 1 ... LIMIT 1` keeps the probe cheap regardless of the
+        // table's eventual size. The bootstrap route is the only caller
+        // and only fires before the first user is set up, so we trade a
+        // round-trip for keeping the SQL trivial.
+        let row: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT 1
+            FROM user_passwords
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        Ok(row.is_some())
+    }
 }

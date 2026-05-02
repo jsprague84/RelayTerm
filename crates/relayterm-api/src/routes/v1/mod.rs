@@ -9,6 +9,7 @@ use axum::Router;
 use crate::AppState;
 
 mod audit_events;
+pub(crate) mod auth;
 mod hosts;
 mod server_profiles;
 mod ssh_identities;
@@ -17,6 +18,7 @@ mod terminal_sessions;
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .nest("/audit-events", audit_events::router())
+        .nest("/auth", auth::router())
         .nest("/hosts", hosts::router())
         .nest("/server-profiles", server_profiles::router())
         .nest("/ssh-identities", ssh_identities::router())

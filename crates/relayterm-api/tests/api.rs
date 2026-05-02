@@ -26,14 +26,15 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt as _;
-use relayterm_api::{AppState, router};
+use relayterm_api::{AppState, AuthRoutesConfig, router};
+use relayterm_auth::{AuthService, PasswordHasher, PasswordHasherConfig};
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
     AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry, CreateServerProfile,
     CreateSshIdentity, CreateUser, HostRepository, KnownHostEntryRepository,
-    ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
-    TerminalSessionRepository, UserRepository,
+    PasswordCredentialRepository, ServerProfileRepository, SessionEventRepository,
+    SshIdentityRepository, TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
@@ -59,6 +60,46 @@ use tower::ServiceExt;
 use zeroize::Zeroizing;
 
 const PRIVATE_KEY_MARKER: &[u8] = b"REDACT-MARKER-API-9F2B";
+
+/// Origin allow-listed by the per-test [`AuthRoutesConfig`]. Tests that
+/// drive the `/api/v1/auth/*` routes set `Origin: <this>` so the
+/// inline CSRF guard accepts the request; all other tests do not need
+/// to set the header (GETs are exempt and existing app routes still
+/// run through the [`relayterm_api::DevUser`] shim).
+const TEST_AUTH_ORIGIN: &str = "https://relay.test.local";
+
+/// Bootstrap token plumbed into every test [`AuthRoutesConfig`].
+/// Sentinel-shaped so the audit-redaction tests can assert it never
+/// reaches a persisted payload.
+const TEST_BOOTSTRAP_TOKEN: &str = "TEST-BOOTSTRAP-TOKEN-MARKER-DO-NOT-LEAK";
+
+fn test_auth(db: &Db) -> Arc<AuthService> {
+    // Tuned-down hasher so test runs stay sub-second. Production code
+    // path uses `PasswordHasher::default()` (OWASP_2023 baseline) — see
+    // `apps/backend/src/main.rs`.
+    Arc::new(AuthService::new(
+        Arc::new(db.password_credentials()) as Arc<dyn PasswordCredentialRepository>,
+        Arc::new(db.user_sessions()) as Arc<dyn UserSessionRepository>,
+        PasswordHasher::new(PasswordHasherConfig {
+            m_cost: 19_456,
+            t_cost: 1,
+            p_cost: 1,
+        })
+        .expect("fast hasher params are valid"),
+    ))
+}
+
+fn test_auth_routes() -> Arc<AuthRoutesConfig> {
+    Arc::new(AuthRoutesConfig {
+        // Tests run over `tower::ServiceExt::oneshot` so `Secure` would
+        // not be honored anyway; pin to `false` so the auth-route
+        // tests don't have to special-case it.
+        cookie_secure: false,
+        cookie_domain: None,
+        allowed_origins: vec![TEST_AUTH_ORIGIN.to_owned()],
+        bootstrap_token: Some(zeroize::Zeroizing::new(TEST_BOOTSTRAP_TOKEN.to_owned())),
+    })
+}
 
 async fn create_user(pool: &PgPool, label: &str) -> UserId {
     PgUserRepository::new(pool.clone())
@@ -111,6 +152,8 @@ async fn setup_with_full_state(
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -119,6 +162,8 @@ async fn setup_with_full_state(
         pty_bridge,
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     (router(state), user_id)
 }
@@ -136,6 +181,8 @@ async fn setup_with_full_state_short_ttl(
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager_with_short_ttl(&db, detach_ttl);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -144,6 +191,8 @@ async fn setup_with_full_state_short_ttl(
         pty_bridge,
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     (router(state), user_id)
 }
@@ -797,6 +846,8 @@ async fn get_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool
 async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -805,6 +856,8 @@ async fn devuser_returns_401_when_dev_auth_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -982,6 +1035,8 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
     // vault work happens. The request body never reaches the vault.
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -990,6 +1045,8 @@ async fn post_ssh_identity_returns_401_when_dev_auth_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -1018,6 +1075,8 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: None,
@@ -1026,6 +1085,8 @@ async fn post_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -1752,6 +1813,8 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
     let probe = FakeProbe::new(captured_for_test("SHA256:any"));
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: None,
@@ -1760,6 +1823,8 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -2323,6 +2388,8 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2333,6 +2400,8 @@ async fn auth_check_returns_connection_failed_when_checker_errors(pool: PgPool) 
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
     let profile_id = make_owned_profile(
@@ -2369,6 +2438,8 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
     let user_id = create_user(&pool, "dev").await;
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: None,
@@ -2377,6 +2448,8 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -2432,6 +2505,8 @@ async fn auth_check_returns_503_when_vault_disabled(pool: PgPool) {
 async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2440,6 +2515,8 @@ async fn auth_check_returns_401_when_dev_auth_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
     let bogus = uuid::Uuid::new_v4();
@@ -2520,6 +2597,8 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
     ));
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2528,6 +2607,8 @@ async fn auth_check_outer_timeout_returns_connection_failed_safely(pool: PgPool)
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -2584,6 +2665,8 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
     ));
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -2592,6 +2675,8 @@ async fn auth_check_returns_503_when_concurrency_limit_reached(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -3343,6 +3428,8 @@ async fn close_terminal_session_foreign_owned_returns_indistinguishable_404(pool
 async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -3351,6 +3438,8 @@ async fn terminal_session_routes_return_401_when_dev_auth_disabled(pool: PgPool)
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -3691,6 +3780,8 @@ async fn ws_attach_closed_session_returns_409(pool: PgPool) {
 async fn ws_attach_returns_401_when_dev_auth_disabled(pool: PgPool) {
     let db = Db::from_pool(pool);
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -3699,6 +3790,8 @@ async fn ws_attach_returns_401_when_dev_auth_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
     let addr = spawn_app(app).await;
@@ -3834,6 +3927,8 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
     let db = relayterm_db::Db::from_pool(pool.clone());
     let bridge = FakePtyBridge::new();
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db: db.clone(),
         vault: Some(test_vault()),
@@ -3842,6 +3937,8 @@ async fn ws_input_against_session_without_live_pty_returns_pty_not_live(pool: Pg
         pty_bridge: bridge as Arc<dyn SshPtyBridge>,
         terminal_sessions: terminal_sessions.clone(),
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -4497,6 +4594,8 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let bridge = FakePtyBridge::new();
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: None,
@@ -4505,6 +4604,8 @@ async fn create_terminal_session_returns_503_when_vault_disabled(pool: PgPool) {
         pty_bridge: bridge.clone() as Arc<dyn SshPtyBridge>,
         terminal_sessions,
         dev_user_id: Some(user_id),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -6222,6 +6323,15 @@ const AUDIT_FORBIDDEN_SUBSTRINGS: &[&str] = &[
     "encrypted_private_key",
     "private_key",
     "BEGIN OPENSSH PRIVATE KEY",
+    // Auth-shaped sentinels per SPEC.md "Audit events" — extending the
+    // shared backstop so any audit-redaction assert catches a future
+    // route that smuggles password / session / bootstrap material into
+    // a payload, regardless of which kind it emits.
+    "password_hash",
+    "session_token",
+    "token_hash",
+    "bootstrap_token",
+    "argon2id",
     "client_info",
     "remote_addr",
     "user_agent",
@@ -6598,6 +6708,8 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
 
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -6606,6 +6718,8 @@ async fn audit_events_recent_excludes_other_users_events(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: Some(caller),
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -6793,6 +6907,8 @@ async fn audit_events_recent_unauthorized_when_dev_user_disabled(pool: PgPool) {
     // MUST go through that gate.
     let db = Db::from_pool(pool.clone());
     let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
     let state = AppState {
         db,
         vault: Some(test_vault()),
@@ -6801,6 +6917,8 @@ async fn audit_events_recent_unauthorized_when_dev_user_disabled(pool: PgPool) {
         pty_bridge: default_pty_bridge(),
         terminal_sessions,
         dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
     };
     let app = router(state);
 
@@ -6809,4 +6927,738 @@ async fn audit_events_recent_unauthorized_when_dev_user_disabled(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ----------------------------------------------------------------------
+// Auth routes (/api/v1/auth/*)
+// ----------------------------------------------------------------------
+
+/// Sentinel password used by the auth-route tests. Long enough to clear
+/// the boundary minimum (12 chars) and unique-looking so a redaction
+/// test can prove it never reaches a persisted audit payload, log line,
+/// or response body.
+const TEST_AUTH_PASSWORD: &str = "TEST-AUTH-PASSWORD-DO-NOT-LEAK-1234";
+
+fn auth_post(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn auth_post_with_origin(uri: &str, body: Value, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, origin)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn auth_post_no_origin(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn auth_get_with_cookie(uri: &str, cookie_value: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::COOKIE, format!("relayterm_session={cookie_value}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn auth_post_with_cookie(uri: &str, cookie_value: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .header(header::COOKIE, format!("relayterm_session={cookie_value}"))
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+fn extract_set_cookie(resp: &axum::response::Response) -> Option<String> {
+    resp.headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Pull the cookie token value from a `Set-Cookie` header. Returns the
+/// segment between `relayterm_session=` and the first `;`.
+fn cookie_token_from_set_cookie(set_cookie: &str) -> &str {
+    let rest = set_cookie
+        .strip_prefix("relayterm_session=")
+        .expect("Set-Cookie starts with the session cookie name");
+    match rest.find(';') {
+        Some(i) => &rest[..i],
+        None => rest,
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bootstrap_creates_first_user_and_does_not_set_cookie(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+                "email": "first@relayterm.local",
+                "display_name": "First Operator",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(
+        resp.headers().get(header::SET_COOKIE).is_none(),
+        "bootstrap MUST NOT mint a session cookie",
+    );
+    let body = read_body(resp).await;
+    assert_eq!(body["email"], "first@relayterm.local");
+    assert_eq!(body["display_name"], "First Operator");
+    assert!(body["id"].is_string());
+    // No secret-shaped fields on the response.
+    for forbidden in [
+        "password",
+        "password_hash",
+        "session_token",
+        "token_hash",
+        "bootstrap_token",
+        "argon2id",
+    ] {
+        let raw = body.to_string();
+        assert!(
+            !raw.contains(forbidden),
+            "bootstrap response must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // First-user-created audit event written, with safe payload.
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|e| e.kind == AuditEventKind::FirstUserCreated)
+        .expect("first_user_created audit row");
+    assert!(row.actor_id.is_some());
+    let raw_payload = row.payload.to_string();
+    assert!(!raw_payload.contains(TEST_BOOTSTRAP_TOKEN));
+    assert!(!raw_payload.contains(TEST_AUTH_PASSWORD));
+    for forbidden in [
+        "password",
+        "password_hash",
+        "session_token",
+        "token_hash",
+        "bootstrap_token",
+        "argon2id",
+    ] {
+        assert!(
+            !raw_payload.contains(forbidden),
+            "first_user_created payload must not contain `{forbidden}`: {raw_payload}",
+        );
+    }
+    // Email/display_name MUST NOT be in the payload (PII / SET NULL on
+    // delete contract — see SPEC.md "Audit events" table).
+    assert!(!raw_payload.contains("first@relayterm.local"));
+    assert!(!raw_payload.contains("First Operator"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bootstrap_rejects_wrong_token_without_echo(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+    };
+    let app = router(state);
+
+    let attempted_token = "WRONG-BOOTSTRAP-TOKEN-DO-NOT-LEAK";
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": attempted_token,
+                "email": "first@relayterm.local",
+                "display_name": "First Operator",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    let raw = body.to_string();
+    assert!(!raw.contains(attempted_token));
+    assert!(!raw.contains(TEST_BOOTSTRAP_TOKEN));
+    assert!(!raw.contains(TEST_AUTH_PASSWORD));
+
+    // login_failed audit row exists with NULL actor and reason "bad_token".
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|e| e.kind == AuditEventKind::LoginFailed)
+        .expect("login_failed row");
+    assert!(row.actor_id.is_none());
+    let raw_payload = row.payload.to_string();
+    assert!(raw_payload.contains("\"reason\":\"bad_token\""));
+    assert!(!raw_payload.contains(attempted_token));
+    assert!(!raw_payload.contains(TEST_BOOTSTRAP_TOKEN));
+    assert!(!raw_payload.contains(TEST_AUTH_PASSWORD));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bootstrap_rejects_when_already_bootstrapped(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+    };
+    let app = router(state);
+
+    let body = json!({
+        "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+        "email": "first@relayterm.local",
+        "display_name": "First Operator",
+        "password": TEST_AUTH_PASSWORD,
+    });
+    let first = app
+        .clone()
+        .oneshot(auth_post("/api/v1/auth/bootstrap", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // Second bootstrap with the same token: blocked.
+    let second = app
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+                "email": "second@relayterm.local",
+                "display_name": "Second",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = read_body(second).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already_bootstrapped"),
+    );
+
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|e| {
+            e.kind == AuditEventKind::LoginFailed
+                && e.payload.get("reason").and_then(|v| v.as_str()) == Some("already_bootstrapped")
+        })
+        .expect("login_failed already_bootstrapped row");
+    assert!(row.actor_id.is_none());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn bootstrap_returns_503_when_no_token_configured(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = Arc::new(AuthRoutesConfig {
+        cookie_secure: false,
+        cookie_domain: None,
+        allowed_origins: vec![TEST_AUTH_ORIGIN.to_owned()],
+        bootstrap_token: None,
+    });
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": "anything",
+                "email": "first@relayterm.local",
+                "display_name": "First",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Helper: set up an app + bootstrap a single user with the test
+/// password, returning (app, user_id).
+async fn setup_with_first_user(pool: PgPool, email: &str) -> (Router, UserId) {
+    let db = Db::from_pool(pool.clone());
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let terminal_sessions = test_terminal_manager(&db);
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        dev_user_id: None,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+    };
+    let app = router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/bootstrap",
+            json!({
+                "bootstrap_token": TEST_BOOTSTRAP_TOKEN,
+                "email": email,
+                "display_name": "Operator",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let user_id: UserId = serde_json::from_value(body["id"].clone()).unwrap();
+    (app, user_id)
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_succeeds_and_sets_strict_httponly_cookie(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "login@relayterm.local").await;
+
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "login@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = extract_set_cookie(&resp).expect("Set-Cookie header set");
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("SameSite=Strict"));
+    assert!(cookie.contains("Path=/"));
+    assert!(cookie.contains("Max-Age=2592000"));
+    assert!(cookie.starts_with("relayterm_session="));
+    let body = read_body(resp).await;
+    let raw = body.to_string();
+    // Response carries safe DTO only.
+    assert_eq!(body["email"], "login@relayterm.local");
+    assert_eq!(body["id"].as_str().unwrap(), user_id.to_string());
+    for forbidden in [
+        "password",
+        "password_hash",
+        "session_token",
+        "token_hash",
+        "argon2id",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "login response must not contain `{forbidden}`: {raw}",
+        );
+    }
+    let token = cookie_token_from_set_cookie(&cookie);
+    assert!(
+        !raw.contains(token),
+        "login body must not echo the cookie token"
+    );
+
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|e| e.kind == AuditEventKind::LoginSucceeded)
+        .expect("login_succeeded audit row");
+    assert_eq!(row.actor_id, Some(user_id));
+    let raw_payload = row.payload.to_string();
+    assert!(raw_payload.contains("\"method\":\"password\""));
+    assert!(!raw_payload.contains(TEST_AUTH_PASSWORD));
+    assert!(!raw_payload.contains(token));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_with_wrong_password_returns_401_and_logs_login_failed(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "wrong@relayterm.local").await;
+
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "wrong@relayterm.local",
+                "password": "WRONG-PASSWORD-DO-NOT-LEAK-12345",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "unauthorized");
+
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|e| e.kind == AuditEventKind::LoginFailed)
+        .expect("login_failed audit row");
+    assert!(row.actor_id.is_none());
+    let raw_payload = row.payload.to_string();
+    assert!(raw_payload.contains("\"reason\":\"bad_credentials\""));
+    assert!(!raw_payload.contains("WRONG-PASSWORD-DO-NOT-LEAK"));
+    assert!(!raw_payload.contains(TEST_AUTH_PASSWORD));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_unknown_email_is_indistinguishable_from_wrong_password(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "known@relayterm.local").await;
+
+    let known_resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "known@relayterm.local",
+                "password": "this-is-not-the-password-1234",
+            }),
+        ))
+        .await
+        .unwrap();
+    let unknown_resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "stranger@relayterm.local",
+                "password": "this-is-not-the-password-1234",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(known_resp.status(), unknown_resp.status());
+    assert_eq!(known_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(read_body(known_resp).await, read_body(unknown_resp).await);
+
+    // Audit-row equivalence: BOTH branches must write a `login_failed`
+    // row with `actor_id IS NULL` and `payload.reason = "bad_credentials"`,
+    // and neither row may carry the offered email or password. Without
+    // this assertion, a future change that splits the audit emission
+    // by branch would silently re-introduce the probe channel through
+    // the persisted audit feed.
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let failed: Vec<_> = audit
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::LoginFailed)
+        .collect();
+    assert_eq!(
+        failed.len(),
+        2,
+        "expected one login_failed audit row per request; got {}: {failed:?}",
+        failed.len(),
+    );
+    for row in &failed {
+        assert!(row.actor_id.is_none());
+        let raw = row.payload.to_string();
+        assert!(raw.contains("\"reason\":\"bad_credentials\""));
+        assert!(!raw.contains("known@relayterm.local"));
+        assert!(!raw.contains("stranger@relayterm.local"));
+        assert!(!raw.contains("this-is-not-the-password-1234"));
+        assert_audit_payload_redacted(&row.payload, AuditEventKind::LoginFailed);
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_returns_user_for_valid_cookie(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "me@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "me@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+    let _ = login.into_body();
+
+    let resp = app
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["id"].as_str().unwrap(), user_id.to_string());
+    assert_eq!(body["email"], "me@relayterm.local");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_rejects_missing_cookie(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "missing@relayterm.local").await;
+    let resp = app.oneshot(get("/api/v1/auth/me")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_rejects_unknown_cookie(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "unknown@relayterm.local").await;
+    let resp = app
+        .oneshot(auth_get_with_cookie(
+            "/api/v1/auth/me",
+            "absolutely-not-a-real-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn logout_revokes_session_and_clears_cookie(pool: PgPool) {
+    let (app, user_id) = setup_with_first_user(pool.clone(), "logout@relayterm.local").await;
+
+    let login = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "logout@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cookie = extract_set_cookie(&login).unwrap();
+    let token = cookie_token_from_set_cookie(&cookie).to_owned();
+
+    let logout = app
+        .clone()
+        .oneshot(auth_post_with_cookie("/api/v1/auth/logout", &token))
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    let clear = extract_set_cookie(&logout).unwrap();
+    assert!(clear.contains("Max-Age=0"));
+    assert!(clear.contains("HttpOnly"));
+    assert!(clear.contains("SameSite=Strict"));
+
+    // The same cookie is now revoked — /me MUST 401.
+    let resp = app
+        .clone()
+        .oneshot(auth_get_with_cookie("/api/v1/auth/me", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // logout_succeeded audit row written with safe payload.
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|e| e.kind == AuditEventKind::LogoutSucceeded)
+        .expect("logout_succeeded audit row");
+    assert_eq!(row.actor_id, Some(user_id));
+    let raw_payload = row.payload.to_string();
+    assert!(!raw_payload.contains(&token));
+    assert!(!raw_payload.contains(TEST_AUTH_PASSWORD));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn logout_is_idempotent_for_missing_or_unknown_cookie(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "idempotent@relayterm.local").await;
+
+    // No cookie at all: still 204 with a clear cookie.
+    let bare = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), StatusCode::NO_CONTENT);
+    assert!(extract_set_cookie(&bare).unwrap().contains("Max-Age=0"));
+
+    // Cookie that never corresponded to any session row: still 204.
+    let bogus = app
+        .clone()
+        .oneshot(auth_post_with_cookie(
+            "/api/v1/auth/logout",
+            "definitely-not-a-real-token-string",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bogus.status(), StatusCode::NO_CONTENT);
+
+    // No logout_succeeded audit rows should have been written for these
+    // probe paths.
+    let audit = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let count = audit
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::LogoutSucceeded)
+        .count();
+    assert_eq!(count, 0, "no logout_succeeded rows for no-op logout calls");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_post_routes_reject_missing_origin(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "csrf@relayterm.local").await;
+    let resp = app
+        .oneshot(auth_post_no_origin(
+            "/api/v1/auth/login",
+            json!({
+                "email": "csrf@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn auth_post_routes_reject_disallowed_origin(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "csrf2@relayterm.local").await;
+    let resp = app
+        .oneshot(auth_post_with_origin(
+            "/api/v1/auth/login",
+            json!({
+                "email": "csrf2@relayterm.local",
+                "password": TEST_AUTH_PASSWORD,
+            }),
+            "https://evil.example.com",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn me_does_not_require_origin(pool: PgPool) {
+    // GET /auth/me is exempt from the inline CSRF guard. Without a
+    // cookie it returns 401, not 403 — the auth check runs even with
+    // no Origin header present.
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "noorigin@relayterm.local").await;
+    let resp = app.oneshot(get("/api/v1/auth/me")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn login_validation_rejects_short_password(pool: PgPool) {
+    let (app, _user_id) = setup_with_first_user(pool.clone(), "short@relayterm.local").await;
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/auth/login",
+            json!({
+                "email": "short@relayterm.local",
+                "password": "short",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
 }

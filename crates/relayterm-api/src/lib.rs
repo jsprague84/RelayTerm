@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::{Router, extract::FromRef};
+use relayterm_auth::AuthService;
 use relayterm_core::ids::UserId;
 use relayterm_db::Db;
 use relayterm_ssh::{HostKeyPreflightService, SshAuthCheckService, SshPtyBridge};
@@ -22,6 +23,7 @@ mod routes;
 
 pub use dev_user::DevUser;
 pub use error::ApiError;
+pub use routes::v1::auth::AuthRoutesConfig;
 
 /// Shared state injected into every handler via `axum::extract::State`.
 #[derive(Clone)]
@@ -76,6 +78,20 @@ pub struct AppState {
     /// return `401`. See [`dev_user`](crate::dev_user) for the full
     /// transition story.
     pub dev_user_id: Option<UserId>,
+    /// Server-issued opaque session + password primitives. Reachable
+    /// today only by the `/api/v1/auth/*` routes; existing app routes
+    /// continue to use [`DevUser`]. The handle is held behind `Arc` so
+    /// `AppState` stays `Clone`.
+    ///
+    /// **Scope**: this slice exposes login, logout, bootstrap, and
+    /// `/auth/me`. The `AuthenticatedUser` extractor migration (SPEC
+    /// step 5) is a future slice; production-auth enablement still
+    /// fails fast at boot.
+    pub auth: Arc<AuthService>,
+    /// Cookie / Origin / bootstrap-token policy for the auth routes.
+    /// Shared via `Arc` so secret-shaped fields are not cloned on every
+    /// request and so `AppState` stays cheap to clone.
+    pub auth_routes: Arc<AuthRoutesConfig>,
 }
 
 impl FromRef<AppState> for Option<UserId> {

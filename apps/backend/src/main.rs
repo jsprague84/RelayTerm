@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use relayterm_api::{AppState, router};
+use relayterm_api::{AppState, AuthRoutesConfig, router};
+use relayterm_auth::{AuthService, PasswordHasher};
 use relayterm_core::ids::UserId;
 use relayterm_core::repository::{
-    CreateUser, SessionEventRepository, TerminalSessionRepository, UserRepository,
+    CreateUser, PasswordCredentialRepository, SessionEventRepository, TerminalSessionRepository,
+    UserRepository, UserSessionRepository,
 };
 use relayterm_db::Db;
 use relayterm_ssh::{
@@ -15,6 +17,7 @@ use relayterm_terminal::TerminalSessionManager;
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 mod config;
 
@@ -133,6 +136,35 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
     ));
 
+    // Compose the auth service from the existing repositories. The
+    // hasher uses production parameters (`PasswordHasher::default()` =
+    // `PasswordHasherConfig::OWASP_2023`); tests construct their own
+    // tuned-down hasher. The `auth.mode = production` boot gate has
+    // not flipped yet — the auth service is reachable only by the new
+    // `/api/v1/auth/*` routes; existing app routes still go through
+    // the `DevUser` shim until the extractor migration slice lands.
+    let auth = Arc::new(AuthService::new(
+        Arc::new(db.password_credentials()) as Arc<dyn PasswordCredentialRepository>,
+        Arc::new(db.user_sessions()) as Arc<dyn UserSessionRepository>,
+        PasswordHasher::default(),
+    ));
+
+    // Auth-routes policy. Bootstrap token is moved into a `Zeroizing`
+    // wrapper here so the heap copy wipes itself when `AppState`
+    // drops; the typed config field on `AuthConfig` is consumed via
+    // `take()` so a copy is not retained on `cfg.auth` after the
+    // shared state is built.
+    let auth_routes = Arc::new(AuthRoutesConfig {
+        cookie_secure: cfg.auth.cookie_secure,
+        cookie_domain: cfg.auth.cookie_domain.clone(),
+        allowed_origins: cfg.auth.allowed_origins.clone(),
+        bootstrap_token: cfg
+            .auth
+            .first_user_bootstrap_token
+            .take()
+            .map(Zeroizing::new),
+    });
+
     let state = AppState {
         db,
         vault,
@@ -141,6 +173,8 @@ async fn main() -> anyhow::Result<()> {
         pty_bridge,
         terminal_sessions,
         dev_user_id,
+        auth,
+        auth_routes,
     };
     let app = router(state);
 

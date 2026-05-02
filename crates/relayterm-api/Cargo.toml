@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 relayterm-core = { workspace = true }
+relayterm-auth = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-protocol = { workspace = true }
 relayterm-ssh = { workspace = true }
@@ -32,6 +33,7 @@ zeroize = { workspace = true }
 postgres-tests = []
 
 [dev-dependencies]
+relayterm-auth = { workspace = true }
 relayterm-db = { workspace = true }
 relayterm-protocol = { workspace = true }
 relayterm-ssh = { workspace = true }

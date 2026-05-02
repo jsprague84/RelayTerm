@@ -10,6 +10,7 @@
 //!    and **never** the encrypted private key on `SshIdentity`.
 
 pub(crate) mod audit_event;
+pub(crate) mod auth;
 pub(crate) mod auth_check;
 pub(crate) mod host;
 pub(crate) mod preflight;

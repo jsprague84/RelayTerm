@@ -425,6 +425,17 @@ pub trait PasswordCredentialRepository: Send + Sync {
         &self,
         user_id: UserId,
     ) -> Result<Option<PasswordCredential>, RepositoryError>;
+
+    /// Cheap "is anyone already bootstrapped?" probe for the auth
+    /// bootstrap route.
+    ///
+    /// Returns `true` iff at least one row exists in `user_passwords`.
+    /// The bootstrap route uses this to decide whether the first-user
+    /// path is already closed (a `users` row with no password is the
+    /// dev fixture and MUST NOT block bootstrap, per SPEC.md "User
+    /// model and first-user bootstrap"). Implementations SHOULD scan at
+    /// most one row (`SELECT 1 ... LIMIT 1`); this is hot-path-cheap.
+    async fn any_exists(&self) -> Result<bool, RepositoryError>;
 }
 
 /// Browser session persistence.

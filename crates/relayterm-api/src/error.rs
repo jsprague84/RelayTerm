@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use relayterm_auth::AuthServiceError;
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::validation::ValidationError;
 use relayterm_ssh::{HostKeyPreflightError, ProbeError, SshAuthCheckError};
@@ -26,6 +27,7 @@ use tracing::{error, warn};
 pub enum ErrorCode {
     InvalidInput,
     Unauthorized,
+    CsrfOriginMismatch,
     NotFound,
     Conflict,
     BadGateway,
@@ -38,6 +40,7 @@ impl ErrorCode {
         match self {
             Self::InvalidInput => "invalid_input",
             Self::Unauthorized => "unauthorized",
+            Self::CsrfOriginMismatch => "csrf_origin_mismatch",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::BadGateway => "bad_gateway",
@@ -64,6 +67,16 @@ pub enum ApiError {
     /// boundary, treat it as a server-side log line.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+
+    /// 403 — request rejected by the inline CSRF Origin guard. Emitted
+    /// by the auth routes (login / logout / bootstrap) before any auth
+    /// or DB work runs. The wrapped detail is operator-facing only;
+    /// the wire body collapses to the static `forbidden` message and
+    /// the wire `code` is `csrf_origin_mismatch` per SPEC.md "CSRF
+    /// posture". When the shared CSRF middleware lands (SPEC step 6)
+    /// this variant moves there in the same commit.
+    #[error("forbidden: {0}")]
+    CsrfOriginMismatch(String),
 
     /// 404 — the addressed entity does not exist (or is not visible to the caller).
     #[error("{entity} not found")]
@@ -116,6 +129,11 @@ impl ApiError {
                 ErrorCode::Unauthorized,
                 "unauthorized".to_owned(),
             ),
+            Self::CsrfOriginMismatch(_) => (
+                StatusCode::FORBIDDEN,
+                ErrorCode::CsrfOriginMismatch,
+                "forbidden".to_owned(),
+            ),
             Self::NotFound { entity } => (
                 StatusCode::NOT_FOUND,
                 ErrorCode::NotFound,
@@ -167,6 +185,7 @@ impl IntoResponse for ApiError {
         match &self {
             Self::Internal(detail) => error!(detail = %detail, "internal API error"),
             Self::Unauthorized(detail) => warn!(detail = %detail, "unauthorized request"),
+            Self::CsrfOriginMismatch(detail) => warn!(detail = %detail, "csrf origin mismatch"),
             Self::BadGateway(detail) => warn!(detail = %detail, "bad gateway"),
             Self::ServiceUnavailable(detail) => {
                 warn!(detail = %detail, "service unavailable");
@@ -283,6 +302,28 @@ impl From<TerminalSessionManagerError> for ApiError {
                 Self::Internal(format!("ssh pty: {inner}"))
             }
             TerminalSessionManagerError::Repository(e) => e.into(),
+        }
+    }
+}
+
+impl From<AuthServiceError> for ApiError {
+    fn from(err: AuthServiceError) -> Self {
+        match err {
+            // Every "you are not (or no longer) authenticated" shape
+            // collapses to the same 401 on the wire. The structural
+            // distinction (`InvalidCredentials` vs `SessionInvalid` vs
+            // `SessionExpired` vs `SessionRevoked`) survives in the
+            // operator-side `warn!` line via the wrapped detail string;
+            // the client sees the static `unauthorized` body either
+            // way.
+            AuthServiceError::InvalidCredentials => {
+                Self::Unauthorized("invalid credentials".to_owned())
+            }
+            AuthServiceError::SessionInvalid => Self::Unauthorized("session invalid".to_owned()),
+            AuthServiceError::SessionExpired => Self::Unauthorized("session expired".to_owned()),
+            AuthServiceError::SessionRevoked => Self::Unauthorized("session revoked".to_owned()),
+            AuthServiceError::Repository(detail) => Self::Internal(format!("auth repo: {detail}")),
+            AuthServiceError::Crypto => Self::Internal("auth crypto failure".to_owned()),
         }
     }
 }
