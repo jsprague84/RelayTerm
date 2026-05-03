@@ -1117,10 +1117,11 @@ posture (Section 7) defensible at every stop.
      and no wire `attach` handshake.
    - The Sessions list deliberately does NOT pre-fetch metadata
      for every row (would be N+1 against
-     `/recording/metadata`). The affordance is offered for any
-     non-`starting` row; the viewer's metadata gate honestly
-     surfaces "No recording available" when an opened session
-     turns out empty.
+     `/recording/metadata`). The affordance is offered for
+     `detached` and `closed` rows only — `active` rows route to
+     the live `Open` action, `starting` rows have nothing to
+     replay; the viewer's metadata gate honestly surfaces "No
+     recording available" when an opened session turns out empty.
    - Decoded chunk bytes go straight to `renderer.write(...)`
      and are never stashed in `$state`, never persisted to
      `localStorage` / `sessionStorage`, never logged. The

@@ -848,8 +848,10 @@ authenticated user with at least one row in
    - Expect `[data-testid="sessions-row"]` for the just-closed session
      with `data-status="closed"`.
    - On that row, expect `[data-testid="sessions-row-view-recording"]`
-     (the affordance is offered for any non-`starting` row; the
-     viewer's metadata gate is the load-bearing check).
+     (the affordance is offered for `detached` and `closed` rows only —
+     `active` rows route to the live `Open` action, `starting` rows
+     have nothing to replay; the viewer's metadata gate is the
+     load-bearing check for whether any chunks actually exist).
    - `browser_click [data-testid="sessions-row-view-recording"]`
    - Expect `[data-testid="recording-replay-view"]` to appear with
      `data-session-id` matching the row's `data-session-id`.

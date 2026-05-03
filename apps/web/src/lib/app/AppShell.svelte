@@ -79,6 +79,12 @@
     // the live URL is genuinely unknown (initial mount on a stale link).
     if (typeof window === "undefined") return;
     const onPopState = () => {
+      // Browser back/forward is semantically equivalent to a sidebar
+      // nav click — same rule as `navigate()`: drop the transient
+      // replay overlay so the operator does not end up on a different
+      // route with a stale full-pane viewer still mounted.
+      activeReplaySessionId = null;
+      activeReplayLabel = null;
       selected = viewForPath(window.location.pathname);
     };
     if (!isKnownAppPath(window.location.pathname)) {
