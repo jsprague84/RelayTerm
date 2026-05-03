@@ -2742,16 +2742,43 @@ async fn reconcile_orphaned_on_startup_spans_users_and_keeps_recordings(pool: Pg
         Some("detached"),
     );
 
-    // Recording chunks AND markers untouched.
+    // Recording chunks untouched. Markers grow by exactly one row on
+    // session_a — the new `closed` marker reconciliation appends at
+    // `MAX(seq_end)` (= 4) for sessions with chunks. session_b had no
+    // chunks, so it gets no recording marker.
     let after_chunks = recordings.list_chunks(session_a.id, 0, 1024).await.unwrap();
-    let after_markers = recordings
+    let after_markers_a = recordings
         .list_markers(session_a.id, 0, 1024)
         .await
         .unwrap();
+    let after_markers_b = recordings
+        .list_markers(session_b.id, 0, 1024)
+        .await
+        .unwrap();
     assert_eq!(after_chunks.len(), 1, "reconcile must not delete chunks");
-    assert_eq!(after_markers.len(), 1, "reconcile must not delete markers");
     assert_eq!(after_chunks[0].seq_start, 1);
     assert_eq!(after_chunks[0].seq_end, 4);
+    assert_eq!(
+        after_markers_a.len(),
+        2,
+        "reconcile must preserve the started marker and append one closed marker",
+    );
+    assert!(
+        after_markers_b.is_empty(),
+        "session with no chunks must not receive a recording marker",
+    );
+
+    let closed_a = after_markers_a
+        .iter()
+        .find(|m| m.kind == TerminalRecordingMarkerKind::Closed)
+        .expect("session_a should have a closed recording marker");
+    assert_eq!(closed_a.seq, 4, "closed marker must sit at MAX(seq_end)");
+    assert_eq!(
+        closed_a.payload["reason"].as_str(),
+        Some("startup_reconciliation"),
+    );
+    assert_eq!(closed_a.payload["previous_status"].as_str(), Some("active"));
+    assert!(closed_a.payload.get("reconciled_at").is_some());
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -2785,4 +2812,387 @@ async fn reconcile_orphaned_on_startup_writes_no_audit_events(pool: PgPool) {
         "startup reconciliation must NOT write audit_events \
          (matches the existing close-path audit shape)",
     );
+}
+
+// ----------------------------------------------------------------------
+// Closed-recording-marker reconciliation
+// ----------------------------------------------------------------------
+//
+// When startup reconciliation transitions a non-closed session that has
+// at least one durable chunk row, it appends one
+// `terminal_recording_markers { kind: closed, seq: MAX(seq_end),
+// payload: { reason: "startup_reconciliation", previous_status,
+// reconciled_at } }` row inside the same transaction. This gives the
+// replay viewer a clean terminator instead of a trailing chunk with no
+// end marker. See `docs/terminal-recording.md` Section 9.3.
+//
+// Idempotency rules:
+//   * A session with no chunks gets no marker.
+//   * A pre-closed session (already terminated before reconciliation)
+//     never reaches the marker branch.
+//   * A second startup reconciliation finds no orphans and writes no
+//     duplicate marker.
+//   * A pre-existing `(closed, seq=MAX(seq_end))` marker (from a
+//     partial run or operator action) is NOT duplicated.
+//   * Audit events stay zero on the marker write path too.
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_writes_closed_marker_for_session_with_chunks(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Detached,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    // Two chunks: seq 1..=4 then 5..=9 — last_seq is 9.
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 4,
+            byte_len: 4,
+            payload: b"abcd".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 5,
+            seq_end: 9,
+            byte_len: 5,
+            payload: b"efghi".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    let started_payload =
+        json!({ "cols": 80, "rows": 24, "encryption": "none", "compression": "none" });
+    recordings
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Started,
+            seq: 0,
+            payload: started_payload.clone(),
+        })
+        .await
+        .unwrap();
+
+    let audit_before = audit.recent(1024).await.unwrap().len();
+
+    let now = chrono::Utc::now();
+    let reconciled = repo.reconcile_orphaned_on_startup(now).await.unwrap();
+    assert_eq!(reconciled.len(), 1);
+
+    let markers = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    let closed: Vec<_> = markers
+        .iter()
+        .filter(|m| m.kind == TerminalRecordingMarkerKind::Closed)
+        .collect();
+    assert_eq!(
+        closed.len(),
+        1,
+        "exactly one closed recording marker per reconciled session with chunks",
+    );
+    let closed = closed[0];
+    assert_eq!(closed.seq, 9, "closed marker sits at MAX(seq_end)");
+    assert_eq!(
+        closed.payload["reason"].as_str(),
+        Some("startup_reconciliation"),
+    );
+    assert_eq!(closed.payload["previous_status"].as_str(), Some("detached"),);
+    assert!(closed.payload.get("reconciled_at").is_some());
+
+    // The pre-existing `started` marker is preserved untouched and the
+    // chunk rows are not modified.
+    let started: Vec<_> = markers
+        .iter()
+        .filter(|m| m.kind == TerminalRecordingMarkerKind::Started)
+        .collect();
+    assert_eq!(started.len(), 1, "started marker preserved");
+    assert_eq!(started[0].payload, started_payload);
+    let chunks_after = recordings.list_chunks(session.id, 0, 1024).await.unwrap();
+    assert_eq!(chunks_after.len(), 2);
+    assert_eq!(chunks_after[0].seq_start, 1);
+    assert_eq!(chunks_after[0].seq_end, 4);
+    assert_eq!(chunks_after[1].seq_start, 5);
+    assert_eq!(chunks_after[1].seq_end, 9);
+
+    // Marker payload must not carry any redacted-matrix sentinel.
+    let raw = serde_json::to_string(&closed.payload).unwrap();
+    for forbidden in [
+        "private_key",
+        "encrypted_private_key",
+        "password_hash",
+        "client_info",
+        "data_b64",
+        "payload_bytes",
+        "remote_addr",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "closed marker payload must not carry redacted field {forbidden}: {raw}",
+        );
+    }
+
+    // No audit_events written on the marker path.
+    let audit_after = audit.recent(1024).await.unwrap().len();
+    assert_eq!(audit_before, audit_after);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_skips_marker_for_session_without_chunks(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let reconciled = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(reconciled.len(), 1);
+
+    let markers = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    assert!(
+        markers.is_empty(),
+        "session with no chunks must not receive a recording marker",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_does_not_remark_pre_closed_session_with_chunks(
+    pool: PgPool,
+) {
+    // A session that closed before reconciliation runs must not receive
+    // a startup_reconciliation closed marker — even when chunks exist —
+    // because the outer scan only iterates non-closed candidates.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 3,
+            byte_len: 3,
+            payload: b"xyz".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    repo.set_status(
+        session.id,
+        TerminalSessionStatus::Closed,
+        Some(chrono::Utc::now() - Duration::hours(1)),
+    )
+    .await
+    .unwrap();
+
+    let reconciled = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        reconciled.is_empty(),
+        "pre-closed session must not be reconciled",
+    );
+
+    let markers = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    assert!(
+        markers
+            .iter()
+            .all(|m| m.payload["reason"].as_str() != Some("startup_reconciliation")),
+        "pre-closed session must not receive a startup_reconciliation marker",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_does_not_duplicate_existing_closed_marker_at_last_seq(
+    pool: PgPool,
+) {
+    // A pre-existing `(closed, seq=MAX(seq_end))` marker (from a
+    // partial earlier run or an operator-written marker) MUST NOT be
+    // duplicated. The repository pre-checks for the equivalent row
+    // before inserting.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 7,
+            byte_len: 7,
+            payload: b"hello!?".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    let preexisting_payload = json!({ "reason": "operator_pre_existing" });
+    recordings
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Closed,
+            seq: 7,
+            payload: preexisting_payload.clone(),
+        })
+        .await
+        .unwrap();
+
+    let reconciled = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(reconciled.len(), 1);
+
+    let markers = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    let closed: Vec<_> = markers
+        .iter()
+        .filter(|m| m.kind == TerminalRecordingMarkerKind::Closed && m.seq == 7)
+        .collect();
+    assert_eq!(
+        closed.len(),
+        1,
+        "existing closed marker at last_seq must not be duplicated",
+    );
+    assert_eq!(
+        closed[0].payload, preexisting_payload,
+        "the original marker is preserved untouched",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_marker_pass_is_idempotent(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let events = PgSessionEventRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 5,
+            byte_len: 5,
+            payload: b"first".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+
+    let first = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+
+    let markers_after_first = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    let events_after_first = events.list_for_session(session.id).await.unwrap().len();
+    let audit_after_first = audit.recent(1024).await.unwrap().len();
+
+    let second = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        second.is_empty(),
+        "second pass must find nothing to reconcile",
+    );
+
+    let markers_after_second = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    let events_after_second = events.list_for_session(session.id).await.unwrap().len();
+    let audit_after_second = audit.recent(1024).await.unwrap().len();
+    assert_eq!(
+        markers_after_first.len(),
+        markers_after_second.len(),
+        "second pass must not write a duplicate closed marker",
+    );
+    assert_eq!(
+        events_after_first, events_after_second,
+        "second pass must not append a duplicate session_event",
+    );
+    assert_eq!(
+        audit_after_first, audit_after_second,
+        "marker reconciliation must keep audit_events untouched",
+    );
+
+    // Chunks remain untouched too.
+    let chunks = recordings.list_chunks(session.id, 0, 1024).await.unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].seq_end, 5);
 }

@@ -6,6 +6,7 @@ use relayterm_core::repository::{
     TerminalSessionRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
+use relayterm_core::terminal_recording::TerminalRecordingMarkerKind;
 use relayterm_core::terminal_session::{
     ReconciledTerminalSession, TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
@@ -18,6 +19,7 @@ use crate::rows::{TerminalSessionAttachmentRow, TerminalSessionRow};
 const ENTITY: &str = "terminal_session";
 const ATTACHMENT_ENTITY: &str = "terminal_session_attachment";
 const SESSION_EVENT_ENTITY: &str = "session_event";
+const RECORDING_MARKER_ENTITY: &str = "terminal_recording_marker";
 
 #[derive(Debug, Clone)]
 pub struct PgTerminalSessionRepository {
@@ -281,6 +283,71 @@ impl TerminalSessionRepository for PgTerminalSessionRepository {
             .execute(&mut *tx)
             .await
             .map_err(|e| map_sqlx_error(SESSION_EVENT_ENTITY, e))?;
+
+            // Closed-recording-marker reconciliation. If this session has
+            // any durable chunk rows, append a `closed` marker at the
+            // highest persisted seq so the replay viewer can render
+            // "session ended at seq N due to backend restart" instead of
+            // a trailing chunk with no terminator.
+            //
+            // Idempotent on three axes:
+            //   1. The outer reconciliation pass only iterates over
+            //      non-closed sessions, so a second startup won't reach
+            //      this branch for a session it already swept (the row
+            //      is now `closed`).
+            //   2. The partial unique index
+            //      `terminal_recording_markers_session_closed_seq_uidx`
+            //      on `(terminal_session_id, seq) WHERE kind = 'closed'`
+            //      backstops the idempotency at the schema layer; the
+            //      INSERT below uses `ON CONFLICT DO NOTHING` so a
+            //      partial earlier run, an operator-written marker, or
+            //      a racing writer all collapse to a single row.
+            //   3. No marker is written for sessions with zero chunks
+            //      (`MAX(seq_end) IS NULL`).
+            //
+            // Privacy: the SQL projection touches only `seq_end` (and
+            // never `payload`). The marker payload is built field-by-
+            // field with public metadata only — no PTY bytes, no
+            // `client_info`, no peer banners.
+            let last_seq: Option<i64> = sqlx::query_scalar(
+                r#"
+                SELECT MAX(seq_end)
+                FROM terminal_recording_chunks
+                WHERE terminal_session_id = $1
+                "#,
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(RECORDING_MARKER_ENTITY, e))?;
+
+            if let Some(last_seq) = last_seq {
+                let marker_payload = serde_json::json!({
+                    "reason": "startup_reconciliation",
+                    "previous_status": previous_status.as_str(),
+                    "reconciled_at": at,
+                });
+                let marker_id = Uuid::new_v4();
+                sqlx::query(
+                    r#"
+                    INSERT INTO terminal_recording_markers (
+                        id, terminal_session_id, kind, seq, payload
+                    )
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (terminal_session_id, seq)
+                        WHERE kind = 'closed'
+                    DO NOTHING
+                    "#,
+                )
+                .bind(marker_id)
+                .bind(id)
+                .bind(TerminalRecordingMarkerKind::Closed.as_str())
+                .bind(last_seq)
+                .bind(&marker_payload)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_sqlx_error(RECORDING_MARKER_ENTITY, e))?;
+            }
 
             reconciled.push(ReconciledTerminalSession {
                 session_id: TerminalSessionId::from_uuid(id),

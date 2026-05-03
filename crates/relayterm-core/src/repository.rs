@@ -446,16 +446,31 @@ pub trait TerminalSessionRepository: Send + Sync {
     ///   not possible (`docs/terminal-recording.md` Section 9.3).
     /// - Idempotent. A second call finds no candidates and returns an
     ///   empty `Vec` without writing anything.
-    /// - Does NOT touch `terminal_recording_chunks` /
-    ///   `terminal_recording_markers`. Recordings remain readable
-    ///   through the existing closed-session replay path. Writing a
-    ///   `closed` recording marker on reconciliation is design-intent
-    ///   (`docs/terminal-recording.md` Section 9.3) but is deferred
-    ///   to a future slice; see the SPEC.md "Durable terminal
-    ///   recording and replay architecture" status block.
+    /// - Does NOT touch `terminal_recording_chunks`. Chunks are
+    ///   append-only and survive the restart unchanged so the existing
+    ///   closed-session replay path keeps working.
+    /// - Appends one `terminal_recording_markers` row with `kind =
+    ///   closed`, `seq = MAX(seq_end)` across the session's chunks,
+    ///   and `payload = { "reason": "startup_reconciliation",
+    ///   "previous_status": <prior>, "reconciled_at": at }` for any
+    ///   reconciled session that has at least one chunk row.
+    ///   Idempotency is enforced at the schema layer by the partial
+    ///   unique index `terminal_recording_markers_session_closed_seq_uidx`
+    ///   on `(terminal_session_id, seq) WHERE kind = 'closed'`; the
+    ///   INSERT uses `ON CONFLICT DO NOTHING` so a partial earlier
+    ///   run, an operator-written marker at the same seq, or a racing
+    ///   writer all collapse to a single row at the database. This
+    ///   gives the replay viewer a clean terminator instead of a
+    ///   trailing chunk with no end marker (see
+    ///   `docs/terminal-recording.md` Section 9.3). Sessions with no
+    ///   chunks get no marker. The marker insert is committed in the
+    ///   same transaction as the status transition + `session_events`
+    ///   row, so a partial reconciliation that closes a row without
+    ///   the matching marker is not possible.
     /// - Does NOT write `audit_events`. Reconciliation is operational
     ///   bookkeeping and matches the existing close-path audit shape
-    ///   (lifecycle close writes a `session_events` row only).
+    ///   (lifecycle close writes a `session_events` row only). The new
+    ///   recording-marker write follows the same rule.
     /// - Does NOT delete any row.
     /// - Returns the reconciled (id, previous-status) pairs in a
     ///   stable per-row shape so the caller (the backend startup
@@ -463,7 +478,10 @@ pub trait TerminalSessionRepository: Send + Sync {
     ///
     /// Implementations MUST keep the SQL boundary tight: no terminal
     /// output, no `client_info`, no peer banners, no recording bytes
-    /// can appear in any returned error or constructed payload.
+    /// (including chunk `payload`) can appear in any returned error or
+    /// constructed payload. The closed-marker `payload` is built
+    /// field-by-field from public metadata only, mirroring the
+    /// `session_events` payload.
     async fn reconcile_orphaned_on_startup(
         &self,
         at: DateTime<Utc>,

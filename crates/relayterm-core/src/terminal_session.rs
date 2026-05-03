@@ -80,11 +80,15 @@ pub struct TerminalSession {
 /// `session_events { kind: closed, payload: { reason, previous_status,
 /// reconciled_at } }` row is written by the repository inside the same
 /// database transaction — callers do NOT need to write a session_event
-/// themselves. By contract this never carries terminal output, peer
-/// banners, client info, or any other surface the redaction matrix
-/// guards. Intentionally no `Serialize` / `Deserialize` — this type
-/// never crosses a wire surface; producing one means "I just swept a
-/// row" and consumers (`tracing`, tests) do not need round-trip JSON.
+/// themselves. The same transaction also appends a `closed`
+/// `terminal_recording_markers` row at `seq = MAX(seq_end)` for any
+/// reconciled session that has chunks AND no equivalent existing
+/// marker, with a payload mirroring the `session_events` shape. By
+/// contract this struct never carries terminal output, peer banners,
+/// client info, or any other surface the redaction matrix guards.
+/// Intentionally no `Serialize` / `Deserialize` — this type never
+/// crosses a wire surface; producing one means "I just swept a row"
+/// and consumers (`tracing`, tests) do not need round-trip JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconciledTerminalSession {
     pub session_id: TerminalSessionId,

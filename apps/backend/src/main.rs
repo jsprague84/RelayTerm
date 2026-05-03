@@ -63,12 +63,20 @@ async fn main() -> anyhow::Result<()> {
     // from a clean slate. Each transitioned row gets one
     // `session_events { kind: closed, payload: { reason:
     // "startup_reconciliation", previous_status, reconciled_at } }`
-    // row inside the same database transaction. No `audit_events`,
-    // no row deletion, no recording-table writes (recordings remain
-    // readable through the existing closed-session replay path).
-    // Idempotent: a second startup with no orphans is a no-op. See
-    // `docs/terminal-recording.md` Section 9.3 and SPEC.md "Durable
-    // terminal recording and replay architecture" for the policy.
+    // row inside the same database transaction; reconciled sessions
+    // that have at least one durable chunk row ALSO get one
+    // `terminal_recording_markers { kind: closed, seq: MAX(seq_end),
+    // payload: { reason: "startup_reconciliation", previous_status,
+    // reconciled_at } }` row appended in the same transaction. The
+    // marker INSERT uses `ON CONFLICT DO NOTHING` against the partial
+    // unique index `terminal_recording_markers_session_closed_seq_uidx`
+    // so a pre-existing equivalent marker is preserved at the schema
+    // layer. No `audit_events`, no row deletion, no chunk writes
+    // (chunks are append-only and survive the restart).
+    // Idempotent across reruns: a second startup with no orphans is
+    // a no-op. See `docs/terminal-recording.md` Section 9.3 and
+    // SPEC.md "Durable terminal recording and replay architecture"
+    // for the policy.
     //
     // Fails the boot on a DB error: a partial reconciliation that
     // leaves the orchestrator running with stale "live" rows is the
