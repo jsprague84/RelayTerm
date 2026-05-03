@@ -210,6 +210,30 @@ describe("describeAuditEventKind", () => {
     );
   });
 
+  it("labels recording_purged with a meaningful, payload-free string", () => {
+    // The label must read as a complete UI line for any future admin /
+    // "system actions affecting your data" surface, but it MUST NOT
+    // echo any payload field — no session id, no byte count, no
+    // retention days, no closed_at / purged_at timestamps.
+    const label = describeAuditEventKind("recording_purged");
+    expect(label).toBe("Terminal recording purged by retention");
+    for (const forbidden of [
+      "private_key",
+      "encrypted_private_key",
+      "client_info",
+      "data_b64",
+      "payload",
+      "byte_len",
+      "bytes_purged",
+      "retention_days",
+      "closed_at",
+      "purged_at",
+      "target_id",
+    ]) {
+      expect(label).not.toContain(forbidden);
+    }
+  });
+
   it("falls through to a generic label for unknown kinds", () => {
     expect(describeAuditEventKind("future_kind")).toBe("Audit event");
     expect(describeAuditEventKind("other")).toBe("Audit event");

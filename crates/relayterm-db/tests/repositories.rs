@@ -29,8 +29,8 @@ use relayterm_core::repository::{
     CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
     CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, CreateTerminalSession,
     CreateTerminalSessionAttachment, CreateUser, CreateUserSession, HostRepository,
-    KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
-    ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
+    KnownHostEntryRepository, PasswordCredentialRepository, PurgeRecordingForRetention,
+    RepositoryError, ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
     TerminalRecordingRepository, TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
@@ -3195,4 +3195,645 @@ async fn reconcile_orphaned_on_startup_marker_pass_is_idempotent(pool: PgPool) {
     let chunks = recordings.list_chunks(session.id, 0, 1024).await.unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].seq_end, 5);
+}
+
+// ----------------------------------------------------------------------
+// TerminalRecording — retention purge primitive
+// ----------------------------------------------------------------------
+//
+// `purge_for_retention` is the single-session, single-transaction
+// primitive that the future cleanup worker (`docs/terminal-recording.md`
+// Section 12) will drive. The shape pinned here:
+//
+//   - Eligibility predicate (closed AND past threshold AND non-empty
+//     recording).
+//   - Audit row is `recording_purged`, `actor_id = NULL`, payload is
+//     public metadata only (target ids, counts, bytes, retention,
+//     timestamps, reason code).
+//   - `terminal_sessions`, `session_events`, and pre-existing
+//     `audit_events` are preserved.
+//   - Chunk + marker rows are deleted together inside the same
+//     transaction as the audit insert.
+//   - Idempotency is a schema invariant: a second purge on the same
+//     session is a no-op (predicate (3) excludes already-purged
+//     sessions).
+//   - Repository errors / Debug never echo chunk payload bytes,
+//     marker payload contents, or audit-payload sentinels.
+
+const PURGE_CHUNK_PAYLOAD_SENTINEL: &[u8] = b"PURGE-CHUNK-SENTINEL-9D4F";
+const PURGE_MARKER_PAYLOAD_SENTINEL: &str = "PURGE-MARKER-SENTINEL-7AB2";
+
+/// Set up a closed, eligible session pre-populated with chunks +
+/// markers. The session is closed at `closed_at`; the caller decides
+/// whether that puts it inside or outside the retention window.
+async fn make_closed_session_with_recording(
+    pool: &PgPool,
+    user: &relayterm_core::user::User,
+    profile: &relayterm_core::server_profile::ServerProfile,
+    closed_at: chrono::DateTime<chrono::Utc>,
+) -> relayterm_core::terminal_session::TerminalSession {
+    let sessions = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let session = sessions
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    sessions
+        .set_status(session.id, TerminalSessionStatus::Closed, Some(closed_at))
+        .await
+        .unwrap();
+
+    // Two chunks at seq 1..=4 and 5..=8 with distinctive byte_len so
+    // the SUM(byte_len) aggregate in the purge audit payload has
+    // something concrete to assert against.
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 4,
+            byte_len: PURGE_CHUNK_PAYLOAD_SENTINEL.len() as i32,
+            payload: PURGE_CHUNK_PAYLOAD_SENTINEL.to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 5,
+            seq_end: 8,
+            byte_len: 7,
+            payload: b"abcdefg".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    // Two markers at the bracketed seqs. The marker `payload` carries
+    // a sentinel string so the test can assert that string never
+    // surfaces through the purge primitive's error / Debug / audit
+    // surface — markers are metadata-only by contract, and the
+    // primitive must not read marker payloads.
+    recordings
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Started,
+            seq: 0,
+            payload: json!({ "note": PURGE_MARKER_PAYLOAD_SENTINEL }),
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session.id,
+            kind: TerminalRecordingMarkerKind::Closed,
+            seq: 8,
+            payload: json!({ "reason": "session_close" }),
+        })
+        .await
+        .unwrap();
+
+    session
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_deletes_chunks_markers_and_writes_audit(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let closed_at = now - Duration::days(31);
+    let session = make_closed_session_with_recording(&pool, &user, &profile, closed_at).await;
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let sessions = PgTerminalSessionRepository::new(pool.clone());
+    let events = PgSessionEventRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let session_events_before = events.list_for_session(session.id).await.unwrap();
+    let audit_before = audit.recent(1024).await.unwrap();
+
+    let summary = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap()
+        .expect("an eligible session must purge");
+
+    assert_eq!(summary.terminal_session_id, session.id);
+    assert_eq!(summary.chunk_count, 2);
+    assert_eq!(summary.marker_count, 2);
+    let expected_bytes = (PURGE_CHUNK_PAYLOAD_SENTINEL.len() as i64) + 7;
+    assert_eq!(summary.bytes_purged, expected_bytes);
+    assert!(
+        (summary.closed_at - closed_at).num_milliseconds().abs() < 1000,
+        "closed_at must round-trip through the summary",
+    );
+    assert!(
+        (summary.purged_at - now).num_milliseconds().abs() < 1000,
+        "purged_at must reflect the worker timestamp",
+    );
+
+    // Chunks + markers gone.
+    let chunks_after = recordings.list_chunks(session.id, 0, 1024).await.unwrap();
+    let markers_after = recordings.list_markers(session.id, 0, 1024).await.unwrap();
+    assert!(chunks_after.is_empty(), "chunks must be deleted");
+    assert!(markers_after.is_empty(), "markers must be deleted");
+
+    // `terminal_sessions` row preserved (status, closed_at unchanged).
+    let session_after = sessions.get(session.id).await.unwrap().unwrap();
+    assert_eq!(session_after.status, TerminalSessionStatus::Closed);
+    let preserved_closed_at = session_after.closed_at.expect("closed_at preserved");
+    assert!(
+        (preserved_closed_at - closed_at).num_milliseconds().abs() < 1000,
+        "closed_at must NOT be overwritten by purge",
+    );
+
+    // `session_events` row count is unchanged.
+    let session_events_after = events.list_for_session(session.id).await.unwrap();
+    assert_eq!(
+        session_events_after.len(),
+        session_events_before.len(),
+        "session_events must not change",
+    );
+
+    // `audit_events` grew by exactly one — the new recording_purged row.
+    let audit_after = audit.recent(1024).await.unwrap();
+    assert_eq!(
+        audit_after.len(),
+        audit_before.len() + 1,
+        "exactly one new audit row written",
+    );
+    let new_audit = audit_after
+        .iter()
+        .find(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .expect("recording_purged audit row must exist");
+    assert!(
+        new_audit.actor_id.is_none(),
+        "system-authored audit row must have actor_id NULL",
+    );
+    assert_eq!(
+        new_audit.payload["target_kind"].as_str(),
+        Some("terminal_session"),
+    );
+    assert_eq!(
+        new_audit.payload["target_id"].as_str(),
+        Some(session.id.into_uuid().to_string()).as_deref(),
+    );
+    assert_eq!(new_audit.payload["chunk_count"].as_i64(), Some(2));
+    assert_eq!(new_audit.payload["marker_count"].as_i64(), Some(2));
+    assert_eq!(
+        new_audit.payload["bytes_purged"].as_i64(),
+        Some(expected_bytes),
+    );
+    assert_eq!(new_audit.payload["retention_days"].as_u64(), Some(30),);
+    assert_eq!(
+        new_audit.payload["reason"].as_str(),
+        Some("retention_expired"),
+    );
+    assert!(
+        new_audit.payload.get("closed_at").is_some(),
+        "closed_at must be present in audit payload",
+    );
+    assert!(
+        new_audit.payload.get("purged_at").is_some(),
+        "purged_at must be present in audit payload",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_audit_payload_redacted(pool: PgPool) {
+    // The audit payload is built field-by-field from primitives; chunk
+    // bytes never get read (`bytes_purged` comes from `SUM(byte_len)`)
+    // and marker payload contents never get read (the primitive only
+    // counts markers). Sentinel strings smuggled through both surfaces
+    // must be invisible to the audit row's stringified form AND to
+    // every standard forbidden substring.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let closed_at = now - Duration::days(31);
+    let session = make_closed_session_with_recording(&pool, &user, &profile, closed_at).await;
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let _ = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap()
+        .expect("eligible session must purge");
+
+    let new_audit = audit
+        .recent(1024)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .expect("recording_purged row");
+    let raw = new_audit.payload.to_string();
+
+    // Local sentinels: the chunk byte sentinel and the marker payload
+    // sentinel must not survive into the audit row. Either one would
+    // be a redaction regression.
+    assert!(
+        !raw.contains("PURGE-CHUNK-SENTINEL-9D4F"),
+        "audit payload must not echo chunk bytes: {raw}",
+    );
+    assert!(
+        !raw.contains(PURGE_MARKER_PAYLOAD_SENTINEL),
+        "audit payload must not echo marker payload: {raw}",
+    );
+
+    // Standard forbidden substrings (mirrors the repo-wide list in
+    // `crates/relayterm-api/tests/api.rs::AUDIT_FORBIDDEN_SUBSTRINGS`
+    // — kept in sync by hand because that constant lives behind the
+    // postgres-tests feature in another crate).
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "password_hash",
+        "session_token",
+        "token_hash",
+        "bootstrap_token",
+        "argon2id",
+        "client_info",
+        "remote_addr",
+        "user_agent",
+        "data_b64",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "audit payload must not contain {forbidden}: {raw}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_skips_active_session(pool: PgPool) {
+    // status = active, closed_at IS NULL. Even with chunks 100 days
+    // old, the session must NOT be purged — eligibility keys on
+    // `closed_at`, not chunk `created_at`.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+
+    let audit_before = audit.recent(1024).await.unwrap().len();
+    let result = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    assert!(result.is_none(), "active sessions must never purge");
+
+    let chunks = recordings.list_chunks(session.id, 0, 1024).await.unwrap();
+    assert_eq!(chunks.len(), 1, "active session chunks must be preserved");
+    let audit_after = audit.recent(1024).await.unwrap().len();
+    assert_eq!(audit_after, audit_before, "no audit row must be written");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_skips_session_inside_retention_window(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    // Closed 5 days ago with retention_days = 30 → still inside window.
+    let session =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(5)).await;
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let audit_before = audit.recent(1024).await.unwrap().len();
+    let result = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(result.is_none(), "in-retention sessions must not purge");
+
+    let chunks = recordings.list_chunks(session.id, 0, 1024).await.unwrap();
+    assert_eq!(chunks.len(), 2, "in-retention chunks preserved");
+    let audit_after = audit.recent(1024).await.unwrap().len();
+    assert_eq!(audit_after, audit_before, "no audit row written");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_no_recording_is_noop(pool: PgPool) {
+    // Closed past threshold but never recorded. No chunks, no markers
+    // — the schema-side idempotency keystone collapses this into a
+    // no-op. Zero deletes, zero audit rows.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let sessions = PgTerminalSessionRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let now = chrono::Utc::now();
+    sessions
+        .set_status(
+            session.id,
+            TerminalSessionStatus::Closed,
+            Some(now - Duration::days(60)),
+        )
+        .await
+        .unwrap();
+
+    let audit_before = audit.recent(1024).await.unwrap().len();
+    let result = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(
+        result.is_none(),
+        "session with no recording must produce a no-op",
+    );
+    let audit_after = audit.recent(1024).await.unwrap().len();
+    assert_eq!(audit_after, audit_before);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_idempotent_on_second_call(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let session =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    // First call purges.
+    let first = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(first.is_some(), "first call must purge");
+    let audit_after_first = audit.recent(1024).await.unwrap();
+    let recording_audit_count_first = audit_after_first
+        .iter()
+        .filter(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .count();
+    assert_eq!(recording_audit_count_first, 1);
+
+    // Second call: chunks and markers are gone (predicate (3) excludes
+    // the session). No-op AND no second audit row.
+    let second = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(
+        second.is_none(),
+        "second call must be a no-op once chunks + markers are gone",
+    );
+    let audit_after_second = audit.recent(1024).await.unwrap();
+    let recording_audit_count_second = audit_after_second
+        .iter()
+        .filter(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .count();
+    assert_eq!(
+        recording_audit_count_second, 1,
+        "second call must NOT write a duplicate audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_unknown_session_is_noop(pool: PgPool) {
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let bogus = relayterm_core::ids::TerminalSessionId::new();
+    let audit_before = audit.recent(1024).await.unwrap().len();
+
+    let result = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: bogus,
+            retention_days: 30,
+            now: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    assert!(result.is_none(), "unknown session id must be a no-op");
+
+    let audit_after = audit.recent(1024).await.unwrap().len();
+    assert_eq!(audit_after, audit_before);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_at_exact_threshold_is_eligible(pool: PgPool) {
+    // `closed_at + retention_days == now` is the inclusive boundary
+    // documented in `docs/terminal-recording.md` Section 12.2. A
+    // session closed exactly `retention_days` ago must purge.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let session =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(30)).await;
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let result = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(
+        result.is_some(),
+        "session at the exact retention threshold must purge",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_metadata_after_purge_matches_never_recorded(pool: PgPool) {
+    // After a purge, `get_metadata` returns `has_recording = false` —
+    // byte-identical to a session that was never recorded. This is
+    // the post-purge wire shape pinned in
+    // `docs/terminal-recording.md` Section 12.8.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let session =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let before = recordings.get_metadata(session.id).await.unwrap();
+    assert!(before.has_recording());
+
+    recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let after = recordings.get_metadata(session.id).await.unwrap();
+    assert!(!after.has_recording(), "post-purge metadata reads as empty");
+    assert_eq!(after.chunk_count, 0);
+    assert_eq!(after.marker_count, 0);
+    assert_eq!(after.first_seq, None);
+    assert_eq!(after.last_seq, None);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_isolates_per_session(pool: PgPool) {
+    // Two eligible sessions for two users. Purging one must not touch
+    // the other's chunks, markers, audit footprint, or session row.
+    let alice = make_user(&pool).await;
+    let bob = make_user(&pool).await;
+    let host_a = make_host(&pool, &alice).await;
+    let identity_a = make_identity(&pool, &alice).await;
+    let profile_a = make_profile(&pool, &alice, &host_a, &identity_a).await;
+    let host_b = make_host(&pool, &bob).await;
+    let identity_b = make_identity(&pool, &bob).await;
+    let profile_b = make_profile(&pool, &bob, &host_b, &identity_b).await;
+
+    let now = chrono::Utc::now();
+    let session_a =
+        make_closed_session_with_recording(&pool, &alice, &profile_a, now - Duration::days(31))
+            .await;
+    let session_b =
+        make_closed_session_with_recording(&pool, &bob, &profile_b, now - Duration::days(31)).await;
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let audit_before = audit.recent(1024).await.unwrap().len();
+
+    let purged_a = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session_a.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap()
+        .expect("session_a purges");
+    assert_eq!(purged_a.terminal_session_id, session_a.id);
+
+    // Bob's recording is untouched.
+    let chunks_b = recordings.list_chunks(session_b.id, 0, 1024).await.unwrap();
+    let markers_b = recordings
+        .list_markers(session_b.id, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(chunks_b.len(), 2, "bob's chunks must be preserved");
+    assert_eq!(markers_b.len(), 2, "bob's markers must be preserved");
+
+    let audit_after = audit.recent(1024).await.unwrap();
+    assert_eq!(
+        audit_after.len(),
+        audit_before + 1,
+        "exactly one new audit row across both sessions",
+    );
+    let new_audit = audit_after
+        .iter()
+        .find(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .expect("recording_purged row");
+    assert_eq!(
+        new_audit.payload["target_id"].as_str(),
+        Some(session_a.id.into_uuid().to_string()).as_deref(),
+        "the audit row must address session_a, never session_b",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn purge_for_retention_summary_debug_does_not_leak_payload(pool: PgPool) {
+    // The `PurgedRecordingSummary` is a primitives-only struct by
+    // contract; `Debug` is derived because every field is
+    // public-safe. Pin that the chunk-byte sentinel and the marker
+    // payload sentinel never appear in `Debug` output.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let session =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let summary = recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let dbg = format!("{summary:?}");
+    assert!(
+        !dbg.contains("PURGE-CHUNK-SENTINEL-9D4F"),
+        "PurgedRecordingSummary Debug leaked chunk sentinel: {dbg}",
+    );
+    assert!(
+        !dbg.contains(PURGE_MARKER_PAYLOAD_SENTINEL),
+        "PurgedRecordingSummary Debug leaked marker sentinel: {dbg}",
+    );
 }

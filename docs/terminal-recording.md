@@ -911,10 +911,16 @@ The recording corpus grows monotonically until something cleans it
 up. The recording-writer foundation (Section 6, Section 9.3,
 implementation step 3) already persists chunks and markers; the
 read API (Section 10) and the replay viewer (step 5) already render
-them. There is **no purge surface yet** — neither a cleanup worker,
-a `recording_purged` audit kind, nor any DELETE path. The corpus
-is operator-managed by hand today (or by manual `DELETE` against
-the schema), and it grows until something cleans it up.
+them. The `recording_purged` audit kind and the single-session
+`purge_for_retention` repository primitive have now landed
+(Section 12.1) — but **no caller drives the primitive yet**.
+There is no startup sweep, no periodic worker, no
+`[terminal_recording.cleanup]` config block, no admin or
+user-triggered purge surface, no operator command. The corpus is
+still operator-managed by hand today (or by manual `DELETE` against
+the schema OR by directly calling the repository primitive against
+a maintenance pool), and it grows until something automated cleans
+it up.
 
 This section is the binding contract for the future retention
 slice (implementation step 8). The slice MUST land exactly the
@@ -944,19 +950,48 @@ What already exists that retention rests on:
   one chunk row. The reconciliation pass writes ZERO
   `audit_events` rows; it is operational bookkeeping, not a
   destructive action.
+- The `recording_purged` audit kind. Migration
+  `20260503000021_audit_events_recording_purged_kind.sql`
+  extends `audit_events_kind_chk` with the new tag;
+  `AuditEventKind::RecordingPurged` (`crates/relayterm-core/src/
+  audit_event.rs`) carries the wire tag `"recording_purged"`. The
+  kind is invisible to the user-facing
+  `recent_for_actor` feed by construction (12.9): the row's
+  `actor_id IS NULL` and the SQL filter is `WHERE actor_id =
+  $caller`.
+- The single-session purge primitive
+  `TerminalRecordingRepository::purge_for_retention(input) ->
+  Option<PurgedRecordingSummary>`. Postgres impl in
+  `crates/relayterm-db/src/repositories/terminal_recording.rs`
+  drives one transaction per session that locks the session row
+  `FOR UPDATE`, checks eligibility (12.2), aggregates
+  `COUNT(*)` and `COALESCE(SUM(byte_len), 0)` (no `payload`
+  SELECT), deletes markers then chunks, and inserts the
+  `recording_purged` audit row — all inside the same
+  `BEGIN`...`COMMIT`. Audit-failure ROLLBACK reverts the deletes
+  (12.4 fail-closed). `Ok(None)` for unknown / open / in-window
+  / zero-recording sessions, with no audit row written. Test
+  coverage (`crates/relayterm-db/tests/repositories.rs::
+  purge_for_retention_*`): 11 cases pinning the eligibility
+  predicate at the inclusive boundary, the audit payload shape,
+  the redaction sentinels (chunk byte sentinel, marker payload
+  sentinel, the standard
+  `AUDIT_FORBIDDEN_SUBSTRINGS` set), `terminal_sessions` and
+  `session_events` preservation, idempotency on second call,
+  per-session isolation, and the post-purge `get_metadata` read
+  collapsing to `has_recording = false`.
 
 What does NOT exist yet and is what step 8 will land:
 
-- No cleanup worker (neither startup-only nor periodic).
-- No `recording_purged` audit kind in
-  `audit_events_kind_chk` and no matching `AuditEventKind`
-  variant.
-- No `delete_for_session` (or equivalent) repository method on
-  `TerminalRecordingRepository`.
-- No retention-related cleanup config block; only the policy
-  inputs (`terminal_recording.retention_days`,
+- No cleanup worker (neither startup-only nor periodic). The
+  retention purge primitive is not yet wired into a caller.
+- No `[terminal_recording.cleanup]` config block; only the
+  policy inputs (`terminal_recording.retention_days`,
   `terminal_recording.max_bytes_per_session`) are accepted and
-  validated at boot.
+  validated at boot. The new fields in 12.6 (`cleanup.enabled`,
+  `cleanup.startup_sweep_enabled`,
+  `cleanup.sweep_interval_seconds`, `cleanup.batch_size`) land
+  with the worker slice.
 
 ### 12.2 Retention policy
 
@@ -1470,14 +1505,34 @@ plan.
 1. **This design slice** (current). Doc only. No code, no
    migrations, no runtime behaviour change.
 2. **Audit-kind extension + repository purge method**
-   (step 8a-prep). Migration extends the
-   `audit_events_kind_chk` CHECK with `recording_purged`;
-   `AuditEventKind` Rust enum gains the variant; serde tag
-   pinned by unit test; `.sqlx/` regenerated. Repository
-   gains `delete_recording_for_session(TerminalSessionId) ->
-   Result<DeleteSummary>` returning `{ chunk_count,
-   marker_count, bytes_purged }`. No worker, no caller, no
-   route.
+   (step 8a-prep, **landed**). Migration
+   `20260503000021_audit_events_recording_purged_kind.sql`
+   extends `audit_events_kind_chk` with `recording_purged`.
+   `AuditEventKind::RecordingPurged` (`crates/relayterm-core/src/
+   audit_event.rs`) carries the wire tag and is pinned by a
+   unit test. The repository surface is
+   `TerminalRecordingRepository::purge_for_retention(input) ->
+   Result<Option<PurgedRecordingSummary>>` with the input
+   carrying `terminal_session_id`, `retention_days`, and the
+   worker's authoritative `now`. The Postgres impl runs one
+   transaction per session that locks the session row
+   `FOR UPDATE`, checks the eligibility predicate (closed AND
+   past threshold AND non-empty recording — the inclusive
+   boundary `closed_at + retention_days <= now`), aggregates
+   `COUNT(*)` and `COALESCE(SUM(byte_len), 0)` from chunks,
+   counts markers, deletes markers then chunks, and inserts
+   the `recording_purged` audit row inside the same
+   transaction (12.4 fail-closed: audit failure ROLLBACK
+   reverts the deletes). `Ok(None)` for ineligible / unknown
+   sessions writes no audit row. The summary carries the
+   counts, total bytes, the session's `closed_at`, and the
+   worker `purged_at` — all primitive aggregates, never
+   per-chunk shape. Repository payload-byte and audit-payload
+   redaction is pinned by sentinel tests in
+   `crates/relayterm-db/tests/repositories.rs::
+   purge_for_retention_*`. No worker, no caller, no route in
+   this slice — the next slice (8a) wires the primitive into
+   a startup sweep.
 3. **Cleanup config block** (step 8a-prep). Add
    `[terminal_recording.cleanup]` to `apps/backend/src/config.rs`
    with the bounds in 12.6. Production-validation envelope

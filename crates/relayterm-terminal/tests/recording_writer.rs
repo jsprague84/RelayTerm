@@ -19,8 +19,9 @@ use relayterm_core::ids::{
 };
 use relayterm_core::repository::{
     CreateSessionEvent, CreateTerminalRecordingChunk, CreateTerminalRecordingMarker,
-    CreateTerminalSession, CreateTerminalSessionAttachment, RepositoryError,
-    SessionEventRepository, TerminalRecordingRepository, TerminalSessionRepository,
+    CreateTerminalSession, CreateTerminalSessionAttachment, PurgeRecordingForRetention,
+    RepositoryError, SessionEventRepository, TerminalRecordingRepository,
+    TerminalSessionRepository,
 };
 use relayterm_core::session_event::{SessionEvent, SessionEventKind};
 use relayterm_core::terminal_recording::{
@@ -348,6 +349,13 @@ impl TerminalRecordingRepository for FakeRecordingRepo {
         Ok(relayterm_core::TerminalRecordingMetadata::empty(
             terminal_session_id,
         ))
+    }
+
+    async fn purge_for_retention(
+        &self,
+        _input: PurgeRecordingForRetention,
+    ) -> Result<Option<relayterm_core::PurgedRecordingSummary>, RepositoryError> {
+        Ok(None)
     }
 }
 

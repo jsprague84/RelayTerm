@@ -260,6 +260,50 @@ impl TerminalRecordingMetadata {
     }
 }
 
+/// Summary of one session's purge — the durable counts and bytes that
+/// the retention worker writes into the `recording_purged` audit row.
+///
+/// All fields are aggregate primitives (counts, byte totals, ids,
+/// timestamps). This struct deliberately does NOT carry per-chunk seq
+/// ranges, per-chunk byte counts, per-chunk ids, per-marker kinds, or
+/// per-marker payloads — the audit row's redaction policy
+/// (`docs/terminal-recording.md` Section 12.5) collapses to aggregates,
+/// and the repository-side type enforces the same shape so a future
+/// caller cannot accidentally widen the payload.
+///
+/// `Debug` is derived because every field is a public-safe primitive.
+/// The struct is NOT `Serialize` — the API / audit DTO builds its
+/// payload field-by-field rather than `serde_json::to_value`-ing a
+/// domain struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedRecordingSummary {
+    pub terminal_session_id: TerminalSessionId,
+    /// Number of chunk rows that were deleted. `>= 0`.
+    pub chunk_count: i64,
+    /// Number of marker rows that were deleted. `>= 0`.
+    pub marker_count: i64,
+    /// `SUM(byte_len)` across deleted chunks. Markers are
+    /// metadata-only by contract and contribute zero bytes here.
+    /// `>= 0`.
+    pub bytes_purged: i64,
+    /// The session's `closed_at` value at the moment of the purge —
+    /// the field the retention eligibility predicate measured against
+    /// (`docs/terminal-recording.md` Section 12.2). Pinned in the
+    /// summary so the audit row can record it without re-querying the
+    /// (preserved) `terminal_sessions` row.
+    pub closed_at: DateTime<Utc>,
+    /// Worker-supplied UTC timestamp captured at the START of the
+    /// per-session purge transaction (the same value the worker passed
+    /// in as `PurgeRecordingForRetention::now`). The repository writes
+    /// this same value into the `audit_events.recorded_at` column of
+    /// the `recording_purged` row, so the summary's `purged_at` and
+    /// the audit row's `recorded_at` are byte-identical. The actual
+    /// `COMMIT` happens slightly later — typically sub-millisecond,
+    /// but a slow transaction can widen the gap; callers that need
+    /// COMMIT-precise timing should not rely on this field.
+    pub purged_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,8 +26,9 @@ use crate::server_profile::ServerProfile;
 use crate::session_event::{SessionEvent, SessionEventKind};
 use crate::ssh_identity::{SshIdentity, SshKeyType};
 use crate::terminal_recording::{
-    TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
-    TerminalRecordingMarkerKind, TerminalRecordingMetadata, TerminalRecordingPayloadEncryption,
+    PurgedRecordingSummary, TerminalRecordingChunk, TerminalRecordingCompression,
+    TerminalRecordingMarker, TerminalRecordingMarkerKind, TerminalRecordingMetadata,
+    TerminalRecordingPayloadEncryption,
 };
 use crate::terminal_session::{
     ReconciledTerminalSession, TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
@@ -281,6 +282,31 @@ pub struct CreateTerminalRecordingMarker {
     pub kind: TerminalRecordingMarkerKind,
     pub seq: i64,
     pub payload: JsonValue,
+}
+
+/// Repository input for the retention purge primitive.
+///
+/// All four fields are required: the eligibility predicate
+/// (`docs/terminal-recording.md` Section 12.2) is evaluated server-side
+/// inside the same transaction as the deletes to avoid a TOCTOU window
+/// between "is this session eligible?" and "purge it now."
+///
+/// - `retention_days` is the active retention policy at sweep time.
+///   The eligibility check is `closed_at + retention_days <= now`; the
+///   value is also written verbatim into the `recording_purged` audit
+///   payload so a later operator audit can correlate "this purge
+///   happened under the old 30-day policy."
+/// - `now` is the worker's authoritative timestamp. Used both for the
+///   eligibility comparison AND for the `purged_at` field in the audit
+///   payload. The worker captures one value at the start of the
+///   per-session transaction and passes it here.
+///
+/// `Debug` is derived — every field is a public-safe primitive.
+#[derive(Debug, Clone)]
+pub struct PurgeRecordingForRetention {
+    pub terminal_session_id: TerminalSessionId,
+    pub retention_days: u32,
+    pub now: DateTime<Utc>,
 }
 
 // ----------------------------------------------------------------------
@@ -775,6 +801,61 @@ pub trait TerminalRecordingRepository: Send + Sync {
         &self,
         terminal_session_id: TerminalSessionId,
     ) -> Result<TerminalRecordingMetadata, RepositoryError>;
+
+    /// Purge one eligible session's durable recording in a single
+    /// Postgres transaction.
+    ///
+    /// Eligibility predicate (matches
+    /// `docs/terminal-recording.md` Section 12.2):
+    /// 1. The session's `closed_at IS NOT NULL`, AND
+    /// 2. `closed_at + retention_days <= now` (inclusive at the
+    ///    boundary), AND
+    /// 3. At least one row exists in `terminal_recording_chunks` OR
+    ///    `terminal_recording_markers` for the session.
+    ///
+    /// Behaviour:
+    /// - The transaction shape is exactly Section 12.4: locks the
+    ///   session row `FOR UPDATE`, computes the chunk aggregate
+    ///   (`COUNT(*)`, `COALESCE(SUM(byte_len), 0)`) and the marker
+    ///   `COUNT(*)`, deletes markers, deletes chunks, and inserts one
+    ///   `recording_purged` audit row — all in one `BEGIN` ... `COMMIT`.
+    /// - **Audit failure ROLLBACK reverts the deletes** (Section 12.4):
+    ///   the purge is fail-closed. Either both writes land OR neither
+    ///   does and the next sweep retries. This is a deliberate
+    ///   departure from the two-phase fail-closed pattern used by the
+    ///   server-profile lifecycle audit (where the lifecycle row
+    ///   commits before the audit insert and a partial-success orphan
+    ///   is operator-actionable). The recording purge is irreversibly
+    ///   destructive, so transactional atomicity is the right shape.
+    /// - Returns `Ok(Some(PurgedRecordingSummary))` on a real purge.
+    ///   The summary's counts and bytes reflect what was deleted; the
+    ///   caller does NOT re-derive these from a follow-up SELECT.
+    /// - Returns `Ok(None)` for a session that does not exist, that is
+    ///   not yet closed, that is closed but still inside the retention
+    ///   window, OR that has zero chunk AND zero marker rows. None of
+    ///   those cases write any row — no audit, no delete. Idempotency
+    ///   is therefore a schema invariant: a second call against a
+    ///   session whose chunks AND markers were already deleted falls
+    ///   through predicate (3) and returns `None` without writing.
+    /// - The aggregate query reads `byte_len` only — never `payload`.
+    ///   `bytes_purged` is computed via `SUM(byte_len)`. Implementations
+    ///   MUST NOT widen the projection to chunk `payload` bytes.
+    /// - Repository errors MUST NOT echo chunk `payload` bytes,
+    ///   marker payload contents, or audit-payload sentinels.
+    /// - `terminal_sessions` rows, `session_events` rows, and
+    ///   pre-existing `audit_events` rows are NEVER touched; only the
+    ///   chunk + marker rows for the session are deleted, and exactly
+    ///   one new `audit_events` row is appended.
+    ///
+    /// Owner-scope: the worker is system-driven and owner-agnostic
+    /// (Section 12.10). This method does NOT take a `UserId` and does
+    /// NOT filter by `owner_id`. The retention worker is the only
+    /// caller; there is no user-triggered or admin-triggered purge
+    /// route in v1.
+    async fn purge_for_retention(
+        &self,
+        input: PurgeRecordingForRetention,
+    ) -> Result<Option<PurgedRecordingSummary>, RepositoryError>;
 }
 
 #[cfg(test)]

@@ -211,6 +211,15 @@ export function describeAuditEventKind(kind: AuditEventKindTag): string {
       return "Terminal session opened";
     case "session_closed":
       return "Terminal session closed";
+    case "recording_purged":
+      // System-authored retention sweep. The current `recent_for_actor`
+      // SQL filters with `WHERE actor_id = $caller`, so a system-actor
+      // (`actor_id IS NULL`) row never reaches this surface today —
+      // labelled here so a future admin / "system actions affecting
+      // your data" surface can render it without echoing payload
+      // details. NEVER include the session id, retention days, byte
+      // counts, or any other payload field in the label string.
+      return "Terminal recording purged by retention";
     default:
       return "Audit event";
   }

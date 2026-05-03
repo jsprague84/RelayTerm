@@ -883,8 +883,8 @@ mod tests {
         TerminalRecordingChunkId, TerminalRecordingMarkerId, TerminalSessionId,
     };
     use relayterm_core::repository::{
-        CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, RepositoryError,
-        TerminalRecordingRepository,
+        CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, PurgeRecordingForRetention,
+        RepositoryError, TerminalRecordingRepository,
     };
     use relayterm_core::terminal_recording::{TerminalRecordingChunk, TerminalRecordingMarker};
     use std::sync::Mutex as StdMutex;
@@ -979,6 +979,18 @@ mod tests {
             Ok(relayterm_core::TerminalRecordingMetadata::empty(
                 terminal_session_id,
             ))
+        }
+
+        async fn purge_for_retention(
+            &self,
+            _input: PurgeRecordingForRetention,
+        ) -> Result<Option<relayterm_core::PurgedRecordingSummary>, RepositoryError> {
+            // The recording-writer test fakes never exercise the
+            // retention purge path; the worker that drives this method
+            // is its own slice. Returning `None` keeps the trait
+            // implementable without leaking any behaviour into the
+            // writer fake.
+            Ok(None)
         }
     }
 

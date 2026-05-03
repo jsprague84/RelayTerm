@@ -56,6 +56,20 @@ pub enum AuditEventKind {
     SshIdentityDeleted,
     SessionOpened,
     SessionClosed,
+    /// The retention cleanup worker purged one session's durable
+    /// recording (chunks + markers). System-authored: `actor_id` is
+    /// `NULL` because the cleanup worker is not a user. The payload
+    /// carries `target_id`, `target_kind = "terminal_session"`,
+    /// `chunk_count`, `marker_count`, `bytes_purged`, `retention_days`,
+    /// `closed_at`, `purged_at`, and `reason = "retention_expired"` —
+    /// public metadata only. NEVER chunk `payload` bytes (or any
+    /// base64 form), marker payload contents, `client_info`, hostnames,
+    /// peer banners, raw russh / DB error text, vault internals,
+    /// session-token bytes, token hashes, password hashes, or bootstrap
+    /// tokens (see `docs/terminal-recording.md` Section 12.5 for the
+    /// full redaction list and `crates/relayterm-api/tests/api.rs`'s
+    /// `AUDIT_FORBIDDEN_SUBSTRINGS` for the sentinel backstop).
+    RecordingPurged,
     Other,
 }
 
@@ -84,6 +98,7 @@ impl AuditEventKind {
             Self::SshIdentityDeleted => "ssh_identity_deleted",
             Self::SessionOpened => "session_opened",
             Self::SessionClosed => "session_closed",
+            Self::RecordingPurged => "recording_purged",
             Self::Other => "other",
         }
     }
@@ -113,6 +128,7 @@ impl AuditEventKind {
             "ssh_identity_deleted" => Self::SshIdentityDeleted,
             "session_opened" => Self::SessionOpened,
             "session_closed" => Self::SessionClosed,
+            "recording_purged" => Self::RecordingPurged,
             "other" => Self::Other,
             _ => return None,
         })
@@ -171,6 +187,19 @@ mod tests {
         assert_eq!(
             AuditEventKind::from_str_tag("server_profile_obliterated"),
             None,
+        );
+    }
+
+    /// `recording_purged` is the wire tag the retention cleanup worker
+    /// writes (`audit_events_kind_chk` migration
+    /// `20260503000021_audit_events_recording_purged_kind.sql`).
+    /// Renaming it is a schema break; pin both directions.
+    #[test]
+    fn recording_purged_wire_tag_is_stable() {
+        assert_eq!(AuditEventKind::RecordingPurged.as_str(), "recording_purged",);
+        assert_eq!(
+            AuditEventKind::from_str_tag("recording_purged"),
+            Some(AuditEventKind::RecordingPurged),
         );
     }
 }

@@ -34,16 +34,17 @@ pub use repository::{
     CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
     CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, CreateTerminalSession,
     CreateTerminalSessionAttachment, CreateUser, CreateUserSession, HostRepository,
-    KnownHostEntryRepository, PasswordCredentialRepository, RepositoryError,
-    ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
+    KnownHostEntryRepository, PasswordCredentialRepository, PurgeRecordingForRetention,
+    RepositoryError, ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
     TerminalRecordingRepository, TerminalSessionRepository, UserRepository, UserSessionRepository,
 };
 pub use server_profile::ServerProfile;
 pub use session_event::{SessionEvent, SessionEventKind};
 pub use ssh_identity::{SshIdentity, SshKeyType};
 pub use terminal_recording::{
-    TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
-    TerminalRecordingMarkerKind, TerminalRecordingMetadata, TerminalRecordingPayloadEncryption,
+    PurgedRecordingSummary, TerminalRecordingChunk, TerminalRecordingCompression,
+    TerminalRecordingMarker, TerminalRecordingMarkerKind, TerminalRecordingMetadata,
+    TerminalRecordingPayloadEncryption,
 };
 pub use terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 pub use user::User;
