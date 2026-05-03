@@ -695,14 +695,43 @@ is touched. State-changing routes (none in this section yet, but
 future enable/disable endpoints) follow the
 `CsrfGuard` rule from `AGENTS.md`.
 
+**Status (this slice).** The read-API foundation has landed —
+metadata, chunks, and markers endpoints are wired in
+`crates/relayterm-api/src/routes/v1/terminal_recordings.rs`. They
+are owner-scoped, write zero audit rows, and surface chunk bytes
+as base64 only. Behaviour caveats versus the original sketch are
+called out inline below.
+
 ### 10.1 `GET /api/v1/terminal-sessions/:id/recording/metadata`
 
-Returns metadata only: `{ "session_id", "recording_enabled",
-"first_seq", "last_seq", "chunk_count", "marker_count",
-"first_marker_at", "last_marker_at", "encryption", "compression" }`.
-No bytes. Returns `404` for foreign or unknown sessions, `404` for
-sessions that have no recording rows (recording disabled), `200`
-with metadata otherwise.
+Returns aggregate metadata across the session's chunk and marker
+rows. The response shape is:
+
+```json
+{
+  "terminal_session_id": "<uuid>",
+  "has_recording": true,
+  "chunk_count": 0,
+  "marker_count": 0,
+  "first_seq": null,
+  "last_seq": null,
+  "first_recorded_at": null,
+  "last_recorded_at": null
+}
+```
+
+Where `has_recording` is `true` iff at least one chunk OR marker
+row exists for the session. `first_seq` / `last_seq` are derived
+from chunks only (`MIN(seq_start)` / `MAX(seq_end)`); a session
+that has only a `started` marker reports `chunk_count = 0`,
+`first_seq = null`, but `has_recording = true`. Foreign / unknown
+sessions → `404 terminal_session not found`. **Note** versus the
+original sketch: an empty-recording session (no chunks AND no
+markers) returns `200` with `has_recording = false` rather than
+`404` — this lets a future UI distinguish "session exists, never
+recorded" from "session does not exist." Reads write zero audit
+rows. Recording disabled / never enabled is observable through
+`has_recording = false`.
 
 ### 10.2 `GET /api/v1/terminal-sessions/:id/recording/chunks?from_seq=...&limit=...`
 
@@ -710,21 +739,25 @@ Streams or pages chunked output for a closed session (or a session
 with no live PTY runtime). The wire shape is **per-chunk, not
 per-frame**: each entry in the response array is one `chunk` row,
 namely `{ seq_start, seq_end, byte_len, data_b64, encryption,
-compression }`. This avoids forcing the schema to store intra-chunk
-frame boundaries (Section 5.1 deliberately stores concatenated
-payload bytes only) and avoids forcing the REST handler to re-parse
-chunk bytes back into per-frame `Output { seq, data }` shape on the
-hot read path.
+compression, created_at }`. This avoids forcing the schema to store
+intra-chunk frame boundaries (Section 5.1 deliberately stores
+concatenated payload bytes only) and avoids forcing the REST
+handler to re-parse chunk bytes back into per-frame `Output { seq,
+data }` shape on the hot read path.
 
 The `data_b64` field uses the same base64 codec as the legacy JSON
 `Output` shape (`output_data_encode/decode` in `relayterm-protocol`).
 Binary `RTB1` framing is **not** used on this REST surface — REST
-clients should not be forced to parse the binary envelope. `data_b64`
-is the chunk's *post-decryption, post-decompression* plaintext bytes
-when the row's `encryption`/`compression` are `0`; for non-zero
-schemes the handler MUST decrypt/decompress server-side and emit
-plaintext bytes — the wire MUST NOT carry envelope ciphertext, since
-the recording master key never crosses the API boundary.
+clients should not be forced to parse the binary envelope. In v1
+(`encryption = 'none'`, `compression = 'none'`) `data_b64` is the
+chunk's plaintext bytes as persisted. When a future
+`encryption = 'recording_v1'` row lands, the handler MUST
+decrypt/decompress server-side and emit plaintext bytes — the wire
+MUST NOT carry envelope ciphertext, since the recording master key
+never crosses the API boundary. The current implementation will
+return rows with `encryption != 'none'` opaquely (still as base64);
+that path is unreachable today because the writer only emits
+`'none'`.
 
 The renderer treats each `data_b64` payload as a contiguous slice of
 PTY output bytes and feeds it directly into `renderer.write(bytes)` —
@@ -732,12 +765,29 @@ the renderer's existing VT parser handles cross-chunk escape-sequence
 boundaries the same way it already handles cross-frame boundaries on
 the live wire.
 
-`from_seq` defaults to `1`. `limit` is bounded server-side
-(suggested max 32 chunks per response; the client paginates with
-the highest-seen `seq_end + 1` as the next `from_seq`). Foreign /
-unknown / no-recording → `404`.
+`from_seq` defaults to `1`; negative values are rejected as `400
+invalid_input` (the wire body does NOT echo the offending value).
+`limit` clamps to `1..=1024` at the API layer; the repository adds
+the same `1024` ceiling underneath as defence-in-depth. Default
+page size is `256`. Foreign / unknown sessions → `404`. An empty
+recording returns `200 []` (NOT `404`) so callers can distinguish
+"no chunks yet" from "no such session."
 
-### 10.3 WebSocket replay (existing surface, extended)
+### 10.3 `GET /api/v1/terminal-sessions/:id/recording/markers?from_seq=...&limit=...`
+
+Returns marker rows ordered by `(seq ASC, created_at ASC)`. The
+response shape per item is `{ kind, seq, payload, created_at }`.
+`kind` is one of the canonical tags (`started`, `attached`,
+`detached`, `reattached`, `resized`, `closed`, `replay_gap`).
+`payload` is metadata-only by writer contract — counts, dims,
+reason codes — never PTY bytes.
+
+`from_seq` defaults to `0` for markers (the `started` marker rides
+at `seq = 0`); negative values are rejected as `400 invalid_input`.
+`limit` follows the same clamp rules as chunks. Foreign / unknown →
+`404`. Empty list returns `200 []`.
+
+### 10.4 WebSocket replay (existing surface, extended)
 
 The existing `GET /api/v1/terminal-sessions/:id/ws` upgrade
 continues to be the live attach surface. Sections 8.2 and 8.4
@@ -747,7 +797,7 @@ closed-session attach drives a replay-only flow before the wire
 closes. **No new wire variant is required** — `ReplayStart` /
 `Output` / `ReplayEnd` / `ReplayWindowLost` already cover it.
 
-### 10.4 What MUST NOT appear
+### 10.5 What MUST NOT appear
 
 - Any chunk byte material on `GET /api/v1/terminal-sessions`
   (the list endpoint).
@@ -1018,11 +1068,37 @@ posture (Section 7) defensible at every stop.
        `(session_id, seq_start)` index are the durable backstop.
      - Encryption-aware writer (the `encryption.mode = required`
        path; landing this unblocks production recording).
-4. **Durable replay read API**.
-   - The two HTTP endpoints in Section 10.1 / 10.2.
-   - Owner-scope tests (foreign session 404), no-recording 404
-     tests, bounded `limit` tests.
-   - Redaction sentinel tests against the API response bodies.
+4. **Durable replay read API** (foundation landed).
+   - **Status**: the three HTTP endpoints in Section 10.1 / 10.2 /
+     10.3 have landed in
+     `crates/relayterm-api/src/routes/v1/terminal_recordings.rs`,
+     backed by `TerminalRecordingRepository::get_metadata`,
+     `list_chunks`, `list_markers` (the metadata method is the new
+     trait surface added in this slice). All three routes resolve
+     the addressed `terminal_session` through `AuthenticatedUser` +
+     the existing `terminal_sessions.owner_id == user.user_id()`
+     filter; foreign and missing sessions collapse to a
+     byte-identical 404. Reads write zero `audit_events` rows.
+   - **Behaviour caveat versus the original sketch**: an empty
+     recording (no chunks AND no markers) returns `200` with
+     `has_recording = false` rather than `404`, so a future UI can
+     distinguish "session exists, never recorded" from "session
+     does not exist." The Section 10.1 sketch said `404`; the
+     implementation chose `200 + has_recording: false`.
+   - Owner-scope tests
+     (`recording_routes_foreign_owned_returns_indistinguishable_404`),
+     auth tests
+     (`recording_read_routes_return_401_without_session_cookie`),
+     bounded `limit` clamp tests, negative-`from_seq` 400 tests,
+     and base64 round-trip + sentinel-not-in-JSON redaction tests
+     all pin the contract.
+   - Frontend replay viewer (step 5) is still ahead — no UI
+     consumes these endpoints today.
+   - Encryption-aware decode is still ahead. The writer only emits
+     `encryption = 'none'` rows, so the route returns the
+     post-persistence bytes verbatim as base64. When the
+     `recording_v1` envelope lands the route MUST decrypt
+     server-side; the wire MUST NOT carry envelope ciphertext.
 5. **Frontend replay viewer for closed sessions**.
    - New production view under `apps/web/src/lib/app/views/`,
      wired through `AppViewId` / `NAV_ITEMS`. Mounts

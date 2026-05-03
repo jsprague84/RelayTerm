@@ -43,7 +43,7 @@ pub use session_event::{SessionEvent, SessionEventKind};
 pub use ssh_identity::{SshIdentity, SshKeyType};
 pub use terminal_recording::{
     TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
-    TerminalRecordingMarkerKind, TerminalRecordingPayloadEncryption,
+    TerminalRecordingMarkerKind, TerminalRecordingMetadata, TerminalRecordingPayloadEncryption,
 };
 pub use terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 pub use user::User;

@@ -27,7 +27,7 @@ use crate::session_event::{SessionEvent, SessionEventKind};
 use crate::ssh_identity::{SshIdentity, SshKeyType};
 use crate::terminal_recording::{
     TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
-    TerminalRecordingMarkerKind, TerminalRecordingPayloadEncryption,
+    TerminalRecordingMarkerKind, TerminalRecordingMetadata, TerminalRecordingPayloadEncryption,
 };
 use crate::terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
 use crate::user::User;
@@ -690,6 +690,22 @@ pub trait TerminalRecordingRepository: Send + Sync {
         from_seq: i64,
         limit: u32,
     ) -> Result<Vec<TerminalRecordingMarker>, RepositoryError>;
+
+    /// Aggregate read-side metadata for a session's recording (counts
+    /// and seq/time bounds across chunks AND markers). Returns
+    /// [`TerminalRecordingMetadata::empty`] when the session has no
+    /// chunks AND no markers — never errors with `NotFound`. Unknown
+    /// session ids also return the empty shape; the caller is
+    /// responsible for proving the session exists / is owner-scoped
+    /// BEFORE calling this method.
+    ///
+    /// Implementations MUST NOT echo chunk payload bytes through any
+    /// error path; the metadata aggregate touches `BYTEA` rows but
+    /// never reads `payload`.
+    async fn get_metadata(
+        &self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Result<TerminalRecordingMetadata, RepositoryError>;
 }
 
 #[cfg(test)]

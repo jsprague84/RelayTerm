@@ -971,6 +971,15 @@ mod tests {
         ) -> Result<Vec<TerminalRecordingMarker>, RepositoryError> {
             Ok(self.markers.lock().unwrap().clone())
         }
+
+        async fn get_metadata(
+            &self,
+            terminal_session_id: TerminalSessionId,
+        ) -> Result<relayterm_core::TerminalRecordingMetadata, RepositoryError> {
+            Ok(relayterm_core::TerminalRecordingMetadata::empty(
+                terminal_session_id,
+            ))
+        }
     }
 
     fn build(

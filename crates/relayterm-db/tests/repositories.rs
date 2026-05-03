@@ -2262,3 +2262,154 @@ async fn recording_repository_is_session_scoped_only(pool: PgPool) {
     assert_eq!(alices[0].terminal_session_id, session_a.id);
     assert_eq!(bobs[0].terminal_session_id, session_b.id);
 }
+
+// ----------------------------------------------------------------------
+// TerminalRecording — metadata
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_empty_for_session_with_no_rows(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    let meta = repo.get_metadata(session.id).await.unwrap();
+    assert_eq!(meta.terminal_session_id, session.id);
+    assert_eq!(meta.chunk_count, 0);
+    assert_eq!(meta.marker_count, 0);
+    assert_eq!(meta.first_seq, None);
+    assert_eq!(meta.last_seq, None);
+    assert!(meta.first_recorded_at.is_none());
+    assert!(meta.last_recorded_at.is_none());
+    assert!(!meta.has_recording());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_unknown_session_returns_empty(pool: PgPool) {
+    // Repository surface is session-scoped; an unknown id surfaces as the
+    // empty metadata shape (route layer is responsible for owner scoping
+    // and 404). This pins that the aggregate query never errors when the
+    // session row is missing.
+    let bogus = relayterm_core::ids::TerminalSessionId::new();
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+    let meta = repo.get_metadata(bogus).await.unwrap();
+    assert_eq!(meta.chunk_count, 0);
+    assert_eq!(meta.marker_count, 0);
+    assert!(!meta.has_recording());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_aggregates_chunks_and_markers(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    repo.append_marker(CreateTerminalRecordingMarker {
+        terminal_session_id: session.id,
+        kind: TerminalRecordingMarkerKind::Started,
+        seq: 0,
+        payload: json!({}),
+    })
+    .await
+    .unwrap();
+    for &(seq_start, seq_end) in &[(1_i64, 10_i64), (50, 60), (200, 250)] {
+        repo.append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session.id,
+            seq_start,
+            seq_end,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    }
+    repo.append_marker(CreateTerminalRecordingMarker {
+        terminal_session_id: session.id,
+        kind: TerminalRecordingMarkerKind::Resized,
+        seq: 17,
+        payload: json!({ "cols": 132, "rows": 40 }),
+    })
+    .await
+    .unwrap();
+
+    let meta = repo.get_metadata(session.id).await.unwrap();
+    assert_eq!(meta.chunk_count, 3);
+    assert_eq!(meta.marker_count, 2);
+    assert_eq!(meta.first_seq, Some(1));
+    assert_eq!(meta.last_seq, Some(250));
+    let first = meta.first_recorded_at.expect("first_recorded_at");
+    let last = meta.last_recorded_at.expect("last_recorded_at");
+    assert!(first <= last, "first must be <= last");
+    assert!(meta.has_recording());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_session_with_only_markers(pool: PgPool) {
+    // A session that has a `started` marker but no chunks yet still
+    // counts as `has_recording = true`. The seq bounds remain `None`
+    // because they are derived from chunks only.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let session = make_terminal_session(&pool, &user, &profile).await;
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+
+    repo.append_marker(CreateTerminalRecordingMarker {
+        terminal_session_id: session.id,
+        kind: TerminalRecordingMarkerKind::Started,
+        seq: 0,
+        payload: json!({}),
+    })
+    .await
+    .unwrap();
+
+    let meta = repo.get_metadata(session.id).await.unwrap();
+    assert_eq!(meta.chunk_count, 0);
+    assert_eq!(meta.marker_count, 1);
+    assert_eq!(meta.first_seq, None);
+    assert_eq!(meta.last_seq, None);
+    assert!(meta.has_recording());
+    assert!(meta.first_recorded_at.is_some());
+    assert!(meta.last_recorded_at.is_some());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_isolates_per_session(pool: PgPool) {
+    let alice = make_user(&pool).await;
+    let bob = make_user(&pool).await;
+    let host_a = make_host(&pool, &alice).await;
+    let identity_a = make_identity(&pool, &alice).await;
+    let profile_a = make_profile(&pool, &alice, &host_a, &identity_a).await;
+    let host_b = make_host(&pool, &bob).await;
+    let identity_b = make_identity(&pool, &bob).await;
+    let profile_b = make_profile(&pool, &bob, &host_b, &identity_b).await;
+    let session_a = make_terminal_session(&pool, &alice, &profile_a).await;
+    let session_b = make_terminal_session(&pool, &bob, &profile_b).await;
+
+    let repo = PgTerminalRecordingRepository::new(pool.clone());
+    repo.append_chunk(CreateTerminalRecordingChunk {
+        terminal_session_id: session_a.id,
+        seq_start: 1,
+        seq_end: 5,
+        byte_len: 4,
+        payload: b"data".to_vec(),
+        encryption: TerminalRecordingPayloadEncryption::None,
+        compression: TerminalRecordingCompression::None,
+    })
+    .await
+    .unwrap();
+
+    let meta_a = repo.get_metadata(session_a.id).await.unwrap();
+    let meta_b = repo.get_metadata(session_b.id).await.unwrap();
+    assert_eq!(meta_a.chunk_count, 1);
+    assert_eq!(meta_b.chunk_count, 0);
+}

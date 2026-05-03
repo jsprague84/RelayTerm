@@ -15,12 +15,15 @@
 //!   on top; this is the floor that no caller can blow past.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use relayterm_core::ids::TerminalSessionId;
 use relayterm_core::repository::{
     CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, RepositoryError,
     TerminalRecordingRepository,
 };
-use relayterm_core::terminal_recording::{TerminalRecordingChunk, TerminalRecordingMarker};
+use relayterm_core::terminal_recording::{
+    TerminalRecordingChunk, TerminalRecordingMarker, TerminalRecordingMetadata,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -168,6 +171,81 @@ impl TerminalRecordingRepository for PgTerminalRecordingRepository {
         rows.into_iter()
             .map(TerminalRecordingMarkerRow::try_into_domain)
             .collect()
+    }
+
+    async fn get_metadata(
+        &self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Result<TerminalRecordingMetadata, RepositoryError> {
+        // Aggregate over chunks: count, seq bounds, time bounds.
+        // `payload` is intentionally NOT in the projection — metadata
+        // queries must never read chunk bytes.
+        let chunks: (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            r#"
+                SELECT
+                    COUNT(*)           AS chunk_count,
+                    MIN(seq_start)     AS first_seq,
+                    MAX(seq_end)       AS last_seq,
+                    MIN(created_at)    AS first_recorded_at,
+                    MAX(created_at)    AS last_recorded_at
+                FROM terminal_recording_chunks
+                WHERE terminal_session_id = $1
+                "#,
+        )
+        .bind(terminal_session_id.into_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY_CHUNK, e))?;
+
+        let markers: (i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*)           AS marker_count,
+                MIN(created_at)    AS first_marker_at,
+                MAX(created_at)    AS last_marker_at
+            FROM terminal_recording_markers
+            WHERE terminal_session_id = $1
+            "#,
+        )
+        .bind(terminal_session_id.into_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY_MARKER, e))?;
+
+        let (chunk_count, first_seq, last_seq, chunk_first_at, chunk_last_at) = chunks;
+        let (marker_count, marker_first_at, marker_last_at) = markers;
+
+        Ok(TerminalRecordingMetadata {
+            terminal_session_id,
+            chunk_count,
+            marker_count,
+            first_seq,
+            last_seq,
+            first_recorded_at: min_opt(chunk_first_at, marker_first_at),
+            last_recorded_at: max_opt(chunk_last_at, marker_last_at),
+        })
+    }
+}
+
+fn min_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn max_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
     }
 }
 

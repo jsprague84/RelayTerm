@@ -214,6 +214,52 @@ pub struct TerminalRecordingMarker {
     pub created_at: DateTime<Utc>,
 }
 
+/// Aggregate read-side metadata for a session's durable recording.
+///
+/// Contains counts and the seq / time bounds the read API surfaces to a
+/// caller. NEVER carries chunk payload bytes — by contract this is a
+/// metadata-only summary. A session with no chunks AND no markers
+/// produces a struct with zero counts and `None` bounds (i.e.
+/// `has_recording == false` at the API layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRecordingMetadata {
+    pub terminal_session_id: TerminalSessionId,
+    /// Number of chunk rows for the session.
+    pub chunk_count: i64,
+    /// Number of marker rows for the session.
+    pub marker_count: i64,
+    /// Lowest `seq_start` across chunks; `None` when no chunks exist.
+    pub first_seq: Option<i64>,
+    /// Highest `seq_end` across chunks; `None` when no chunks exist.
+    pub last_seq: Option<i64>,
+    /// Earliest `created_at` across chunk OR marker rows.
+    pub first_recorded_at: Option<DateTime<Utc>>,
+    /// Latest `created_at` across chunk OR marker rows.
+    pub last_recorded_at: Option<DateTime<Utc>>,
+}
+
+impl TerminalRecordingMetadata {
+    /// Empty / "no recording" instance for a session id.
+    #[must_use]
+    pub fn empty(terminal_session_id: TerminalSessionId) -> Self {
+        Self {
+            terminal_session_id,
+            chunk_count: 0,
+            marker_count: 0,
+            first_seq: None,
+            last_seq: None,
+            first_recorded_at: None,
+            last_recorded_at: None,
+        }
+    }
+
+    /// `true` iff at least one chunk OR marker row exists.
+    #[must_use]
+    pub const fn has_recording(&self) -> bool {
+        self.chunk_count > 0 || self.marker_count > 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

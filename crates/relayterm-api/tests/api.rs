@@ -47,7 +47,7 @@ use relayterm_core::validation::{
 use relayterm_db::{
     Db, PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
     PgServerProfileRepository, PgSessionEventRepository, PgSshIdentityRepository,
-    PgTerminalSessionRepository, PgUserRepository,
+    PgTerminalRecordingRepository, PgTerminalSessionRepository, PgUserRepository,
 };
 use relayterm_ssh::{
     AuthAttemptKind, AuthCheckOutcome, AuthCheckTarget, CapturedHostKey, HostKeyPreflightService,
@@ -10271,5 +10271,562 @@ async fn change_password_bad_origin_returns_403_before_verify(pool: PgPool) {
             .iter()
             .any(|e| e.kind == AuditEventKind::PasswordChanged),
         "CSRF-rejected request must not write a password_changed audit row",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Terminal recording read API
+// ----------------------------------------------------------------------
+
+/// Sentinel bytes inserted into a chunk payload. Tests assert the raw
+/// sentinel never reaches a JSON body except via the base64 wrapper.
+const RECORDING_API_PAYLOAD_SENTINEL: &[u8] = b"PTY-OUTPUT-SENTINEL-API-7Q";
+
+/// Create a terminal-session row directly via the repository, bypassing
+/// the API. Owned by `owner` and bound to `profile`.
+async fn create_terminal_session_row(
+    pool: &PgPool,
+    owner: UserId,
+    profile: relayterm_core::ids::ServerProfileId,
+) -> relayterm_core::ids::TerminalSessionId {
+    PgTerminalSessionRepository::new(pool.clone())
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: owner,
+            server_profile_id: profile,
+            status: TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect("create terminal session row")
+        .id
+}
+
+/// Append a chunk row to the recording for `session`. Wraps the
+/// repository call so tests can keep the payload literal small.
+async fn append_recording_chunk(
+    pool: &PgPool,
+    session: relayterm_core::ids::TerminalSessionId,
+    seq_start: i64,
+    seq_end: i64,
+    payload: &[u8],
+) {
+    use relayterm_core::repository::TerminalRecordingRepository;
+    PgTerminalRecordingRepository::new(pool.clone())
+        .append_chunk(relayterm_core::repository::CreateTerminalRecordingChunk {
+            terminal_session_id: session,
+            seq_start,
+            seq_end,
+            byte_len: payload.len() as i32,
+            payload: payload.to_vec(),
+            encryption: relayterm_core::TerminalRecordingPayloadEncryption::None,
+            compression: relayterm_core::TerminalRecordingCompression::None,
+        })
+        .await
+        .expect("append recording chunk");
+}
+
+async fn append_recording_marker(
+    pool: &PgPool,
+    session: relayterm_core::ids::TerminalSessionId,
+    kind: relayterm_core::TerminalRecordingMarkerKind,
+    seq: i64,
+    payload: Value,
+) {
+    use relayterm_core::repository::TerminalRecordingRepository;
+    PgTerminalRecordingRepository::new(pool.clone())
+        .append_marker(relayterm_core::repository::CreateTerminalRecordingMarker {
+            terminal_session_id: session,
+            kind,
+            seq,
+            payload,
+        })
+        .await
+        .expect("append recording marker");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_read_routes_return_401_without_session_cookie(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+    let bogus = uuid::Uuid::new_v4();
+
+    for path in [
+        format!("/api/v1/terminal-sessions/{bogus}/recording/metadata"),
+        format!("/api/v1/terminal-sessions/{bogus}/recording/chunks"),
+        format!("/api/v1/terminal-sessions/{bogus}/recording/markers"),
+    ] {
+        let resp = app.clone().oneshot(get_no_auth(&path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "path={path}");
+        let body = read_body(resp).await;
+        assert_eq!(body["error"]["code"], "unauthorized");
+        assert_eq!(body["error"]["message"], "unauthorized");
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_unknown_session_returns_404(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let bogus = uuid::Uuid::new_v4();
+    let resp = app
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{bogus}/recording/metadata"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+    assert_eq!(body["error"]["message"], "terminal_session not found");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_routes_foreign_owned_returns_indistinguishable_404(pool: PgPool) {
+    // Same shape as the existing terminal-session ownership tests: a
+    // foreign-owned id MUST collapse to a byte-identical 404 response
+    // with a wholly-bogus id, so cross-user existence is never leaked.
+    let other_user = create_user(&pool, "other").await;
+    let foreign_profile = make_owned_profile(
+        &pool,
+        other_user,
+        &test_vault(),
+        "foreign-rec",
+        "foreign-rec.example.com",
+    )
+    .await;
+    let foreign_session = create_terminal_session_row(&pool, other_user, foreign_profile).await;
+    // Recording rows on the foreign session — the route must not even
+    // hint at their existence to a different caller.
+    append_recording_chunk(&pool, foreign_session, 1, 4, RECORDING_API_PAYLOAD_SENTINEL).await;
+    append_recording_marker(
+        &pool,
+        foreign_session,
+        relayterm_core::TerminalRecordingMarkerKind::Started,
+        0,
+        json!({}),
+    )
+    .await;
+
+    let (app, _user, cookie) = setup(pool.clone()).await;
+
+    let bogus = uuid::Uuid::new_v4();
+    for path_template in [
+        "/api/v1/terminal-sessions/{}/recording/metadata",
+        "/api/v1/terminal-sessions/{}/recording/chunks",
+        "/api/v1/terminal-sessions/{}/recording/markers",
+    ] {
+        let bogus_path = path_template.replace("{}", &bogus.to_string());
+        let bogus_resp = app
+            .clone()
+            .oneshot(get(&bogus_path, &cookie))
+            .await
+            .unwrap();
+        let bogus_status = bogus_resp.status();
+        let bogus_body = read_body(bogus_resp).await;
+        assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+        let foreign_path = path_template.replace("{}", &foreign_session.to_string());
+        let resp = app
+            .clone()
+            .oneshot(get(&foreign_path, &cookie))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), bogus_status, "path={foreign_path}");
+        let body = read_body(resp).await;
+        assert_eq!(
+            body, bogus_body,
+            "foreign-owned 404 must be byte-identical to a genuine 404 (path={foreign_path})",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_metadata_empty_session_returns_no_recording(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "empty-rec",
+        "empty-rec.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/metadata"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["has_recording"], false);
+    assert_eq!(body["chunk_count"], 0);
+    assert_eq!(body["marker_count"], 0);
+    assert!(body["first_seq"].is_null());
+    assert!(body["last_seq"].is_null());
+    assert!(body["first_recorded_at"].is_null());
+    assert!(body["last_recorded_at"].is_null());
+
+    // Empty chunks / markers lists.
+    let chunks = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/chunks"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(chunks.status(), StatusCode::OK);
+    let chunks_body = read_body(chunks).await;
+    assert_eq!(chunks_body.as_array().unwrap().len(), 0);
+
+    let markers = app
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/markers"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(markers.status(), StatusCode::OK);
+    let markers_body = read_body(markers).await;
+    assert_eq!(markers_body.as_array().unwrap().len(), 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_routes_owner_can_read_metadata_chunks_markers(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "rec-owner",
+        "rec-owner.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+    append_recording_marker(
+        &pool,
+        session,
+        relayterm_core::TerminalRecordingMarkerKind::Started,
+        0,
+        json!({}),
+    )
+    .await;
+    append_recording_chunk(&pool, session, 1, 4, RECORDING_API_PAYLOAD_SENTINEL).await;
+    append_recording_chunk(&pool, session, 100, 110, b"second-chunk").await;
+    append_recording_marker(
+        &pool,
+        session,
+        relayterm_core::TerminalRecordingMarkerKind::Resized,
+        17,
+        json!({ "cols": 132, "rows": 40 }),
+    )
+    .await;
+
+    // Metadata.
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/metadata"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["has_recording"], true);
+    assert_eq!(body["chunk_count"], 2);
+    assert_eq!(body["marker_count"], 2);
+    assert_eq!(body["first_seq"], 1);
+    assert_eq!(body["last_seq"], 110);
+    assert!(body["first_recorded_at"].is_string());
+    assert!(body["last_recorded_at"].is_string());
+    assert_eq!(
+        body["terminal_session_id"].as_str().unwrap(),
+        session.to_string()
+    );
+
+    // Chunks: data_b64 round-trips back to the sentinel; raw sentinel
+    // string must NOT appear anywhere outside the base64 surface.
+    let chunks = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/chunks"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(chunks.status(), StatusCode::OK);
+    let chunks_body = read_body(chunks).await;
+    let arr = chunks_body.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    let first = &arr[0];
+    assert_eq!(first["seq_start"], 1);
+    assert_eq!(first["seq_end"], 4);
+    assert_eq!(first["encryption"], "none");
+    assert_eq!(first["compression"], "none");
+    assert_eq!(
+        first["byte_len"],
+        RECORDING_API_PAYLOAD_SENTINEL.len() as i64
+    );
+    let data_b64 = first["data_b64"].as_str().expect("data_b64 string");
+    let decoded = relayterm_protocol::output_data_decode(data_b64)
+        .expect("data_b64 decodes via the protocol helper");
+    assert_eq!(decoded, RECORDING_API_PAYLOAD_SENTINEL);
+
+    // Sentinel must NOT be present anywhere in the JSON body except via
+    // the base64-encoded `data_b64` field.
+    let raw_json = chunks_body.to_string();
+    let sentinel_str = std::str::from_utf8(RECORDING_API_PAYLOAD_SENTINEL).unwrap();
+    assert!(
+        !raw_json.contains(sentinel_str),
+        "raw payload sentinel must not appear in JSON body: {raw_json}",
+    );
+
+    // Markers.
+    let markers = app
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/markers"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(markers.status(), StatusCode::OK);
+    let markers_body = read_body(markers).await;
+    let marr = markers_body.as_array().unwrap();
+    assert_eq!(marr.len(), 2);
+    assert_eq!(marr[0]["kind"], "started");
+    assert_eq!(marr[0]["seq"], 0);
+    assert_eq!(marr[1]["kind"], "resized");
+    assert_eq!(marr[1]["seq"], 17);
+    assert_eq!(marr[1]["payload"]["cols"], 132);
+    assert_eq!(marr[1]["payload"]["rows"], 40);
+
+    // Marker payload must NOT contain terminal byte sentinels — markers
+    // are metadata-only by writer contract.
+    let raw_markers = markers_body.to_string();
+    assert!(
+        !raw_markers.contains(sentinel_str),
+        "marker JSON must not contain raw terminal bytes: {raw_markers}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunks_from_seq_filter_works(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "rec-from-seq",
+        "rec-from-seq.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+    for &(start, end) in &[(1_i64, 9_i64), (100, 109), (200, 209), (300, 309)] {
+        append_recording_chunk(&pool, session, start, end, b"data").await;
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/chunks?from_seq=150"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let starts: Vec<i64> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["seq_start"].as_i64().unwrap())
+        .collect();
+    assert_eq!(starts, vec![200, 300]);
+
+    // limit=1 still returns the smallest matching item.
+    let resp = app
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/chunks?from_seq=150&limit=1"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let body = read_body(resp).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["seq_start"], 200);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_routes_reject_negative_from_seq(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "rec-neg",
+        "rec-neg.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+
+    for path in [
+        format!("/api/v1/terminal-sessions/{session}/recording/chunks?from_seq=-1"),
+        format!("/api/v1/terminal-sessions/{session}/recording/markers?from_seq=-5"),
+    ] {
+        let resp = app.clone().oneshot(get(&path, &cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "path={path}");
+        let body = read_body(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_input");
+        // Wire body must not echo the offending value.
+        assert!(
+            !body.to_string().contains("-1") && !body.to_string().contains("-5"),
+            "wire body must not echo the offending from_seq value: {body}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_routes_reject_malformed_query_params(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "rec-malformed",
+        "rec-malformed.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+
+    // axum's `Query` extractor 400s on non-numeric / out-of-range values
+    // BEFORE the handler runs. The default `QueryRejection` body is plain
+    // text (not the API JSON envelope) — confirm the offending value is
+    // NOT reflected in the bytes a probe would observe. A future change
+    // that swaps the rejection for a JSON envelope MUST keep the same
+    // "no value reflected" property.
+    for (path, sentinel) in [
+        (
+            format!("/api/v1/terminal-sessions/{session}/recording/chunks?limit=not-a-number"),
+            "not-a-number",
+        ),
+        (
+            format!("/api/v1/terminal-sessions/{session}/recording/chunks?from_seq=abc"),
+            "abc",
+        ),
+    ] {
+        let resp = app.clone().oneshot(get(&path, &cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "path={path}");
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        let body_text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body_text.contains(sentinel),
+            "wire body must not echo offending query value `{sentinel}`: {body_text}",
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_chunks_limit_caps_at_max(pool: PgPool) {
+    // Asking for limit=u32::MAX must clamp at the API-layer ceiling
+    // (1024) — no caller can pull a whole session's worth of chunks
+    // in one query. With only 5 inserted rows we can't observe the
+    // 1024 ceiling directly here; the unit-test `limit_clamping_table`
+    // in `routes::v1::terminal_recordings::tests` pins the clamp logic
+    // exactly. This test pins that the route accepts u32::MAX without
+    // 500-ing on the bind / query path.
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "rec-limit",
+        "rec-limit.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+    // Insert a small handful — clamp logic doesn't need 1024+ rows to
+    // verify it accepted the request and didn't 500.
+    for i in 0..5_i64 {
+        let seq_start = 1 + i * 10;
+        append_recording_chunk(&pool, session, seq_start, seq_start + 5, b"data").await;
+    }
+
+    let resp = app
+        .oneshot(get(
+            &format!("/api/v1/terminal-sessions/{session}/recording/chunks?limit=4294967295"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body.as_array().unwrap().len(), 5);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn recording_read_routes_write_no_audit_rows(pool: PgPool) {
+    // Read endpoints are intentionally NOT audited — pin the contract
+    // so a future "add a recording_read audit_kind" change is forced
+    // through review.
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let profile = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "rec-noaudit",
+        "rec-noaudit.example.com",
+    )
+    .await;
+    let session = create_terminal_session_row(&pool, user_id, profile).await;
+    append_recording_chunk(&pool, session, 1, 2, RECORDING_API_PAYLOAD_SENTINEL).await;
+    append_recording_marker(
+        &pool,
+        session,
+        relayterm_core::TerminalRecordingMarkerKind::Started,
+        0,
+        json!({}),
+    )
+    .await;
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let before = audit.recent(50).await.unwrap().len();
+
+    for path in [
+        format!("/api/v1/terminal-sessions/{session}/recording/metadata"),
+        format!("/api/v1/terminal-sessions/{session}/recording/chunks"),
+        format!("/api/v1/terminal-sessions/{session}/recording/markers"),
+    ] {
+        let resp = app.clone().oneshot(get(&path, &cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "path={path}");
+    }
+
+    let after = audit.recent(50).await.unwrap().len();
+    assert_eq!(
+        before, after,
+        "recording read endpoints must not write audit rows",
     );
 }

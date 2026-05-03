@@ -13,6 +13,7 @@ pub(crate) mod auth;
 mod hosts;
 mod server_profiles;
 mod ssh_identities;
+mod terminal_recordings;
 mod terminal_sessions;
 
 pub(crate) fn router() -> Router<AppState> {
@@ -22,5 +23,8 @@ pub(crate) fn router() -> Router<AppState> {
         .nest("/hosts", hosts::router())
         .nest("/server-profiles", server_profiles::router())
         .nest("/ssh-identities", ssh_identities::router())
-        .nest("/terminal-sessions", terminal_sessions::router())
+        .nest(
+            "/terminal-sessions",
+            terminal_sessions::router().merge(terminal_recordings::router()),
+        )
 }
