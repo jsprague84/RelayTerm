@@ -1,0 +1,155 @@
+# syntax=docker/dockerfile:1.7
+
+# Multi-stage build for the RelayTerm backend.
+#
+# Final stages:
+#   - runtime  (default): a slim Debian image carrying only the
+#                         `relayterm-backend` release binary and CA certs.
+#   - migrate            : a slim Debian image carrying `sqlx-cli` and the
+#                         `apps/backend/migrations/` folder, intended to
+#                         be run as a one-shot side container before the
+#                         backend service starts.
+#
+# Build the runtime image (default):
+#   docker build -f Dockerfile.backend -t relayterm-backend .
+#
+# Build the migration image:
+#   docker build -f Dockerfile.backend --target migrate \
+#                -t relayterm-migrate .
+#
+# Neither stage bakes secrets into the image. Configuration is supplied
+# at run time via `RELAYTERM_*` env vars and/or a TOML file mounted via
+# `RELAYTERM_CONFIG`. See `docs/deployment/docker-compose.md`.
+
+# `rust-version` in `Cargo.toml` claims MSRV 1.85, but workspace code
+# consumes language features that landed after that (e.g. `if let
+# chains`, stabilised in Rust 1.88). The repo has no
+# `rust-toolchain.toml` pin yet, so the working source of truth is
+# whatever local dev compiles against — currently 1.95. Pin the
+# builder to match so container and host compile against the same
+# compiler. Bump this in lockstep when the project bumps its dev
+# toolchain; ideally a future slice adds a `rust-toolchain.toml`
+# at the repo root and this `ARG` reads from that single source.
+ARG RUST_VERSION=1.95
+ARG DEBIAN_VERSION=bookworm-slim
+
+
+# ---------------------------------------------------------------------------
+# Builder stage — compiles the workspace in release mode and installs
+# `sqlx-cli` into a known path so the migrate stage can copy it.
+# ---------------------------------------------------------------------------
+FROM rust:${RUST_VERSION}-bookworm AS builder
+
+WORKDIR /workspace
+
+# Install build dependencies. `pkg-config` and `libssl-dev` are not
+# strictly required (`sqlx` uses `rustls` and the workspace forbids
+# `unsafe_code`), but `git` is needed by some build scripts and the
+# defaults are kept narrow.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        pkg-config \
+        ca-certificates \
+        git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire workspace. This is intentionally a single COPY rather
+# than a manifests-first cache trick: the workspace has many crates and
+# the manifest-only fake-build pattern is fragile across `path = "..."`
+# dependencies. Layer caching still works — rebuilding without source
+# edits hits the cargo cache. If build time becomes a problem, a future
+# slice can wire `cargo-chef` or sccache.
+COPY . .
+
+# Build the backend binary.
+RUN --mount=type=cache,target=/workspace/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --bin relayterm-backend \
+ && cp target/release/relayterm-backend /usr/local/bin/relayterm-backend
+
+# Build sqlx-cli with only the features we need (postgres + rustls).
+# Pinned to the same minor line as the workspace `sqlx` dependency so
+# the migration semantics match the application's compile-time queries.
+RUN --mount=type=cache,target=/workspace/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install sqlx-cli \
+        --version ^0.8 \
+        --no-default-features \
+        --features postgres,rustls \
+        --root /sqlx-out
+
+
+# ---------------------------------------------------------------------------
+# Migrate stage — minimal image carrying `sqlx-cli` and the migrations
+# folder. Intended to run once on deploy / upgrade:
+#
+#   docker compose --profile migrate run --rm relayterm-migrate
+#
+# Reads `DATABASE_URL` from the environment (sqlx-cli's standard
+# convention). Keeping migrations in a separate image keeps the runtime
+# image small AND keeps the migration step explicit — `relayterm-backend`
+# itself does NOT auto-run migrations.
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_VERSION} AS migrate
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 relayterm \
+ && useradd  --system --uid 10001 --gid relayterm \
+             --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin \
+             relayterm
+
+COPY --from=builder /sqlx-out/bin/sqlx /usr/local/bin/sqlx
+COPY --from=builder /workspace/apps/backend/migrations /app/migrations
+
+WORKDIR /app
+
+USER relayterm:relayterm
+
+# The default command applies pending migrations against `$DATABASE_URL`.
+# Operators can override the command for a dry run (`sqlx migrate info`)
+# or a revert (`sqlx migrate revert`).
+ENTRYPOINT ["/usr/bin/tini", "--", "sqlx"]
+CMD ["migrate", "run", "--source", "/app/migrations"]
+
+
+# ---------------------------------------------------------------------------
+# Runtime stage — minimal Debian image with the backend binary, CA certs,
+# and a non-root user. No source code, no `target/`, no migrations.
+#
+# This is the LAST stage in the file so that a bare
+# `docker build -f Dockerfile.backend .` produces the backend runtime
+# image (the migrate image is opt-in via `--target migrate`).
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_VERSION} AS runtime
+
+# `wget` is here purely for the container healthcheck in the example
+# Compose stack (`relayterm-backend.healthcheck`). It adds ~600 KB; the
+# trade-off versus dragging in `curl` or relying on bash's `/dev/tcp`
+# (which doesn't exist on dash) is acceptable. Operators who want a
+# leaner image can drop it AND swap the healthcheck for a sidecar.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+        wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 relayterm \
+ && useradd  --system --uid 10001 --gid relayterm \
+             --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin \
+             relayterm
+
+COPY --from=builder /usr/local/bin/relayterm-backend /usr/local/bin/relayterm-backend
+
+USER relayterm:relayterm
+
+# The backend binds `127.0.0.1:8080` by default. Inside a container that
+# is unreachable from the rest of the compose network, so the deploy
+# example sets `RELAYTERM_SERVER__BIND=0.0.0.0:8080`. The port number
+# itself is policy-free and can be remapped via env.
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/relayterm-backend"]

@@ -1,0 +1,49 @@
+# Build context exclusions for `Dockerfile.backend` / `Dockerfile.web`.
+# Keep this lean so `docker build` doesn't pay for the host's caches.
+
+# Rust artefacts (regenerated inside the builder).
+target/
+**/target/
+
+# Node / pnpm artefacts (regenerated inside the builder).
+node_modules/
+**/node_modules/
+.pnpm-store/
+**/.pnpm-store/
+dist/
+**/dist/
+.svelte-kit/
+**/.svelte-kit/
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# VCS.
+.git/
+.gitignore
+
+# Local secrets / overrides — never ship into an image.
+.env
+.env.*
+config/relayterm.local.toml
+
+# Editor / OS.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Tauri scaffolds — not needed for backend / web builds.
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/mobile/src-tauri/target/
+apps/mobile/src-tauri/gen/
+
+# Docker scaffolding does not need to copy itself, but the Dockerfiles
+# themselves are required for `docker build -f` to find them.
+.dockerignore
+
+# Playwright MCP transient artefacts.
+.playwright-mcp/
+
+# Build / agent caches.
+.claude/

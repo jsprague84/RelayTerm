@@ -1,0 +1,215 @@
+# RelayTerm — example production-like Compose stack.
+#
+# Copy this file alongside `relayterm.env.example` (rename to `.env`) on
+# your deploy host, fill in the secrets, then:
+#
+#   # 1. Apply database migrations (one-shot).
+#   docker compose --profile migrate run --rm relayterm-migrate
+#
+#   # 2. Bring the stack up.
+#   docker compose up -d postgres relayterm-backend relayterm-web
+#
+# This stack is intended for self-hosted, single-host deployments. It is
+# NOT a release platform — no image registry push, no zero-downtime,
+# no multi-node HA, no automated backups. Operators who want any of
+# those layer them on top.
+#
+# Compose file format. v2 / current Compose Spec — `version:` is no
+# longer required and is intentionally omitted.
+
+name: relayterm
+
+services:
+  # -------------------------------------------------------------------
+  # Postgres. Internal-only by default; expose only if you need to run
+  # `psql` from the host. The recording corpus and every audit row live
+  # here, so the volume is the most important thing to back up.
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: relayterm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+    volumes:
+      - relayterm-pgdata:/var/lib/postgresql/data
+    networks:
+      - relayterm-internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------
+  # One-shot migrations. Profile-gated so it never runs as part of
+  # `docker compose up`. Operators run it manually before deploying a
+  # new image:
+  #
+  #   docker compose --profile migrate run --rm relayterm-migrate
+  #
+  # The image bundles `sqlx-cli` and the `apps/backend/migrations/`
+  # folder. `DATABASE_URL` is the canonical sqlx-cli env var; we set
+  # it from the same building blocks the backend uses so a single
+  # source of truth covers both.
+  # -------------------------------------------------------------------
+  relayterm-migrate:
+    profiles: [migrate]
+    image: relayterm-migrate:local
+    build:
+      context: ..
+      dockerfile: Dockerfile.backend
+      target: migrate
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    networks:
+      - relayterm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Backend. Bound to the internal compose network only — the web
+  # container reverse-proxies `/api` and `/healthz`. Do NOT expose a
+  # host port for the backend in production unless you have explicitly
+  # decided to (e.g. running another reverse proxy on the host that
+  # already terminates TLS and you want it to bypass nginx).
+  # -------------------------------------------------------------------
+  relayterm-backend:
+    image: relayterm-backend:local
+    build:
+      context: ..
+      dockerfile: Dockerfile.backend
+      target: runtime
+    restart: unless-stopped
+    environment:
+      # The backend defaults to 127.0.0.1:8080, which is unreachable
+      # from another container. Bind on all interfaces inside the
+      # container; the compose network keeps it private.
+      RELAYTERM_SERVER__BIND: 0.0.0.0:8080
+
+      # Database — required.
+      RELAYTERM_DATABASE__URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+      # Auth — see `relayterm.env.example` for the field rules. Every
+      # placeholder here must be a real value at deploy time. The
+      # boot-time validator in `apps/backend/src/config.rs` rejects a
+      # half-valid combination (empty allow-list, missing signing key,
+      # cookie_secure=false, etc.) before binding the listener.
+      RELAYTERM_AUTH__MODE: "${RELAYTERM_AUTH__MODE:-production}"
+      RELAYTERM_AUTH__ALLOWED_ORIGINS: "${RELAYTERM_AUTH__ALLOWED_ORIGINS:?set to your public origin (e.g. https://relayterm.example.com)}"
+      RELAYTERM_AUTH__COOKIE_SECURE: "${RELAYTERM_AUTH__COOKIE_SECURE:-true}"
+      RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64: "${RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64:?generate with openssl rand -base64 32}"
+      RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN: "${RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN:-}"
+
+      # Vault — required when `enabled = true` (default). The `:?`
+      # guard makes Compose itself emit a clear error if the operator
+      # forgets to set the key. To run without a vault, set
+      # `RELAYTERM_VAULT__ENABLED=false` AND remove the
+      # `RELAYTERM_VAULT__MASTER_KEY_B64` line from your `.env` (an
+      # empty value would still be injected and cause a confusing
+      # base64-decode error at boot).
+      RELAYTERM_VAULT__ENABLED: "${RELAYTERM_VAULT__ENABLED:-true}"
+      RELAYTERM_VAULT__MASTER_KEY_B64: "${RELAYTERM_VAULT__MASTER_KEY_B64:?generate with openssl rand -base64 32, or set RELAYTERM_VAULT__ENABLED=false and remove this line}"
+
+      # Terminal recording — OFF by default. Flip these only after
+      # reading `docs/terminal-recording.md` end-to-end (privacy
+      # posture in Section 7).
+      RELAYTERM_TERMINAL_RECORDING__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__ENABLED:-false}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS:-3600}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE:-250}"
+
+      # Tracing. The backend honors `RUST_LOG` via tracing_subscriber's
+      # env filter. Default keeps app-level info on, dependencies at
+      # warn.
+      RUST_LOG: "${RUST_LOG:-relayterm=info,axum=info,sqlx=warn,info}"
+    networks:
+      - relayterm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The backend exposes `/healthz` returning 200 `{"status":"ok"}`.
+    # Compose runs the healthcheck inside the container; we use the
+    # backend's bind so we never depend on the web container's nginx
+    # being up first.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1:8080/healthz >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # -------------------------------------------------------------------
+  # Web frontend. nginx serves the static SPA and proxies `/api` and
+  # `/healthz` to the backend. This container is the public-facing
+  # surface; in production it sits behind a TLS-terminating reverse
+  # proxy (Traefik / Caddy / outer nginx).
+  #
+  # The host port mapping below is intentionally `127.0.0.1:8081` so a
+  # bare `docker compose up` on a server does NOT expose plain HTTP to
+  # the public internet by default. Comment it out and use Traefik
+  # labels (or your reverse proxy of choice) to route public traffic
+  # to this service instead.
+  # -------------------------------------------------------------------
+  relayterm-web:
+    image: relayterm-web:local
+    build:
+      context: ..
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    environment:
+      RELAYTERM_BACKEND_URL: http://relayterm-backend:8080
+    ports:
+      - "127.0.0.1:8081:80"
+    networks:
+      - relayterm-internal
+    depends_on:
+      relayterm-backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1/_web_health >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+    # Example Traefik labels — UNCOMMENT and adjust for your domain when
+    # you deploy behind Traefik. Replace `relayterm.example.com` and the
+    # cert resolver name. The ACME / cert-resolver setup is operator-side
+    # configuration in your Traefik config and is intentionally not
+    # included here.
+    #
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.docker.network=relayterm-internal"
+    #   - "traefik.http.routers.relayterm.rule=Host(`relayterm.example.com`)"
+    #   - "traefik.http.routers.relayterm.entrypoints=websecure"
+    #   - "traefik.http.routers.relayterm.tls=true"
+    #   - "traefik.http.routers.relayterm.tls.certresolver=letsencrypt"
+    #   - "traefik.http.services.relayterm.loadbalancer.server.port=80"
+
+volumes:
+  relayterm-pgdata:
+
+networks:
+  # All services live on this internal network. There is no `external:
+  # true` here because this stack is the unit of deployment; if you
+  # plug Traefik in, attach Traefik's container to this network with
+  # `--network relayterm_relayterm-internal` (compose-prefixed name) or
+  # promote the network to `external: true` and create it ahead of
+  # time.
+  relayterm-internal:
+    driver: bridge

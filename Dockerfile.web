@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.7
+
+# Multi-stage build for the RelayTerm web frontend.
+#
+#   Stage 1: builder — Node + pnpm builds the Vite production bundle from
+#                      `apps/web/`. The dev-lab and experimental
+#                      renderers are tree-shaken out by `import.meta.env.DEV`
+#                      gates in the source — see
+#                      `apps/web/tests/appShellIsolation.test.ts`.
+#   Stage 2: runtime — nginx alpine serves the built static assets and
+#                      proxies `/api` (with WebSocket upgrade) and
+#                      `/healthz` to the backend service. Same-origin
+#                      proxying is required for the cookie + CSRF posture
+#                      RelayTerm assumes (see SPEC.md, "Production
+#                      authentication architecture").
+
+ARG NODE_VERSION=22
+ARG NGINX_VERSION=1.27-alpine
+
+
+# ---------------------------------------------------------------------------
+# Builder — pnpm install + vite build.
+# ---------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-bookworm-slim AS builder
+
+ENV CI=1
+ENV NODE_ENV=production
+
+# Use the package manager pinned by `package.json#packageManager` via
+# corepack. This keeps the build reproducible against the lockfile
+# without hard-coding a version here.
+RUN corepack enable
+
+WORKDIR /workspace
+
+# Copy the entire workspace. Vite imports TypeScript source from the
+# `@relayterm/terminal-*` workspace packages directly (their
+# `package.json#main` points at `src/index.ts`), so the build needs the
+# packages on disk — a manifests-only install would not be enough.
+COPY . .
+
+# `--frozen-lockfile` enforces lockfile correctness. The web frontend
+# does not depend on the Tauri shells, so we install scoped to just
+# `apps/web` and the workspace packages it pulls in.
+RUN pnpm install --frozen-lockfile --filter @relayterm/web...
+
+# Build the production bundle. NODE_ENV=production above + Vite's own
+# build mode together drop dev-only branches (`import.meta.env.DEV`).
+RUN pnpm --filter @relayterm/web build
+
+
+# ---------------------------------------------------------------------------
+# Runtime — nginx alpine serves /usr/share/nginx/html and proxies /api.
+# ---------------------------------------------------------------------------
+FROM nginx:${NGINX_VERSION} AS runtime
+
+# The proxy target is supplied at deploy time. The default points at the
+# `relayterm-backend` service name on the compose network; operators can
+# override it for a non-compose deployment.
+ENV RELAYTERM_BACKEND_URL=http://relayterm-backend:8080
+
+# Replace the default site config with the RelayTerm one. Templated so
+# `RELAYTERM_BACKEND_URL` lands in the rendered config at container
+# start (nginx alpine runs `envsubst` over `/etc/nginx/templates/*.template`
+# automatically before launching nginx).
+RUN rm -f /etc/nginx/conf.d/default.conf
+COPY deploy/nginx/web.conf.template /etc/nginx/templates/relayterm.conf.template
+
+# Drop the built bundle into the document root.
+COPY --from=builder /workspace/apps/web/dist /usr/share/nginx/html
+
+EXPOSE 80

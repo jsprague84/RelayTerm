@@ -1,0 +1,102 @@
+# RelayTerm web frontend — nginx site config.
+#
+# Rendered at container start by nginx alpine's `envsubst` over
+# `/etc/nginx/templates/*.template`. The only variable consumed is
+# `${RELAYTERM_BACKEND_URL}` (e.g. `http://relayterm-backend:8080`).
+#
+# Same-origin contract — production-auth posture:
+#   * Browser hits `https://relayterm.example.com/...`.
+#   * The reverse proxy (Traefik / Caddy / outer nginx) terminates TLS
+#     and forwards every request to THIS nginx as the upstream.
+#   * THIS nginx serves the static SPA bundle for `/` and `/assets/*`,
+#     and reverse-proxies `/api/*` (with WebSocket upgrade) and
+#     `/healthz` to the backend service over the internal compose
+#     network.
+#   * The browser therefore sees a single origin for HTML and the API,
+#     which is what RelayTerm's `auth.allowed_origins` + cookie posture
+#     assume.
+
+# WebSocket upgrade map. `Connection: upgrade` is the only header value
+# we want to set when the client is upgrading; for plain HTTP requests,
+# the existing `Connection` header (or its absence) is preserved by an
+# empty string default.
+map $http_upgrade $relayterm_connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Static asset cache — Vite emits content-hashed filenames under
+    # `/assets/`, so they're safe to cache aggressively.
+    location /assets/ {
+        access_log off;
+        try_files $uri =404;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Backend health passthrough. The backend exposes `/healthz`
+    # unauthenticated and returns 200 `{"status":"ok"}`.
+    location = /healthz {
+        proxy_pass ${RELAYTERM_BACKEND_URL};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # API + terminal WebSocket. The terminal attach endpoint is
+    # `/api/v1/terminal-sessions/:id/ws`; the upgrade headers below
+    # cover both REST and WS under the same prefix.
+    location /api/ {
+        proxy_pass ${RELAYTERM_BACKEND_URL};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $relayterm_connection_upgrade;
+
+        # Preserve the browser's Origin so the backend's CSRF / Origin
+        # allow-list (`auth.allowed_origins`) sees the public URL the
+        # operator configured. Proxy-side rewriting would defeat the
+        # check entirely.
+        proxy_set_header Host             $host;
+        proxy_set_header Origin           $http_origin;
+        proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Faster failure when the backend is unreachable — default
+        # would hold the browser for ~60s before returning 502.
+        proxy_connect_timeout 10s;
+
+        # Long-lived terminal sessions. nginx's default 60s read
+        # timeout would close an idle WebSocket; bump generously.
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+
+        # Disable response buffering so PTY frames stream through
+        # without nginx coalescing them.
+        proxy_buffering off;
+    }
+
+    # SPA fallback — every non-asset path returns `index.html` so the
+    # client-side router can resolve the URL. The Vite dev lab is
+    # tree-shaken out at build time (`import.meta.env.DEV`), so there
+    # is no `/lab` or `/dev/*` to worry about.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Server-side healthcheck endpoint for compose / external probes.
+    # Distinct from `/healthz` (which proxies to the backend) so a
+    # backend outage does not mark the web container unhealthy.
+    location = /_web_health {
+        access_log off;
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+}
