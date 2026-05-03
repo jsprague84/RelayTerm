@@ -21,15 +21,20 @@
 # at run time via `RELAYTERM_*` env vars and/or a TOML file mounted via
 # `RELAYTERM_CONFIG`. See `docs/deployment/docker-compose.md`.
 
-# `rust-version` in `Cargo.toml` claims MSRV 1.85, but workspace code
-# consumes language features that landed after that (e.g. `if let
-# chains`, stabilised in Rust 1.88). The repo has no
-# `rust-toolchain.toml` pin yet, so the working source of truth is
-# whatever local dev compiles against — currently 1.95. Pin the
-# builder to match so container and host compile against the same
-# compiler. Bump this in lockstep when the project bumps its dev
-# toolchain; ideally a future slice adds a `rust-toolchain.toml`
-# at the repo root and this `ARG` reads from that single source.
+# `rust-version` in `Cargo.toml` is the public MSRV claim (1.85).
+# `edition = "2024"` is the only post-1.85 language feature currently in
+# use, and 1.85 is the version that stabilised it — so the workspace
+# does in fact compile cleanly at the MSRV today. The 1.95 pin here is
+# NOT driven by a specific feature requirement; it tracks the working
+# local dev toolchain so the container compiler matches host
+# diagnostics (including new lints / clippy nudges) and so a CI build
+# does not surface a warning the dev never saw. The repo has no
+# `rust-toolchain.toml` pin yet — the Dockerfile is therefore the de
+# facto source of truth for "what Rust does CI build with". A future
+# slice should add a `rust-toolchain.toml` at the repo root and this
+# `ARG` should read from that single source. Bump in lockstep with
+# `.forgejo/workflows/ci.yml` and the §5.1 / §6.3 base-image table in
+# `docs/deployment/docker-compose.md`.
 ARG RUST_VERSION=1.95
 ARG DEBIAN_VERSION=bookworm-slim
 

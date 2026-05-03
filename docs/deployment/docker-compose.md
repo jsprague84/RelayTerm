@@ -356,13 +356,117 @@ docker build -f Dockerfile.web -t relayterm-web:local .
 Dockerfiles automatically (paths are relative to the repo root via
 `context: ..`).
 
-Image registry push, tag policy, and image signing are intentionally
-out of scope for this slice — when CI lands, that's the layer that
-publishes images.
+### 5.1 Selected base images
+
+The Dockerfiles pin every base image with a versioned `ARG`. CI in
+`.forgejo/workflows/ci.yml` mirrors these pins exactly — bumping any
+of them is one commit that touches the Dockerfile, the workflow, and
+this section.
+
+| Image | Pin | Why |
+|---|---|---|
+| `rust:${RUST_VERSION}-bookworm` | `RUST_VERSION=1.95` | The Cargo.toml-declared MSRV is `rust-version = "1.85"` and `edition = "2024"` is the only post-1.85 language feature currently in use (1.85 stabilised it), so the workspace compiles cleanly at MSRV today. The 1.95 pin here is NOT driven by a specific feature requirement — it tracks the working local dev toolchain so the container compiler matches host diagnostics (including new lints and clippy nudges) and so a CI build does not surface a warning the dev never saw. The repo has no `rust-toolchain.toml` yet; the Dockerfile is the de facto source of truth for "what Rust does CI build with". A future slice should add a `rust-toolchain.toml` at the repo root and have this `ARG` read from it. |
+| `node:${NODE_VERSION}-bookworm-slim` | `NODE_VERSION=22` | Node 22 is the current LTS line. `package.json#packageManager` (`pnpm@10.33.0`) is the source of truth for pnpm — corepack handles the activation in both the Dockerfile and CI, so there's nothing to pin twice. |
+| `nginx:${NGINX_VERSION}` | `NGINX_VERSION=1.27-alpine` | Stable line. The `envsubst`-on-`/etc/nginx/templates/*.template` behaviour the runtime stage relies on is alpine-specific. |
+| `debian:${DEBIAN_VERSION}` | `DEBIAN_VERSION=bookworm-slim` | Matches the `bookworm` base of the Rust builder so `glibc` versions line up between build and runtime. |
+
+## 6. CI image build (Forgejo Actions)
+
+`.forgejo/workflows/ci.yml` runs three jobs on every push to `main` and
+every pull request:
+
+1. **`rust-checks`** — `cargo fmt --all -- --check`, `cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+   The workspace integration tests on `relayterm-db` and
+   `relayterm-api` are gated behind a `postgres-tests` cargo feature
+   and do NOT run in CI — they require a live Postgres reachable via
+   `DATABASE_URL` and are exercised manually per
+   [`crates/relayterm-db/tests/repositories.rs`](../../crates/relayterm-db/tests/repositories.rs).
+2. **`web-checks`** — `pnpm install --frozen-lockfile`, `pnpm -r
+   check`, `pnpm -r build`, `pnpm -r test`. pnpm is activated via
+   `corepack` against the version pinned in
+   `package.json#packageManager`.
+3. **`docker-build`** — `docker build` for `Dockerfile.backend`
+   (`runtime` and `migrate` targets) and `Dockerfile.web`. Build-only;
+   the workflow does NOT push to a registry.
+
+### 6.1 Runner Docker access
+
+The `docker-build` job runs `docker build` from inside the job
+container. Forgejo runners do NOT expose the host Docker daemon by
+default — you must configure ONE of the following in the runner's
+`config.yml`:
+
+- **Socket mount** (preferred for self-hosted runners on a trusted
+  host):
+  ```yaml
+  container:
+    docker_host: 'automount'
+  ```
+  Forgejo Runner mounts the host's `/var/run/docker.sock` into the job
+  container as `/var/run/docker.sock`. The job's `docker:28-cli` image
+  then talks to the host daemon directly. Note: any job on this
+  runner can reach the host daemon, which is approximately equivalent
+  to root on the host.
+- **Docker-in-Docker** (preferred for shared/multi-tenant runners):
+  run a `docker:dind` sidecar and point `DOCKER_HOST` at it. The full
+  recipe is in
+  [Forgejo's docker-access docs](https://forgejo.org/docs/latest/admin/actions/docker-access).
+
+Without one of these, the `docker info` step in the workflow fails
+fast with a recognisable "Cannot connect to the Docker daemon" error
+— that's the operator's signal to fix runner config, not the
+workflow.
+
+### 6.2 What the workflow does NOT do
+
+Intentionally deferred — these will land in their own slices once
+conventions are set:
+
+- **Push to a registry.** Future slice will publish images to the
+  Forgejo container registry at `git.js-node.cc` after a tagging
+  policy and registry credentials are in place. Until then,
+  consumers build images locally per §5.
+- **Multi-arch / `linux/arm64`.** Single-arch builds only. A future
+  slice can wire `docker buildx` against a QEMU-backed builder.
+- **Image signing (cosign / notary), SBOM generation, vulnerability
+  scanning.** All deferred until publish lands.
+- **Build cache between runs.** The Dockerfiles use BuildKit cache
+  mounts, but no remote / registry cache is wired up. First-run CI
+  will be slow (fully recompiles the Rust workspace); cached reruns
+  on the same runner reuse the local BuildKit cache.
+- **Playwright / browser SSH smoke.** The browser smoke runbook in
+  [`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) is
+  intentionally manual.
+- **Production secrets in CI.** No registry tokens, deployment keys,
+  domain names, or test credentials live in the workflow. The first
+  registry-publish slice will add a token via Forgejo's `secrets`
+  mechanism — never inline.
+
+### 6.3 Updating the toolchain
+
+The workflow's Rust and Node major versions live alongside the
+matching `ARG` defaults in the Dockerfiles. Any bump is a single
+commit touching all of:
+
+- `Dockerfile.backend` `ARG RUST_VERSION=...`
+- `Dockerfile.web` `ARG NODE_VERSION=...`
+- `.forgejo/workflows/ci.yml` `container.image: rust:...` /
+  `node:...`
+- This section's "Selected base images" table.
+- `Cargo.toml` `rust-version = "..."` IF (and only if) the bump also
+  raises the MSRV — most local-toolchain bumps do NOT raise the
+  MSRV, since 1.85 is the floor that `edition = "2024"` requires.
+
+If the local `rustc --version` and the Dockerfile pin diverge, the
+Dockerfile is the source of truth — bump local rustup to match, then
+update all four (or five) files in the same commit. Cite the actual
+trigger in the commit message: a new lint, a new feature requirement,
+or just routine alignment with the local dev toolchain.
 
 ---
 
-## 6. Smoke / verification checklist
+## 7. Smoke / verification checklist
 
 After a fresh deploy or upgrade:
 
@@ -378,7 +482,7 @@ After a fresh deploy or upgrade:
 
 ---
 
-## 7. Deferred / out of scope
+## 8. Deferred / out of scope
 
 Tracking ledger for things this slice intentionally does NOT cover.
 File these as separate slices when they're needed:
@@ -390,10 +494,9 @@ File these as separate slices when they're needed:
 - Automated production secrets management (Vault auto-unwrap, etc).
 - Backup automation (snapshots, off-site replication).
 - Zero-downtime deploys (rolling restart, blue/green).
-- Forgejo Actions / CI workflows. The repo currently has no CI
-  workflows, and adding one was deferred until conventions are set —
-  see the next slice.
-- Image registry push and tag policy.
+- Image registry push and tag policy. The build-only CI from §6 will
+  graduate to publishing images to `git.js-node.cc` once a tagging
+  policy lands.
 - Production renderer selector (production stays on the
   `@relayterm/terminal-xterm` baseline; experimental renderers are
   dev-lab-only).

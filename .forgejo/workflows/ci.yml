@@ -1,0 +1,156 @@
+# RelayTerm Forgejo Actions CI — build-only.
+#
+# Scope:
+#   * cargo fmt / clippy / test (workspace, default features)
+#   * pnpm -r check / build / test
+#   * docker build for `Dockerfile.backend` (default and `--target migrate`)
+#     and `Dockerfile.web`
+#
+# Out of scope (intentionally deferred):
+#   * Pushing images to a registry (future slice will publish to
+#     git.js-node.cc's container registry once registry credentials and
+#     a tagging policy are in place).
+#   * Deployment / SSH / image signing / SBOM / multi-arch.
+#   * Playwright / browser SSH smoke (manual per `apps/web/e2e/SMOKE.md`).
+#
+# Runner requirements:
+#   * `docker` label on the Forgejo runner.
+#   * Docker daemon access for the `docker-build` job. The Forgejo
+#     runner config must enable EITHER `container.docker_host: automount`
+#     (socket mount) OR a Docker-in-Docker sidecar exposing
+#     `DOCKER_HOST` to the job. See
+#     https://forgejo.org/docs/latest/admin/actions/docker-access and
+#     `docs/deployment/docker-compose.md` ("CI image build" section).
+#
+# Toolchain pins (must stay in lockstep with the Dockerfiles):
+#   * Rust  1.95 — matches `Dockerfile.backend` `ARG RUST_VERSION`.
+#                  Tracks the working local dev toolchain, NOT a
+#                  specific language-feature requirement — Cargo.toml's
+#                  `rust-version = "1.85"` is the actual MSRV. Bumping
+#                  exists to keep CI's compiler diagnostics aligned
+#                  with what the dev sees locally.
+#   * Node  22   — matches `Dockerfile.web` `ARG NODE_VERSION`. Current
+#                  LTS line.
+#   * pnpm  pinned by `package.json#packageManager` via corepack.
+# Bumping any of these requires bumping the matching Dockerfile ARG and
+# `docs/deployment/docker-compose.md` "Selected base images" together.
+
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# Avoid running redundant CI on the same branch — when a new push lands
+# while a previous run is still in flight, cancel the older one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-checks:
+    name: rust checks (fmt + clippy + test)
+    runs-on: docker
+    container:
+      image: rust:1.95-bookworm
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rustup components (rustfmt + clippy)
+        # The official `rust:*` image ships rustfmt and clippy in the
+        # default profile, but `rustup component add` is idempotent and
+        # paves over surprises if the base image changes.
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # Default features only. The `postgres-tests` feature on
+        # `relayterm-db` and `relayterm-api` requires a live Postgres
+        # via `DATABASE_URL` — those integration tests are not part of
+        # the build-only CI gate. See `crates/relayterm-db/tests/`.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  web-checks:
+    name: web checks (check + build + test)
+    runs-on: docker
+    container:
+      image: node:22-bookworm-slim
+    env:
+      CI: "1"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: enable corepack (pnpm via package.json#packageManager)
+        run: |
+          corepack enable
+          # `corepack prepare` is implicit on first pnpm invocation, but
+          # making it explicit fails fast on a missing/wrong pin.
+          corepack prepare --activate
+          node --version
+          pnpm --version
+
+      - name: install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm check
+        run: pnpm -r check
+
+      - name: pnpm lint
+        # Several workspace packages (terminal-* renderers, apps/web)
+        # currently expose a "lint" script that is a no-op echo; this
+        # step is here so AGENTS.md "Definition of done" item 2 is
+        # actually gated by CI even if a future package wires real
+        # linting under the same script name.
+        run: pnpm -r lint
+
+      - name: pnpm build
+        run: pnpm -r build
+
+      - name: pnpm test
+        run: pnpm -r test
+
+  docker-build:
+    name: docker build (backend + migrate + web)
+    runs-on: docker
+    # `docker:28-cli` is a thin alpine image carrying just the Docker
+    # CLI. The job assumes the runner is configured with Docker daemon
+    # access (socket-mount or DinD) per the workflow header — without
+    # that, `docker build` will fail with "Cannot connect to the Docker
+    # daemon" and the message is the operator's signal to fix runner
+    # config, not the workflow.
+    container:
+      image: docker:28-cli
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: docker info
+        # Surfaces the daemon endpoint the job is talking to so a misconfigured
+        # runner produces a recognisable failure instead of a generic
+        # "connection refused" further down. Does NOT print credentials.
+        run: docker info
+
+      - name: build relayterm-backend (runtime)
+        run: docker build -f Dockerfile.backend -t relayterm-backend:ci .
+
+      - name: build relayterm-migrate (sqlx-cli + migrations)
+        run: docker build -f Dockerfile.backend --target migrate -t relayterm-migrate:ci .
+
+      - name: build relayterm-web
+        run: docker build -f Dockerfile.web -t relayterm-web:ci .
