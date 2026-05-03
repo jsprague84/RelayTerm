@@ -381,6 +381,74 @@ impl TerminalRecordingRepository for PgTerminalRecordingRepository {
         }))
     }
 
+    async fn list_eligible_for_retention(
+        &self,
+        retention_days: u32,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<TerminalSessionId>, RepositoryError> {
+        // Privacy contract: the projection is `terminal_sessions.id`
+        // ONLY. The eligibility filter touches `terminal_sessions`
+        // columns plus an `EXISTS (SELECT 1 FROM ... LIMIT 1)` against
+        // the recording tables — never `payload`, never `byte_len`.
+        // Aggregating bytes is the job of `purge_for_retention`, not
+        // this listing.
+        //
+        // Bound discipline: this is an internal sweep surface, NOT a
+        // user-paginated API call, so we do NOT apply the
+        // `LIST_LIMIT_CEILING = 1024` clamp the chunk / marker reads
+        // use — that clamp is defence-in-depth against arbitrary
+        // browser callers, but the retention sweep's `limit` already
+        // comes from the boot-validated `cleanup.batch_size` (capped
+        // at 10_000 by the config validator). Forcing the ceiling
+        // here would silently truncate a large operator-configured
+        // batch and let the `batch_truncated` signal go stale across
+        // restarts. The only safety floor we keep is `>= 1`.
+        //
+        // Ordering: `closed_at ASC` so the oldest backlog drains first
+        // across multiple sweep cycles.
+        let bounded_limit = i64::from(limit.max(1));
+        let retention_days_i32 =
+            i32::try_from(retention_days).map_err(|_| RepositoryError::Validation {
+                field: "retention_days",
+                message: format!("retention_days {retention_days} exceeds i32::MAX"),
+            })?;
+
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT s.id
+            FROM terminal_sessions AS s
+            WHERE s.closed_at IS NOT NULL
+              AND s.closed_at + make_interval(days => $1) <= $2
+              AND (
+                  EXISTS (
+                      SELECT 1
+                      FROM terminal_recording_chunks AS c
+                      WHERE c.terminal_session_id = s.id
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM terminal_recording_markers AS m
+                      WHERE m.terminal_session_id = s.id
+                  )
+              )
+            ORDER BY s.closed_at ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(retention_days_i32)
+        .bind(now)
+        .bind(bounded_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY_SESSION, e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id,)| TerminalSessionId::from_uuid(id))
+            .collect())
+    }
+
     async fn get_metadata(
         &self,
         terminal_session_id: TerminalSessionId,

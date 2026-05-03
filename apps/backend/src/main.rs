@@ -12,7 +12,10 @@ use relayterm_ssh::{
     HostKeyPreflightService, RusshAuthChecker, RusshHostKeyProbe, RusshPtyBridge,
     SshAuthCheckService, SshPtyBridge,
 };
-use relayterm_terminal::{RecordingRuntime, RecordingWriterConfig, TerminalSessionManager};
+use relayterm_terminal::{
+    RecordingRuntime, RecordingWriterConfig, TerminalSessionManager,
+    run_recording_retention_startup_sweep,
+};
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
@@ -100,6 +103,48 @@ async fn main() -> anyhow::Result<()> {
                 "terminal session startup reconciliation: \
                  swept orphaned sessions to closed",
             );
+        }
+    }
+
+    // Recording retention startup sweep (Stage A — `docs/terminal-recording.md`
+    // Section 12.7). Runs AFTER terminal-session reconciliation and
+    // BEFORE the HTTP listener binds. Bounded to one batch
+    // (`cleanup.batch_size`) so a long retention backlog does not
+    // block boot indefinitely; remaining work is picked up by the
+    // future Stage B periodic worker (not landed yet) or by the next
+    // backend restart.
+    //
+    // Cleanup is independent of `terminal_recording.enabled`
+    // (Section 12.6 independence rule): an operator who turned
+    // recording off after running it for some time MUST NOT have
+    // their existing recording corpus become immortal. The sweep
+    // therefore runs whenever `cleanup.enabled` AND
+    // `cleanup.startup_sweep_enabled` are both true, regardless of
+    // whether the chunk writer is active in this process.
+    //
+    // Failure semantics — fail-soft. Unlike Section 9.3
+    // reconciliation (which is fail-fast), a retention sweep failure
+    // is a `warn!` and the boot continues to the listener bind.
+    // Missing one sweep cycle is operationally undesirable but is not
+    // a security-relevant correctness issue — the corpus has not
+    // grown past its existing on-disk footprint by skipping a single
+    // sweep.
+    {
+        let cleanup = &cfg.terminal_recording.cleanup;
+        if cleanup.enabled && cleanup.startup_sweep_enabled {
+            let now = chrono::Utc::now();
+            let repo: Arc<dyn TerminalRecordingRepository> = Arc::new(db.terminal_recordings());
+            // The sweep is fully self-contained: it logs its own
+            // summary line and never returns an error. We capture the
+            // summary purely for the test seam — no operator-side
+            // log line should be emitted from main.rs.
+            let _summary = run_recording_retention_startup_sweep(
+                repo,
+                cfg.terminal_recording.retention_days,
+                cleanup.batch_size,
+                now,
+            )
+            .await;
         }
     }
 

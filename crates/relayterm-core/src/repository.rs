@@ -856,6 +856,44 @@ pub trait TerminalRecordingRepository: Send + Sync {
         &self,
         input: PurgeRecordingForRetention,
     ) -> Result<Option<PurgedRecordingSummary>, RepositoryError>;
+
+    /// List up to `limit` `terminal_session_id`s currently eligible
+    /// for retention purge.
+    ///
+    /// Eligibility mirrors [`Self::purge_for_retention`]
+    /// (`docs/terminal-recording.md` Section 12.2):
+    /// 1. `terminal_sessions.closed_at IS NOT NULL`, AND
+    /// 2. `closed_at + retention_days <= now`, AND
+    /// 3. At least one row exists in `terminal_recording_chunks` OR
+    ///    `terminal_recording_markers` for the session.
+    ///
+    /// Returned ids are bounded by `limit` (the worker's
+    /// `cleanup.batch_size`). Order is implementation-defined but
+    /// stable enough for tests; the Postgres implementation orders by
+    /// `closed_at ASC` so the oldest backlog drains first.
+    ///
+    /// Privacy contract:
+    /// - The query reads `terminal_sessions.id` and uses an `EXISTS`
+    ///   sub-query against the recording tables. It MUST NOT read
+    ///   `terminal_recording_chunks.payload`,
+    ///   `terminal_recording_chunks.byte_len`, or
+    ///   `terminal_recording_markers.payload`. Aggregating bytes is
+    ///   the job of [`Self::purge_for_retention`], not this listing.
+    /// - Errors flow through the same redaction discipline as the
+    ///   purge primitive.
+    ///
+    /// `Ok(Vec::new())` when nothing is eligible. Unknown / open /
+    /// in-window / never-recorded / already-purged sessions all fall
+    /// out of the result set without writing anything; the sweep is
+    /// idempotent across reruns (a second call against the same
+    /// `now` returns a strict subset of the first call's ids — empty
+    /// once the first batch has been purged).
+    async fn list_eligible_for_retention(
+        &self,
+        retention_days: u32,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<crate::ids::TerminalSessionId>, RepositoryError>;
 }
 
 #[cfg(test)]

@@ -3837,3 +3837,395 @@ async fn purge_for_retention_summary_debug_does_not_leak_payload(pool: PgPool) {
         "PurgedRecordingSummary Debug leaked marker sentinel: {dbg}",
     );
 }
+
+// ----------------------------------------------------------------------
+// TerminalRecording — list_eligible_for_retention
+// ----------------------------------------------------------------------
+//
+// Backs the future Stage A startup sweep. Eligibility mirrors
+// `purge_for_retention` (closed AND past threshold AND has any chunk
+// OR marker), bounded by `limit`. The query reads `terminal_sessions.id`
+// only — never `payload`, never `byte_len`.
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_eligible_for_retention_returns_only_closed_past_threshold_with_recording(
+    pool: PgPool,
+) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+
+    // Eligible: closed past threshold with chunks + markers.
+    let eligible =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+
+    // In-window: closed but inside retention window.
+    let _in_window =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(5)).await;
+
+    // Active session with chunks: never eligible (closed_at IS NULL).
+    let active = make_terminal_session(&pool, &user, &profile).await;
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: active.id,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+
+    // Closed past threshold but never recorded: ineligible (predicate 3).
+    let never_recorded = make_terminal_session(&pool, &user, &profile).await;
+    let sessions = PgTerminalSessionRepository::new(pool.clone());
+    sessions
+        .set_status(
+            never_recorded.id,
+            TerminalSessionStatus::Closed,
+            Some(now - Duration::days(60)),
+        )
+        .await
+        .unwrap();
+
+    let ids = recordings
+        .list_eligible_for_retention(30, now, 100)
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![eligible.id]);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_eligible_for_retention_respects_limit(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+
+    // Five eligible sessions with strictly increasing closed_at.
+    let mut sessions = Vec::new();
+    for i in 0..5 {
+        let s = make_closed_session_with_recording(
+            &pool,
+            &user,
+            &profile,
+            now - Duration::days(60 - i),
+        )
+        .await;
+        sessions.push(s.id);
+    }
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let ids = recordings
+        .list_eligible_for_retention(30, now, 2)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 2, "limit must bound the result");
+    // Oldest closed_at first.
+    assert_eq!(ids, sessions[..2]);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_eligible_for_retention_empty_when_no_candidates(pool: PgPool) {
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let ids = recordings
+        .list_eligible_for_retention(30, chrono::Utc::now(), 100)
+        .await
+        .unwrap();
+    assert!(ids.is_empty());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_eligible_for_retention_does_not_clamp_to_chunk_listing_ceiling(pool: PgPool) {
+    // The chunk / marker list reads clamp at 1024 (defence-in-depth
+    // against arbitrary API callers). The retention sweep is internal
+    // — its `limit` comes from the boot-validated `cleanup.batch_size`
+    // (capped at 10_000 by the config validator). Passing a value
+    // ABOVE 1024 must not silently clamp to 1024, otherwise the
+    // sweep's `batch_truncated` signal would go stale across
+    // restarts on a deployment with a large operator-configured
+    // batch.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    // Two eligible sessions is plenty — the contract being pinned is
+    // "limit > 1024 does not silently truncate the result", not "we
+    // can return >1024 rows in one query."
+    for i in 0..2 {
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(60 - i))
+            .await;
+    }
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let ids = recordings
+        .list_eligible_for_retention(30, now, 2048)
+        .await
+        .expect("limit above 1024 must not error");
+    assert_eq!(
+        ids.len(),
+        2,
+        "limit above the chunk-listing ceiling must not silently truncate",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn list_eligible_for_retention_idempotent_after_purge(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let session =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let before = recordings
+        .list_eligible_for_retention(30, now, 100)
+        .await
+        .unwrap();
+    assert_eq!(before, vec![session.id]);
+
+    recordings
+        .purge_for_retention(PurgeRecordingForRetention {
+            terminal_session_id: session.id,
+            retention_days: 30,
+            now,
+        })
+        .await
+        .unwrap()
+        .expect("first purge");
+
+    let after = recordings
+        .list_eligible_for_retention(30, now, 100)
+        .await
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "after purge the session must drop out of the eligible set",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Startup sweep service (relayterm-terminal::retention) integration
+// ----------------------------------------------------------------------
+//
+// These tests drive `run_recording_retention_startup_sweep` against the
+// real Postgres repository so the candidate-selection + per-session
+// purge wiring is exercised end-to-end. The sweep must:
+// - sweep eligible closed sessions
+// - leave ineligible (active / detached / starting / in-window /
+//   never-recorded) sessions untouched
+// - respect batch_size
+// - be idempotent on a second run
+// - run independently of `terminal_recording.enabled` (the sweep takes
+//   the repository directly; nothing in the call path consults the
+//   recording-writer config)
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn startup_sweep_purges_eligible_sessions_only(pool: PgPool) {
+    use relayterm_terminal::run_recording_retention_startup_sweep;
+    use std::sync::Arc;
+
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+
+    let eligible =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+    let in_window =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(5)).await;
+    let active = make_terminal_session(&pool, &user, &profile).await;
+    let recordings_setup = PgTerminalRecordingRepository::new(pool.clone());
+    recordings_setup
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: active.id,
+            seq_start: 1,
+            seq_end: 1,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+
+    // Append a real session_events row so the preservation assertion
+    // post-sweep is meaningful (the fixture's set_status path does not
+    // write events itself).
+    let session_events_repo = PgSessionEventRepository::new(pool.clone());
+    session_events_repo
+        .create(CreateSessionEvent {
+            session_id: eligible.id,
+            kind: SessionEventKind::Created,
+            payload: json!({ "cols": 80, "rows": 24, "stub": false }),
+        })
+        .await
+        .unwrap();
+
+    let repo: Arc<dyn TerminalRecordingRepository> =
+        Arc::new(PgTerminalRecordingRepository::new(pool.clone()));
+    let sessions = PgTerminalSessionRepository::new(pool.clone());
+    let events = PgSessionEventRepository::new(pool.clone());
+
+    let summary = run_recording_retention_startup_sweep(repo.clone(), 30, 100, now).await;
+    assert_eq!(summary.candidate_count, 1);
+    assert_eq!(summary.purged_sessions, 1);
+    assert_eq!(summary.errors, 0);
+    assert!(summary.chunks_purged >= 2);
+    assert!(summary.markers_purged >= 2);
+    assert!(summary.bytes_purged > 0);
+
+    // Eligible session: chunks + markers gone; row + events preserved.
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+    let chunks = recordings.list_chunks(eligible.id, 0, 1024).await.unwrap();
+    assert!(chunks.is_empty());
+    let markers = recordings.list_markers(eligible.id, 0, 1024).await.unwrap();
+    assert!(markers.is_empty());
+    let row = sessions.get(eligible.id).await.unwrap().unwrap();
+    assert_eq!(row.status, TerminalSessionStatus::Closed);
+    let evs = events.list_for_session(eligible.id).await.unwrap();
+    assert!(
+        !evs.is_empty(),
+        "pre-existing session_events rows must be preserved post-purge",
+    );
+
+    // In-window session: chunks + markers preserved.
+    let in_window_chunks = recordings.list_chunks(in_window.id, 0, 1024).await.unwrap();
+    assert_eq!(in_window_chunks.len(), 2);
+    let in_window_markers = recordings
+        .list_markers(in_window.id, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(in_window_markers.len(), 2);
+
+    // Active session: chunk preserved.
+    let active_chunks = recordings.list_chunks(active.id, 0, 1024).await.unwrap();
+    assert_eq!(active_chunks.len(), 1);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn startup_sweep_respects_batch_size(pool: PgPool) {
+    use relayterm_terminal::run_recording_retention_startup_sweep;
+    use std::sync::Arc;
+
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+
+    // Three eligible sessions.
+    for i in 0..3 {
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(60 - i))
+            .await;
+    }
+
+    let repo: Arc<dyn TerminalRecordingRepository> =
+        Arc::new(PgTerminalRecordingRepository::new(pool.clone()));
+
+    // batch_size = 2: first sweep purges 2, leaves 1.
+    let first = run_recording_retention_startup_sweep(repo.clone(), 30, 2, now).await;
+    assert_eq!(first.candidate_count, 2);
+    assert_eq!(first.purged_sessions, 2);
+    assert!(first.batch_truncated);
+
+    let second = run_recording_retention_startup_sweep(repo.clone(), 30, 2, now).await;
+    assert_eq!(second.candidate_count, 1);
+    assert_eq!(second.purged_sessions, 1);
+    assert!(!second.batch_truncated);
+
+    let third = run_recording_retention_startup_sweep(repo.clone(), 30, 2, now).await;
+    assert_eq!(third.candidate_count, 0);
+    assert_eq!(third.purged_sessions, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn startup_sweep_idempotent_on_second_run(pool: PgPool) {
+    use relayterm_terminal::run_recording_retention_startup_sweep;
+    use std::sync::Arc;
+
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let _ =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+
+    let repo: Arc<dyn TerminalRecordingRepository> =
+        Arc::new(PgTerminalRecordingRepository::new(pool.clone()));
+    let audit = PgAuditEventRepository::new(pool.clone());
+
+    let _ = run_recording_retention_startup_sweep(repo.clone(), 30, 100, now).await;
+    let after_first = audit.recent(1024).await.unwrap();
+    let recording_audit_first = after_first
+        .iter()
+        .filter(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .count();
+    assert_eq!(recording_audit_first, 1);
+
+    let summary2 = run_recording_retention_startup_sweep(repo.clone(), 30, 100, now).await;
+    assert_eq!(summary2.candidate_count, 0);
+    assert_eq!(summary2.purged_sessions, 0);
+    assert_eq!(summary2.errors, 0);
+
+    let after_second = audit.recent(1024).await.unwrap();
+    let recording_audit_second = after_second
+        .iter()
+        .filter(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .count();
+    assert_eq!(
+        recording_audit_second, 1,
+        "second sweep must not write a duplicate audit row",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn startup_sweep_writes_recording_purged_audit_with_actor_null(pool: PgPool) {
+    use relayterm_terminal::run_recording_retention_startup_sweep;
+    use std::sync::Arc;
+
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let _ =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+
+    let repo: Arc<dyn TerminalRecordingRepository> =
+        Arc::new(PgTerminalRecordingRepository::new(pool.clone()));
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let _ = run_recording_retention_startup_sweep(repo.clone(), 30, 100, now).await;
+
+    let row = audit
+        .recent(1024)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|ev| ev.kind == AuditEventKind::RecordingPurged)
+        .expect("recording_purged row");
+    assert!(
+        row.actor_id.is_none(),
+        "system audit must have actor_id NULL"
+    );
+
+    // user-facing recent_for_actor feed must NOT see this row.
+    let user_feed = audit.recent_for_actor(user.id, 1024).await.unwrap();
+    assert!(
+        !user_feed
+            .iter()
+            .any(|ev| ev.kind == AuditEventKind::RecordingPurged),
+        "user audit feed must not include recording_purged",
+    );
+}

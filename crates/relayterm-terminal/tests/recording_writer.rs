@@ -357,6 +357,15 @@ impl TerminalRecordingRepository for FakeRecordingRepo {
     ) -> Result<Option<relayterm_core::PurgedRecordingSummary>, RepositoryError> {
         Ok(None)
     }
+
+    async fn list_eligible_for_retention(
+        &self,
+        _retention_days: u32,
+        _now: chrono::DateTime<Utc>,
+        _limit: u32,
+    ) -> Result<Vec<TerminalSessionId>, RepositoryError> {
+        Ok(Vec::new())
+    }
 }
 
 // ----- Fake PTY -----

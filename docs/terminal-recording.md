@@ -912,15 +912,13 @@ up. The recording-writer foundation (Section 6, Section 9.3,
 implementation step 3) already persists chunks and markers; the
 read API (Section 10) and the replay viewer (step 5) already render
 them. The `recording_purged` audit kind, the single-session
-`purge_for_retention` repository primitive, AND the typed
-`[terminal_recording.cleanup]` config block (Section 12.6) have
-now all landed (Section 12.1) — but **no caller drives the
-primitive yet**. There is no startup sweep, no periodic worker,
-no admin or user-triggered purge surface, no operator command.
-The corpus is still operator-managed by hand today (or by manual
-`DELETE` against the schema OR by directly calling the repository
-primitive against a maintenance pool), and it grows until
-something automated cleans it up.
+`purge_for_retention` repository primitive, the typed
+`[terminal_recording.cleanup]` config block (Section 12.6), AND
+the **Stage A startup-only sweep** (Section 12.7) have now all
+landed (Section 12.1). There is still no periodic worker, no
+admin or user-triggered purge surface, and no operator command —
+between restarts the corpus continues to grow until the next
+boot's startup sweep runs.
 
 This section is the binding contract for the future retention
 slice (implementation step 8). The slice MUST land exactly the
@@ -981,30 +979,57 @@ What already exists that retention rests on:
   per-session isolation, and the post-purge `get_metadata` read
   collapsing to `has_recording = false`.
 
-What does NOT exist yet and is what step 8 will land:
+What does NOT exist yet and is what later steps will land:
 
-- No cleanup worker (neither startup-only nor periodic). The
-  retention purge primitive is not yet wired into a caller.
+- No periodic managed worker (Stage B — step 8b). Between
+  startups the corpus grows; the next boot's Stage A sweep is
+  the only retention pressure.
 
 What now also exists in addition to the audit kind + repository
-primitive:
+primitive + startup sweep:
 
 - The `[terminal_recording.cleanup]` typed config block. Five
   fields (`enabled`, `startup_sweep_enabled`,
   `periodic_sweep_enabled`, `sweep_interval_seconds`,
   `batch_size`) plus their `RELAYTERM_TERMINAL_RECORDING__
   CLEANUP__*` env mirrors are accepted at boot, validated against
-  the bounds in 12.6, and otherwise unused — no caller consumes
-  them yet. The validator runs INDEPENDENTLY of
-  `terminal_recording.enabled` so a future cleanup worker is
-  allowed to sweep an existing recording corpus even after
-  recording is later disabled (12.6 independence rule). Defaults:
-  `enabled = true`, `startup_sweep_enabled = true`,
+  the bounds in 12.6. The startup-sweep slice (this step) consumes
+  `cleanup.enabled`, `cleanup.startup_sweep_enabled`, and
+  `cleanup.batch_size`. The validator runs INDEPENDENTLY of
+  `terminal_recording.enabled` so the cleanup pass is allowed to
+  sweep an existing recording corpus even after recording is later
+  disabled (12.6 independence rule). Defaults: `enabled = true`,
+  `startup_sweep_enabled = true`,
   `periodic_sweep_enabled = false`, `sweep_interval_seconds = 0`
   (no periodic schedule), `batch_size = 100`. With the default
   `periodic_sweep_enabled = false` no Stage B cadence is required;
   flipping it true requires a non-zero, in-bounds
   `sweep_interval_seconds`.
+- The candidate-selection repository method
+  `TerminalRecordingRepository::list_eligible_for_retention(retention_days,
+  now, limit) -> Vec<TerminalSessionId>`. Postgres impl returns
+  closed-and-past-threshold sessions that have at least one chunk
+  OR marker row, ordered by `closed_at ASC` so the oldest backlog
+  drains first across multiple sweep cycles. The query reads
+  `terminal_sessions.id` and uses `EXISTS` against the recording
+  tables — never `payload`, never `byte_len`. Bounded by `limit`.
+- The Stage A startup sweep service in
+  `relayterm-terminal::retention`:
+  `run_recording_retention_startup_sweep(repo, retention_days,
+  batch_size, now) -> RecordingRetentionSweepSummary`. Driven from
+  `apps/backend/src/main.rs` AFTER terminal-session reconciliation
+  AND BEFORE the HTTP listener binds. Bounded to one batch
+  (`cleanup.batch_size`) so a long retention backlog does not
+  block boot indefinitely. Fail-soft: a repository error during
+  candidate selection OR a per-session purge logs a static
+  category tag (`"retention_sweep_failed"`) and the boot
+  continues to the listener bind. The first per-session error
+  stops the sweep; remaining eligible sessions wait for the next
+  boot. The summary carries primitive aggregates only
+  (`candidate_count`, `purged_sessions`, `chunks_purged`,
+  `markers_purged`, `bytes_purged`, `errors`, `batch_truncated`)
+  — never session ids, never byte material from the corpus, never
+  repository error text.
 
 ### 12.2 Retention policy
 
@@ -1295,15 +1320,21 @@ The matching boot-validation rule:
 The retention work is staged across two implementation slices.
 Neither slice runs unless `cleanup.enabled = true`.
 
-**Stage A (step 8a) — startup-only sweep.** A single sweep runs
-at boot with the same boot-ordering rule as Section 9.3
-reconciliation: AFTER the database pool is ready, AFTER startup
-reconciliation, BEFORE the HTTP listener binds, BEFORE the
-`TerminalSessionManager` is constructed. Bounded to one batch
-(`batch_size`) so a long retention backlog does not block boot
-indefinitely; remaining work is picked up by Stage B's first
-periodic tick. If `startup_sweep_enabled = false` the boot skips
-the sweep entirely.
+**Stage A (step 8a) — startup-only sweep (LANDED).** A single
+sweep runs at boot with the same boot-ordering rule as Section
+9.3 reconciliation: AFTER the database pool is ready, AFTER
+startup reconciliation, BEFORE the HTTP listener binds, BEFORE
+the `TerminalSessionManager` is constructed. Bounded to one
+batch (`batch_size`) so a long retention backlog does not block
+boot indefinitely; remaining work is picked up by Stage B's
+first periodic tick (when Stage B lands) or by the next backend
+restart. If either `cleanup.enabled = false` OR
+`cleanup.startup_sweep_enabled = false` the boot skips the sweep
+entirely. The sweep is independent of `terminal_recording.enabled`
+(12.6 independence rule): an existing recording corpus is swept
+on schedule even when the chunk writer is currently disabled.
+Implementation: `relayterm-terminal::retention::run_recording_retention_startup_sweep`
+called from `apps/backend/src/main.rs`.
 
 **Stage B (step 8b) — periodic managed worker.** A managed
 background task spawned from `AppState` after the listener binds.
@@ -1336,12 +1367,18 @@ because the cost is one round-trip and the safety is global.
 
 **Failure semantics.**
 
-- Stage A startup sweep failure (DB error, advisory-lock
-  contention, audit-insert rollback) is **not** fail-fast. The
-  boot proceeds; a `warn!` line names the static category tag
-  only (`"retention_sweep_failed"`); operators see "boot
-  succeeded but retention deferred". Rationale: missing one
-  sweep cycle is operationally undesirable but is not a
+- Stage A startup sweep failure (DB error, audit-insert
+  rollback) is **not** fail-fast (LANDED). The boot proceeds; a
+  `warn!` line names the static category tag only
+  (`"retention_sweep_failed"`) plus the stage (`list_eligible` /
+  `purge_session`) and a coarse `error_kind` tag (`not_found` /
+  `conflict` / `validation` / `database`); operators see "boot
+  succeeded but retention deferred". The first per-session
+  purge error stops the current sweep so a flapping DB does
+  not amplify into hundreds of retries; remaining eligible
+  sessions wait for the next sweep cycle (next boot, or the
+  future Stage B periodic tick). Rationale: missing one sweep
+  cycle is operationally undesirable but is not a
   security-relevant correctness issue (orphaned recording rows
   are not a security risk per se — the data was already
   authorised to exist, retention just trims it). This is a
@@ -1576,10 +1613,30 @@ plan.
    "cleanup disabled" production warn-at-boot is deferred to
    the worker slice (steps 4 / 5 below) so the config-only
    foundation is a true boot no-op.
-4. **Startup-only sweep** (step 8a). Wire the worker into
-   `apps/backend/src/main.rs` AFTER reconciliation, BEFORE the
-   listener binds. Bounded to one batch. Failure is `warn!` +
-   continue (12.7). Audit row written per session purged.
+4. **Startup-only sweep** (step 8a, **LANDED**). The retention
+   sweep service `run_recording_retention_startup_sweep` lives in
+   `crates/relayterm-terminal/src/retention.rs`; the candidate
+   selection method `TerminalRecordingRepository::list_eligible_for_retention`
+   lives alongside `purge_for_retention`. The sweep is wired into
+   `apps/backend/src/main.rs` AFTER terminal-session
+   reconciliation and BEFORE the listener binds. Bounded to one
+   batch (`cleanup.batch_size`). Failure is `warn!` + continue
+   (12.7); a per-session purge failure stops the sweep but does
+   not fail the boot. The repository purge primitive writes the
+   `recording_purged` audit row per session purged (12.5).
+   Coverage:
+   - Unit tests in `crates/relayterm-terminal/src/retention.rs`
+     drive the sweep against an in-memory fake (empty candidates,
+     full sweep, list error, purge error stops sweep, eligibility
+     flip producing `Ok(None)`, batch-truncation flag, summary
+     `Debug` redaction).
+   - Postgres integration tests in
+     `crates/relayterm-db/tests/repositories.rs` cover the
+     candidate-selection method (eligible-only filter, limit,
+     idempotency after purge) AND the end-to-end startup sweep
+     (purges eligible sessions only, respects `batch_size`,
+     idempotent on second run, `recording_purged` audit row
+     `actor_id IS NULL` and invisible to `recent_for_actor`).
 5. **Periodic managed worker** (step 8b). Spawn the managed
    background task on `AppState`. Advisory-lock dance per
    tick. Graceful-shutdown wired to the same signal future
