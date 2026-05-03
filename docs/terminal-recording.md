@@ -908,40 +908,700 @@ steps will land.
 ## 12. Retention and cleanup
 
 The recording corpus grows monotonically until something cleans it
-up. The policy below is what the future cleanup slice MUST
-implement; the v1 recording slice ships with manual operator
-control only (config flag + DB-level housekeeping).
+up. The recording-writer foundation (Section 6, Section 9.3,
+implementation step 3) already persists chunks and markers; the
+read API (Section 10) and the replay viewer (step 5) already render
+them. There is **no purge surface yet** — neither a cleanup worker,
+a `recording_purged` audit kind, nor any DELETE path. The corpus
+is operator-managed by hand today (or by manual `DELETE` against
+the schema), and it grows until something cleans it up.
 
-- **Default off**. Recording is disabled by default at the config
-  layer. An operator opts in deliberately.
-- **Per-session retention** (when enabled): default **30 days**
-  from `terminal_sessions.closed_at`. Sessions with no `closed_at`
-  (still live) are retained indefinitely while live; once
-  `closed_at` is stamped (or backfilled by Section 9.3
-  reconciliation), the retention clock starts.
-- **Per-session byte cap** (when enabled): default **64 MiB** of
-  payload bytes per session. The chunk writer (Section 6.1) enforces
-  the cap inline by emitting a `replay_gap { reason:
-  "byte_cap_reached" }` marker when adding the next chunk would
-  exceed the cap, then dropping further frames *for recording only*
-  — the live wire is never affected. (Whether to overwrite-front or
-  drop-tail is a writer-slice decision; this design recommends
-  drop-tail because it keeps the chunk stream contiguous up to the
-  gap and makes the cap visible to a replay viewer.)
-- **Cleanup worker** (later slice): a periodic background task
-  scans `terminal_sessions WHERE closed_at < now() -
-  recording_retention_days` and deletes the matching chunk and
-  marker rows. Per the FK rule (Section 5.4), the session row
-  itself is *not* deleted — historical session metadata survives
-  retention sweeps. The sweep writes one `audit_events` row per
-  swept session: `kind = "recording_purged"`, `payload = {
-  "session_id", "chunk_count", "marker_count" }` — counts and ids
-  only, no bytes. (This audit kind requires a new migration when
-  the cleanup slice lands.)
-- **Admin retention UI**: out of scope for v1 of recording. Config
-  + the cleanup worker is the v1 surface; an admin UI to view
-  per-session retention overrides comes later, behind the same
-  multi-user / RBAC story RelayTerm doesn't have today.
+This section is the binding contract for the future retention
+slice (implementation step 8). The slice MUST land exactly the
+shape below; any drift goes through this document first, not
+through code.
+
+### 12.1 Current state (as of this doc slice)
+
+What already exists that retention rests on:
+
+- `terminal_recording_chunks` and `terminal_recording_markers`
+  schemas (Section 5; migrations
+  `20260502000018_terminal_recording_chunks.sql` and
+  `20260502000019_terminal_recording_markers.sql`). FKs to
+  `terminal_sessions(id)` are `ON DELETE RESTRICT` — recording
+  rows are NEVER cascade-deleted with their session row.
+- The output-only chunk + marker writer (Section 6, Section 9.3).
+  The writer emits `started`, `closed`, `resized`, and
+  `replay_gap` markers; `attached`/`detached`/`reattached` are
+  deferred to a follow-up.
+- The owner-scoped read API (Section 10): three GET routes under
+  `/api/v1/terminal-sessions/:id/recording/{metadata,chunks,markers}`.
+- The frontend replay viewer (step 5).
+- Startup reconciliation (Section 9.3) that closes orphaned
+  `terminal_sessions` rows AND writes a `closed` recording marker
+  at `MAX(seq_end)` for any reconciled session that has at least
+  one chunk row. The reconciliation pass writes ZERO
+  `audit_events` rows; it is operational bookkeeping, not a
+  destructive action.
+
+What does NOT exist yet and is what step 8 will land:
+
+- No cleanup worker (neither startup-only nor periodic).
+- No `recording_purged` audit kind in
+  `audit_events_kind_chk` and no matching `AuditEventKind`
+  variant.
+- No `delete_for_session` (or equivalent) repository method on
+  `TerminalRecordingRepository`.
+- No retention-related cleanup config block; only the policy
+  inputs (`terminal_recording.retention_days`,
+  `terminal_recording.max_bytes_per_session`) are accepted and
+  validated at boot.
+
+### 12.2 Retention policy
+
+**Eligibility is keyed on `terminal_sessions.closed_at`, not on
+chunk `created_at`.** Eligibility for purge is per-session, not
+per-chunk. A session's recording is eligible for purge iff:
+
+1. `terminal_sessions.closed_at IS NOT NULL`, AND
+2. `closed_at + retention_days <= NOW()` (inclusive at the
+   boundary — a session closed exactly `retention_days` ago is
+   eligible), AND
+3. At least one row exists in `terminal_recording_chunks` OR
+   `terminal_recording_markers` for the session.
+
+Predicate (3) is the natural idempotency keystone: an
+already-purged session falls out of the eligible set without any
+application-side bookkeeping. A session that was never recorded
+also falls out — there is nothing to purge.
+
+Sessions whose `closed_at IS NULL` (status `starting` / `active` /
+`detached`) are NEVER purged. The retention clock starts only
+once `closed_at` is stamped — by the wired close path
+(`POST /api/v1/terminal-sessions/:id/close`), by the future
+TTL-expiry close, or by Section 9.3 startup reconciliation
+backfilling `closed_at = reconciled_at`. An indefinitely-detached
+live PTY does NOT bypass retention; once it eventually closes,
+its retention clock starts from that close.
+
+The config field `terminal_recording.max_bytes_per_session`
+is a **write-time cap** enforced by the chunk writer (Section 6.1) —
+it is NOT a cleanup trigger and the retention worker does NOT
+re-evaluate it. A session that hit the byte cap mid-life carries
+a `replay_gap { reason: "byte_cap_reached" }` marker and continues
+running; its chunks remain readable until normal retention purges
+them. A future "storage quota sweep" that triggers cleanup off
+total bytes per user / per host is explicitly out of scope for
+step 8 and is not designed here.
+
+### 12.3 What is preserved vs deleted
+
+When a session is purged:
+
+| Table                          | Action  | Why                                                                   |
+|--------------------------------|---------|-----------------------------------------------------------------------|
+| `terminal_recording_chunks`    | DELETE  | The recording corpus is what retention exists to bound.               |
+| `terminal_recording_markers`   | DELETE  | Markers are part of the recording table family (Section 5.5). They are NOT a substitute for `audit_events` and MUST NOT outlive the chunks they describe — see the marker-vs-audit decision in 12.5 below. |
+| `terminal_sessions`            | KEEP    | Per `SPEC.md` → "Inventory lifecycle and destructive-action policy", `terminal_sessions` are NEVER deleted from any user or system surface. The historical metadata row survives. |
+| `session_events`               | KEEP    | Append-only forensic log of session lifecycle; per `SPEC.md` "session_events and audit_events are never deleted". |
+| `audit_events`                 | KEEP    | Append-only forensic log; the cleanup itself APPENDS one row, never deletes. |
+| `terminal_session_attachments` | KEEP    | Owner-scoped attachment metadata; not part of the recording corpus.   |
+| `users`, `hosts`, `ssh_identities`, `server_profiles`, `known_host_entries` | KEEP    | Untouched. Retention is scoped to the recording table family. |
+
+The session row's `closed_at`, `last_seen_at`, `status`, and
+`session_events` chain remain readable after purge. A future
+"session detail" surface can render "Recording purged on
+{purged_at}" by joining `audit_events WHERE kind =
+'recording_purged' AND payload->>'target_id' = <session_id>` — but
+that join is not part of step 8 itself (12.8 expands).
+
+The cleanup worker MUST NOT:
+
+- delete a `terminal_sessions` row;
+- delete or update a `session_events` row;
+- delete or update a row in `users`, `hosts`, `ssh_identities`,
+  `server_profiles`, `known_host_entries`, or
+  `terminal_session_attachments`;
+- accept caller-supplied chunk-id or marker-id lists from any
+  HTTP surface (the worker is fully system-driven; there is no
+  user-triggered purge in v1, see 12.9).
+
+### 12.4 Delete order and transaction shape
+
+The purge of a single session is **one Postgres transaction**:
+
+```
+BEGIN;
+  -- 1. Aggregate counts and bytes (no payload SELECT).
+  --    chunk_count  = count(*) on chunks
+  --    marker_count = count(*) on markers
+  --    bytes_purged = COALESCE(SUM(byte_len), 0) on chunks
+  -- 2. DELETE FROM terminal_recording_markers
+  --      WHERE terminal_session_id = $1;
+  -- 3. DELETE FROM terminal_recording_chunks
+  --      WHERE terminal_session_id = $1;
+  -- 4. INSERT INTO audit_events (...) VALUES (..., 'recording_purged', ...);
+COMMIT;
+```
+
+There is no FK between chunks and markers, so either delete order
+is correct. **Recommended order: markers first, then chunks** —
+markers are smaller and fewer, and clearing them first leaves a
+predictable mid-transaction state if a later step fails. The
+order is documented for readability, not correctness.
+
+The aggregates in step 1 read `byte_len` only — never `payload`.
+`SUM(byte_len)` and `COUNT(*)` are computed by Postgres without
+loading any chunk's bytes into the application process, the wire,
+or the query planner's working set in a way the application can
+observe. The repository surface that exposes this aggregate MUST
+type the response as primitive integers — never `Vec<...Chunk>`
+— so a caller cannot accidentally widen the read to `payload`
+material.
+
+The audit insert (step 4) sits **inside** the same transaction as
+the deletes. Audit failure ROLLBACK reverts the deletes — the
+purge is fail-closed. This is a deliberate departure from the
+two-phase fail-closed pattern used by the server-profile lifecycle
+audit (where the lifecycle row commits before the audit insert
+runs and a partial-success orphan is operator-actionable). The
+recording purge is irreversibly destructive, so transactional
+atomicity is the right shape: either both writes land and an
+operator can prove the purge happened, or neither does and the
+next sweep will retry.
+
+If a future slice ever needs to relax this (very large purge
+batches that don't fit in one transaction, advisory-lock
+contention against an unrelated writer), the relaxation MUST
+preserve the "every deleted session has a paired
+`recording_purged` audit row" invariant. Never break the
+audit-pairing rule for performance.
+
+### 12.5 Audit-event behaviour
+
+Cleanup writes one `audit_events` row per session purged.
+
+- **Kind**: `recording_purged` (NEW; requires the audit-kind
+  extension migration documented in Section 13 step 8 below). The
+  variant lands on `relayterm_core::audit_event::AuditEventKind`
+  in lockstep with the migration; a unit test pins the wire tag
+  to `"recording_purged"` (matches the existing
+  `password_changed` / `session_revoked` pattern).
+- **`actor_id`**: `NULL`. The cleanup worker is the system, not
+  a user. The existing `audit_events.actor_id` column is
+  `REFERENCES users(id) ON DELETE SET NULL` and nullable; the
+  pattern matches pre-auth audit rows (`login_failed` for
+  unknown emails, `host_key_mismatch` from the preflight probe).
+  See 12.9 for what this means for the user-facing audit feed.
+- **Payload** (public metadata only — built field-by-field from
+  primitives, never `serde_json::to_value` of a domain struct):
+
+  ```json
+  {
+    "target_id": "<terminal_session_id>",
+    "target_kind": "terminal_session",
+    "chunk_count": 0,
+    "marker_count": 0,
+    "bytes_purged": 0,
+    "retention_days": 30,
+    "closed_at": "2026-04-03T12:00:00Z",
+    "purged_at": "2026-05-03T12:00:00Z",
+    "reason": "retention_expired"
+  }
+  ```
+
+  Fields:
+  - `target_id` / `target_kind` — match the existing
+    audit-payload contract from `SPEC.md` →
+    "Audit-event expectations" rule 1.
+  - `chunk_count`, `marker_count` — `COUNT(*)` aggregates
+    captured before the deletes.
+  - `bytes_purged` — `SUM(byte_len)` on chunks (markers are
+    metadata-only and contribute 0 bytes by construction).
+  - `retention_days` — the active retention policy at sweep
+    time. Records the policy in effect so a later operator
+    audit can correlate "this purge happened under the old 30d
+    policy."
+  - `closed_at` — the session's `closed_at` (the field the
+    eligibility predicate measured against). Lets an operator
+    confirm the threshold without re-querying the (preserved)
+    session row.
+  - `purged_at` — UTC timestamp at the COMMIT boundary,
+    captured by the worker before the INSERT. (`audit_events`
+    already has its own `created_at` column with `DEFAULT NOW()`;
+    `purged_at` in the payload is the worker's authoritative
+    timestamp and matches `created_at` to the millisecond on a
+    healthy clock.)
+  - `reason` — for v1 always `"retention_expired"`. Reserved
+    for future reasons: `"manual_purge"` (operator-triggered),
+    `"storage_quota"` (future quota sweep). Step 8 ships only
+    `retention_expired`.
+
+- **What MUST NOT appear in the payload**:
+  - chunk `payload` bytes, any base64 form of payload, any
+    decoded form;
+  - marker `payload` JSON contents;
+  - `client_info` from any attachment row;
+  - hostnames, peer banners, russh / DB error text;
+  - `private_key`, `encrypted_private_key`, vault internals,
+    session token bytes, token hashes, password hashes,
+    bootstrap tokens — the full
+    `AUDIT_FORBIDDEN_SUBSTRINGS` set continues to apply;
+  - per-chunk seq ranges, per-chunk byte counts, per-chunk ids,
+    per-marker kinds, per-marker seqs, or any other field that
+    would let an operator dump partial recording shape from
+    audit alone. Aggregate counts and total bytes only.
+
+- **Why audit instead of a `purged` recording marker**: a marker
+  in `terminal_recording_markers` would (a) require keeping a
+  marker row alive past the chunk deletes, breaking the
+  "markers are part of the recording corpus and purged with it"
+  invariant, AND (b) make `has_recording = false` impossible to
+  define cleanly post-purge (a session with one `purged` marker
+  has `marker_count = 1`). The right durable home for the
+  purge record is `audit_events`, where it sits beside every
+  other forensic-grade lifecycle write.
+
+- **Audit-failure policy**: fail-closed at the transaction
+  boundary (12.4). If the audit insert fails, the worker logs a
+  static category tag (`"audit_insert_failed"`), does NOT
+  surface the error text, and moves on to the next eligible
+  session in the batch. The session's recording is preserved
+  by the ROLLBACK and the next sweep will retry. There is no
+  retry-loop inside the worker — bounded batches and the
+  next-sweep-retries shape are sufficient (12.7).
+
+### 12.6 Configuration
+
+The retention slice introduces a new `[terminal_recording.cleanup]`
+TOML section, alongside the existing `[terminal_recording]`
+top-level fields. Existing fields stay where they are; the new
+fields are namespaced so they don't collide with the writer's
+config knobs.
+
+| Key                                                          | Default          | Bounds            | Notes                                                                            |
+|--------------------------------------------------------------|------------------|-------------------|----------------------------------------------------------------------------------|
+| `terminal_recording.retention_days` (existing)               | `30`             | `1..=3650`        | Already accepted at boot. Cleanup reads this. Bumping this trims past purges     |
+|                                                              |                  |                   | only at the next sweep.                                                          |
+| `terminal_recording.cleanup.enabled` (NEW)                   | `true`           | bool              | Independent of `terminal_recording.enabled` — see below.                         |
+| `terminal_recording.cleanup.startup_sweep_enabled` (NEW)     | `true`           | bool              | Run a single sweep at boot AFTER reconciliation, BEFORE the listener binds.      |
+| `terminal_recording.cleanup.sweep_interval_seconds` (NEW)    | `21600` (6h)     | `0` OR `60..=604800` | Periodic sweep cadence. The sentinel `0` disables the periodic worker entirely  |
+|                                                              |                  |                   | (Stage B); the startup sweep still runs if `startup_sweep_enabled = true`. Any   |
+|                                                              |                  |                   | non-zero value MUST be in `60..=604800` — sub-60s cadence creates a              |
+|                                                              |                  |                   | thundering-herd against an empty corpus, and `> 7d` defers retention past the    |
+|                                                              |                  |                   | default `retention_days = 30` window without operator intent. The validator      |
+|                                                              |                  |                   | rejects any non-zero value below 60 with a typed error.                          |
+| `terminal_recording.cleanup.batch_size` (NEW)                | `100`            | `1..=10000`       | Max sessions purged per sweep iteration. Each session is its own transaction.    |
+
+Environment-variable overrides follow the existing convention
+(`RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED`,
+`RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS`,
+etc.).
+
+**Independence from `terminal_recording.enabled`** — load-bearing.
+The cleanup worker MUST run even when
+`terminal_recording.enabled = false`, as long as
+`cleanup.enabled = true`. Reasoning: an operator who turns
+recording off after running it for some time MUST NOT have their
+existing recording corpus become immortal — that would be the
+opposite of the privacy posture. The recording writer is gated
+on `terminal_recording.enabled`; the cleanup worker is gated on
+`cleanup.enabled`. The two switches are independent and serve
+different purposes.
+
+The matching boot-validation rule:
+- `cleanup.enabled = true` is permitted regardless of
+  `terminal_recording.enabled`. No master-key check is required
+  for cleanup — purge does not read chunk `payload` bytes
+  (12.10), only `byte_len` aggregates and ids, so it does not
+  need to decrypt anything.
+- `cleanup.enabled = false` is permitted in dev for contributors
+  exercising the writer in isolation. In production it is a hard
+  warn-at-boot ("cleanup disabled — recording corpus will grow
+  unbounded") but NOT a boot failure: an operator may legitimately
+  want to manage retention out-of-band (DB-side cron, external
+  pipeline, vacuum tooling). The warn-at-boot is the operator-
+  visible reminder.
+
+### 12.7 Worker timing and lifecycle
+
+The retention work is staged across two implementation slices.
+Neither slice runs unless `cleanup.enabled = true`.
+
+**Stage A (step 8a) — startup-only sweep.** A single sweep runs
+at boot with the same boot-ordering rule as Section 9.3
+reconciliation: AFTER the database pool is ready, AFTER startup
+reconciliation, BEFORE the HTTP listener binds, BEFORE the
+`TerminalSessionManager` is constructed. Bounded to one batch
+(`batch_size`) so a long retention backlog does not block boot
+indefinitely; remaining work is picked up by Stage B's first
+periodic tick. If `startup_sweep_enabled = false` the boot skips
+the sweep entirely.
+
+**Stage B (step 8b) — periodic managed worker.** A managed
+background task spawned from `AppState` after the listener binds.
+The task owns:
+
+- a `tokio::sync::watch` (or equivalent) shutdown channel wired
+  to the same graceful-shutdown signal the listener uses;
+- a `tokio::time::interval` driven by
+  `cleanup.sweep_interval_seconds`;
+- on each tick, scan up to `batch_size` eligible sessions and
+  purge them (each in its own transaction per 12.4).
+
+The task is NEVER `tokio::spawn`-and-forget. It returns a
+`JoinHandle` (or rides on `JoinSet`) so shutdown can `await` its
+completion. Mandated by the no-spawn-and-forget rule in
+`AGENTS.md` "Encountered Lessons" 2026-05-02 (originally written
+for the `last_seen_at` touch in the auth path; the rule
+generalises to every managed background task).
+
+**Concurrency safety.** Two periodic ticks must not run
+concurrently against the same sweep. The single-task design
+already guarantees this for a single-process deployment. For a
+future multi-instance deployment, the worker takes a Postgres
+advisory lock (e.g. `pg_try_advisory_lock(<fixed_id>)`) at the
+start of each tick and releases it at the end; a second instance
+that fails to acquire the lock skips the tick (no error, no
+log spam) — only one node sweeps at a time. Step 8 ships the
+advisory-lock dance even if the deployment is single-instance,
+because the cost is one round-trip and the safety is global.
+
+**Failure semantics.**
+
+- Stage A startup sweep failure (DB error, advisory-lock
+  contention, audit-insert rollback) is **not** fail-fast. The
+  boot proceeds; a `warn!` line names the static category tag
+  only (`"retention_sweep_failed"`); operators see "boot
+  succeeded but retention deferred". Rationale: missing one
+  sweep cycle is operationally undesirable but is not a
+  security-relevant correctness issue (orphaned recording rows
+  are not a security risk per se — the data was already
+  authorised to exist, retention just trims it). This is a
+  deliberate departure from Section 9.3 reconciliation, which
+  IS fail-fast — reconciliation correctness affects the
+  user-facing session list and the live PTY recovery path,
+  while retention correctness affects only durable corpus size.
+- Stage B periodic-tick failure logs the same static category
+  tag and continues. The next tick retries.
+- Per-session purge failure (covered by the transaction
+  rollback in 12.4) increments a static error counter but does
+  not abort the rest of the batch — other sessions in the same
+  tick proceed normally.
+
+**Logging surface.** Every operator-side log line in the worker
+is a static category tag plus public ids and primitive counts
+only — never `?err` formatting that could round-trip driver
+text, never the chunk payload in any form, never marker payload
+JSON. The worker's `Debug` impl exposes the variant tag and (when
+enabled) the static configuration; it never includes any session
+data. Same posture as the chunk writer's `Debug` rule
+(Section 6.1).
+
+### 12.8 API / UI behaviour after purge
+
+A purged session looks identical to a never-recorded session on
+the read API surface (Section 10):
+
+- `GET /api/v1/terminal-sessions/:id/recording/metadata`:
+  ```json
+  {
+    "terminal_session_id": "<uuid>",
+    "has_recording": false,
+    "chunk_count": 0,
+    "marker_count": 0,
+    "first_seq": null,
+    "last_seq": null,
+    "first_recorded_at": null,
+    "last_recorded_at": null
+  }
+  ```
+  This is the exact shape the metadata route already returns
+  today for a session that was never recorded (Section 10.1).
+  No new field is added in step 8; "purged" and "never
+  recorded" collapse to the same wire shape. Distinguishing
+  them requires a join through `audit_events` (12.5) which the
+  metadata route deliberately does NOT do.
+- `GET /api/v1/terminal-sessions/:id/recording/chunks` —
+  returns `200 []`.
+- `GET /api/v1/terminal-sessions/:id/recording/markers` —
+  returns `200 []`.
+
+**Replay viewer behaviour after purge** is unchanged from the
+existing "no recording available" path (Section 11). The viewer
+reads the metadata endpoint, sees `has_recording = false`, and
+renders the existing honest-copy empty state. There is no
+purge-specific banner in step 8.
+
+A purpose-built "Recording was purged on {date} (retained for
+{retention_days} days from session close)" banner is **future
+work**, not in scope for step 8. When it lands it consumes the
+audit row's `purged_at` / `retention_days` / `closed_at` payload
+fields, joined through `audit_events.kind = 'recording_purged'
+AND payload->>'target_id' = <session_id>`. Until that slice
+ships, the audit-events read API
+(`/api/v1/audit-events/recent`) is the operator-facing
+"my recordings just got swept" signal — see 12.9 for the
+visibility caveat.
+
+The session list, dashboard summary, and recent-activity
+surfaces continue to NOT join through the recording tables
+(Section 10.5); a purge changes nothing about what those
+surfaces render.
+
+**Frontend cache discipline (load-bearing).** A future replay
+viewer that ever caches recording metadata must invalidate on
+`metadata.has_recording === false` — never paint stale chunks
+from a previous fetch into a viewer whose backing store has
+since been purged. For step 5's existing viewer this is a no-op
+(it already fetches metadata once per mount and never caches
+across mounts); pinning the rule here so a future caching
+optimisation does not regress it.
+
+### 12.9 Owner / admin visibility
+
+- The cleanup worker is **system-wide and owner-agnostic**.
+  Eligibility is driven by `closed_at + retention_days`, never
+  by an `owner_id` filter. A user's recordings are purged on
+  the same schedule as everyone else's.
+- User read access stays owner-scoped through
+  `AuthenticatedUser` and `terminal_sessions.owner_id ==
+  user.user_id()` (Section 10). A user querying a foreign
+  session's metadata / chunks / markers continues to receive
+  a byte-identical 404 — pre-purge AND post-purge.
+- **No user-triggered purge in v1.** There is no `POST
+  /api/v1/terminal-sessions/:id/recording/purge` route, no
+  user-facing "delete recording" affordance, no bulk-purge
+  affordance. Adding one introduces a destructive surface
+  that needs CSRF, confirmation copy, and its own audit kind
+  (`recording_user_purged` or similar) — out of scope for
+  step 8.
+- **No admin / cross-user purge UI in v1.** RelayTerm has no
+  admin/RBAC story today (`SPEC.md` "no admin / cross-user
+  audit view" rule); cross-user retention overrides arrive
+  with that broader admin slice, not with step 8.
+- **`recording_purged` is invisible to the user-facing audit
+  feed by construction.** The current
+  `GET /api/v1/audit-events/recent` route filters with
+  `WHERE actor_id = $caller` (per the
+  `recent_for_actor` rule documented in `AGENTS.md`
+  "Encountered Lessons" 2026-05-01). `recording_purged` rows
+  carry `actor_id = NULL` (system actor), so they are
+  excluded — the user-facing feed never grows to include
+  retention bookkeeping. This is **intentional** for v1: a
+  multi-user deployment's recent-activity panel cleanly
+  separates "things this user did" from "things the system
+  did to this user's data."
+
+  A future per-user "system actions affecting your data"
+  surface MUST NOT relax the `actor_id = $caller` filter on
+  `recent_for_actor` — that would expose every user's
+  retention sweep to every other user via NULL-actor leak. The
+  correct shape is a separate route that joins
+  `audit_events` (system kinds) on `terminal_sessions.owner_id
+  = $caller`. Step 8 leaves that join unimplemented.
+
+### 12.10 Safety, redaction, and concurrency
+
+The cleanup worker inherits every redaction rule the rest of the
+recording subsystem already enforces. The load-bearing items
+specific to retention:
+
+- **Never SELECT `payload` bytes.** The worker reads
+  `byte_len`, `id`, and `terminal_session_id` only. The
+  aggregate query (12.4 step 1) is `SELECT COUNT(*), COALESCE
+  (SUM(byte_len), 0) FROM terminal_recording_chunks WHERE
+  terminal_session_id = $1`; the eligibility query is on
+  `terminal_sessions` columns plus `EXISTS (SELECT 1 FROM
+  terminal_recording_chunks WHERE ...)`. Neither query
+  references `payload`, neither column projection pulls it.
+  A repository-test pins this with a sentinel byte string in a
+  fixture chunk and asserts the byte string never appears in
+  any returned domain object, formatted error, or `tracing::*`
+  line emitted by the worker.
+- **Audit payload public-only.** Mirror the existing
+  `AUDIT_FORBIDDEN_SUBSTRINGS` sentinel test pattern from
+  `crates/relayterm-api/tests/api.rs`: drive a synthetic PTY
+  workload through the writer (containing `private_key`,
+  `BEGIN OPENSSH PRIVATE KEY`, `password=`, and a unique
+  random fixture string), close the session, advance the
+  fixture clock past `retention_days`, run the worker, and
+  assert NONE of those sentinels appears in the
+  `recording_purged` row's `payload`, the worker's
+  `tracing::*` lines, or any 5xx error body.
+- **Deletion by `terminal_session_id` and eligibility only.**
+  The repository surface is `delete_recording_for_session
+  (TerminalSessionId)` (or similar) — never `delete_chunks
+  (Vec<ChunkId>)`. There is no HTTP route that takes
+  caller-supplied chunk-id lists. A future user-purge route
+  (12.9, deliberately out of scope) would still take a
+  session id and re-derive the chunks server-side, never a
+  client-supplied id list.
+- **Owner-scope is irrelevant at the worker layer because
+  there is no caller.** The worker is system-driven; it does
+  NOT consult `AuthenticatedUser`, does NOT take a `UserId`,
+  does NOT scope by `owner_id`. The eligibility predicate
+  applies uniformly.
+- **Concurrency and idempotency.** The advisory-lock dance
+  (12.7) ensures one sweep at a time across a multi-instance
+  deployment. Within a single sweep, batched per-session
+  transactions (12.4) ensure that a partial failure does not
+  cross-contaminate other sessions. Idempotency is a schema
+  invariant: once a session's chunks and markers are deleted,
+  the eligibility predicate (12.2 step 3) excludes it from the
+  next sweep — re-running the worker is a byte-identical
+  no-op.
+- **Logging discipline.** Static category tags only; no
+  `?err`-formatted driver text, no chunk bytes, no marker JSON.
+  See 12.7's logging-surface paragraph.
+- **No background third-party processing.** The cleanup worker
+  does NOT stream purge events to an external service, search
+  indexer, or notification surface. The DB is the only sink
+  (the audit row IS the sink).
+
+### 12.11 Implementation order
+
+This is the staged rollout for the retention work. Each step is
+its own slice; nothing ships unless the prior step is green.
+This list refines Section 13 step 8 of the broader recording
+plan.
+
+1. **This design slice** (current). Doc only. No code, no
+   migrations, no runtime behaviour change.
+2. **Audit-kind extension + repository purge method**
+   (step 8a-prep). Migration extends the
+   `audit_events_kind_chk` CHECK with `recording_purged`;
+   `AuditEventKind` Rust enum gains the variant; serde tag
+   pinned by unit test; `.sqlx/` regenerated. Repository
+   gains `delete_recording_for_session(TerminalSessionId) ->
+   Result<DeleteSummary>` returning `{ chunk_count,
+   marker_count, bytes_purged }`. No worker, no caller, no
+   route.
+3. **Cleanup config block** (step 8a-prep). Add
+   `[terminal_recording.cleanup]` to `apps/backend/src/config.rs`
+   with the bounds in 12.6. Production-validation envelope
+   warns on `cleanup.enabled = false`. No worker yet.
+4. **Startup-only sweep** (step 8a). Wire the worker into
+   `apps/backend/src/main.rs` AFTER reconciliation, BEFORE the
+   listener binds. Bounded to one batch. Failure is `warn!` +
+   continue (12.7). Audit row written per session purged.
+5. **Periodic managed worker** (step 8b). Spawn the managed
+   background task on `AppState`. Advisory-lock dance per
+   tick. Graceful-shutdown wired to the same signal future
+   the listener uses.
+6. **UI copy for purged recordings** (later, optional). Replay
+   viewer banner that distinguishes "purged" from "never
+   recorded" by joining `audit_events`. Only when an operator
+   asks for it; not part of step 8 itself.
+7. **Operator retention metrics / dashboard** (later,
+   optional). Counters of swept sessions per cycle, total
+   bytes reclaimed, last successful sweep time. Belongs in a
+   future operator-metrics slice; not part of step 8 itself.
+
+### 12.12 Tests required for the implementation slices
+
+The implementation slices above MUST add the following classes
+of test. None are written in this design slice; they are the
+contract a future code-reviewer enforces.
+
+- **Eligibility — closed session past threshold is purged.**
+  Fixture: a closed session with `closed_at = NOW() -
+  (retention_days + 1 day)`, plus chunk + marker rows. After
+  one worker run: zero chunks, zero markers, one
+  `recording_purged` audit row. The session row is preserved.
+- **Eligibility — closed session at exact threshold is purged.**
+  `closed_at = NOW() - retention_days` exactly. Inclusive
+  boundary semantics (12.2). A pinned test prevents the
+  off-by-one regression.
+- **Eligibility — closed session before threshold is preserved.**
+  `closed_at = NOW() - (retention_days - 1 day)`. Zero deletes,
+  zero audit rows.
+- **Active / detached / starting sessions are NEVER purged.**
+  Three fixtures with `closed_at IS NULL` and
+  `status IN ('active', 'detached', 'starting')` — each with
+  chunk rows. After the worker runs: chunk rows untouched, no
+  audit row. (A live PTY whose chunks are 100 days old does
+  NOT get its chunks swept; the clock starts at close.)
+- **Already-purged session is a no-op.** A session with
+  `closed_at` past threshold but zero chunks AND zero markers
+  (already purged earlier). After the worker runs: no audit
+  row written, no transaction begun against it.
+- **`terminal_sessions` row preserved after purge.** Pre / post
+  row equality except for nothing — the row is byte-identical
+  before and after.
+- **`session_events` rows preserved after purge.** All
+  pre-existing `session_events` rows for the session continue
+  to exist post-purge — same byte-identical equality check as
+  the `terminal_sessions` row test above (kind, payload, seq,
+  created_at compared row-for-row pre vs post). Pinned
+  separately from the `terminal_sessions` test for parity with
+  the "audit_events KEEP" rule (the `recording_purged` row
+  IS appended; pre-existing audit rows for the session must
+  not be touched).
+- **Audit row: kind, actor, payload shape.** The inserted row
+  has `kind = 'recording_purged'`, `actor_id = NULL`, and
+  `payload` keys exactly `{ target_id, target_kind,
+  chunk_count, marker_count, bytes_purged, retention_days,
+  closed_at, purged_at, reason }`. `target_kind ==
+  'terminal_session'`, `reason == 'retention_expired'`.
+- **Audit row: redaction sentinels.** Drive synthetic PTY
+  bytes containing `BEGIN OPENSSH PRIVATE KEY`, a unique
+  random sentinel, `password=hunter2`, and `data_b64=...`
+  through the writer pre-purge. After purge: NONE of those
+  sentinels appears in any `recording_purged` row, in any
+  `tracing::*` line emitted by the worker, in any 5xx error
+  body, or in any `Debug` output of the worker / repository
+  delete summary.
+- **Audit-failure rolls back deletes.** Force the audit insert
+  to fail (e.g. constraint violation via a faulty test seam).
+  After: chunks and markers are STILL present; no
+  `recording_purged` row exists; the static error category
+  tag was logged; the session remains eligible for the next
+  sweep.
+- **No `payload` SELECT.** A repository-test asserts that the
+  aggregate query and the eligibility query do NOT load the
+  chunk `payload` column. Implementation seam: the repository
+  exposes the aggregate as `(chunk_count: i64, marker_count:
+  i64, bytes_purged: i64)`, NOT as `Vec<TerminalRecordingChunk>`.
+  A unit test against an in-memory fake AND a Postgres
+  integration test pins the projection.
+- **Batch size is honoured.** With 5 eligible sessions and
+  `batch_size = 2`, one worker tick purges exactly 2; the
+  next tick purges another 2; the third purges the last 1.
+- **Idempotency on a second sweep.** After a clean sweep,
+  re-run the worker immediately. Zero deletes, zero audit
+  rows.
+- **Cleanup runs even when `terminal_recording.enabled =
+  false`.** Fixture: pre-existing chunks and markers from a
+  previous deploy. Boot with `terminal_recording.enabled =
+  false` AND `cleanup.enabled = true`. Eligible rows are
+  swept normally.
+- **`cleanup.enabled = false` skips the work.** Boot with the
+  flag off; the worker is not constructed; eligible rows are
+  preserved.
+- **Owner-scope unaffected by purge.** A user GET against a
+  foreign session id continues to return a byte-identical
+  404 both pre-purge and post-purge.
+- **`recording_purged` does NOT appear in the user-facing
+  audit feed.** A test against `GET /api/v1/audit-events/recent`
+  after a purge: the response array does NOT include any
+  `recording_purged` row, regardless of whose session was
+  swept. The NULL-actor exclusion is the load-bearing rule
+  (12.9).
+- **Concurrency: advisory lock prevents double-sweep.** Two
+  test workers racing the same eligibility set; one acquires
+  the advisory lock, the other skips silently. Total purges
+  across both = exactly one per session.
+- **Graceful shutdown.** A periodic worker mid-tick when the
+  shutdown signal fires completes the in-flight per-session
+  transaction (or rolls it back cleanly if not yet
+  committed) and exits within a bounded deadline. No
+  detached `tokio::spawn` futures.
+- **Recording-disabled means no chunks (existing test, named
+  here for completeness).** The Section 14 test "Recording
+  disabled means no chunks" continues to pass; cleanup is
+  orthogonal.
 
 ## 13. Implementation order
 
@@ -1228,8 +1888,14 @@ posture (Section 7) defensible at every stop.
      checkpoints the libghostty-vt grid at intervals.
    - Replay path (Section 8) chooses the nearest snapshot ≤
      `from_seq` and replays only the chunks past it.
-8. **Retention cleanup job**.
-   - Section 12. Configurable retention window.
+8. **Retention cleanup job** (design landed in Section 12; worker not
+   yet implemented).
+   - Section 12 is the binding contract — eligibility, delete order,
+     transactional audit, config, worker timing, post-purge API/UI
+     behaviour, owner/admin visibility, redaction, implementation
+     order (12.11), and tests (12.12). The bullets below are the
+     audit-kind extension protocol the slice MUST follow on top of
+     Section 12; both must be satisfied.
    - The new `recording_purged` audit kind is added with the
      full audit-kind extension protocol from `SPEC.md` →
      "Inventory lifecycle and destructive-action policy" →
@@ -1296,7 +1962,11 @@ none of these tests are written in this design slice.
   fixture with sessions older than the retention window, deletes
   exactly the chunk and marker rows for those sessions, leaves
   the `terminal_sessions` rows in place, and writes one
-  `recording_purged` audit row per swept session.
+  `recording_purged` audit row per swept session. Section 12.12
+  is the full test list (eligibility boundaries, transactional
+  audit rollback, batch size, idempotency, owner-scope, NULL-actor
+  exclusion from the user-facing audit feed); the bullet here
+  is the one-line summary.
 - **No input recording by default**. With recording enabled and
   `record_input` configured to its default (off, or unset), zero
   rows in any recording table reference an `input` payload.

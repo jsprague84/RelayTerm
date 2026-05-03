@@ -92,3 +92,14 @@ enabled = false
 
 # [terminal_recording.compression]
 # mode = "none"
+
+# Retention cleanup (design landed in `docs/terminal-recording.md`
+# Section 12; worker not yet implemented). Documented shape only —
+# uncommenting will fail config validation until the retention
+# slice ships. Cleanup is independent of `terminal_recording.enabled`.
+#
+# [terminal_recording.cleanup]
+# enabled                 = true
+# startup_sweep_enabled   = true
+# sweep_interval_seconds  = 21600
+# batch_size              = 100

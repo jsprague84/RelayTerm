@@ -150,3 +150,19 @@ enabled = true
 # # Only `none` ships in v1. The schema reserves `zstd` for a later
 # # slice; configuring an unknown value is a hard boot failure.
 # mode = "none"
+#
+# Retention cleanup (design landed in `docs/terminal-recording.md`
+# Section 12; worker not yet implemented). The block below is the
+# proposed shape and is NOT yet accepted at boot — uncommenting it
+# will fail config validation until the retention slice ships.
+# It is documented here so an operator can see the shape coming.
+#
+# Cleanup is INDEPENDENT of `terminal_recording.enabled`: turning
+# recording off later MUST NOT make an existing recording corpus
+# immortal. Cleanup will run as long as `cleanup.enabled = true`.
+#
+# [terminal_recording.cleanup]
+# enabled                 = true
+# startup_sweep_enabled   = true
+# sweep_interval_seconds  = 21600   # 6h; 60..=604800
+# batch_size              = 100     # sessions per sweep tick
