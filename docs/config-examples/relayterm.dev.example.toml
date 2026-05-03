@@ -93,12 +93,25 @@ enabled = false
 # [terminal_recording.compression]
 # mode = "none"
 
-# Retention cleanup (config foundation landed; worker not yet
-# implemented). The fields below are accepted at boot and validated
-# but NOT yet consumed — no startup sweep, no periodic worker, no
-# purge call. Cleanup is independent of `terminal_recording.enabled`,
-# so a future worker will sweep an existing recording corpus even
-# after recording is later disabled.
+# Retention cleanup. Stage A startup sweep AND Stage B periodic
+# managed worker are both wired. Cleanup is independent of
+# `terminal_recording.enabled`: an existing recording corpus continues
+# to age out even after recording is later disabled.
+#
+# Stage A — single bounded sweep at boot, BEFORE the listener binds.
+# Gated by `cleanup.enabled` AND `cleanup.startup_sweep_enabled`. A
+# repository error is fail-soft (logged with a static category tag,
+# boot continues to the listener bind).
+#
+# Stage B — managed periodic task, spawned AFTER `AppState`
+# construction and BEFORE the listener accepts connections. Gated by
+# `cleanup.enabled` AND `cleanup.periodic_sweep_enabled` AND a
+# non-zero `cleanup.sweep_interval_seconds`. The first periodic tick
+# fires AFTER `sweep_interval_seconds` has elapsed (the startup sweep
+# already covers boot). Each tick takes a Postgres advisory lock so a
+# multi-instance deployment never double-sweeps; lock contention is a
+# silent skip. Shutdown is wired to the same graceful-shutdown signal
+# that drives `axum::serve`.
 #
 # Env name pattern:
 #   RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED
@@ -108,8 +121,8 @@ enabled = false
 #   RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE
 #
 # [terminal_recording.cleanup]
-# enabled                 = true     # default true
-# startup_sweep_enabled   = true     # default true
-# periodic_sweep_enabled  = false    # default false
-# sweep_interval_seconds  = 0        # 0 = disabled; or 60..=604800
-# batch_size              = 100      # 1..=10000
+# enabled                 = true     # default true; master switch for both stages
+# startup_sweep_enabled   = true     # default true; one bounded sweep at boot
+# periodic_sweep_enabled  = false    # default false; flip to true to run Stage B
+# sweep_interval_seconds  = 0        # 0 = no periodic schedule; or 60..=604800
+# batch_size              = 100      # 1..=10000; sessions per sweep iteration

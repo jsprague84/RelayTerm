@@ -151,29 +151,45 @@ enabled = true
 # # slice; configuring an unknown value is a hard boot failure.
 # mode = "none"
 #
-# Retention cleanup (config foundation landed; worker not yet
-# implemented). The block below is accepted at boot and validated
-# but NOT yet consumed — there is no startup sweep, no periodic
-# worker, and no purge call in this slice. The fields exist so an
-# operator can stage their retention posture without a follow-up
-# code change; the future cleanup slice reads exactly these numbers.
+# Retention cleanup. Stage A startup sweep AND Stage B periodic
+# managed worker are both wired.
 #
 # Cleanup is INDEPENDENT of `terminal_recording.enabled`: turning
 # recording off later MUST NOT make an existing recording corpus
-# immortal. The validator therefore checks this section regardless
-# of the parent `enabled` flag, and the future worker will run as
-# long as `cleanup.enabled = true` even when `terminal_recording.
-# enabled = false`.
+# immortal. The validator checks this section regardless of the
+# parent `enabled` flag, and both stages run as long as
+# `cleanup.enabled = true` even when `terminal_recording.enabled =
+# false`.
+#
+# Stage A — one bounded sweep at boot, AFTER terminal-session
+# reconciliation and BEFORE the listener binds. Gated by
+# `cleanup.enabled` AND `cleanup.startup_sweep_enabled`. Fail-soft:
+# a repository error logs a static category tag and the boot
+# continues.
+#
+# Stage B — managed periodic task, spawned after `AppState`
+# construction and BEFORE the listener accepts connections. Gated
+# by `cleanup.enabled` AND `cleanup.periodic_sweep_enabled` AND a
+# non-zero `cleanup.sweep_interval_seconds`. The first periodic
+# tick fires AFTER `sweep_interval_seconds` has elapsed (the
+# startup sweep already drained the eligibility set on boot). Each
+# tick acquires `pg_try_advisory_lock(<retention key>)` so a
+# multi-instance deployment never double-sweeps — lock contention
+# is a silent skip, not an error. Shutdown rides the same graceful-
+# shutdown signal `axum::serve` uses; the worker's join is awaited
+# AFTER the listener returns.
 #
 # Env name pattern: `RELAYTERM_TERMINAL_RECORDING__CLEANUP__<FIELD>`
 # (all-caps, double-underscore as the section separator). Examples:
 #   RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED=true
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED=true
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS=3600
 #   RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE=250
 #
 # [terminal_recording.cleanup]
-# enabled                 = true     # default true
-# startup_sweep_enabled   = true     # default true; future Stage A
-# periodic_sweep_enabled  = false    # default false; future Stage B
+# enabled                 = true     # default true; master switch
+# startup_sweep_enabled   = true     # default true; Stage A
+# periodic_sweep_enabled  = false    # default false; Stage B
 # sweep_interval_seconds  = 0        # 0 = no periodic schedule;
 #                                    # otherwise 60..=604800
 # batch_size              = 100      # 1..=10000; sessions per tick

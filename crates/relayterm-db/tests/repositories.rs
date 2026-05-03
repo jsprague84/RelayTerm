@@ -4229,3 +4229,197 @@ async fn startup_sweep_writes_recording_purged_audit_with_actor_null(pool: PgPoo
         "user audit feed must not include recording_purged",
     );
 }
+
+// --------------------------------------------------------------------
+// Stage B: periodic retention worker advisory lock
+// --------------------------------------------------------------------
+
+/// Pick a stable but per-test unique advisory-lock key so parallel
+/// `sqlx::test` runs don't false-share the lock across databases.
+/// (Each `sqlx::test` runs against its own DB so cross-test contention
+/// shouldn't actually happen, but a unique key is the right
+/// belt-and-suspenders default.)
+fn lock_key_for(seed: &str) -> i64 {
+    let mut h: i64 = 0x52_45_43_5f_52_45_54_4e;
+    for b in seed.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as i64);
+    }
+    h
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn advisory_lock_acquire_runs_work_then_releases(pool: PgPool) {
+    use relayterm_db::PgRetentionAdvisoryLock;
+    use relayterm_terminal::{AdvisoryLockOutcome, RetentionAdvisoryLock};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let key = lock_key_for("acquire_runs_work");
+    let lock = PgRetentionAdvisoryLock::with_key(pool.clone(), key);
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_for_work = Arc::clone(&ran);
+    let outcome = lock
+        .run_with_lock(Box::pin(async move {
+            ran_for_work.store(true, Ordering::SeqCst);
+        }))
+        .await
+        .expect("lock acquire");
+    assert_eq!(outcome, AdvisoryLockOutcome::Acquired);
+    assert!(ran.load(Ordering::SeqCst), "work future ran under the lock");
+
+    // After release, a fresh lock instance from a different connection
+    // can re-acquire the same key.
+    let lock2 = PgRetentionAdvisoryLock::with_key(pool.clone(), key);
+    let outcome2 = lock2
+        .run_with_lock(Box::pin(async move {}))
+        .await
+        .expect("re-acquire after release");
+    assert_eq!(
+        outcome2,
+        AdvisoryLockOutcome::Acquired,
+        "lock must be released after the first run_with_lock returned",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn advisory_lock_contention_skips_work(pool: PgPool) {
+    use relayterm_db::PgRetentionAdvisoryLock;
+    use relayterm_terminal::{AdvisoryLockOutcome, RetentionAdvisoryLock};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let key = lock_key_for("contention");
+
+    // Take the lock on a held connection so a second acquirer
+    // observes contention. The held connection is kept alive for the
+    // duration of the second acquire; on drop the connection returns
+    // to the pool and Postgres releases all advisory locks it held.
+    let mut held = pool.acquire().await.expect("hold conn");
+    let acquired_first: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(held.as_mut())
+        .await
+        .unwrap();
+    assert!(acquired_first.0, "first lock must succeed");
+
+    let lock = PgRetentionAdvisoryLock::with_key(pool.clone(), key);
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_for_work = Arc::clone(&ran);
+    let outcome = lock
+        .run_with_lock(Box::pin(async move {
+            ran_for_work.store(true, Ordering::SeqCst);
+        }))
+        .await
+        .expect("contended acquire returns Skipped, not Err");
+    assert_eq!(outcome, AdvisoryLockOutcome::Skipped);
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "work future MUST NOT run under contention",
+    );
+
+    // Release the held lock and confirm a subsequent acquire succeeds.
+    let _: (bool,) = sqlx::query_as("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(held.as_mut())
+        .await
+        .unwrap();
+    drop(held);
+
+    let lock2 = PgRetentionAdvisoryLock::with_key(pool.clone(), key);
+    let outcome2 = lock2
+        .run_with_lock(Box::pin(async move {}))
+        .await
+        .expect("acquire after release");
+    assert_eq!(outcome2, AdvisoryLockOutcome::Acquired);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn periodic_tick_with_lock_purges_eligible_session(pool: PgPool) {
+    use relayterm_db::PgRetentionAdvisoryLock;
+    use relayterm_terminal::{
+        RecordingRetentionTickOutcome, RetentionAdvisoryLock, run_one_periodic_tick,
+    };
+    use std::sync::Arc;
+
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let _ =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+
+    let repo: Arc<dyn TerminalRecordingRepository> =
+        Arc::new(PgTerminalRecordingRepository::new(pool.clone()));
+    let key = lock_key_for("periodic_tick");
+    let lock: Arc<dyn RetentionAdvisoryLock> =
+        Arc::new(PgRetentionAdvisoryLock::with_key(pool.clone(), key));
+
+    let outcome = run_one_periodic_tick(repo.clone(), Some(lock), 30, 100).await;
+    match outcome {
+        RecordingRetentionTickOutcome::Ran(summary) => {
+            assert_eq!(summary.candidate_count, 1);
+            assert_eq!(summary.purged_sessions, 1);
+        }
+        other => panic!("expected Ran, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn periodic_tick_under_contention_skips_without_purging(pool: PgPool) {
+    use relayterm_db::PgRetentionAdvisoryLock;
+    use relayterm_terminal::{
+        RecordingRetentionTickOutcome, RetentionAdvisoryLock, run_one_periodic_tick,
+    };
+    use std::sync::Arc;
+
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let now = chrono::Utc::now();
+    let _ =
+        make_closed_session_with_recording(&pool, &user, &profile, now - Duration::days(31)).await;
+
+    let key = lock_key_for("contention_no_purge");
+
+    // Hold the lock on a side connection so the worker tick observes
+    // contention.
+    let mut held = pool.acquire().await.expect("hold conn");
+    let acquired: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(held.as_mut())
+        .await
+        .unwrap();
+    assert!(acquired.0);
+
+    let repo: Arc<dyn TerminalRecordingRepository> =
+        Arc::new(PgTerminalRecordingRepository::new(pool.clone()));
+    let lock: Arc<dyn RetentionAdvisoryLock> =
+        Arc::new(PgRetentionAdvisoryLock::with_key(pool.clone(), key));
+
+    let outcome = run_one_periodic_tick(repo.clone(), Some(lock), 30, 100).await;
+    assert_eq!(outcome, RecordingRetentionTickOutcome::Skipped);
+
+    // Eligible session is still present — confirm by running the
+    // sweep again after releasing the lock.
+    let _: (bool,) = sqlx::query_as("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(held.as_mut())
+        .await
+        .unwrap();
+    drop(held);
+
+    let lock2: Arc<dyn RetentionAdvisoryLock> =
+        Arc::new(PgRetentionAdvisoryLock::with_key(pool.clone(), key));
+    let outcome2 = run_one_periodic_tick(repo, Some(lock2), 30, 100).await;
+    match outcome2 {
+        RecordingRetentionTickOutcome::Ran(summary) => {
+            assert_eq!(
+                summary.purged_sessions, 1,
+                "purge happens once contention clears"
+            );
+        }
+        other => panic!("expected Ran after release, got {other:?}"),
+    }
+}

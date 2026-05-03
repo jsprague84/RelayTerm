@@ -8,11 +8,13 @@ publish.workspace = true
 
 [dependencies]
 relayterm-core = { workspace = true }
+relayterm-terminal = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
@@ -23,7 +25,6 @@ uuid = { workspace = true }
 postgres-tests = []
 
 [dev-dependencies]
-relayterm-terminal = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

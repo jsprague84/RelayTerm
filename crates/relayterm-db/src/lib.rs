@@ -23,9 +23,9 @@ use std::time::Duration;
 pub use error::map_sqlx_error;
 pub use repositories::{
     PgAuditEventRepository, PgHostRepository, PgKnownHostEntryRepository,
-    PgPasswordCredentialRepository, PgServerProfileRepository, PgSessionEventRepository,
-    PgSshIdentityRepository, PgTerminalRecordingRepository, PgTerminalSessionRepository,
-    PgUserRepository, PgUserSessionRepository,
+    PgPasswordCredentialRepository, PgRetentionAdvisoryLock, PgServerProfileRepository,
+    PgSessionEventRepository, PgSshIdentityRepository, PgTerminalRecordingRepository,
+    PgTerminalSessionRepository, PgUserRepository, PgUserSessionRepository,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -120,5 +120,10 @@ impl Db {
     #[must_use]
     pub fn terminal_recordings(&self) -> PgTerminalRecordingRepository {
         PgTerminalRecordingRepository::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn retention_advisory_lock(&self) -> PgRetentionAdvisoryLock {
+        PgRetentionAdvisoryLock::new(self.pool.clone())
     }
 }

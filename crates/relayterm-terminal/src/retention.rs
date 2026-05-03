@@ -1,9 +1,13 @@
 //! Retention sweep for the durable terminal-recording corpus.
 //!
-//! Stage A (this slice): a single bounded sweep run at backend startup,
+//! Stage A (landed): a single bounded sweep run at backend startup,
 //! AFTER the database pool is ready and AFTER terminal-session
-//! reconciliation, BEFORE the HTTP listener binds. See
-//! `docs/terminal-recording.md` Section 12.7.
+//! reconciliation, BEFORE the HTTP listener binds.
+//!
+//! Stage B (this slice): a managed periodic worker that runs the same
+//! bounded sweep on the configured cadence after the listener binds.
+//! See [`crate::retention_worker`] and `docs/terminal-recording.md`
+//! Section 12.7.
 //!
 //! ## Shape
 //!
@@ -100,7 +104,34 @@ impl RecordingRetentionSweepSummary {
     }
 }
 
+/// Cadence label for the sweep. Used purely for the operator-side log
+/// prefix so a startup sweep and a periodic-tick sweep are
+/// distinguishable in operator logs without changing the actual sweep
+/// semantics. The repository's purge transaction does NOT see this
+/// label — the audit row payload is identical for both cadences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepCadence {
+    /// Stage A: one bounded sweep at boot.
+    Startup,
+    /// Stage B: a managed periodic-worker tick.
+    Periodic,
+}
+
+impl SweepCadence {
+    const fn log_prefix(self) -> &'static str {
+        match self {
+            Self::Startup => "recording retention startup sweep",
+            Self::Periodic => "recording retention periodic sweep",
+        }
+    }
+}
+
 /// Run one bounded retention sweep cycle. Stage A startup behaviour.
+///
+/// Thin wrapper around [`run_recording_retention_sweep`] that pins the
+/// cadence to [`SweepCadence::Startup`]. Kept as the explicit boot-side
+/// entry point so `apps/backend/src/main.rs` reads as
+/// "run startup sweep" rather than "run sweep with the startup tag".
 ///
 /// Caller obligations:
 /// - Pass the repository as an `Arc<dyn TerminalRecordingRepository>`
@@ -135,6 +166,24 @@ pub async fn run_recording_retention_startup_sweep(
     batch_size: u32,
     now: DateTime<Utc>,
 ) -> RecordingRetentionSweepSummary {
+    run_recording_retention_sweep(repo, retention_days, batch_size, now, SweepCadence::Startup)
+        .await
+}
+
+/// Cadence-tagged sweep. Used by the Stage B periodic worker (which
+/// passes [`SweepCadence::Periodic`]) and by the Stage A boot path
+/// (via [`run_recording_retention_startup_sweep`]).
+///
+/// Failure semantics, privacy contract, and bounded-batch shape are
+/// identical for both cadences; only the operator log prefix differs.
+pub async fn run_recording_retention_sweep(
+    repo: Arc<dyn TerminalRecordingRepository>,
+    retention_days: u32,
+    batch_size: u32,
+    now: DateTime<Utc>,
+    cadence: SweepCadence,
+) -> RecordingRetentionSweepSummary {
+    let prefix = cadence.log_prefix();
     let mut summary = RecordingRetentionSweepSummary::default();
 
     let candidates = match repo
@@ -150,8 +199,7 @@ pub async fn run_recording_retention_startup_sweep(
                 category = "retention_sweep_failed",
                 stage = "list_eligible",
                 error_kind = repository_error_kind(&err),
-                "recording retention startup sweep: candidate selection failed; \
-                 boot continues, retention deferred",
+                "{prefix}: candidate selection failed; boot/tick continues, retention deferred",
             );
             summary.errors = 1;
             return summary;
@@ -162,7 +210,7 @@ pub async fn run_recording_retention_startup_sweep(
     summary.batch_truncated = candidates.len() == batch_size as usize;
 
     if candidates.is_empty() {
-        info!("recording retention startup sweep: no eligible sessions");
+        info!("{prefix}: no eligible sessions");
         return summary;
     }
 
@@ -197,8 +245,7 @@ pub async fn run_recording_retention_startup_sweep(
                     stage = "purge_session",
                     error_kind = repository_error_kind(&err),
                     purged_so_far = summary.purged_sessions,
-                    "recording retention startup sweep: per-session purge failed; \
-                     stopping sweep, boot continues",
+                    "{prefix}: per-session purge failed; stopping sweep, boot/tick continues",
                 );
                 summary.errors = 1;
                 // Clear the truncation flag on error so the
@@ -217,7 +264,7 @@ pub async fn run_recording_retention_startup_sweep(
             markers_purged = summary.markers_purged,
             bytes_purged = summary.bytes_purged,
             batch_truncated = summary.batch_truncated,
-            "recording retention startup sweep: completed",
+            "{prefix}: completed",
         );
     } else if summary.errors == 0 {
         // Repository returned candidate ids but every per-session
@@ -226,7 +273,7 @@ pub async fn run_recording_retention_startup_sweep(
         // a phantom "swept zero" event.
         info!(
             candidate_count = summary.candidate_count,
-            "recording retention startup sweep: no eligible sessions remained at purge time",
+            "{prefix}: no eligible sessions remained at purge time",
         );
     }
 
@@ -237,7 +284,7 @@ pub async fn run_recording_retention_startup_sweep(
 /// operator-side logging. Returns one of a fixed set of strings; the
 /// underlying error message is NEVER returned (it may carry driver
 /// text or constraint names that the worker keeps out of logs).
-const fn repository_error_kind(err: &RepositoryError) -> &'static str {
+pub(crate) const fn repository_error_kind(err: &RepositoryError) -> &'static str {
     match err {
         RepositoryError::NotFound { .. } => "not_found",
         RepositoryError::Conflict { .. } => "conflict",

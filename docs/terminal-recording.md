@@ -981,9 +981,14 @@ What already exists that retention rests on:
 
 What does NOT exist yet and is what later steps will land:
 
-- No periodic managed worker (Stage B — step 8b). Between
-  startups the corpus grows; the next boot's Stage A sweep is
-  the only retention pressure.
+- *(2026-05-04)* The Stage B periodic managed worker is now
+  landed (see Section 12.7 "Stage B" below for the full
+  contract). Between-restart corpus growth is bounded by the
+  configured cadence; the next-boot Stage A sweep remains the
+  fail-soft floor. The remaining gaps for retention work are
+  the admin / user-triggered purge, the storage-quota sweep,
+  the export/download endpoint, the recording-search surface,
+  and any UI for retention overrides.
 
 What now also exists in addition to the audit kind + repository
 primitive + startup sweep:
@@ -1336,34 +1341,63 @@ on schedule even when the chunk writer is currently disabled.
 Implementation: `relayterm-terminal::retention::run_recording_retention_startup_sweep`
 called from `apps/backend/src/main.rs`.
 
-**Stage B (step 8b) — periodic managed worker.** A managed
-background task spawned from `AppState` after the listener binds.
-The task owns:
+**Stage B (step 8b) — periodic managed worker (LANDED).** A
+managed background task spawned from `apps/backend/src/main.rs`
+right after `AppState` construction and BEFORE the listener
+accepts connections. The task owns:
 
-- a `tokio::sync::watch` (or equivalent) shutdown channel wired
-  to the same graceful-shutdown signal the listener uses;
-- a `tokio::time::interval` driven by
-  `cleanup.sweep_interval_seconds`;
-- on each tick, scan up to `batch_size` eligible sessions and
-  purge them (each in its own transaction per 12.4).
+- a `tokio::sync::watch::Receiver<bool>` shutdown channel
+  wired to the same graceful-shutdown signal that drives
+  `axum::serve::with_graceful_shutdown` — the listener fans
+  the shutdown signal out to the worker by sending `true` on
+  the watch channel inside the same closure that drives
+  axum's drain.
+- a `tokio::time::interval_at` driven by
+  `cleanup.sweep_interval_seconds`. The first tick fires
+  AFTER `interval` has elapsed — the Stage A startup sweep
+  already drained the eligibility set on the same boot, so an
+  immediate periodic tick would be redundant. Missed-tick
+  behaviour is `Delay` so a slow sweep does not produce a
+  burst.
+- on each tick, the worker either delegates to
+  `RetentionAdvisoryLock::run_with_lock` (the production
+  Postgres impl) or runs the sweep directly. The sweep is the
+  same `run_recording_retention_sweep` body Stage A uses,
+  cadence-tagged with `SweepCadence::Periodic` so the
+  operator log line reads "recording retention periodic
+  sweep: ...".
 
 The task is NEVER `tokio::spawn`-and-forget. It returns a
-`JoinHandle` (or rides on `JoinSet`) so shutdown can `await` its
-completion. Mandated by the no-spawn-and-forget rule in
+[`RetentionPeriodicWorkerHandle`] holding the `JoinHandle`,
+which `apps/backend/src/main.rs` awaits AFTER `axum::serve`
+returns. Mandated by the no-spawn-and-forget rule in
 `AGENTS.md` "Encountered Lessons" 2026-05-02 (originally written
 for the `last_seen_at` touch in the auth path; the rule
 generalises to every managed background task).
 
-**Concurrency safety.** Two periodic ticks must not run
-concurrently against the same sweep. The single-task design
-already guarantees this for a single-process deployment. For a
-future multi-instance deployment, the worker takes a Postgres
-advisory lock (e.g. `pg_try_advisory_lock(<fixed_id>)`) at the
-start of each tick and releases it at the end; a second instance
-that fails to acquire the lock skips the tick (no error, no
-log spam) — only one node sweeps at a time. Step 8 ships the
-advisory-lock dance even if the deployment is single-instance,
-because the cost is one round-trip and the safety is global.
+Implementation: `relayterm_terminal::retention_worker::{spawn_recording_retention_periodic_worker,
+RetentionAdvisoryLock, AdvisoryLockOutcome}`; Postgres impl is
+`relayterm_db::PgRetentionAdvisoryLock`. Gating helper
+`periodic_worker_config_if_enabled` returns `None` when
+`cleanup.enabled = false`, `cleanup.periodic_sweep_enabled =
+false`, OR `cleanup.sweep_interval_seconds == 0`.
+
+**Concurrency safety (LANDED).** Two periodic ticks must not
+run concurrently against the same sweep. The single-task design
+already guarantees this within one process. For multi-instance
+deployments the worker takes a Postgres advisory lock —
+`pg_try_advisory_lock(RECORDING_RETENTION_ADVISORY_LOCK_KEY)` —
+at the start of each tick and releases it at the end; a second
+instance that fails to acquire the lock skips the tick silently
+(no error, no log spam — `debug!` only). Stage B ships the
+advisory-lock dance unconditionally even on single-instance
+deployments because the cost is one round-trip and the safety
+is global. The lock key is a stable `i64` constant centralised
+in `relayterm-terminal::retention_worker::RECORDING_RETENTION_ADVISORY_LOCK_KEY`;
+every backend instance reads the same value. The startup sweep
+(Stage A) deliberately runs WITHOUT the lock — Stage A executes
+serially before the listener binds, so cross-instance contention
+is impossible during the boot pass.
 
 **Failure semantics.**
 

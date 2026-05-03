@@ -13,8 +13,9 @@ use relayterm_ssh::{
     SshAuthCheckService, SshPtyBridge,
 };
 use relayterm_terminal::{
-    RecordingRuntime, RecordingWriterConfig, TerminalSessionManager,
-    run_recording_retention_startup_sweep,
+    RecordingRuntime, RecordingWriterConfig, RetentionAdvisoryLock, TerminalSessionManager,
+    periodic_worker_config_if_enabled, run_recording_retention_startup_sweep,
+    spawn_recording_retention_periodic_worker,
 };
 use relayterm_vault::VaultService;
 use tokio::{net::TcpListener, signal};
@@ -295,6 +296,52 @@ async fn main() -> anyhow::Result<()> {
         auth_routes,
         login_throttler,
     };
+
+    // Stage B periodic retention worker. Spawned AFTER `AppState`
+    // construction and BEFORE the listener accepts connections so the
+    // worker is part of the same shutdown coordination as `axum::serve`.
+    // Disabled paths (no `cleanup.enabled`, no `cleanup.periodic_sweep_enabled`,
+    // or `sweep_interval_seconds == 0`) return `None` and no task is
+    // spawned. See `docs/terminal-recording.md` Section 12.7 Stage B.
+    //
+    // Independence rule (Section 12.6): cleanup runs even when
+    // `terminal_recording.enabled = false`, so the worker is gated on
+    // `cleanup.*` only. The advisory lock is wired unconditionally
+    // when the worker spawns — single-instance deployments pay one
+    // round-trip per tick for global safety; multi-instance deployments
+    // need it to avoid double-sweeps.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker_handle = {
+        let cleanup = &cfg.terminal_recording.cleanup;
+        match periodic_worker_config_if_enabled(
+            cleanup.enabled,
+            cleanup.periodic_sweep_enabled,
+            cleanup.sweep_interval_seconds,
+            cfg.terminal_recording.retention_days,
+            cleanup.batch_size,
+        ) {
+            Some(worker_cfg) => {
+                let repo: Arc<dyn TerminalRecordingRepository> =
+                    Arc::new(state.db.terminal_recordings());
+                let advisory_lock: Arc<dyn RetentionAdvisoryLock> =
+                    Arc::new(state.db.retention_advisory_lock());
+                Some(spawn_recording_retention_periodic_worker(
+                    repo,
+                    Some(advisory_lock),
+                    worker_cfg,
+                    shutdown_rx,
+                ))
+            }
+            None => {
+                // Drop the unused receiver. The worker is the only
+                // intended subscriber; no other component watches this
+                // channel today.
+                drop(shutdown_rx);
+                None
+            }
+        }
+    };
+
     let app = router(state);
 
     let listener = TcpListener::bind(cfg.server.bind)
@@ -304,9 +351,20 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %cfg.server.bind, "listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Fan the shutdown out to the periodic retention worker
+            // BEFORE axum returns, so the worker observes the same
+            // signal that drives graceful shutdown of the HTTP layer.
+            // Failure to send (no subscriber) is benign.
+            let _ = shutdown_tx.send(true);
+        })
         .await
         .context("axum::serve")?;
+
+    if let Some(handle) = worker_handle {
+        handle.shutdown().await;
+    }
 
     Ok(())
 }

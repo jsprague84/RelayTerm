@@ -29,6 +29,7 @@ pub mod manager;
 pub mod recording;
 pub mod replay;
 pub mod retention;
+pub mod retention_worker;
 
 pub use manager::{
     AttachSessionOutcome, AttachSessionRequest, AttachmentRuntime, CloseTerminalSessionOutcome,
@@ -40,4 +41,13 @@ pub use manager::{
 };
 pub use recording::{RecordingRuntime, RecordingWriter, RecordingWriterConfig, replay_gap_reason};
 pub use replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};
-pub use retention::{RecordingRetentionSweepSummary, run_recording_retention_startup_sweep};
+pub use retention::{
+    RecordingRetentionSweepSummary, SweepCadence, run_recording_retention_startup_sweep,
+    run_recording_retention_sweep,
+};
+pub use retention_worker::{
+    AdvisoryLockOutcome, RECORDING_RETENTION_ADVISORY_LOCK_KEY, RecordingRetentionPeriodicConfig,
+    RecordingRetentionTickOutcome, RetentionAdvisoryLock, RetentionPeriodicWorkerHandle, SweepWork,
+    periodic_worker_config_if_enabled, run_one_periodic_tick,
+    spawn_recording_retention_periodic_worker,
+};
