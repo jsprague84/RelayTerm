@@ -293,6 +293,54 @@ pub(crate) struct TerminalRecordingCompressionConfig {
     pub(crate) mode: TerminalRecordingCompressionMode,
 }
 
+/// Retention-cleanup configuration for durable terminal recording.
+///
+/// Operator-facing knobs for the future retention worker. THIS SLICE IS
+/// CONFIG-ONLY — no caller drives the cleanup primitive yet (no startup
+/// sweep, no periodic worker, no admin / user-triggered purge). The
+/// fields are parsed, validated, and otherwise unused at runtime;
+/// existing boot behaviour is unchanged. The shape is defined now so
+/// the future worker has a canonical place to read from and operators
+/// can stage their retention posture without a follow-up code change.
+///
+/// **Independence from `terminal_recording.enabled`** — load-bearing.
+/// Cleanup MUST be allowed to run even when recording is disabled, so
+/// turning recording OFF after running it for some time does NOT make
+/// the existing recording corpus immortal. The recording writer is
+/// gated on `terminal_recording.enabled`; cleanup is gated on
+/// `cleanup.enabled`. The two switches are independent and serve
+/// different purposes. The validator therefore inspects this struct
+/// regardless of the parent `enabled` flag.
+///
+/// Field semantics (canonical contract: `docs/terminal-recording.md`
+/// Section 12.6 / 12.7):
+/// * `enabled` — master switch for the future worker. `true` means
+///   "the cleanup worker MAY run when it is implemented"; `false`
+///   means "do not sweep". No-op today.
+/// * `startup_sweep_enabled` — when the future Stage A startup sweep
+///   lands, run a single bounded purge at boot before the listener
+///   binds.
+/// * `periodic_sweep_enabled` — when the future Stage B periodic
+///   managed worker lands, run on the cadence in
+///   `sweep_interval_seconds`. `false` means "no periodic worker
+///   even if the implementation exists".
+/// * `sweep_interval_seconds` — periodic cadence. Sentinel `0` means
+///   "no periodic schedule"; any non-zero value is bounded
+///   `60..=604800`. Sub-60s cadence creates a thundering-herd
+///   against an empty corpus; `> 7d` defers retention past the
+///   default 30-day window without operator intent.
+/// * `batch_size` — max sessions touched per sweep iteration. Each
+///   session is its own transaction in the future worker, so a
+///   batch boundary is the natural pause point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalRecordingCleanupConfig {
+    pub(crate) enabled: bool,
+    pub(crate) startup_sweep_enabled: bool,
+    pub(crate) periodic_sweep_enabled: bool,
+    pub(crate) sweep_interval_seconds: u64,
+    pub(crate) batch_size: u32,
+}
+
 /// Durable terminal-recording configuration.
 ///
 /// `enabled = false` is the default and the recommended posture for
@@ -323,6 +371,7 @@ pub(crate) struct TerminalRecordingConfig {
     pub(crate) chunk_hard_cap_bytes: u32,
     pub(crate) encryption: TerminalRecordingEncryptionConfig,
     pub(crate) compression: TerminalRecordingCompressionConfig,
+    pub(crate) cleanup: TerminalRecordingCleanupConfig,
 }
 
 impl fmt::Debug for TerminalRecordingConfig {
@@ -335,6 +384,7 @@ impl fmt::Debug for TerminalRecordingConfig {
             .field("chunk_hard_cap_bytes", &self.chunk_hard_cap_bytes)
             .field("encryption", &self.encryption)
             .field("compression", &self.compression)
+            .field("cleanup", &self.cleanup)
             .finish()
     }
 }
@@ -368,6 +418,54 @@ pub(crate) mod terminal_recording_defaults {
     /// to leave room for any future format-version growth without
     /// forcing every existing operator to retune.
     pub(crate) const CHUNK_HARD_CAP_BYTES_FLOOR: u32 = (1024 * 1024) + (64 * 1024);
+
+    // --- Retention-cleanup defaults ----------------------------------
+    //
+    // The cleanup worker is not yet implemented. These defaults are the
+    // typed shape an operator stages today; the validator enforces them
+    // at boot so a future worker slice does not have to re-relitigate
+    // the bounds. Source of truth: `docs/terminal-recording.md`
+    // Section 12.6.
+
+    /// Default for `terminal_recording.cleanup.enabled`. `true` means
+    /// "the future cleanup worker MAY run"; flipping this to `false`
+    /// is the explicit opt-out an operator declares when they manage
+    /// retention out-of-band.
+    pub(crate) const CLEANUP_ENABLED: bool = true;
+    /// Default for `terminal_recording.cleanup.startup_sweep_enabled`.
+    /// `true` means "the future Stage A startup sweep MAY run". No
+    /// caller drives the sweep yet, so this is no-op runtime today.
+    pub(crate) const CLEANUP_STARTUP_SWEEP_ENABLED: bool = true;
+    /// Default for `terminal_recording.cleanup.periodic_sweep_enabled`.
+    /// `false` means "do not run a periodic cadence even if Stage B is
+    /// later implemented". Operators opt in by flipping the flag AND
+    /// setting a non-zero `sweep_interval_seconds`.
+    pub(crate) const CLEANUP_PERIODIC_SWEEP_ENABLED: bool = false;
+    /// Default for `terminal_recording.cleanup.sweep_interval_seconds`.
+    /// `0` is the sentinel "no periodic schedule"; the validator
+    /// allows it whenever `periodic_sweep_enabled = false`.
+    pub(crate) const CLEANUP_SWEEP_INTERVAL_SECONDS: u64 = 0;
+    /// Default for `terminal_recording.cleanup.batch_size`. Matches
+    /// the design's recommended starting cadence — small enough that
+    /// a long retention backlog does not block boot, large enough
+    /// that the periodic worker makes useful progress per tick.
+    pub(crate) const CLEANUP_BATCH_SIZE: u32 = 100;
+    /// Lower bound for a non-zero `sweep_interval_seconds`. Sub-60s
+    /// cadence creates a thundering-herd against an empty corpus.
+    pub(crate) const CLEANUP_SWEEP_INTERVAL_SECONDS_MIN: u64 = 60;
+    /// Upper bound for `sweep_interval_seconds`. Anything above one
+    /// week defers retention past the default 30-day window without
+    /// operator intent and almost certainly indicates a unit mistake.
+    pub(crate) const CLEANUP_SWEEP_INTERVAL_SECONDS_MAX: u64 = 7 * 24 * 60 * 60;
+    /// Lower bound for `batch_size`. A zero-batch worker is a config
+    /// mistake — collapse to a typed boot failure rather than a no-op
+    /// runtime that silently never sweeps.
+    pub(crate) const CLEANUP_BATCH_SIZE_MIN: u32 = 1;
+    /// Upper bound for `batch_size`. 10k sessions per tick is already
+    /// well past the bounded-per-batch design intent (Section 12.7);
+    /// values above almost certainly indicate a unit mistake (rows
+    /// vs. sessions, or "all of them").
+    pub(crate) const CLEANUP_BATCH_SIZE_MAX: u32 = 10_000;
 }
 
 impl Config {
@@ -435,6 +533,16 @@ impl Config {
                     master_key_file: None,
                 },
                 compression: TerminalRecordingCompressionConfig::default(),
+                cleanup: TerminalRecordingCleanupConfig {
+                    enabled: terminal_recording_defaults::CLEANUP_ENABLED,
+                    startup_sweep_enabled:
+                        terminal_recording_defaults::CLEANUP_STARTUP_SWEEP_ENABLED,
+                    periodic_sweep_enabled:
+                        terminal_recording_defaults::CLEANUP_PERIODIC_SWEEP_ENABLED,
+                    sweep_interval_seconds:
+                        terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS,
+                    batch_size: terminal_recording_defaults::CLEANUP_BATCH_SIZE,
+                },
             },
         }
     }
@@ -574,6 +682,40 @@ impl Config {
             cfg.terminal_recording.compression.mode =
                 TerminalRecordingCompressionMode::from_str(&v)
                     .context("RELAYTERM_TERMINAL_RECORDING__COMPRESSION__MODE")?;
+        }
+        // Retention-cleanup env overrides. Same strict-parse posture as
+        // the recording scalars above: a malformed value is a hard boot
+        // failure rather than a silent fall-through to default. The
+        // cleanup worker is not yet wired, but an operator who set
+        // `RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE=abc`
+        // expecting an override would otherwise believe the value took
+        // effect — fail-fast keeps configured intent and configured
+        // state aligned, exactly as Section 12.6 of
+        // `docs/terminal-recording.md` requires.
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED") {
+            cfg.terminal_recording.cleanup.enabled = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED") {
+            cfg.terminal_recording.cleanup.startup_sweep_enabled = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED") {
+            cfg.terminal_recording.cleanup.periodic_sweep_enabled = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS") {
+            cfg.terminal_recording.cleanup.sweep_interval_seconds = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE") {
+            cfg.terminal_recording.cleanup.batch_size = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE")?;
         }
         Ok(())
     }
@@ -744,6 +886,15 @@ impl Config {
             );
         }
 
+        // Retention-cleanup bounds run REGARDLESS of `enabled`. The
+        // cleanup worker (when implemented) MUST be allowed to run
+        // even when recording is later turned off — disabling
+        // recording must NOT make an existing recording corpus
+        // immortal. `docs/terminal-recording.md` Section 12.6 spells
+        // out the independence rule. We therefore inspect the cleanup
+        // sub-struct here, BEFORE the `!rec.enabled` early return.
+        Self::validate_terminal_recording_cleanup(&rec.cleanup)?;
+
         if !rec.enabled {
             // Stale key sources on a disabled recording config are not
             // a boot failure — operator may be staging future enable
@@ -831,6 +982,93 @@ impl Config {
             );
         }
 
+        Ok(())
+    }
+
+    /// Validate the retention-cleanup sub-config.
+    ///
+    /// Pure inspection: no filesystem reads, no key consumption, no
+    /// effect on running state. Bounds match `terminal_recording_defaults`
+    /// and the canonical contract in `docs/terminal-recording.md`
+    /// Section 12.6 / 12.7.
+    ///
+    /// Independence rule (load-bearing): this validator runs regardless
+    /// of `terminal_recording.enabled`. Cleanup MUST be allowed to run
+    /// even when recording is disabled — turning recording off later
+    /// must NOT make an existing recording corpus immortal.
+    ///
+    /// Cases:
+    /// * `batch_size` — bounded `1..=10_000`. A zero-batch worker is a
+    ///   config mistake (no progress per tick) and a > 10k value almost
+    ///   certainly indicates a unit confusion.
+    /// * `sweep_interval_seconds` — `0` is the sentinel "no periodic
+    ///   schedule"; any non-zero value MUST sit in `60..=604800`.
+    ///   Sub-60s cadence is a thundering-herd; > 7d defers retention
+    ///   past the default 30-day window without operator intent.
+    /// * `periodic_sweep_enabled = true` requires a non-zero,
+    ///   in-bounds `sweep_interval_seconds`. The validator refuses
+    ///   the contradictory `enabled-but-no-cadence` posture so a
+    ///   future worker slice can trust its config.
+    /// * `periodic_sweep_enabled = false` accepts either `0` (no
+    ///   schedule, common) or a valid in-bounds value (operator
+    ///   stages a future enable). Both are intentional shapes.
+    /// * `enabled = false` and `startup_sweep_enabled = false` are
+    ///   permitted regardless of the other fields — they are the
+    ///   explicit opt-outs for an operator who manages retention
+    ///   out-of-band.
+    fn validate_terminal_recording_cleanup(
+        cleanup: &TerminalRecordingCleanupConfig,
+    ) -> anyhow::Result<()> {
+        if cleanup.batch_size < terminal_recording_defaults::CLEANUP_BATCH_SIZE_MIN {
+            bail!(
+                "terminal_recording.cleanup.batch_size = {got} must be >= {min}; a zero-batch \
+                 worker would never make progress",
+                got = cleanup.batch_size,
+                min = terminal_recording_defaults::CLEANUP_BATCH_SIZE_MIN,
+            );
+        }
+        if cleanup.batch_size > terminal_recording_defaults::CLEANUP_BATCH_SIZE_MAX {
+            bail!(
+                "terminal_recording.cleanup.batch_size = {got} exceeds the hard cap of {max}; \
+                 values above this almost always indicate a unit confusion",
+                got = cleanup.batch_size,
+                max = terminal_recording_defaults::CLEANUP_BATCH_SIZE_MAX,
+            );
+        }
+        // Non-zero cadence must sit in the documented band. Zero is the
+        // sentinel "no periodic schedule" and is always accepted unless
+        // `periodic_sweep_enabled = true` (checked below).
+        if cleanup.sweep_interval_seconds != 0
+            && cleanup.sweep_interval_seconds
+                < terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MIN
+        {
+            bail!(
+                "terminal_recording.cleanup.sweep_interval_seconds = {got} must be 0 (disabled) \
+                 or >= {min}s; sub-{min}s cadence is a thundering-herd against an empty corpus",
+                got = cleanup.sweep_interval_seconds,
+                min = terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MIN,
+            );
+        }
+        if cleanup.sweep_interval_seconds
+            > terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MAX
+        {
+            bail!(
+                "terminal_recording.cleanup.sweep_interval_seconds = {got} exceeds the hard cap \
+                 of {max}s (one week); values above this defer retention past the default \
+                 retention window without operator intent",
+                got = cleanup.sweep_interval_seconds,
+                max = terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MAX,
+            );
+        }
+        if cleanup.periodic_sweep_enabled && cleanup.sweep_interval_seconds == 0 {
+            bail!(
+                "terminal_recording.cleanup.periodic_sweep_enabled = true requires \
+                 sweep_interval_seconds > 0 (set a cadence in {min}..={max} seconds, or flip \
+                 periodic_sweep_enabled = false)",
+                min = terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MIN,
+                max = terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MAX,
+            );
+        }
         Ok(())
     }
 
@@ -965,6 +1203,7 @@ struct FileTerminalRecordingConfig {
     chunk_hard_cap_bytes: Option<u32>,
     encryption: Option<FileTerminalRecordingEncryptionConfig>,
     compression: Option<FileTerminalRecordingCompressionConfig>,
+    cleanup: Option<FileTerminalRecordingCleanupConfig>,
 }
 
 impl fmt::Debug for FileTerminalRecordingConfig {
@@ -977,8 +1216,23 @@ impl fmt::Debug for FileTerminalRecordingConfig {
             .field("chunk_hard_cap_bytes", &self.chunk_hard_cap_bytes)
             .field("encryption", &self.encryption)
             .field("compression", &self.compression)
+            .field("cleanup", &self.cleanup)
             .finish()
     }
+}
+
+/// File-side mirror of [`TerminalRecordingCleanupConfig`]. Carries no
+/// secret material — boolean flags and small numeric bounds — so a
+/// derived `Debug` is fine. Each field is `Option` so the merge step
+/// only overrides fields the operator explicitly set, exactly like the
+/// other file-side mirrors.
+#[derive(Debug, Default, Deserialize)]
+struct FileTerminalRecordingCleanupConfig {
+    enabled: Option<bool>,
+    startup_sweep_enabled: Option<bool>,
+    periodic_sweep_enabled: Option<bool>,
+    sweep_interval_seconds: Option<u64>,
+    batch_size: Option<u32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1084,6 +1338,23 @@ impl FileConfig {
             {
                 cfg.terminal_recording.compression.mode = m;
             }
+            if let Some(c) = r.cleanup {
+                if let Some(enabled) = c.enabled {
+                    cfg.terminal_recording.cleanup.enabled = enabled;
+                }
+                if let Some(s) = c.startup_sweep_enabled {
+                    cfg.terminal_recording.cleanup.startup_sweep_enabled = s;
+                }
+                if let Some(p) = c.periodic_sweep_enabled {
+                    cfg.terminal_recording.cleanup.periodic_sweep_enabled = p;
+                }
+                if let Some(i) = c.sweep_interval_seconds {
+                    cfg.terminal_recording.cleanup.sweep_interval_seconds = i;
+                }
+                if let Some(b) = c.batch_size {
+                    cfg.terminal_recording.cleanup.batch_size = b;
+                }
+            }
         }
     }
 }
@@ -1129,6 +1400,16 @@ mod tests {
                     master_key_file: None,
                 },
                 compression: TerminalRecordingCompressionConfig::default(),
+                cleanup: TerminalRecordingCleanupConfig {
+                    enabled: terminal_recording_defaults::CLEANUP_ENABLED,
+                    startup_sweep_enabled:
+                        terminal_recording_defaults::CLEANUP_STARTUP_SWEEP_ENABLED,
+                    periodic_sweep_enabled:
+                        terminal_recording_defaults::CLEANUP_PERIODIC_SWEEP_ENABLED,
+                    sweep_interval_seconds:
+                        terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS,
+                    batch_size: terminal_recording_defaults::CLEANUP_BATCH_SIZE,
+                },
             },
         }
     }
@@ -2221,5 +2502,296 @@ mode = "none"
             cfg.terminal_recording.compression.mode,
             TerminalRecordingCompressionMode::None
         );
+    }
+
+    // --- Terminal recording cleanup config -------------------------
+
+    #[test]
+    fn terminal_recording_cleanup_default_validates() {
+        // Defaults are picked deliberately so a fresh boot does NOT
+        // change runtime behaviour on the way in (no caller drives the
+        // cleanup primitive yet) and validation still passes — the
+        // future worker reads exactly these numbers.
+        let cfg = Config::defaults();
+        assert!(cfg.terminal_recording.cleanup.enabled);
+        assert!(cfg.terminal_recording.cleanup.startup_sweep_enabled);
+        assert!(!cfg.terminal_recording.cleanup.periodic_sweep_enabled);
+        assert_eq!(cfg.terminal_recording.cleanup.sweep_interval_seconds, 0);
+        assert_eq!(
+            cfg.terminal_recording.cleanup.batch_size,
+            terminal_recording_defaults::CLEANUP_BATCH_SIZE
+        );
+        cfg.validate_terminal_recording()
+            .expect("default cleanup config must validate");
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_validates_when_recording_disabled() {
+        // Independence rule (Section 12.6): cleanup must validate even
+        // when `terminal_recording.enabled = false`. Disabling
+        // recording later must not make an existing recording corpus
+        // immortal.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.enabled = false;
+        // Explicit cleanup that would be exercised on a future tick.
+        cfg.terminal_recording.cleanup.enabled = true;
+        cfg.terminal_recording.cleanup.periodic_sweep_enabled = true;
+        cfg.terminal_recording.cleanup.sweep_interval_seconds = 21_600;
+        cfg.terminal_recording.cleanup.batch_size = 250;
+        cfg.validate_terminal_recording()
+            .expect("cleanup must validate independently of recording.enabled");
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_zero_batch_size_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.batch_size = 0;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("batch_size"),
+            "error must name batch_size: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_huge_batch_size_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.batch_size =
+            terminal_recording_defaults::CLEANUP_BATCH_SIZE_MAX + 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("batch_size"),
+            "error must name batch_size: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_zero_interval_with_periodic_disabled_validates() {
+        // The canonical "no periodic schedule" shape: sentinel `0` and
+        // `periodic_sweep_enabled = false`.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.periodic_sweep_enabled = false;
+        cfg.terminal_recording.cleanup.sweep_interval_seconds = 0;
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_valid_interval_with_periodic_disabled_validates() {
+        // Operator stages a future enable: keep `periodic_sweep_enabled
+        // = false` for now but pin the cadence in advance. Validator
+        // accepts both shapes.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.periodic_sweep_enabled = false;
+        cfg.terminal_recording.cleanup.sweep_interval_seconds = 3_600;
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_sub_minimum_interval_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.sweep_interval_seconds =
+            terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MIN - 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sweep_interval_seconds"),
+            "error must name sweep_interval_seconds: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_above_max_interval_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.sweep_interval_seconds =
+            terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS_MAX + 1;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sweep_interval_seconds"),
+            "error must name sweep_interval_seconds: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_periodic_enabled_without_interval_fails() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.periodic_sweep_enabled = true;
+        cfg.terminal_recording.cleanup.sweep_interval_seconds = 0;
+        let err = cfg.validate_terminal_recording().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("periodic_sweep_enabled"),
+            "error must name periodic_sweep_enabled: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_periodic_enabled_with_valid_interval_validates() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.periodic_sweep_enabled = true;
+        cfg.terminal_recording.cleanup.sweep_interval_seconds = 21_600;
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_disabled_master_switch_validates() {
+        // `cleanup.enabled = false` is the explicit opt-out; the
+        // remaining fields are still bounds-checked but valid.
+        let mut cfg = empty_cfg();
+        cfg.terminal_recording.cleanup.enabled = false;
+        cfg.terminal_recording.cleanup.startup_sweep_enabled = false;
+        cfg.terminal_recording.cleanup.periodic_sweep_enabled = false;
+        cfg.terminal_recording.cleanup.sweep_interval_seconds = 0;
+        cfg.terminal_recording.cleanup.batch_size = 1;
+        cfg.validate_terminal_recording().unwrap();
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_malformed_enabled_env_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[("RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED", "maybe")]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_malformed_batch_size_env_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[("RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE", "abc")]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_malformed_startup_sweep_enabled_env_value_fails_safely() {
+        // The `STARTUP_SWEEP_ENABLED` boolean parses through the same
+        // strict path as `ENABLED`; pin its env-failure shape too so a
+        // future cleanup that "harmonises" the parsers cannot
+        // re-introduce a silent-discard channel for any one of the
+        // four cleanup booleans.
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED",
+                "yes",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_malformed_periodic_sweep_enabled_env_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED",
+                "1",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_malformed_interval_env_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS",
+                "-1",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_env_overrides_apply() {
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[
+                ("RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED", "false"),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED",
+                    "false",
+                ),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED",
+                    "true",
+                ),
+                (
+                    "RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS",
+                    "21600",
+                ),
+                ("RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE", "250"),
+            ]),
+        )
+        .unwrap();
+        assert!(!cfg.terminal_recording.cleanup.enabled);
+        assert!(!cfg.terminal_recording.cleanup.startup_sweep_enabled);
+        assert!(cfg.terminal_recording.cleanup.periodic_sweep_enabled);
+        assert_eq!(
+            cfg.terminal_recording.cleanup.sweep_interval_seconds,
+            21_600
+        );
+        assert_eq!(cfg.terminal_recording.cleanup.batch_size, 250);
+    }
+
+    #[test]
+    fn terminal_recording_cleanup_toml_round_trip() {
+        let raw = r#"
+[terminal_recording.cleanup]
+enabled = true
+startup_sweep_enabled = true
+periodic_sweep_enabled = true
+sweep_interval_seconds = 21600
+batch_size = 100
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert!(cfg.terminal_recording.cleanup.enabled);
+        assert!(cfg.terminal_recording.cleanup.startup_sweep_enabled);
+        assert!(cfg.terminal_recording.cleanup.periodic_sweep_enabled);
+        assert_eq!(
+            cfg.terminal_recording.cleanup.sweep_interval_seconds,
+            21_600
+        );
+        assert_eq!(cfg.terminal_recording.cleanup.batch_size, 100);
+        cfg.validate_terminal_recording()
+            .expect("TOML round-trip must validate");
     }
 }

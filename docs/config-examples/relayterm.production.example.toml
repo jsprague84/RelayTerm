@@ -151,18 +151,29 @@ enabled = true
 # # slice; configuring an unknown value is a hard boot failure.
 # mode = "none"
 #
-# Retention cleanup (design landed in `docs/terminal-recording.md`
-# Section 12; worker not yet implemented). The block below is the
-# proposed shape and is NOT yet accepted at boot — uncommenting it
-# will fail config validation until the retention slice ships.
-# It is documented here so an operator can see the shape coming.
+# Retention cleanup (config foundation landed; worker not yet
+# implemented). The block below is accepted at boot and validated
+# but NOT yet consumed — there is no startup sweep, no periodic
+# worker, and no purge call in this slice. The fields exist so an
+# operator can stage their retention posture without a follow-up
+# code change; the future cleanup slice reads exactly these numbers.
 #
 # Cleanup is INDEPENDENT of `terminal_recording.enabled`: turning
 # recording off later MUST NOT make an existing recording corpus
-# immortal. Cleanup will run as long as `cleanup.enabled = true`.
+# immortal. The validator therefore checks this section regardless
+# of the parent `enabled` flag, and the future worker will run as
+# long as `cleanup.enabled = true` even when `terminal_recording.
+# enabled = false`.
+#
+# Env name pattern: `RELAYTERM_TERMINAL_RECORDING__CLEANUP__<FIELD>`
+# (all-caps, double-underscore as the section separator). Examples:
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED=true
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE=250
 #
 # [terminal_recording.cleanup]
-# enabled                 = true
-# startup_sweep_enabled   = true
-# sweep_interval_seconds  = 21600   # 6h; 60..=604800
-# batch_size              = 100     # sessions per sweep tick
+# enabled                 = true     # default true
+# startup_sweep_enabled   = true     # default true; future Stage A
+# periodic_sweep_enabled  = false    # default false; future Stage B
+# sweep_interval_seconds  = 0        # 0 = no periodic schedule;
+#                                    # otherwise 60..=604800
+# batch_size              = 100      # 1..=10000; sessions per tick

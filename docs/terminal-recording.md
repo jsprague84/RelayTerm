@@ -911,16 +911,16 @@ The recording corpus grows monotonically until something cleans it
 up. The recording-writer foundation (Section 6, Section 9.3,
 implementation step 3) already persists chunks and markers; the
 read API (Section 10) and the replay viewer (step 5) already render
-them. The `recording_purged` audit kind and the single-session
-`purge_for_retention` repository primitive have now landed
-(Section 12.1) — but **no caller drives the primitive yet**.
-There is no startup sweep, no periodic worker, no
-`[terminal_recording.cleanup]` config block, no admin or
-user-triggered purge surface, no operator command. The corpus is
-still operator-managed by hand today (or by manual `DELETE` against
-the schema OR by directly calling the repository primitive against
-a maintenance pool), and it grows until something automated cleans
-it up.
+them. The `recording_purged` audit kind, the single-session
+`purge_for_retention` repository primitive, AND the typed
+`[terminal_recording.cleanup]` config block (Section 12.6) have
+now all landed (Section 12.1) — but **no caller drives the
+primitive yet**. There is no startup sweep, no periodic worker,
+no admin or user-triggered purge surface, no operator command.
+The corpus is still operator-managed by hand today (or by manual
+`DELETE` against the schema OR by directly calling the repository
+primitive against a maintenance pool), and it grows until
+something automated cleans it up.
 
 This section is the binding contract for the future retention
 slice (implementation step 8). The slice MUST land exactly the
@@ -985,13 +985,26 @@ What does NOT exist yet and is what step 8 will land:
 
 - No cleanup worker (neither startup-only nor periodic). The
   retention purge primitive is not yet wired into a caller.
-- No `[terminal_recording.cleanup]` config block; only the
-  policy inputs (`terminal_recording.retention_days`,
-  `terminal_recording.max_bytes_per_session`) are accepted and
-  validated at boot. The new fields in 12.6 (`cleanup.enabled`,
-  `cleanup.startup_sweep_enabled`,
-  `cleanup.sweep_interval_seconds`, `cleanup.batch_size`) land
-  with the worker slice.
+
+What now also exists in addition to the audit kind + repository
+primitive:
+
+- The `[terminal_recording.cleanup]` typed config block. Five
+  fields (`enabled`, `startup_sweep_enabled`,
+  `periodic_sweep_enabled`, `sweep_interval_seconds`,
+  `batch_size`) plus their `RELAYTERM_TERMINAL_RECORDING__
+  CLEANUP__*` env mirrors are accepted at boot, validated against
+  the bounds in 12.6, and otherwise unused — no caller consumes
+  them yet. The validator runs INDEPENDENTLY of
+  `terminal_recording.enabled` so a future cleanup worker is
+  allowed to sweep an existing recording corpus even after
+  recording is later disabled (12.6 independence rule). Defaults:
+  `enabled = true`, `startup_sweep_enabled = true`,
+  `periodic_sweep_enabled = false`, `sweep_interval_seconds = 0`
+  (no periodic schedule), `batch_size = 100`. With the default
+  `periodic_sweep_enabled = false` no Stage B cadence is required;
+  flipping it true requires a non-zero, in-bounds
+  `sweep_interval_seconds`.
 
 ### 12.2 Retention policy
 
@@ -1209,30 +1222,46 @@ Cleanup writes one `audit_events` row per session purged.
 
 ### 12.6 Configuration
 
-The retention slice introduces a new `[terminal_recording.cleanup]`
-TOML section, alongside the existing `[terminal_recording]`
-top-level fields. Existing fields stay where they are; the new
-fields are namespaced so they don't collide with the writer's
-config knobs.
+The retention slice's typed config foundation has now landed: a
+new `[terminal_recording.cleanup]` TOML section, alongside the
+existing `[terminal_recording]` top-level fields. The block is
+accepted at boot, validated against the bounds below, and
+otherwise unused — **no caller drives the primitive yet**, so
+flipping any of the cleanup fields today is a no-op at runtime.
+Existing fields stay where they are; the cleanup fields are
+namespaced so they don't collide with the writer's config knobs.
 
 | Key                                                          | Default          | Bounds            | Notes                                                                            |
 |--------------------------------------------------------------|------------------|-------------------|----------------------------------------------------------------------------------|
 | `terminal_recording.retention_days` (existing)               | `30`             | `1..=3650`        | Already accepted at boot. Cleanup reads this. Bumping this trims past purges     |
 |                                                              |                  |                   | only at the next sweep.                                                          |
-| `terminal_recording.cleanup.enabled` (NEW)                   | `true`           | bool              | Independent of `terminal_recording.enabled` — see below.                         |
-| `terminal_recording.cleanup.startup_sweep_enabled` (NEW)     | `true`           | bool              | Run a single sweep at boot AFTER reconciliation, BEFORE the listener binds.      |
-| `terminal_recording.cleanup.sweep_interval_seconds` (NEW)    | `21600` (6h)     | `0` OR `60..=604800` | Periodic sweep cadence. The sentinel `0` disables the periodic worker entirely  |
-|                                                              |                  |                   | (Stage B); the startup sweep still runs if `startup_sweep_enabled = true`. Any   |
-|                                                              |                  |                   | non-zero value MUST be in `60..=604800` — sub-60s cadence creates a              |
-|                                                              |                  |                   | thundering-herd against an empty corpus, and `> 7d` defers retention past the    |
-|                                                              |                  |                   | default `retention_days = 30` window without operator intent. The validator      |
-|                                                              |                  |                   | rejects any non-zero value below 60 with a typed error.                          |
-| `terminal_recording.cleanup.batch_size` (NEW)                | `100`            | `1..=10000`       | Max sessions purged per sweep iteration. Each session is its own transaction.    |
+| `terminal_recording.cleanup.enabled`                         | `true`           | bool              | Master switch for the future cleanup worker. Independent of                      |
+|                                                              |                  |                   | `terminal_recording.enabled` — see below.                                        |
+| `terminal_recording.cleanup.startup_sweep_enabled`           | `true`           | bool              | When the future Stage A startup sweep lands, run a single sweep at boot AFTER    |
+|                                                              |                  |                   | reconciliation, BEFORE the listener binds.                                       |
+| `terminal_recording.cleanup.periodic_sweep_enabled`          | `false`          | bool              | When the future Stage B periodic worker lands, run on the cadence in             |
+|                                                              |                  |                   | `sweep_interval_seconds`. `false` means "no periodic worker even if Stage B is   |
+|                                                              |                  |                   | implemented". Defaults to off so the config foundation is a no-op runtime. The   |
+|                                                              |                  |                   | validator refuses `periodic_sweep_enabled = true` with `sweep_interval_seconds   |
+|                                                              |                  |                   | = 0` — the contradictory shape is a typed boot error, not a silent no-op.       |
+| `terminal_recording.cleanup.sweep_interval_seconds`          | `0`              | `0` OR `60..=604800` | Periodic sweep cadence. The sentinel `0` means "no periodic schedule"; the      |
+|                                                              |                  |                   | startup sweep still runs if `startup_sweep_enabled = true`. Any non-zero value   |
+|                                                              |                  |                   | MUST be in `60..=604800` — sub-60s cadence creates a thundering-herd against an  |
+|                                                              |                  |                   | empty corpus, and `> 7d` defers retention past the default `retention_days =     |
+|                                                              |                  |                   | 30` window without operator intent. The validator rejects any non-zero value     |
+|                                                              |                  |                   | below 60 with a typed error.                                                     |
+| `terminal_recording.cleanup.batch_size`                      | `100`            | `1..=10000`       | Max sessions purged per sweep iteration. Each session is its own transaction.    |
 
 Environment-variable overrides follow the existing convention
 (`RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED`,
+`RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED`,
+`RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED`,
 `RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS`,
-etc.).
+`RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE`). Same
+strict-parse posture as the rest of the recording scalars —
+malformed values fail boot rather than silently fall through to
+the default, so configured intent and configured state stay
+aligned.
 
 **Independence from `terminal_recording.enabled`** — load-bearing.
 The cleanup worker MUST run even when
@@ -1251,13 +1280,15 @@ The matching boot-validation rule:
   for cleanup — purge does not read chunk `payload` bytes
   (12.10), only `byte_len` aggregates and ids, so it does not
   need to decrypt anything.
-- `cleanup.enabled = false` is permitted in dev for contributors
-  exercising the writer in isolation. In production it is a hard
-  warn-at-boot ("cleanup disabled — recording corpus will grow
-  unbounded") but NOT a boot failure: an operator may legitimately
-  want to manage retention out-of-band (DB-side cron, external
-  pipeline, vacuum tooling). The warn-at-boot is the operator-
-  visible reminder.
+- `cleanup.enabled = false` is permitted in every mode and is
+  NOT a boot failure: an operator may legitimately want to
+  manage retention out-of-band (DB-side cron, external pipeline,
+  vacuum tooling). A future operator-visible "cleanup disabled —
+  recording corpus will grow unbounded" warn-at-boot for
+  production deploys lands with the worker slice (Section 12.11
+  step 4 / 5) rather than the config slice — the config-only
+  foundation deliberately introduces no new runtime log line so
+  it can be a true no-op at boot.
 
 ### 12.7 Worker timing and lifecycle
 
@@ -1533,10 +1564,18 @@ plan.
    purge_for_retention_*`. No worker, no caller, no route in
    this slice — the next slice (8a) wires the primitive into
    a startup sweep.
-3. **Cleanup config block** (step 8a-prep). Add
-   `[terminal_recording.cleanup]` to `apps/backend/src/config.rs`
-   with the bounds in 12.6. Production-validation envelope
-   warns on `cleanup.enabled = false`. No worker yet.
+3. **Cleanup config block** (step 8a-prep, **landed**). The
+   `[terminal_recording.cleanup]` block is in
+   `apps/backend/src/config.rs` with the five fields and bounds
+   from 12.6, an `RELAYTERM_TERMINAL_RECORDING__CLEANUP__*`
+   env mirror, and a strict-parse posture matching the existing
+   recording scalars. Validation runs INDEPENDENTLY of
+   `terminal_recording.enabled` so a future worker may sweep an
+   existing corpus even after recording is disabled. The slice
+   deliberately introduces NO new runtime log line — the
+   "cleanup disabled" production warn-at-boot is deferred to
+   the worker slice (steps 4 / 5 below) so the config-only
+   foundation is a true boot no-op.
 4. **Startup-only sweep** (step 8a). Wire the worker into
    `apps/backend/src/main.rs` AFTER reconciliation, BEFORE the
    listener binds. Bounded to one batch. Failure is `warn!` +

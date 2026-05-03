@@ -93,13 +93,23 @@ enabled = false
 # [terminal_recording.compression]
 # mode = "none"
 
-# Retention cleanup (design landed in `docs/terminal-recording.md`
-# Section 12; worker not yet implemented). Documented shape only —
-# uncommenting will fail config validation until the retention
-# slice ships. Cleanup is independent of `terminal_recording.enabled`.
+# Retention cleanup (config foundation landed; worker not yet
+# implemented). The fields below are accepted at boot and validated
+# but NOT yet consumed — no startup sweep, no periodic worker, no
+# purge call. Cleanup is independent of `terminal_recording.enabled`,
+# so a future worker will sweep an existing recording corpus even
+# after recording is later disabled.
+#
+# Env name pattern:
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__STARTUP_SWEEP_ENABLED
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS
+#   RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE
 #
 # [terminal_recording.cleanup]
-# enabled                 = true
-# startup_sweep_enabled   = true
-# sweep_interval_seconds  = 21600
-# batch_size              = 100
+# enabled                 = true     # default true
+# startup_sweep_enabled   = true     # default true
+# periodic_sweep_enabled  = false    # default false
+# sweep_interval_seconds  = 0        # 0 = disabled; or 60..=604800
+# batch_size              = 100      # 1..=10000
