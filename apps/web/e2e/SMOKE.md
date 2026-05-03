@@ -196,6 +196,22 @@ update this file in the same change.
 | `[data-testid="sessions-row-close"]`              | Per-row "Close" button (disabled for `closed` rows).          |
 | `[data-testid="sessions-row-close-error"]`        | Per-row close-error summary (safe formatter only — never echoes wire `message` or transport detail). |
 | `[data-testid="sessions-row-open-error"]`         | Per-row open-error summary (rendered when the pre-handoff backend verify reports the row is stale or still `starting`; safe formatter only — never echoes wire `message` or transport detail; dismissable). |
+| `[data-testid="sessions-row-view-recording"]`     | Per-row "View recording" button (rendered for `detached` and `closed` rows only — `active` rows route to the live `Open` action, `starting` rows have nothing to replay; opens the read-only recording replay viewer in place of the navigation-selected view; the viewer's metadata gate honestly surfaces "No recording available" if the opened session has no chunk / marker rows). |
+| `[data-testid="recording-replay-view"]`           | Read-only recording replay viewer root (carries `data-session-id` and `data-status` ∈ {`idle`,`loading_metadata`,`loading_chunks`,`ready`,`empty`,`error`,`decode_warning`}). Mounted by the AppShell when the operator clicks `sessions-row-view-recording`; replaces the navigation-selected view until cleared via `recording-replay-back` or any nav click. |
+| `[data-testid="recording-replay-banner"]`         | Static replay-only banner — pins the contract that the viewer is recorded output, input was not recorded, the live SSH session cannot be resumed from a recording, and backend-restart recovery is not implemented yet. |
+| `[data-testid="recording-replay-refresh"]`        | "Reload recording" button — re-fetches metadata, chunks, and markers; disabled while a load is in flight. |
+| `[data-testid="recording-replay-back"]`           | "Back to sessions" button — clears `activeReplaySessionId` in the AppShell. |
+| `[data-testid="recording-replay-loading"]`        | "Loading recording metadata…" status (rendered while metadata is in flight). |
+| `[data-testid="recording-replay-loading-chunks"]` | "Loading recorded output…" status (rendered while chunks are paging in; reports the chunks-written running total — never the chunk bytes). |
+| `[data-testid="recording-replay-error"]`          | Recording load error (safe formatter only — function of `kind`+`status`+`code`; never echoes wire `message`, `data_b64`, recording bytes, or vault / auth sentinels). |
+| `[data-testid="recording-replay-empty"]`          | "No recording available" empty-state card (rendered when the metadata gate returns `has_recording == false`). |
+| `[data-testid="recording-replay-decode-warning"]` | Decode-warning panel (one chunk had unsupported encryption / unsupported compression / invalid base64 / declared-length mismatch; the warning does NOT echo the chunk bytes). |
+| `[data-testid="recording-replay-complete"]`       | "Replay complete" status (rendered when every chunk has been streamed into the read-only xterm). |
+| `[data-testid="recording-replay-metadata"]`       | Metadata strip (`chunk_count`, `marker_count`, `first_seq`, `last_seq`, `first_recorded_at`, `last_recorded_at` — counts and seq bounds only, never bytes). |
+| `[data-testid="recording-replay-viewport"]`       | Read-only xterm viewport — the only surface decoded chunk bytes reach. xterm is constructed with `disableStdin: true` and the viewer does NOT subscribe to `onInput`; keystrokes inside the viewport produce no input. |
+| `[data-testid="recording-replay-markers"]`        | Markers strip (`<details>` block; rendered only when at least one marker exists). |
+| `[data-testid="recording-replay-marker"]`         | One marker row (`data-marker-kind` ∈ {`started`,`attached`,`detached`,`reattached`,`resized`,`closed`,`replay_gap`}). The payload preview is a truncated JSON snippet of the opaque metadata payload — never PTY bytes by writer contract. |
+| `[data-testid="recording-replay-about"]`          | "About replay" panel — pins the load-bearing copy (sensitive content, output-only, keystrokes not sent anywhere, recording bytes not persisted in browser storage). |
 | `[data-testid="production-view-identities"]`      | Identities view (public-key list + generate panel).           |
 | `[data-testid="identities-refresh-button"]`       | Refresh button on the Identities view.                        |
 | `[data-testid="identities-filter-toolbar"]`       | Identities view filter toolbar above the list (in-memory client-side search + filters; no backend search; no pagination; no URL/local-storage persistence). |
@@ -804,6 +820,115 @@ specific reason string for each paste size.
 If a live SSH target is unavailable, skip this section and re-run
 after the backend gains one. The `pastePolicy.test.ts` unit tests pin
 the underlying classification rules without a backend.
+
+### B.2. Production recording replay smoke (requires a live backend with `terminal_recording.enabled = true`)
+
+This step verifies the read-only recording replay viewer
+(`apps/web/src/lib/app/views/RecordingReplayView.svelte`) end-to-end
+against a real recorded session. It is **not** part of the production
+prod-build smoke above because it requires:
+
+  - the backend booted with
+    `[terminal_recording] enabled = true` and `[terminal_recording.encryption] mode = "disabled"`
+    (dev-only — operator accepts plaintext-at-rest),
+  - a launchable SSH target (so chunks actually get written),
+  - the operator running a brief session and closing it.
+
+Skip if the local backend has no recording / no SSH target available.
+The unit tests in `apps/web/tests/terminalRecordingsApi.test.ts` pin
+the parser / decode / redaction rules without a backend.
+
+Pre-conditions: at least one `terminal_session` row owned by the
+authenticated user with at least one row in
+`terminal_recording_chunks`. Easiest: launch a session, run
+`echo replayterm-recording-smoke; date`, then click `End session`.
+
+1. **Open the replay viewer from the Sessions list.**
+   - `browser_click [data-testid="nav-sessions"]`
+   - Expect `[data-testid="sessions-row"]` for the just-closed session
+     with `data-status="closed"`.
+   - On that row, expect `[data-testid="sessions-row-view-recording"]`
+     (the affordance is offered for any non-`starting` row; the
+     viewer's metadata gate is the load-bearing check).
+   - `browser_click [data-testid="sessions-row-view-recording"]`
+   - Expect `[data-testid="recording-replay-view"]` to appear with
+     `data-session-id` matching the row's `data-session-id`.
+
+2. **Replay-only banner is present.**
+   - `[data-testid="recording-replay-banner"]` exists and the rendered
+     text contains `Replay only`, `not connected to a live SSH session`,
+     and `Input was not recorded`.
+
+3. **Metadata strip and replay completion.**
+   - Expect the viewer transitions through
+     `data-status="loading_metadata"` → `loading_chunks` → `ready`
+     (or `decode_warning` if a future chunk lands with unsupported
+     encryption / compression).
+   - `[data-testid="recording-replay-metadata"]` shows non-zero
+     `chunk_count` and a numeric `first_seq` / `last_seq`.
+   - `[data-testid="recording-replay-complete"]` is visible at the end
+     of the load.
+   - The xterm viewport `[data-testid="recording-replay-viewport"]`
+     visibly contains the recorded output (`replayterm-recording-smoke`,
+     the prompt, `date` output, etc.).
+
+4. **Keyboard input is dropped.**
+   - Focus the replay viewport and type a string the recorded shell
+     never produced (e.g. `replayterm-typing-smoke`).
+   - Re-snapshot the viewport text. Expected: the typed string does
+     NOT appear in the viewport. xterm is constructed with
+     `disableStdin: true` and the viewer never subscribes to
+     `onInput`, so keystrokes produce no output and no wire send.
+   - `browser_console_messages level=error all=true` shows no errors.
+
+5. **Recording bytes are not in browser storage.**
+   - `browser_evaluate`:
+
+     ```js
+     () => {
+       const sentinel = 'replayterm-recording-smoke';
+       const local = JSON.stringify({ ...localStorage });
+       const session = JSON.stringify({ ...sessionStorage });
+       return {
+         localStorageHasSentinel: local.includes(sentinel),
+         sessionStorageHasSentinel: session.includes(sentinel),
+         localStorageHasDataB64Key: Object.keys(localStorage).some((k) => k.includes('recording') || k.includes('data_b64')),
+       };
+     }
+     ```
+
+   - Expected: every field is `false`. Decoded chunk bytes are streamed
+     directly into xterm and are never persisted client-side.
+
+6. **Empty-recording case (optional).**
+   - If a session predates `terminal_recording.enabled = true`, click
+     its `View recording` button and expect
+     `[data-testid="recording-replay-empty"]` ("No recording available").
+
+7. **Back to sessions clears the viewer.**
+   - `browser_click [data-testid="recording-replay-back"]`
+   - Expect `[data-testid="recording-replay-view"]` to disappear and
+     `[data-testid="production-view-sessions"]` to be visible again.
+
+8. **Backend audit / log leakage sweep.**
+   - With backend SQL access:
+
+     ```sql
+     SELECT count(*) FROM audit_events
+      WHERE payload::text ILIKE '%replayterm-recording-smoke%';
+     ```
+
+     Expected: `0`. Recording reads MUST write zero audit rows; the
+     synthetic recording sentinel MUST NOT appear in any audit row
+     (canonical rule: AGENTS.md "Don't put recording bytes in audit
+     payloads").
+   - The backend `tracing` logs from the same window MUST NOT contain
+     the sentinel either. `journalctl` / the operator's log surface is
+     the place to grep.
+
+If a live recording is unavailable, skip this section. The unit tests
+already pin the parser / decode / redaction rules; the smoke verifies
+the integration path against real chunk material.
 
 ### C. Auth flow smoke (browser, requires a live backend)
 

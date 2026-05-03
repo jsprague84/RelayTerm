@@ -24,6 +24,7 @@
   import ServersView from "./views/ServersView.svelte";
   import IdentitiesView from "./views/IdentitiesView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
+  import RecordingReplayView from "./views/RecordingReplayView.svelte";
   import {
     findNavItem,
     type AppViewId,
@@ -88,6 +89,11 @@
   });
 
   function navigate(id: AppViewId) {
+    // Any nav click clears an in-flight replay overlay. The viewer is
+    // a transient, full-pane surface that does not own a sidebar
+    // entry — landing on a different view drops it.
+    activeReplaySessionId = null;
+    activeReplayLabel = null;
     if (id === selected) return;
     selected = id;
     if (typeof window === "undefined") return;
@@ -112,8 +118,38 @@
    */
   let activeLaunch = $state<ActiveLaunch | null>(null);
 
+  /**
+   * Active recording replay session id. Set when the operator clicks
+   * "View recording" from the Sessions list. While non-null, the
+   * shell renders {@link RecordingReplayView} INSTEAD of the
+   * navigation-selected view — replay is a transient, full-pane
+   * surface that does not own a sidebar entry. Cleared via
+   * "Back to sessions" or any nav click that calls `navigate()`.
+   *
+   * The session id is held in memory only — never persisted, never
+   * mirrored into the URL (recording chunk bytes are sensitive; we
+   * keep them off any externally observable surface). A page
+   * navigation drops the replay state entirely.
+   */
+  let activeReplaySessionId = $state<string | null>(null);
+  /** Optional human label (usually the originating profile name) so
+   * the replay header is readable without a profile lookup. */
+  let activeReplayLabel = $state<string | null>(null);
+
+  function handleViewRecording(sessionId: string, profileLabel: string | null) {
+    activeReplaySessionId = sessionId;
+    activeReplayLabel = profileLabel;
+  }
+
+  function handleReplayExit() {
+    activeReplaySessionId = null;
+    activeReplayLabel = null;
+  }
+
   function handleLaunch(launch: ActiveLaunch) {
     activeLaunch = launch;
+    activeReplaySessionId = null;
+    activeReplayLabel = null;
     navigate("terminal");
     // Persist a local pointer at the just-launched session so a
     // navigation-away / reload during the bounded detached-TTL window
@@ -229,7 +265,15 @@
       data-view={selected}
     >
       <div class="mx-auto flex max-w-4xl flex-col gap-6">
-        {#if selected === "dashboard"}
+        {#if activeReplaySessionId}
+          {#key activeReplaySessionId}
+            <RecordingReplayView
+              sessionId={activeReplaySessionId}
+              profileLabel={activeReplayLabel ?? undefined}
+              onExit={handleReplayExit}
+            />
+          {/key}
+        {:else if selected === "dashboard"}
           <DashboardView onNavigate={(id) => navigate(id)} />
         {:else if selected === "terminal"}
           <TerminalView
@@ -243,6 +287,7 @@
         {:else if selected === "sessions"}
           <SessionsView
             onReconnect={handleLaunch}
+            onViewRecording={handleViewRecording}
             activeSessionId={activeLaunch?.sessionId ?? null}
           />
 

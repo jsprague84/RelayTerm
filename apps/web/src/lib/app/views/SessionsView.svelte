@@ -46,13 +46,47 @@
      * component only owns the create/close/load calls.
      */
     onReconnect?: (launch: ActiveLaunch) => void;
+    /**
+     * Hand a session id back to the parent shell to open the durable
+     * recording replay viewer. The shell sets the replay state and
+     * renders {@link RecordingReplayView}; this component only owns
+     * the click. The button is offered on rows that COULD have a
+     * recording (detached / closed) — the actual `has_recording`
+     * gate happens inside the replay viewer itself, so we avoid a
+     * per-row metadata fetch (no N+1) and surface "No recording
+     * available" honestly when the operator opens an empty one.
+     */
+    onViewRecording?: (sessionId: string, profileLabel: string | null) => void;
     /** Currently active launch, if any. Used to mark the row in the list
      * so the operator knows which session is already attached and to
      * suppress "Reconnect" on the same id. */
     activeSessionId?: string | null;
   }
 
-  let { onReconnect, activeSessionId = null }: Props = $props();
+  let {
+    onReconnect,
+    onViewRecording,
+    activeSessionId = null,
+  }: Props = $props();
+
+  /**
+   * Whether a row may have a durable recording worth opening the
+   * viewer for. The Sessions list deliberately does NOT pre-fetch
+   * recording metadata for every row (would be N+1 against
+   * `/recording/metadata`); instead we surface the affordance for
+   * `detached` / `closed` rows only and let the viewer's metadata
+   * gate render "No recording available" if the row turns out
+   * empty.
+   *
+   * `starting` is excluded — the row has no recording yet by
+   * definition. `active` is excluded too — the operator should
+   * `Open` an active row to attach to the live session, not open a
+   * "Replay only" view of the partial recording while the same
+   * session is still streaming.
+   */
+  function offersRecording(status: TerminalSession["status"]): boolean {
+    return status === "detached" || status === "closed";
+  }
 
   type LoadState =
     | { kind: "idle" }
@@ -445,6 +479,17 @@
             >
               {closingState?.kind === "submitting" ? "Closing…" : "Close"}
             </button>
+            {#if onViewRecording && offersRecording(session.status)}
+              <button
+                type="button"
+                class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+                onclick={() => onViewRecording?.(session.id, profileName)}
+                data-testid="sessions-row-view-recording"
+                title="Open the recording replay viewer for this session — read-only output, no live SSH"
+              >
+                View recording
+              </button>
+            {/if}
           </div>
 
           {#if closingState?.kind === "error"}

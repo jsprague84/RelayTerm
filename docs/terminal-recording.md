@@ -1092,36 +1092,82 @@ posture (Section 7) defensible at every stop.
      bounded `limit` clamp tests, negative-`from_seq` 400 tests,
      and base64 round-trip + sentinel-not-in-JSON redaction tests
      all pin the contract.
-   - Frontend replay viewer (step 5) is still ahead — no UI
-     consumes these endpoints today.
+   - Frontend replay viewer (step 5) — foundation has now landed
+     (see step 5 below).
    - Encryption-aware decode is still ahead. The writer only emits
      `encryption = 'none'` rows, so the route returns the
      post-persistence bytes verbatim as base64. When the
      `recording_v1` envelope lands the route MUST decrypt
      server-side; the wire MUST NOT carry envelope ciphertext.
-5. **Frontend replay viewer for closed sessions**.
-   - New production view under `apps/web/src/lib/app/views/`,
-     wired through `AppViewId` / `NAV_ITEMS`. Mounts
-     `XtermRenderer` against a replay-only client.
-   - Honest "read-only", "may contain secrets" copy on first
-     open.
-   - **Breaking contract change** — adding the `replay_only`
-     variant to `TerminalSessionState` in
-     `@relayterm/terminal-core/src/client.ts` is a public-API
-     change for the package. Every exhaustive `switch` site over
-     `TerminalSessionState` (production app shell, dev lab,
-     diagnostics panel, tests) MUST be updated in the same
-     commit that adds the variant. Treat this with the same care
-     as adding a `ServerMsg` variant in `relayterm_protocol`:
-     bump the package version, audit every `switch` site, add a
-     compile-time exhaustiveness assertion test if one does not
-     already exist. Renderer adapters are unaffected — the
-     `TerminalRenderer` interface is renderer-state-only and
-     does not see `TerminalSessionState`.
-   - Sentinel test asserting no chunk byte material reaches
-     `localStorage`/`sessionStorage` and that the parsed DTO
-     never carries a `recording_master_key` /
-     `encryption_master_key` / similar field.
+5. **Frontend replay viewer for closed sessions** (foundation landed).
+   - **Status**: read-only viewer at
+     `apps/web/src/lib/app/views/RecordingReplayView.svelte`,
+     reachable from the Sessions list via a new `View recording`
+     action. The shell holds the replay session id in transient
+     in-memory state (`activeReplaySessionId`, NOT a sidebar nav
+     entry, NOT mirrored into the URL — recording chunk bytes are
+     sensitive; we keep them off any externally observable
+     surface) and renders the viewer ABOVE the navigation switch
+     so any nav click clears it.
+   - The viewer uses a fresh `XtermRenderer` constructed with
+     `xtermOnly: { disableStdin: true }` and does NOT subscribe
+     to `onInput` — input is disabled at the renderer AND no
+     listener exists to forward it. There is no live
+     `TerminalSessionClient`, no `WebSocketTerminalTransport`,
+     and no wire `attach` handshake.
+   - The Sessions list deliberately does NOT pre-fetch metadata
+     for every row (would be N+1 against
+     `/recording/metadata`). The affordance is offered for any
+     non-`starting` row; the viewer's metadata gate honestly
+     surfaces "No recording available" when an opened session
+     turns out empty.
+   - Decoded chunk bytes go straight to `renderer.write(...)`
+     and are never stashed in `$state`, never persisted to
+     `localStorage` / `sessionStorage`, never logged. The
+     viewer renders markers as a metadata strip only
+     (`seq`, kind, `created_at`, a truncated JSON preview of the
+     opaque `payload`).
+   - Banner copy is honest: replay-only, output-only, input was
+     not recorded, the live SSH session cannot be resumed from a
+     recording, backend-restart recovery is not implemented yet.
+   - Helpers and tests:
+     `apps/web/src/lib/api/terminalRecordings.ts` adds typed
+     `getTerminalRecordingMetadata` / `Chunks` / `Markers`
+     helpers (every request uses `credentials: "include"`,
+     every session id is path-encoded), strict
+     `parseRecording*` parsers that drop unknown sibling fields
+     by construction, an `isSupportedChunk` guard that requires
+     `encryption == "none"` AND `compression == "none"`, and a
+     `decodeRecordingChunk` helper that decodes base64 once and
+     re-validates against the chunk's declared `byte_len`.
+     `describeRecordingError` and `describeDecodeFailure` stay
+     functions of the discriminant only — never echo the wire
+     `message` field of an HTTP error, the thrown `Error.message`
+     of a transport failure, `data_b64`, raw chunk bytes, or any
+     vault / auth sentinel. Sentinel tests in
+     `apps/web/tests/terminalRecordingsApi.test.ts` pin the
+     redaction posture against `data_b64`, the decoded chunk
+     payload, `private_key`, `encrypted_private_key`,
+     `session_token`, `token_hash`, `password_hash`, and
+     `first_user_bootstrap_token` — none reach a parsed DTO,
+     formatted error string, or a localStorage / sessionStorage
+     write.
+   - **Deferred to a follow-up slice**: live attach fallback to
+     durable chunks (the in-memory ring is still authoritative
+     on a live attach), startup reconciliation, retention
+     cleanup worker, encryption-aware decode, export / download
+     UI, recording search, admin / cross-user replay,
+     production renderer selector for the replay surface, and
+     mobile / Tauri-specific replay UX. The original sketch
+     also called for adding a `replay_only` variant to
+     `TerminalSessionState`; this slice intentionally avoids
+     that public-API change because the viewer does not use a
+     `TerminalSessionClient` at all — there is no client state
+     machine to extend, so the breaking change is unnecessary.
+     If a future slice merges the live + replay viewers behind
+     one client surface, the variant addition becomes the
+     correct way to discriminate, and the breaking-change
+     protocol from the original sketch applies.
 6. **Startup reconciliation for active sessions after crash**.
    - Section 9.3 policy. Idempotent. Audited via existing
      lifecycle audit kinds (no new audit kind required for the
