@@ -70,6 +70,27 @@ pub struct TerminalSession {
     pub closed_at: Option<DateTime<Utc>>,
 }
 
+/// One row produced by
+/// [`TerminalSessionRepository::reconcile_orphaned_on_startup`](crate::repository::TerminalSessionRepository::reconcile_orphaned_on_startup).
+///
+/// Carries only public, non-sensitive metadata: the session id and the
+/// `status` the row held immediately before reconciliation. Used by the
+/// startup reconciliation logger to count what was transitioned and by
+/// tests to assert the right rows were swept. The matching
+/// `session_events { kind: closed, payload: { reason, previous_status,
+/// reconciled_at } }` row is written by the repository inside the same
+/// database transaction — callers do NOT need to write a session_event
+/// themselves. By contract this never carries terminal output, peer
+/// banners, client info, or any other surface the redaction matrix
+/// guards. Intentionally no `Serialize` / `Deserialize` — this type
+/// never crosses a wire surface; producing one means "I just swept a
+/// row" and consumers (`tracing`, tests) do not need round-trip JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciledTerminalSession {
+    pub session_id: TerminalSessionId,
+    pub previous_status: TerminalSessionStatus,
+}
+
 /// One client's attachment to a [`TerminalSession`].
 ///
 /// The session may have multiple historical attachments (detach +

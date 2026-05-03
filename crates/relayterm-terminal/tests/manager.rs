@@ -18,7 +18,7 @@ use relayterm_core::repository::{
 };
 use relayterm_core::session_event::{SessionEvent, SessionEventKind};
 use relayterm_core::terminal_session::{
-    TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
+    ReconciledTerminalSession, TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
 use relayterm_ssh::{ClosedReason, SshPtyError, SshPtyEvent, SshPtyHandle, SshPtyStart};
 use relayterm_terminal::{
@@ -191,6 +191,62 @@ impl TerminalSessionRepository for InMemoryRepo {
             row.last_seen_seq = last_seen_seq;
         }
         Ok(())
+    }
+
+    async fn reconcile_orphaned_on_startup(
+        &self,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<ReconciledTerminalSession>, RepositoryError> {
+        // Mirrors the Postgres impl shape: pick orphan rows, transition
+        // each to `Closed`, append a matching `closed { reason:
+        // startup_reconciliation, ... }` session_event.
+        let mut guard = self.inner.lock().unwrap();
+        let mut targets: Vec<(TerminalSessionId, TerminalSessionStatus)> = guard
+            .sessions
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    TerminalSessionStatus::Starting
+                        | TerminalSessionStatus::Active
+                        | TerminalSessionStatus::Detached,
+                )
+            })
+            .map(|s| (s.id, s.status))
+            .collect();
+        targets.sort_by_key(|(id, _)| *id);
+
+        // Mirror the Postgres impl's clock split: `closed_at` is the
+        // caller-supplied reconciliation timestamp; `last_seen_at`
+        // and the `session_event.recorded_at` are wall-clock at the
+        // moment of the write. A test that intentionally pins `at`
+        // to the past must NOT see `last_seen_at` driven into the
+        // past too.
+        let mut reconciled = Vec::with_capacity(targets.len());
+        for (id, previous_status) in targets {
+            if let Some(row) = guard.sessions.get_mut(&id) {
+                row.status = TerminalSessionStatus::Closed;
+                row.closed_at = Some(at);
+                row.last_seen_at = Utc::now();
+            }
+            let payload = serde_json::json!({
+                "reason": "startup_reconciliation",
+                "previous_status": previous_status.as_str(),
+                "reconciled_at": at,
+            });
+            guard.events.push(SessionEvent {
+                id: SessionEventId::new(),
+                session_id: id,
+                kind: SessionEventKind::Closed,
+                payload,
+                recorded_at: Utc::now(),
+            });
+            reconciled.push(ReconciledTerminalSession {
+                session_id: id,
+                previous_status,
+            });
+        }
+        Ok(reconciled)
     }
 }
 

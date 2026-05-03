@@ -2413,3 +2413,376 @@ async fn recording_metadata_isolates_per_session(pool: PgPool) {
     assert_eq!(meta_a.chunk_count, 1);
     assert_eq!(meta_b.chunk_count, 0);
 }
+
+// ----------------------------------------------------------------------
+// Backend startup reconciliation
+// ----------------------------------------------------------------------
+//
+// Sweeps `terminal_sessions WHERE status IN ('starting','active','detached')`
+// to `closed`, writes one matching `session_events { kind: closed,
+// payload: { reason: "startup_reconciliation", previous_status,
+// reconciled_at } }` row per session in the same transaction, leaves
+// already-closed rows untouched, leaves recording chunks/markers
+// untouched, and writes zero `audit_events`. Idempotent — a second
+// call is a no-op.
+//
+// See `docs/terminal-recording.md` Section 9.3 for the policy and
+// AGENTS.md "Decision tables" for the audit-event redaction rules
+// reconciliation must respect.
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_sweeps_non_closed_states(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let events = PgSessionEventRepository::new(pool.clone());
+
+    let starting = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Starting,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let active = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let detached = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Detached,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    // Pre-closed row must NOT be touched.
+    let pre_closed = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let pre_closed_at = chrono::Utc::now() - Duration::hours(1);
+    repo.set_status(
+        pre_closed.id,
+        TerminalSessionStatus::Closed,
+        Some(pre_closed_at),
+    )
+    .await
+    .unwrap();
+
+    let now = chrono::Utc::now();
+    let reconciled = repo.reconcile_orphaned_on_startup(now).await.unwrap();
+    assert_eq!(reconciled.len(), 3);
+    let mut by_id: std::collections::HashMap<_, _> = reconciled
+        .iter()
+        .map(|r| (r.session_id, r.previous_status))
+        .collect();
+    assert_eq!(
+        by_id.remove(&starting.id),
+        Some(TerminalSessionStatus::Starting),
+    );
+    assert_eq!(
+        by_id.remove(&active.id),
+        Some(TerminalSessionStatus::Active),
+    );
+    assert_eq!(
+        by_id.remove(&detached.id),
+        Some(TerminalSessionStatus::Detached),
+    );
+    assert!(by_id.is_empty(), "no extra rows reconciled");
+
+    // All three sessions are now closed with the supplied `closed_at`.
+    for id in [starting.id, active.id, detached.id] {
+        let row = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(row.status, TerminalSessionStatus::Closed);
+        let closed_at = row.closed_at.expect("closed_at must be set");
+        // tolerate microsecond rounding from Postgres
+        assert!(
+            (closed_at - now).num_milliseconds().abs() < 1000,
+            "closed_at should reflect reconciliation timestamp",
+        );
+    }
+
+    // Pre-closed row is untouched: status stays closed, closed_at
+    // unchanged from the pre-test set_status timestamp (within rounding).
+    let pre = repo.get(pre_closed.id).await.unwrap().unwrap();
+    assert_eq!(pre.status, TerminalSessionStatus::Closed);
+    let pre_closed_at_after = pre.closed_at.expect("pre-closed closed_at preserved");
+    assert!(
+        (pre_closed_at_after - pre_closed_at)
+            .num_milliseconds()
+            .abs()
+            < 1000,
+        "pre-closed row's closed_at must NOT be overwritten by reconciliation",
+    );
+
+    // One closed session_event per reconciled session, with the
+    // payload shape pinned: reason, previous_status, reconciled_at.
+    // Public metadata only — no terminal output, no client_info, no
+    // peer banners. The startup reconciliation is the ONLY event for
+    // each row so far, so the per-session event list has length 1.
+    for (id, want_prev) in [
+        (starting.id, "starting"),
+        (active.id, "active"),
+        (detached.id, "detached"),
+    ] {
+        let evs = events.list_for_session(id).await.unwrap();
+        assert_eq!(
+            evs.len(),
+            1,
+            "exactly one closed event per reconciled session",
+        );
+        let ev = &evs[0];
+        assert_eq!(ev.kind, SessionEventKind::Closed);
+        assert_eq!(
+            ev.payload["reason"].as_str(),
+            Some("startup_reconciliation"),
+        );
+        assert_eq!(ev.payload["previous_status"].as_str(), Some(want_prev));
+        assert!(
+            ev.payload.get("reconciled_at").is_some(),
+            "reconciled_at must be present in payload",
+        );
+        // Defence-in-depth: the payload object must NOT carry any
+        // surface from the redaction matrix. Reconciliation never
+        // sees these strings, but pin it anyway in case a future
+        // refactor leaks one in.
+        let raw = serde_json::to_string(&ev.payload).unwrap();
+        for forbidden in [
+            "private_key",
+            "encrypted_private_key",
+            "password_hash",
+            "client_info",
+            "data_b64",
+            "payload_bytes",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "session_event payload must not carry redacted field {forbidden}: {raw}",
+            );
+        }
+    }
+
+    // Pre-closed row must NOT have a startup-reconciliation event
+    // appended (it had no events to begin with; the test's
+    // set_status call doesn't write one).
+    let pre_evs = events.list_for_session(pre_closed.id).await.unwrap();
+    assert!(
+        pre_evs
+            .iter()
+            .all(|e| e.payload["reason"].as_str() != Some("startup_reconciliation")),
+        "pre-closed row must not receive a startup_reconciliation event",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_is_idempotent(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let events = PgSessionEventRepository::new(pool.clone());
+    let session = repo
+        .create(CreateTerminalSession {
+            owner_id: user.id,
+            server_profile_id: profile.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let first = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let after_first = events.list_for_session(session.id).await.unwrap();
+    assert_eq!(after_first.len(), 1);
+
+    // Second pass: nothing left to reconcile, no events appended.
+    let second = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        second.is_empty(),
+        "second reconciliation must find no orphans",
+    );
+    let after_second = events.list_for_session(session.id).await.unwrap();
+    assert_eq!(
+        after_second.len(),
+        1,
+        "second reconciliation must not append a duplicate event",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_no_orphans_returns_empty(pool: PgPool) {
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let result = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_spans_users_and_keeps_recordings(pool: PgPool) {
+    let alice = make_user(&pool).await;
+    let bob = PgUserRepository::new(pool.clone())
+        .create(CreateUser {
+            email: "bob@example.com".to_owned(),
+            display_name: "Bob".to_owned(),
+        })
+        .await
+        .unwrap();
+    let host_a = make_host(&pool, &alice).await;
+    let identity_a = make_identity(&pool, &alice).await;
+    let profile_a = make_profile(&pool, &alice, &host_a, &identity_a).await;
+    let host_b = make_host(&pool, &bob).await;
+    let identity_b = make_identity(&pool, &bob).await;
+    let profile_b = make_profile(&pool, &bob, &host_b, &identity_b).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let events = PgSessionEventRepository::new(pool.clone());
+    let recordings = PgTerminalRecordingRepository::new(pool.clone());
+
+    let session_a = repo
+        .create(CreateTerminalSession {
+            owner_id: alice.id,
+            server_profile_id: profile_a.id,
+            status: TerminalSessionStatus::Active,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let session_b = repo
+        .create(CreateTerminalSession {
+            owner_id: bob.id,
+            server_profile_id: profile_b.id,
+            status: TerminalSessionStatus::Detached,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    // Recording chunks + a marker on session_a. Reconciliation must
+    // not touch them.
+    recordings
+        .append_chunk(CreateTerminalRecordingChunk {
+            terminal_session_id: session_a.id,
+            seq_start: 1,
+            seq_end: 4,
+            byte_len: 4,
+            payload: b"data".to_vec(),
+            encryption: TerminalRecordingPayloadEncryption::None,
+            compression: TerminalRecordingCompression::None,
+        })
+        .await
+        .unwrap();
+    recordings
+        .append_marker(CreateTerminalRecordingMarker {
+            terminal_session_id: session_a.id,
+            kind: TerminalRecordingMarkerKind::Started,
+            seq: 0,
+            payload: json!({}),
+        })
+        .await
+        .unwrap();
+
+    let before_chunks = recordings.list_chunks(session_a.id, 0, 1024).await.unwrap();
+    let before_markers = recordings
+        .list_markers(session_a.id, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(before_chunks.len(), 1);
+    assert_eq!(before_markers.len(), 1);
+
+    let reconciled = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(reconciled.len(), 2);
+
+    let a = repo.get(session_a.id).await.unwrap().unwrap();
+    let b = repo.get(session_b.id).await.unwrap().unwrap();
+    assert_eq!(a.status, TerminalSessionStatus::Closed);
+    assert_eq!(b.status, TerminalSessionStatus::Closed);
+
+    let evs_a = events.list_for_session(session_a.id).await.unwrap();
+    let evs_b = events.list_for_session(session_b.id).await.unwrap();
+    assert_eq!(evs_a.len(), 1);
+    assert_eq!(evs_b.len(), 1);
+    assert_eq!(evs_a[0].payload["previous_status"].as_str(), Some("active"));
+    assert_eq!(
+        evs_b[0].payload["previous_status"].as_str(),
+        Some("detached"),
+    );
+
+    // Recording chunks AND markers untouched.
+    let after_chunks = recordings.list_chunks(session_a.id, 0, 1024).await.unwrap();
+    let after_markers = recordings
+        .list_markers(session_a.id, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(after_chunks.len(), 1, "reconcile must not delete chunks");
+    assert_eq!(after_markers.len(), 1, "reconcile must not delete markers");
+    assert_eq!(after_chunks[0].seq_start, 1);
+    assert_eq!(after_chunks[0].seq_end, 4);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn reconcile_orphaned_on_startup_writes_no_audit_events(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let identity = make_identity(&pool, &user).await;
+    let profile = make_profile(&pool, &user, &host, &identity).await;
+    let repo = PgTerminalSessionRepository::new(pool.clone());
+    let audit = PgAuditEventRepository::new(pool.clone());
+    repo.create(CreateTerminalSession {
+        owner_id: user.id,
+        server_profile_id: profile.id,
+        status: TerminalSessionStatus::Active,
+        cols: 80,
+        rows: 24,
+    })
+    .await
+    .unwrap();
+
+    let before = audit.recent(1024).await.unwrap();
+    let reconciled = repo
+        .reconcile_orphaned_on_startup(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(reconciled.len(), 1);
+    let after = audit.recent(1024).await.unwrap();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "startup reconciliation must NOT write audit_events \
+         (matches the existing close-path audit shape)",
+    );
+}

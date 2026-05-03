@@ -52,6 +52,49 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connect to postgres")?;
 
+    // Backend startup reconciliation for terminal sessions. Any
+    // `terminal_sessions` row left in `starting`/`active`/`detached`
+    // is an orphan: its in-memory `TerminalSessionManager` runtime
+    // entry, live `russh::Channel`, broadcast fanout, and replay ring
+    // were lost when the previous process exited. The row would
+    // otherwise stay operator-visible as a "live" session the UI can
+    // never resume. Sweep them to `closed` BEFORE the listener binds
+    // and BEFORE the manager is constructed, so the registry starts
+    // from a clean slate. Each transitioned row gets one
+    // `session_events { kind: closed, payload: { reason:
+    // "startup_reconciliation", previous_status, reconciled_at } }`
+    // row inside the same database transaction. No `audit_events`,
+    // no row deletion, no recording-table writes (recordings remain
+    // readable through the existing closed-session replay path).
+    // Idempotent: a second startup with no orphans is a no-op. See
+    // `docs/terminal-recording.md` Section 9.3 and SPEC.md "Durable
+    // terminal recording and replay architecture" for the policy.
+    //
+    // Fails the boot on a DB error: a partial reconciliation that
+    // leaves the orchestrator running with stale "live" rows is the
+    // worse failure mode (operator-invisible, UI-misleading) than
+    // refusing to serve.
+    {
+        let now = chrono::Utc::now();
+        let reconciled = db
+            .terminal_sessions()
+            .reconcile_orphaned_on_startup(now)
+            .await
+            .context("reconcile orphaned terminal sessions on startup")?;
+        if reconciled.is_empty() {
+            info!("terminal session startup reconciliation: nothing to do");
+        } else {
+            // Log the count only — never the session ids. They're
+            // owner-scoped resources the operator log doesn't need
+            // and the count is enough to spot a regression.
+            info!(
+                count = reconciled.len(),
+                "terminal session startup reconciliation: \
+                 swept orphaned sessions to closed",
+            );
+        }
+    }
+
     // Production deploys must be reachable as a real user. Without a
     // first user AND without a `first_user_bootstrap_token`, no operator
     // path exists to create one. Reject before binding the listener so a

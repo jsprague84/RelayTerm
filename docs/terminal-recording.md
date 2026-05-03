@@ -642,17 +642,28 @@ path above (after Section 9.2 reconciles the row).
 
 ### 9.3 Startup reconciliation policy
 
+**Status (this slice).** Terminal-session reconciliation has
+landed. The reconciliation pass runs at boot AFTER the database
+pool is ready and BEFORE the listener binds (and BEFORE the
+`TerminalSessionManager` is constructed, so its in-memory registry
+starts from a clean slate). The closed-recording-marker write is
+**deferred** — see point 6 below.
+
 On startup the orchestrator runs a small reconciliation pass for
 its own metadata before accepting requests:
 
 1. Scan `terminal_sessions WHERE status IN ('starting', 'active',
    'detached')`. These rows describe sessions whose runtime entry
    was lost across the restart.
-2. For each such row, append a `closed { reason: "backend_restart",
-   category: "process_lost" }` lifecycle event (`session_events`)
-   AND transition the row to `closed`. If recording is enabled and
-   any chunk row exists for the session, also write a `closed`
-   recording marker at the highest persisted seq.
+2. For each such row, append a `closed` lifecycle event
+   (`session_events`) with payload `{ "reason":
+   "startup_reconciliation", "previous_status": <starting | active
+   | detached>, "reconciled_at": <ISO 8601 UTC> }` AND transition
+   the row to `closed` (`closed_at = reconciled_at`,
+   `last_seen_at = NOW()`). The status update AND the
+   session_event row are committed in the same database
+   transaction; a partial reconciliation that closes a row without
+   leaving an audit trail is not possible.
 3. **Reconciliation writes `session_events` only, NOT
    `audit_events`.** Rationale: the existing wired close path
    (`POST /api/v1/terminal-sessions/:id/close`) writes a `closed`
@@ -670,12 +681,46 @@ its own metadata before accepting requests:
 4. The reconciliation pass does NOT delete chunk rows. The
    recording remains readable via the closed-session replay path.
 5. Reconciliation is idempotent: a second startup that finds no
-   pre-restart non-`closed` rows is a no-op.
+   pre-restart non-`closed` rows is a no-op (no events appended,
+   no rows touched).
+6. **Closed-recording-marker write is deferred to a future slice.**
+   Writing a `closed` recording marker at the highest persisted
+   seq when chunk rows exist is design-intent — it would let the
+   replay viewer surface "session ended at seq N due to backend
+   restart" rather than the current "trailing chunk + no end
+   marker" shape — but it is NOT implemented in this slice.
+   Reasoning: the existing close path already emits a `closed`
+   marker on graceful close (writer's `shutdown(last_seq)`); the
+   missing case is exactly the crash path, and gluing it on at
+   reconciliation time requires reading
+   `TerminalRecordingMetadata::last_seq` per session to choose the
+   marker's `seq`. That is a small but non-trivial extra repository
+   call in the same transaction, and the slice is explicitly
+   scoped to `terminal_sessions` + `session_events`. Until the
+   marker write lands, a recording that ended with the orchestrator
+   crash will display the trailing chunk and stop; the
+   session_event log carries the `startup_reconciliation` reason
+   so the operator-side audit trail is complete. The replay
+   viewer's "Replay only" banner already names "a recording may
+   end mid-output if the backend restarted while the session was
+   alive" so the user-facing copy does not change.
 
-This is the first step where session lifecycle and recording
-lifecycle interact, and it must be wired together — a row that gets
-reconciled to `closed` without its recording marker would leave the
-read path showing a session that "ended" with no end marker.
+A future slice that wires the closed-marker write should:
+
+- Pull `TerminalRecordingMetadata` for each reconciled
+  `terminal_sessions` row inside the same transaction (or as a
+  best-effort follow-up — the `session_events` row is the
+  load-bearing audit surface and must commit even if the marker
+  write fails).
+- Write a `Closed` marker only when `metadata.has_recording()` is
+  true, with `seq = metadata.last_seq.unwrap_or(0)` and a payload
+  of `{ "reason": "startup_reconciliation", "previous_status":
+  <prior> }` (metadata-only by contract, mirroring
+  `session_events`).
+- Re-validate idempotency: a second startup must NOT write a
+  duplicate `Closed` marker. The natural primary-key /
+  `(session_id, kind, seq)` shape is sufficient because point 5
+  above guarantees the second pass finds no orphans to process.
 
 ### 9.4 Future work: live PTY persistence
 
@@ -1238,8 +1283,10 @@ none of these tests are written in this design slice.
 - **Backend restart reconciliation**. A test process kill +
   restart with one `active` row and recording rows present
   produces (a) a `closed` lifecycle event with `reason =
-  backend_restart`, (b) a `closed` recording marker at the
-  highest persisted seq, and (c) idempotency on a second
+  "startup_reconciliation"` and a `previous_status` field, (b) a
+  `closed` recording marker at the highest persisted seq —
+  **deferred** to a follow-up slice; the current foundation
+  ships only (a) and (c) — and (c) idempotency on a second
   restart.
 - **Retention cleanup**. The cleanup worker, run against a
   fixture with sessions older than the retention window, deletes

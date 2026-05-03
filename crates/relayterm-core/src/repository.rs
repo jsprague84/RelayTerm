@@ -29,7 +29,9 @@ use crate::terminal_recording::{
     TerminalRecordingChunk, TerminalRecordingCompression, TerminalRecordingMarker,
     TerminalRecordingMarkerKind, TerminalRecordingMetadata, TerminalRecordingPayloadEncryption,
 };
-use crate::terminal_session::{TerminalSession, TerminalSessionAttachment, TerminalSessionStatus};
+use crate::terminal_session::{
+    ReconciledTerminalSession, TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
+};
 use crate::user::User;
 use crate::user_session::UserSession;
 use crate::validation::{HostDisplayName, Hostname, ProfileName, SshPort, SshUsername, Tag};
@@ -417,6 +419,55 @@ pub trait TerminalSessionRepository: Send + Sync {
         detached_at: DateTime<Utc>,
         last_seen_seq: Option<i64>,
     ) -> Result<(), RepositoryError>;
+
+    /// Sweep terminal sessions whose runtime entry was lost across a
+    /// backend restart and transition them to `closed`.
+    ///
+    /// A session whose `status` is `starting`, `active`, or `detached`
+    /// only has meaning while the backend's in-memory
+    /// `TerminalSessionManager` still owns its `russh::Channel`,
+    /// broadcast fanout, and replay ring buffer. Once the process
+    /// exits, those resources are unrecoverable (see
+    /// `docs/terminal-recording.md` Section 9.1) and the row would
+    /// otherwise remain operator-visible as a stale "live" session
+    /// the UI cannot ever resume.
+    ///
+    /// Behavior:
+    /// - In a single transaction, locks candidate rows
+    ///   (`status IN ('starting','active','detached')` `FOR UPDATE`),
+    ///   transitions each to `closed` with `closed_at = at` and
+    ///   `last_seen_at = NOW()`, AND inserts one matching
+    ///   `session_events` row per reconciled session with `kind =
+    ///   closed` and a payload of `{ "reason":
+    ///   "startup_reconciliation", "previous_status": <old>,
+    ///   "reconciled_at": at }`. The status transition AND its
+    ///   matching session_event are committed together — a partial
+    ///   reconciliation that closes a row without an audit trail is
+    ///   not possible (`docs/terminal-recording.md` Section 9.3).
+    /// - Idempotent. A second call finds no candidates and returns an
+    ///   empty `Vec` without writing anything.
+    /// - Does NOT touch `terminal_recording_chunks` /
+    ///   `terminal_recording_markers`. Recordings remain readable
+    ///   through the existing closed-session replay path. Writing a
+    ///   `closed` recording marker on reconciliation is design-intent
+    ///   (`docs/terminal-recording.md` Section 9.3) but is deferred
+    ///   to a future slice; see the SPEC.md "Durable terminal
+    ///   recording and replay architecture" status block.
+    /// - Does NOT write `audit_events`. Reconciliation is operational
+    ///   bookkeeping and matches the existing close-path audit shape
+    ///   (lifecycle close writes a `session_events` row only).
+    /// - Does NOT delete any row.
+    /// - Returns the reconciled (id, previous-status) pairs in a
+    ///   stable per-row shape so the caller (the backend startup
+    ///   path) can log the count without reaching the wire payload.
+    ///
+    /// Implementations MUST keep the SQL boundary tight: no terminal
+    /// output, no `client_info`, no peer banners, no recording bytes
+    /// can appear in any returned error or constructed payload.
+    async fn reconcile_orphaned_on_startup(
+        &self,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<ReconciledTerminalSession>, RepositoryError>;
 }
 
 #[async_trait]

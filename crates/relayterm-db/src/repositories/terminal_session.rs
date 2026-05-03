@@ -5,8 +5,9 @@ use relayterm_core::repository::{
     CreateTerminalSession, CreateTerminalSessionAttachment, RepositoryError,
     TerminalSessionRepository,
 };
+use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::terminal_session::{
-    TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
+    ReconciledTerminalSession, TerminalSession, TerminalSessionAttachment, TerminalSessionStatus,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use crate::rows::{TerminalSessionAttachmentRow, TerminalSessionRow};
 
 const ENTITY: &str = "terminal_session";
 const ATTACHMENT_ENTITY: &str = "terminal_session_attachment";
+const SESSION_EVENT_ENTITY: &str = "session_event";
 
 #[derive(Debug, Clone)]
 pub struct PgTerminalSessionRepository {
@@ -195,6 +197,99 @@ impl TerminalSessionRepository for PgTerminalSessionRepository {
         .map_err(|e| map_sqlx_error(ATTACHMENT_ENTITY, e))?;
 
         Ok(row.map(TerminalSessionAttachmentRow::into_domain))
+    }
+
+    async fn reconcile_orphaned_on_startup(
+        &self,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<ReconciledTerminalSession>, RepositoryError> {
+        // The whole sweep runs in one transaction so the status
+        // transition and its matching `session_events` row are
+        // committed together. Reconciliation is once-at-startup and
+        // strictly bounded by the count of orphaned rows; the
+        // transaction stays short.
+        //
+        // `FOR UPDATE` locks the candidate rows so a second startup
+        // racing the same database (operator restart with overlap)
+        // observes consistent state instead of double-closing a row
+        // and writing two `session_events`. Locks are released when
+        // the transaction commits.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        let candidates: Vec<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT id, status
+            FROM terminal_sessions
+            WHERE status IN ('starting', 'active', 'detached')
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        let mut reconciled = Vec::with_capacity(candidates.len());
+        for (id, status_str) in candidates {
+            let previous_status =
+                TerminalSessionStatus::from_str_tag(&status_str).ok_or_else(|| {
+                    RepositoryError::Validation {
+                        field: "status",
+                        message: format!("unknown terminal session status `{status_str}`"),
+                    }
+                })?;
+
+            sqlx::query(
+                r#"
+                UPDATE terminal_sessions
+                SET status = 'closed',
+                    closed_at = $2,
+                    last_seen_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+            // Public metadata only: the reason code, the previous
+            // status (`starting` / `active` / `detached`), and the
+            // reconciliation timestamp. NEVER terminal output, peer
+            // banners, recording bytes, or `client_info`.
+            let payload = serde_json::json!({
+                "reason": "startup_reconciliation",
+                "previous_status": previous_status.as_str(),
+                "reconciled_at": at,
+            });
+            let event_id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO session_events (id, session_id, kind, payload)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(event_id)
+            .bind(id)
+            .bind(SessionEventKind::Closed.as_str())
+            .bind(&payload)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(SESSION_EVENT_ENTITY, e))?;
+
+            reconciled.push(ReconciledTerminalSession {
+                session_id: TerminalSessionId::from_uuid(id),
+                previous_status,
+            });
+        }
+
+        tx.commit().await.map_err(|e| map_sqlx_error(ENTITY, e))?;
+        Ok(reconciled)
     }
 
     async fn mark_attachment_detached(
