@@ -362,15 +362,25 @@ Dockerfiles automatically (paths are relative to the repo root via
 
 ### 5.1 Selected base images
 
-The Dockerfiles pin every base image with a versioned `ARG`. CI in
-`.forgejo/workflows/ci.yml` mirrors these pins exactly — bumping any
-of them is one commit that touches the Dockerfile, the workflow, and
-this section.
+The Dockerfiles pin every build/runtime base image with a versioned
+`ARG`. The toolchain values (`RUST_VERSION`, `NODE_VERSION`) are also
+pinned by `.forgejo/workflows/ci.yml`, but in *separate workflow steps*
+rather than a job-level `container.image:` — the workflow's job
+container is `catthehacker/ubuntu:act-latest` (a generic Forgejo-runner
+base, NOT a toolchain pin and NOT included in the table below) and the
+Rust/Node versions are installed inside the job. Bumping a toolchain is
+one commit that touches the Dockerfile `ARG`, the matching workflow
+step, and this section. See §6.3 for the bump procedure.
+
+The table below lists ONLY Dockerfile base images. The CI runner base
+(`catthehacker/ubuntu:act-latest`) is fixed and not version-bumped
+alongside Rust/Node — replacing it would be its own slice (e.g.
+switching to a Forgejo-official runner image when one stabilises).
 
 | Image | Pin | Why |
 |---|---|---|
-| `rust:${RUST_VERSION}-bookworm` | `RUST_VERSION=1.95` | The Cargo.toml-declared MSRV is `rust-version = "1.85"` and `edition = "2024"` is the only post-1.85 language feature currently in use (1.85 stabilised it), so the workspace compiles cleanly at MSRV today. The 1.95 pin here is NOT driven by a specific feature requirement — it tracks the working local dev toolchain so the container compiler matches host diagnostics (including new lints and clippy nudges) and so a CI build does not surface a warning the dev never saw. The repo has no `rust-toolchain.toml` yet; the Dockerfile is the de facto source of truth for "what Rust does CI build with". A future slice should add a `rust-toolchain.toml` at the repo root and have this `ARG` read from it. |
-| `node:${NODE_VERSION}-bookworm-slim` | `NODE_VERSION=22` | Node 22 is the current LTS line. `package.json#packageManager` (`pnpm@10.33.0`) is the source of truth for pnpm — corepack handles the activation in both the Dockerfile and CI, so there's nothing to pin twice. |
+| `rust:${RUST_VERSION}-bookworm` | `RUST_VERSION=1.95` | The Cargo.toml-declared MSRV is `rust-version = "1.85"` and `edition = "2024"` is the only post-1.85 language feature currently in use (1.85 stabilised it), so the workspace compiles cleanly at MSRV today. The 1.95 pin here is NOT driven by a specific feature requirement — it tracks the working local dev toolchain so the container compiler matches host diagnostics (including new lints and clippy nudges) and so a CI build does not surface a warning the dev never saw. The repo has no `rust-toolchain.toml` yet; the Dockerfile is the de facto source of truth for "what Rust does CI build with", and CI's `rustup --default-toolchain 1.95` mirrors that. A future slice should add a `rust-toolchain.toml` at the repo root and have this `ARG` plus the workflow step read from it, collapsing the three pin sites to one. |
+| `node:${NODE_VERSION}-bookworm-slim` | `NODE_VERSION=22` | Node 22 is the current LTS line. `package.json#packageManager` (`pnpm@10.33.0`) is the source of truth for pnpm — corepack handles the activation in both the Dockerfile and CI, so there's nothing to pin twice. CI's `setup-node` step pins to the same `22` value. |
 | `nginx:${NGINX_VERSION}` | `NGINX_VERSION=1.27-alpine` | Stable line. The `envsubst`-on-`/etc/nginx/templates/*.template` behaviour the runtime stage relies on is alpine-specific. |
 | `debian:${DEBIAN_VERSION}` | `DEBIAN_VERSION=bookworm-slim` | Matches the `bookworm` base of the Rust builder so `glibc` versions line up between build and runtime. |
 
@@ -403,10 +413,10 @@ runs ONLY on push-to-main, `v*` tag pushes, and operator-driven
 
 ### 6.1 Runner Docker access
 
-The `docker-build` job runs `docker build` from inside the job
-container. Forgejo runners do NOT expose the host Docker daemon by
-default — you must configure ONE of the following in the runner's
-`config.yml`:
+The `docker-build` and `publish-images` jobs run `docker build` from
+inside the job container. Forgejo runners do NOT expose the host Docker
+daemon by default — you must configure ONE of the following in the
+runner's `config.yml`:
 
 - **Socket mount** (preferred for self-hosted runners on a trusted
   host):
@@ -415,14 +425,19 @@ default — you must configure ONE of the following in the runner's
     docker_host: 'automount'
   ```
   Forgejo Runner mounts the host's `/var/run/docker.sock` into the job
-  container as `/var/run/docker.sock`. The job's `docker:28-cli` image
-  then talks to the host daemon directly. Note: any job on this
-  runner can reach the host daemon, which is approximately equivalent
-  to root on the host.
+  container as `/var/run/docker.sock`. The job container
+  (`catthehacker/ubuntu:act-latest`, which ships docker CLI + buildx)
+  then talks to the host daemon directly. Note: any job on this runner
+  can reach the host daemon, which is approximately equivalent to root
+  on the host.
 - **Docker-in-Docker** (preferred for shared/multi-tenant runners):
   run a `docker:dind` sidecar and point `DOCKER_HOST` at it. The full
   recipe is in
   [Forgejo's docker-access docs](https://forgejo.org/docs/latest/admin/actions/docker-access).
+  This is the pattern in use on `git.js-node.cc` — the runner's
+  `container.options` config plumbs `DOCKER_HOST` + TLS certs into
+  every job, mirroring `git.js-node.cc/jsprague/qshift`'s working
+  setup.
 
 Without one of these, the `docker info` step in the workflow fails
 fast with a recognisable "Cannot connect to the Docker daemon" error
@@ -467,8 +482,13 @@ commit touching all of:
 
 - `Dockerfile.backend` `ARG RUST_VERSION=...`
 - `Dockerfile.web` `ARG NODE_VERSION=...`
-- `.forgejo/workflows/ci.yml` `container.image: rust:...` /
-  `node:...`
+- `.forgejo/workflows/ci.yml` — Rust pin lives in the
+  `rust-checks → install rust …` step (`--default-toolchain X.Y.Z`);
+  Node pin lives in the `web-checks → setup node …` step
+  (`with: node-version: 'NN'`). The job-level `container.image` is
+  `catthehacker/ubuntu:act-latest` for every job and is NOT the
+  toolchain pin — it's only the Forgejo-runner-compatible base for
+  the JS action runtime.
 - This section's "Selected base images" table.
 - `Cargo.toml` `rust-version = "..."` IF (and only if) the bump also
   raises the MSRV — most local-toolchain bumps do NOT raise the

@@ -15,14 +15,33 @@
 #     registry retention/cleanup policies.
 #   * Multi-arch / `linux/arm64`. Single-arch only.
 #   * Remote / registry build cache. BuildKit cache mounts only.
+#   * Cargo / pnpm dependency caching across runs (first-run-time only).
 #   * Playwright / browser SSH smoke (manual per `apps/web/e2e/SMOKE.md`).
+#
+# Runner pattern (mirrors `git.js-node.cc/jsprague/qshift`):
+#   * Every job runs inside `catthehacker/ubuntu:act-latest` — the standard
+#     Forgejo-runner-compatible base image. It ships docker CLI + buildx,
+#     git, curl, and a Node runtime, so JS-based actions (`checkout`,
+#     `setup-node`, `setup-buildx`, `login`, `build-push`) work without
+#     per-job bootstrap. Earlier per-job choices `rust:1.95-bookworm` and
+#     `docker:28-cli` failed `actions/checkout@v4` at 0s because those
+#     images don't ship Node, and the Forgejo runner does NOT inject one.
+#   * Toolchains are installed *inside* the job rather than baked into the
+#     container image: Rust 1.95 via rustup-init in `rust-checks`, Node 22
+#     via `setup-node` in `web-checks`. The Docker daemon is reached via
+#     `DOCKER_HOST` + TLS certs already plumbed by the runner's
+#     `container.options` config — see `§6.1` of
+#     `docs/deployment/docker-compose.md`.
+#   * Checkout uses the explicit Forgejo-hosted URL
+#     `https://code.forgejo.org/actions/checkout@v4`. The bare
+#     `actions/checkout@v4` form depends on the runner's
+#     `DEFAULT_ACTIONS_URL` config and is fragile across instances; the
+#     explicit URL is the qshift-validated pattern on this runner.
 #
 # Runner requirements:
 #   * `docker` label on the Forgejo runner.
 #   * Docker daemon access for the `docker-build` AND `publish-images`
-#     jobs. The Forgejo runner config must enable EITHER
-#     `container.docker_host: automount` (socket mount) OR a
-#     Docker-in-Docker sidecar exposing `DOCKER_HOST` to the job. See
+#     jobs (socket-mount or DinD sidecar). See
 #     https://forgejo.org/docs/latest/admin/actions/docker-access and
 #     `docs/deployment/docker-compose.md` ("CI image build" + "Registry
 #     publishing" sections).
@@ -37,15 +56,19 @@
 #     context for action compatibility.
 #
 # Toolchain pins (must stay in lockstep with the Dockerfiles):
-#   * Rust  1.95 — matches `Dockerfile.backend` `ARG RUST_VERSION`.
-#                  Tracks the working local dev toolchain, NOT a
-#                  specific language-feature requirement — Cargo.toml's
-#                  `rust-version = "1.85"` is the actual MSRV. Bumping
-#                  exists to keep CI's compiler diagnostics aligned
-#                  with what the dev sees locally.
-#   * Node  22   — matches `Dockerfile.web` `ARG NODE_VERSION`. Current
-#                  LTS line.
-#   * pnpm  pinned by `package.json#packageManager` via corepack.
+#   * Rust  1.95 — pinned in the rustup-init step of `rust-checks`
+#                  (`--default-toolchain 1.95` — rustup resolves to the
+#                  latest 1.95.x). Mirrors `Dockerfile.backend` `ARG
+#                  RUST_VERSION=1.95` (Docker Hub `rust:1.95-bookworm`
+#                  resolves the same way). Tracks the working local dev
+#                  toolchain, NOT a specific language-feature
+#                  requirement — Cargo.toml's `rust-version = "1.85"` is
+#                  the actual MSRV. Bumping keeps CI's compiler
+#                  diagnostics aligned with what the dev sees locally.
+#   * Node  22   — pinned in the `setup-node` step of `web-checks`.
+#                  Mirrors `Dockerfile.web` `ARG NODE_VERSION=22`.
+#                  Current LTS line.
+#   * pnpm      — pinned by `package.json#packageManager` via corepack.
 # Bumping any of these requires bumping the matching Dockerfile ARG and
 # `docs/deployment/docker-compose.md` "Selected base images" together.
 
@@ -75,22 +98,33 @@ jobs:
     name: rust checks (fmt + clippy + test)
     runs-on: docker
     container:
-      image: rust:1.95-bookworm
+      image: catthehacker/ubuntu:act-latest
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -D warnings
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: https://code.forgejo.org/actions/checkout@v4
 
-      - name: rustup components (rustfmt + clippy)
-        # The official `rust:*` image ships rustfmt and clippy in the
-        # default profile, but `rustup component add` is idempotent and
-        # paves over surprises if the base image changes.
+      - name: install rust 1.95 (rustup minimal + rustfmt + clippy)
+        # `--default-toolchain 1.95` is the CI Rust pin and MUST match
+        # `Dockerfile.backend` `ARG RUST_VERSION=1.95`. Both
+        # `rustup --default-toolchain 1.95` and Docker Hub
+        # `rust:1.95-bookworm` resolve to the latest 1.95.x patch, so
+        # the two pins float in lockstep without a separate tracker.
+        # `--profile minimal` skips docs/HTML index/etc.; rustfmt +
+        # clippy are added explicitly because they're the only
+        # components CI uses. `$HOME/.cargo/bin` is appended to
+        # `$GITHUB_PATH` so subsequent `cargo` / `rustc` calls resolve
+        # without an absolute path.
         run: |
-          rustup component add rustfmt clippy
-          rustc --version
-          cargo --version
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.95 --profile minimal \
+                --component rustfmt --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
+          "$HOME/.cargo/bin/cargo" --version
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -109,12 +143,21 @@ jobs:
     name: web checks (check + build + test)
     runs-on: docker
     container:
-      image: node:22-bookworm-slim
+      image: catthehacker/ubuntu:act-latest
     env:
       CI: "1"
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: setup node 22
+        # Node 22 LTS — must match `Dockerfile.web` `ARG NODE_VERSION`.
+        # The catthehacker base image ships *a* Node, but pinning here
+        # makes the CI Node version explicit and decoupled from the
+        # base image's choice.
+        uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: enable corepack (pnpm via package.json#packageManager)
         run: |
@@ -148,22 +191,24 @@ jobs:
   docker-build:
     name: docker build (backend + migrate + web)
     runs-on: docker
-    # `docker:28-cli` is a thin alpine image carrying just the Docker
-    # CLI. The job assumes the runner is configured with Docker daemon
-    # access (socket-mount or DinD) per the workflow header — without
-    # that, `docker build` will fail with "Cannot connect to the Docker
-    # daemon" and the message is the operator's signal to fix runner
+    # `catthehacker/ubuntu:act-latest` ships docker CLI + buildx out of
+    # the box; the runner's `container.options` config provides
+    # `DOCKER_HOST` + TLS certs (DinD sidecar) so `docker build` works
+    # without per-job socket plumbing. If the daemon endpoint is
+    # missing, `docker info` fails fast with "Cannot connect to the
+    # Docker daemon" — that's the operator's signal to fix runner
     # config, not the workflow.
     container:
-      image: docker:28-cli
+      image: catthehacker/ubuntu:act-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: https://code.forgejo.org/actions/checkout@v4
 
       - name: docker info
-        # Surfaces the daemon endpoint the job is talking to so a misconfigured
-        # runner produces a recognisable failure instead of a generic
-        # "connection refused" further down. Does NOT print credentials.
+        # Surfaces the daemon endpoint the job is talking to so a
+        # misconfigured runner produces a recognisable failure instead
+        # of a generic "connection refused" further down. Does NOT print
+        # credentials.
         run: docker info
 
       - name: build relayterm-backend (runtime)
@@ -189,12 +234,6 @@ jobs:
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: docker
-    # `catthehacker/ubuntu:act-latest` is the same runner image qshift's
-    # build-and-push uses on this Forgejo instance — it ships docker CLI
-    # and the buildx plugin out of the box, so `setup-buildx-action`
-    # only has to wire up the builder context. The `docker:28-cli`
-    # image used by `docker-build` is intentionally minimal and would
-    # require an extra apt step to install buildx.
     container:
       image: catthehacker/ubuntu:act-latest
     env:
@@ -205,7 +244,7 @@ jobs:
       IMAGE_NAMESPACE: jsprague
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: https://code.forgejo.org/actions/checkout@v4
 
       - name: set up docker buildx
         uses: https://github.com/docker/setup-buildx-action@v3
