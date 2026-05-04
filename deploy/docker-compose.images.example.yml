@@ -1,0 +1,166 @@
+# RelayTerm — image-mode example Compose stack (pull-based deploy).
+#
+# This is the production-like sibling of `docker-compose.example.yml`.
+# Identical service shape, identical env contract; the only difference
+# is that every service references a published image at the Forgejo
+# container registry instead of a local `build:` context. Use this on
+# a deploy host that does NOT carry the source tree.
+#
+# Required: a `.env` (copied from `relayterm.env.example`) AND
+# `RELAYTERM_IMAGE_TAG` set to whichever published tag you want to
+# pull. The CI publishes:
+#   * `:main`              — branch-tracking dev / staging installs.
+#   * `:vX.Y.Z`            — release pin.
+#   * `:sha-<short>`       — exact build, used for rollback.
+# We deliberately do NOT publish `:latest` — pin explicitly.
+#
+# First-time deploy (postgres is included only on the first start —
+# subsequent upgrades re-use the existing volume and skip the
+# postgres restart, see "Upgrade" below):
+#   echo 'RELAYTERM_IMAGE_TAG=v0.1.0' >> .env
+#   docker login git.js-node.cc            # interactive, one time
+#   docker compose -f docker-compose.images.example.yml pull
+#   docker compose -f docker-compose.images.example.yml \
+#       --profile migrate run --rm relayterm-migrate
+#   docker compose -f docker-compose.images.example.yml up -d \
+#       postgres relayterm-backend relayterm-web
+#
+# Upgrade (postgres deliberately omitted — keep it running with the
+# existing volume; only the app containers swap to the new image):
+#   sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=v0.2.0/' .env
+#   docker compose -f docker-compose.images.example.yml pull
+#   docker compose -f docker-compose.images.example.yml \
+#       --profile migrate run --rm relayterm-migrate
+#   docker compose -f docker-compose.images.example.yml up -d \
+#       --no-deps relayterm-backend relayterm-web
+#
+# Rollback to a known-good build:
+#   sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=sha-abc1234/' .env
+#   docker compose -f docker-compose.images.example.yml pull
+#   docker compose -f docker-compose.images.example.yml up -d \
+#       --no-deps relayterm-backend relayterm-web
+#   # (a backwards-incompatible schema change may require a separate
+#   # `sqlx migrate revert` plan — see docs/deployment/docker-compose.md
+#   # §4.1.)
+#
+# Auto-deploy is intentionally NOT shipped here. The deploy is operator-
+# triggered: a human runs `pull` + `up -d` (and `migrate run` when the
+# new image carries new migrations) on the host. Watchtower / SSH push
+# / GitOps are deferred slices.
+
+name: relayterm
+
+services:
+  # -------------------------------------------------------------------
+  # Postgres. Same shape as the build-mode example — Postgres is not a
+  # RelayTerm-built image and is identical in both files.
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: relayterm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+    volumes:
+      - relayterm-pgdata:/var/lib/postgresql/data
+    networks:
+      - relayterm-internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------
+  # One-shot migrations. `--profile migrate` keeps this out of
+  # `docker compose up`. Pin to the SAME tag as the backend so the
+  # migration set matches the release.
+  # -------------------------------------------------------------------
+  relayterm-migrate:
+    profiles: [migrate]
+    image: git.js-node.cc/jsprague/relayterm-backend-migrate:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0, main, or sha-abc1234)}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    networks:
+      - relayterm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Backend. Internal-only — the web container reverse-proxies /api
+  # and /healthz to it. See `docker-compose.example.yml` and
+  # `docs/deployment/docker-compose.md` for the env contract.
+  # -------------------------------------------------------------------
+  relayterm-backend:
+    image: git.js-node.cc/jsprague/relayterm-backend:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0, main, or sha-abc1234)}
+    restart: unless-stopped
+    environment:
+      RELAYTERM_SERVER__BIND: 0.0.0.0:8080
+      RELAYTERM_DATABASE__URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RELAYTERM_AUTH__MODE: "${RELAYTERM_AUTH__MODE:-production}"
+      RELAYTERM_AUTH__ALLOWED_ORIGINS: "${RELAYTERM_AUTH__ALLOWED_ORIGINS:?set to your public origin (e.g. https://relayterm.example.com)}"
+      RELAYTERM_AUTH__COOKIE_SECURE: "${RELAYTERM_AUTH__COOKIE_SECURE:-true}"
+      RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64: "${RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64:?generate with openssl rand -base64 32}"
+      RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN: "${RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN:-}"
+      RELAYTERM_VAULT__ENABLED: "${RELAYTERM_VAULT__ENABLED:-true}"
+      RELAYTERM_VAULT__MASTER_KEY_B64: "${RELAYTERM_VAULT__MASTER_KEY_B64:?generate with openssl rand -base64 32, or set RELAYTERM_VAULT__ENABLED=false and remove this line}"
+      RELAYTERM_TERMINAL_RECORDING__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__ENABLED:-false}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS:-3600}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE:-250}"
+      RUST_LOG: "${RUST_LOG:-relayterm=info,axum=info,sqlx=warn,info}"
+    networks:
+      - relayterm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1:8080/healthz >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # -------------------------------------------------------------------
+  # Web frontend. Same `127.0.0.1:8081` host port mapping as the
+  # build-mode example — outer reverse proxy (Traefik / Caddy / outer
+  # nginx) terminates TLS in production.
+  # -------------------------------------------------------------------
+  relayterm-web:
+    image: git.js-node.cc/jsprague/relayterm-web:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0, main, or sha-abc1234)}
+    restart: unless-stopped
+    environment:
+      RELAYTERM_BACKEND_URL: http://relayterm-backend:8080
+    ports:
+      - "127.0.0.1:8081:80"
+    networks:
+      - relayterm-internal
+    depends_on:
+      relayterm-backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1/_web_health >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  relayterm-pgdata:
+
+networks:
+  relayterm-internal:
+    driver: bridge

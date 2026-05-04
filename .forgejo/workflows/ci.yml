@@ -1,26 +1,40 @@
-# RelayTerm Forgejo Actions CI — build-only.
+# RelayTerm Forgejo Actions CI — build + (conditional) publish.
 #
 # Scope:
 #   * cargo fmt / clippy / test (workspace, default features)
 #   * pnpm -r check / build / test
 #   * docker build for `Dockerfile.backend` (default and `--target migrate`)
 #     and `Dockerfile.web`
+#   * publish-images: pushes the three OCI images to the Forgejo
+#     container registry at `git.js-node.cc`. RUNS ONLY on push-to-main,
+#     `v*` tag pushes, and `workflow_dispatch`. NEVER on `pull_request`.
 #
 # Out of scope (intentionally deferred):
-#   * Pushing images to a registry (future slice will publish to
-#     git.js-node.cc's container registry once registry credentials and
-#     a tagging policy are in place).
-#   * Deployment / SSH / image signing / SBOM / multi-arch.
+#   * Auto-deploy / SSH / Watchtower / production compose pull-update.
+#   * Image signing (cosign / notary), SBOM, vulnerability scanning,
+#     registry retention/cleanup policies.
+#   * Multi-arch / `linux/arm64`. Single-arch only.
+#   * Remote / registry build cache. BuildKit cache mounts only.
 #   * Playwright / browser SSH smoke (manual per `apps/web/e2e/SMOKE.md`).
 #
 # Runner requirements:
 #   * `docker` label on the Forgejo runner.
-#   * Docker daemon access for the `docker-build` job. The Forgejo
-#     runner config must enable EITHER `container.docker_host: automount`
-#     (socket mount) OR a Docker-in-Docker sidecar exposing
-#     `DOCKER_HOST` to the job. See
+#   * Docker daemon access for the `docker-build` AND `publish-images`
+#     jobs. The Forgejo runner config must enable EITHER
+#     `container.docker_host: automount` (socket mount) OR a
+#     Docker-in-Docker sidecar exposing `DOCKER_HOST` to the job. See
 #     https://forgejo.org/docs/latest/admin/actions/docker-access and
-#     `docs/deployment/docker-compose.md` ("CI image build" section).
+#     `docs/deployment/docker-compose.md` ("CI image build" + "Registry
+#     publishing" sections).
+#
+# Registry auth (publish-images only):
+#   * Repo secret `FORGEJO_REGISTRY_TOKEN` — Forgejo personal access
+#     token with `write:package` scope. Generate via Forgejo →
+#     Settings → Applications → Generate new token, then add under
+#     repo Settings → Secrets. The token is consumed by
+#     `docker/login-action` via `password-stdin` and is NEVER echoed.
+#   * Username is `${{ github.actor }}` — Forgejo aliases the github
+#     context for action compatibility.
 #
 # Toolchain pins (must stay in lockstep with the Dockerfiles):
 #   * Rust  1.95 — matches `Dockerfile.backend` `ARG RUST_VERSION`.
@@ -41,6 +55,12 @@ on:
   push:
     branches:
       - main
+    # Release-style publishes are driven by `v*` annotated tags. The
+    # `publish-images` job below derives its `:vX.Y.Z` image tag from
+    # `${{ github.ref_name }}`. Pushing a non-`v*` tag does not trigger
+    # CI.
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -154,3 +174,105 @@ jobs:
 
       - name: build relayterm-web
         run: docker build -f Dockerfile.web -t relayterm-web:ci .
+
+  publish-images:
+    name: publish images (forgejo registry)
+    needs: [rust-checks, web-checks, docker-build]
+    # Publish ONLY on push-to-main, `v*` tag pushes, and operator-driven
+    # workflow_dispatch. PRs build (via `docker-build`) but never push —
+    # an attacker submitting a PR cannot smuggle an image into the
+    # registry. The condition is duplicated rather than centralised in
+    # `on:` because the build/test jobs above must keep running on PRs
+    # for the gate to mean anything.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: docker
+    # `catthehacker/ubuntu:act-latest` is the same runner image qshift's
+    # build-and-push uses on this Forgejo instance — it ships docker CLI
+    # and the buildx plugin out of the box, so `setup-buildx-action`
+    # only has to wire up the builder context. The `docker:28-cli`
+    # image used by `docker-build` is intentionally minimal and would
+    # require an extra apt step to install buildx.
+    container:
+      image: catthehacker/ubuntu:act-latest
+    env:
+      # Centralised registry/owner/repo for the three images. The
+      # publish step builds `${REGISTRY}/${IMAGE_NAMESPACE}/<name>:<tag>`
+      # for backend, backend-migrate, and web.
+      REGISTRY: git.js-node.cc
+      IMAGE_NAMESPACE: jsprague
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: set up docker buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+
+      - name: log in to forgejo container registry
+        # `docker/login-action` writes the token to ~/.docker/config.json
+        # via `--password-stdin`; the token never appears on a command
+        # line and never lands in the workflow log.
+        uses: https://github.com/docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+
+      - name: compute image tags
+        id: tags
+        # Tag policy:
+        #   * push to main          → :main         + :sha-<short>
+        #   * push to v* tag        → :vX.Y.Z       + :sha-<short>
+        #   * workflow_dispatch     → :<ref_name>   + :sha-<short>
+        # We deliberately do NOT publish `:latest` — operators pin
+        # explicitly (`:vX.Y.Z` for releases, `:sha-...` for rollback,
+        # `:main` for branch-tracking dev installs).
+        #
+        # The two `${{ github.* }}` substitutions both come from the
+        # Forgejo action context (not user input), but `ref_name` can
+        # carry slashes when a feature branch is dispatched (e.g.
+        # `chore/foo`). We `printf` it through a quoted positional
+        # argument so a slash, equals sign, or newline in `ref_name`
+        # cannot corrupt the `GITHUB_OUTPUT` file.
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          sha_short=$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)
+          printf 'sha_short=%s\n' "${sha_short}" >> "$GITHUB_OUTPUT"
+          printf 'ref_tag=%s\n' "${REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: build and push relayterm-backend
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          target: runtime
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend:${{ steps.tags.outputs.ref_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend:sha-${{ steps.tags.outputs.sha_short }}
+
+      - name: build and push relayterm-backend-migrate
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          target: migrate
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend-migrate:${{ steps.tags.outputs.ref_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend-migrate:sha-${{ steps.tags.outputs.sha_short }}
+
+      - name: build and push relayterm-web
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-web:${{ steps.tags.outputs.ref_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-web:sha-${{ steps.tags.outputs.sha_short }}

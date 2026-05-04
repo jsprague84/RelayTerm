@@ -31,6 +31,10 @@ the code, the code wins:
 Files:
 
 - [`deploy/docker-compose.example.yml`](../../deploy/docker-compose.example.yml)
+  — build-mode (operator builds images locally from `Dockerfile.*`).
+- [`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml)
+  — image-mode (operator pulls published images from
+  `git.js-node.cc`; see §6.4).
 - [`deploy/relayterm.env.example`](../../deploy/relayterm.env.example)
 - [`deploy/nginx/web.conf.template`](../../deploy/nginx/web.conf.template)
 - [`Dockerfile.backend`](../../Dockerfile.backend) — multi-target
@@ -370,10 +374,12 @@ this section.
 | `nginx:${NGINX_VERSION}` | `NGINX_VERSION=1.27-alpine` | Stable line. The `envsubst`-on-`/etc/nginx/templates/*.template` behaviour the runtime stage relies on is alpine-specific. |
 | `debian:${DEBIAN_VERSION}` | `DEBIAN_VERSION=bookworm-slim` | Matches the `bookworm` base of the Rust builder so `glibc` versions line up between build and runtime. |
 
-## 6. CI image build (Forgejo Actions)
+## 6. CI image build and registry publishing (Forgejo Actions)
 
-`.forgejo/workflows/ci.yml` runs three jobs on every push to `main` and
-every pull request:
+`.forgejo/workflows/ci.yml` runs four jobs. The first three run on every
+push to `main`, every `v*` tag push, and every pull request; the fourth
+runs ONLY on push-to-main, `v*` tag pushes, and operator-driven
+`workflow_dispatch`:
 
 1. **`rust-checks`** — `cargo fmt --all -- --check`, `cargo clippy
    --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
@@ -387,8 +393,13 @@ every pull request:
    `corepack` against the version pinned in
    `package.json#packageManager`.
 3. **`docker-build`** — `docker build` for `Dockerfile.backend`
-   (`runtime` and `migrate` targets) and `Dockerfile.web`. Build-only;
-   the workflow does NOT push to a registry.
+   (`runtime` and `migrate` targets) and `Dockerfile.web`. Build-only
+   verification — runs on PRs and is the gate that must pass before
+   `publish-images` runs.
+4. **`publish-images`** — pushes the three OCI images to the Forgejo
+   container registry at `git.js-node.cc`. Gated by `if:` to push-to-
+   main / `v*` tags / `workflow_dispatch` only; PRs never publish. See
+   §6.4.
 
 ### 6.1 Runner Docker access
 
@@ -423,25 +434,30 @@ workflow.
 Intentionally deferred — these will land in their own slices once
 conventions are set:
 
-- **Push to a registry.** Future slice will publish images to the
-  Forgejo container registry at `git.js-node.cc` after a tagging
-  policy and registry credentials are in place. Until then,
-  consumers build images locally per §5.
+- **Auto-deploy.** The workflow publishes images but never SSHes /
+  pulls / restarts on the deploy host. Operators run
+  `docker compose pull` + `up -d` themselves (see §6.4). Watchtower,
+  GitOps, and SSH push are all separate slices.
 - **Multi-arch / `linux/arm64`.** Single-arch builds only. A future
   slice can wire `docker buildx` against a QEMU-backed builder.
 - **Image signing (cosign / notary), SBOM generation, vulnerability
-  scanning.** All deferred until publish lands.
-- **Build cache between runs.** The Dockerfiles use BuildKit cache
-  mounts, but no remote / registry cache is wired up. First-run CI
-  will be slow (fully recompiles the Rust workspace); cached reruns
-  on the same runner reuse the local BuildKit cache.
+  scanning, registry retention/cleanup policies.** Deferred.
+- **Remote / registry build cache.** The Dockerfiles use BuildKit
+  cache mounts, but no remote / registry cache is wired up. First-run
+  CI will be slow (fully recompiles the Rust workspace); cached
+  reruns on the same runner reuse the local BuildKit cache. The
+  publish job runs the build a second time (it does not share state
+  with `docker-build`); a future slice can collapse the two via a
+  shared buildx builder.
 - **Playwright / browser SSH smoke.** The browser smoke runbook in
   [`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) is
   intentionally manual.
-- **Production secrets in CI.** No registry tokens, deployment keys,
-  domain names, or test credentials live in the workflow. The first
-  registry-publish slice will add a token via Forgejo's `secrets`
-  mechanism — never inline.
+- **Production secrets in CI beyond registry login.** The
+  `publish-images` job consumes exactly one repo secret —
+  `FORGEJO_REGISTRY_TOKEN`. No deploy SSH keys, no cloud credentials,
+  no app secrets (session signing key, vault master key, bootstrap
+  token) live in the workflow. App secrets are operator-side env on
+  the deploy host.
 
 ### 6.3 Updating the toolchain
 
@@ -463,6 +479,143 @@ Dockerfile is the source of truth — bump local rustup to match, then
 update all four (or five) files in the same commit. Cite the actual
 trigger in the commit message: a new lint, a new feature requirement,
 or just routine alignment with the local dev toolchain.
+
+### 6.4 Registry publishing
+
+After `rust-checks`, `web-checks`, and `docker-build` pass, the
+`publish-images` job builds and pushes three OCI images to the Forgejo
+container registry at `git.js-node.cc`. Pull requests never publish —
+only build verification.
+
+**When publish runs.** The `if:` guard in `publish-images` allows
+exactly three event shapes:
+
+| Event | Image tag derived from |
+|---|---|
+| `push` to `refs/heads/main` | `:main` + `:sha-<short>` |
+| `push` to `refs/tags/v*` | `:vX.Y.Z` + `:sha-<short>` |
+| `workflow_dispatch` (any branch) | `:<ref_name>` + `:sha-<short>` |
+
+> **Operator-only `workflow_dispatch` from a feature branch.**
+> Dispatching the workflow from a non-`main`, non-`v*` ref produces
+> images tagged with the branch slug (e.g. `:chore/foo`). That tag is
+> intended for ad-hoc operator-side debugging / staging only — it is
+> NOT a release path. Pin production deployments to `:vX.Y.Z` (or
+> `:sha-<short>` for a deliberate rollback target). The compose
+> example's `RELAYTERM_IMAGE_TAG` only documents the three normal
+> shapes.
+
+**No `:latest`.** Operators pin explicitly: `:vX.Y.Z` for releases,
+`:sha-...` for rollback to a specific build, `:main` for branch-
+tracking dev / staging installs. A floating `:latest` is a footgun
+when combined with `docker compose pull` — silently picking up the
+next push instead of the intended tag — so we don't publish it.
+
+**Image names.** Three flat package names under the `jsprague` owner:
+
+| Image | Built from |
+|---|---|
+| `git.js-node.cc/jsprague/relayterm-backend:<tag>` | `Dockerfile.backend` (`runtime` target) |
+| `git.js-node.cc/jsprague/relayterm-backend-migrate:<tag>` | `Dockerfile.backend` (`migrate` target) |
+| `git.js-node.cc/jsprague/relayterm-web:<tag>` | `Dockerfile.web` |
+
+#### 6.4.1 Required Forgejo setup
+
+The publish job consumes exactly one secret:
+
+- **`FORGEJO_REGISTRY_TOKEN`** — Forgejo personal access token with
+  `write:package` scope.
+  1. Forgejo → Settings → Applications → Generate new token.
+  2. Name it `relayterm-ci-publish` (or similar — the name is
+     bookkeeping only).
+  3. Under "Permissions", grant only **`write:package`**. No `repo`,
+     no `admin`, no `read:user`.
+  4. Copy the token immediately (Forgejo shows it once).
+  5. Repo → Settings → Secrets → Add Secret.
+     Name: `FORGEJO_REGISTRY_TOKEN`. Value: the token.
+
+The username `${{ github.actor }}` is the Forgejo user that triggered
+the run; Forgejo's container-registry login policy accepts a
+`(user, write:package token)` pair as long as the user can write to
+packages under the configured owner namespace (`jsprague`).
+
+**Deploy host (pull only).** The `FORGEJO_REGISTRY_TOKEN` used in CI
+has `write:package` scope — it can push. The deploy host only needs
+to **pull**, so issue a separate Forgejo PAT with `read:package` only
+for the host's `docker login`. Keep the write-scope token to CI; do
+not copy it to the deploy host. Rotation is per-token, so a leaked
+read-only host token cannot be used to publish over your release
+tags.
+
+#### 6.4.2 Pulling on the deploy host
+
+```sh
+# One-time login — interactive, the prompt accepts the same token.
+docker login git.js-node.cc
+# Username: jsprague
+# Password: <paste FORGEJO_REGISTRY_TOKEN-equivalent>
+#
+# Or, non-interactively, with the token in a file the operator owns:
+cat ~/.config/relayterm/registry-token | \
+  docker login git.js-node.cc -u jsprague --password-stdin
+```
+
+Pin the image tag in your `.env` (image-mode example file lives at
+[`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml)):
+
+```env
+RELAYTERM_IMAGE_TAG=v0.1.0
+```
+
+Then pull + migrate + start:
+
+```sh
+docker compose -f docker-compose.images.example.yml pull
+docker compose -f docker-compose.images.example.yml \
+    --profile migrate run --rm relayterm-migrate
+docker compose -f docker-compose.images.example.yml up -d \
+    postgres relayterm-backend relayterm-web
+```
+
+#### 6.4.3 Upgrade
+
+```sh
+sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=v0.2.0/' .env
+docker compose -f docker-compose.images.example.yml pull
+docker compose -f docker-compose.images.example.yml \
+    --profile migrate run --rm relayterm-migrate
+docker compose -f docker-compose.images.example.yml up -d \
+    --no-deps relayterm-backend relayterm-web
+```
+
+The `relayterm-backend-migrate` image is published in lockstep with
+the backend (same source tree, same tag). Always run `--profile
+migrate run --rm relayterm-migrate` against the NEW tag before
+restarting the backend on that tag — `relayterm-backend` does NOT
+auto-migrate on boot.
+
+#### 6.4.4 Rollback by `:sha-<short>` tag
+
+Each push to main carries a `:sha-abc1234` tag (the seven-char SHA
+prefix of the commit). To roll back to a previously running build:
+
+```sh
+sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=sha-abc1234/' .env
+docker compose -f docker-compose.images.example.yml pull
+docker compose -f docker-compose.images.example.yml up -d \
+    --no-deps relayterm-backend relayterm-web
+```
+
+If the rolled-back tag predates a forward-only schema migration, you
+need `sqlx migrate revert` (or a backup-restore) — pre-rehearse the
+revert plan in staging. The migrate image's `revert` is documented in
+§4.1.
+
+#### 6.4.5 Auto-deploy is deferred
+
+The publish step ends at "image is in the registry." Operators
+trigger the deploy by hand (`pull` + `up -d` on the host). Watchtower
+/ SSH push / GitOps are separate slices — see §8.
 
 ---
 
@@ -491,12 +644,15 @@ File these as separate slices when they're needed:
 - Multi-node HA (active-active backend with shared session state).
 - Image signing (cosign / notary v2).
 - SBOM generation.
+- Vulnerability scanning of published images.
+- Multi-arch (`linux/arm64`) image variants.
 - Automated production secrets management (Vault auto-unwrap, etc).
 - Backup automation (snapshots, off-site replication).
 - Zero-downtime deploys (rolling restart, blue/green).
-- Image registry push and tag policy. The build-only CI from §6 will
-  graduate to publishing images to `git.js-node.cc` once a tagging
-  policy lands.
+- Auto-deploy from CI to a host. The publish job ends at "image is
+  in the registry"; Watchtower, SSH push, and GitOps are all
+  separate slices.
+- Registry retention / cleanup policies (pruning old `:sha-*` tags).
 - Production renderer selector (production stays on the
   `@relayterm/terminal-xterm` baseline; experimental renderers are
   dev-lab-only).
