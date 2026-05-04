@@ -27,7 +27,6 @@ services:
   # -------------------------------------------------------------------
   postgres:
     image: postgres:17-alpine
-    container_name: relayterm-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
