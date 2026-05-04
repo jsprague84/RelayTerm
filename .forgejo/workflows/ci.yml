@@ -249,6 +249,30 @@ jobs:
       - name: set up docker buildx
         uses: https://github.com/docker/setup-buildx-action@v3
 
+      - name: verify registry token is configured
+        # Surface a precise, actionable failure when
+        # `secrets.FORGEJO_REGISTRY_TOKEN` is missing or unavailable to
+        # this workflow run. Without this preflight, `docker/login-action`
+        # fails with the generic `::error::Password required` message —
+        # which is ambiguous between "secret not set in repo settings"
+        # and "secret rotated / scoped wrong / permission lost".
+        #
+        # Redaction posture: the token is passed via `env:` (Forgejo
+        # masks secret values in logs) and tested for emptiness with
+        # `[ -z "${VAR:-}" ]`. The value itself is NEVER expanded into
+        # a command line, an `echo`, a here-doc, or `set -x` output —
+        # only the *length-zero* check executes. The error message is
+        # static and operator-actionable; it does not echo any secret-
+        # adjacent state.
+        env:
+          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${FORGEJO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::FORGEJO_REGISTRY_TOKEN repository secret is not configured or is unavailable to this workflow."
+            exit 1
+          fi
+
       - name: log in to forgejo container registry
         # `docker/login-action` writes the token to ~/.docker/config.json
         # via `--password-stdin`; the token never appears on a command

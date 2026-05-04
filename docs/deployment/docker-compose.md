@@ -541,7 +541,17 @@ next push instead of the intended tag — so we don't publish it.
 
 #### 6.4.1 Required Forgejo setup
 
-The publish job consumes exactly one secret:
+The publish job consumes exactly one secret, and it MUST be added to
+the RelayTerm repo's secrets before the workflow can push images. The
+workflow runs a preflight check (`verify registry token is configured`)
+ahead of `docker/login-action` — when the secret is missing, that step
+fails with the static, redacted message:
+
+> `FORGEJO_REGISTRY_TOKEN repository secret is not configured or is unavailable to this workflow.`
+
+If you see this message, the steps below have NOT been completed (or
+the secret is scoped wrong, e.g. environment-scoped where the workflow
+expects a repository secret).
 
 - **`FORGEJO_REGISTRY_TOKEN`** — Forgejo personal access token with
   `write:package` scope.
@@ -551,8 +561,11 @@ The publish job consumes exactly one secret:
   3. Under "Permissions", grant only **`write:package`**. No `repo`,
      no `admin`, no `read:user`.
   4. Copy the token immediately (Forgejo shows it once).
-  5. Repo → Settings → Secrets → Add Secret.
-     Name: `FORGEJO_REGISTRY_TOKEN`. Value: the token.
+  5. RelayTerm repo (`jsprague/RelayTerm`) → Settings → Secrets →
+     Add Secret. Name: `FORGEJO_REGISTRY_TOKEN`. Value: the token.
+     Add it as a **repository secret** (not an environment secret) so
+     it's available to every `publish-images` run on `main` / `v*`
+     tags / `workflow_dispatch`.
 
 The username `${{ github.actor }}` is the Forgejo user that triggered
 the run; Forgejo's container-registry login policy accepts a
