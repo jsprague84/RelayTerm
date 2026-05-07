@@ -8,6 +8,15 @@ image signing, no SBOM generation, no automated backups, and no
 managed-secrets integration. Operators who want any of those layer
 them on top.
 
+> **Looking for the operator runbook?** The step-by-step "what do I
+> actually run, in order" checklists for first deploy, upgrade,
+> rollback, migration, backup, reverse-proxy, secret rotation, and
+> post-deploy smoke live in
+> [`docs/deployment/production-runbook.md`](./production-runbook.md).
+> This file is the **setup and reference** — services, env contract,
+> CI workflow, registry publish. The runbook is what you walk on
+> deploy day.
+
 The canonical specs live elsewhere — when something here drifts from
 the code, the code wins:
 
@@ -16,6 +25,7 @@ the code, the code wins:
 - Recording / cleanup: [`docs/terminal-recording.md`](../terminal-recording.md).
 - Config schema: `apps/backend/src/config.rs`,
   `docs/config-examples/relayterm.production.example.toml`.
+- Operator runbook: [`docs/deployment/production-runbook.md`](./production-runbook.md).
 
 ---
 
@@ -254,6 +264,12 @@ forces a CORS posture RelayTerm does not currently support.
 ---
 
 ## 4. Operations
+
+The step-by-step upgrade / rollback / backup / smoke checklists for
+operators live in
+[`docs/deployment/production-runbook.md`](./production-runbook.md).
+This section captures the *reference* shape of each operation — the
+runbook is what you walk in order on deploy day.
 
 ### 4.1 Migrations on upgrade
 
@@ -710,7 +726,10 @@ tracking dev / staging installs but is mutable on the next push to
 
 ## 7. Smoke / verification checklist
 
-After a fresh deploy or upgrade:
+The full operator-side smoke (including bad-Origin, log-leakage sweep,
+WebSocket auth gate, and the deeper variants) lives in
+[`docs/deployment/production-runbook.md`](./production-runbook.md) §10.
+The minimum viable checklist for a quick post-deploy sanity:
 
 - [ ] `docker compose ps` — every service is `running` and (where
       configured) `healthy`.
