@@ -37,7 +37,8 @@
 | `docs/agent/redaction-rules.md` | Long-form prose for the audit / session / paste / recording / CSRF / login-throttle redaction rules. |
 | `docs/agent/task-patterns.md` | Long-form step-by-step procedures for renderer adapters, production views, and data fetches. |
 | `docs/spec/README.md` | Per-area index of the split SPEC. |
-| `docs/spec/terminal.md` | Terminal-session lifecycle, WebSocket attach/detach, terminal-core, four renderer adapters, live PTY bridge, replay buffer, terminal launch / sessions list / settings / viewport / paste / local recovery / status refresh. |
+| `docs/spec/terminal.md` | Renderer-independent terminal/session/workspace behavior: terminal-session lifecycle, WebSocket attach/detach, terminal-core, live PTY bridge, replay buffer, terminal launch / sessions list / settings / viewport / paste / local recovery / status refresh. Renderer adapter packages are summarized here and fully specified in `terminal-adapters.md`. |
+| `docs/spec/terminal-adapters.md` | Concrete renderer adapter contracts for `terminal-xterm` (production baseline) and `terminal-ghostty-web` / `terminal-restty` / `terminal-wterm` (experimental, dev-only). Created 2026-05-07 in `docs/split-terminal-renderer-spec` to drop terminal.md from ~155 KB to ~127 KB so an agent following SPEC.md → terminal.md no longer pulls 33 KB of adapter detail it doesn't need. |
 | `docs/spec/auth.md` | Credential creation, host-key trust, auth-check, production authentication architecture. |
 | `docs/spec/inventory.md` | Inventory views, identity / host / profile creation UI, host-key preflight UI, auth-check UI, dashboard, recent activity, server-profile disable/enable backend + audit + UI. |
 | `docs/spec/recording.md` | Load-bearing invariants for durable recording, plus pointer to `docs/terminal-recording.md`. |
@@ -77,10 +78,10 @@
 | Terminal-session lifecycle contract (85–103) | `docs/spec/terminal.md` |
 | Terminal WebSocket attach/detach contract (105–202) | `docs/spec/terminal.md` |
 | Frontend terminal-core contract (203–279) | `docs/spec/terminal.md` |
-| xterm.js baseline renderer adapter (281–315) | `docs/spec/terminal.md` |
-| ghostty-web experimental renderer adapter (317–366) | `docs/spec/terminal.md` |
-| restty experimental renderer adapter (368–418) | `docs/spec/terminal.md` |
-| wterm experimental renderer adapter (420–465) | `docs/spec/terminal.md` |
+| xterm.js baseline renderer adapter (281–315) | `docs/spec/terminal-adapters.md` (initially `docs/spec/terminal.md`; moved 2026-05-07) |
+| ghostty-web experimental renderer adapter (317–366) | `docs/spec/terminal-adapters.md` (initially `docs/spec/terminal.md`; moved 2026-05-07) |
+| restty experimental renderer adapter (368–418) | `docs/spec/terminal-adapters.md` (initially `docs/spec/terminal.md`; moved 2026-05-07) |
+| wterm experimental renderer adapter (420–465) | `docs/spec/terminal-adapters.md` (initially `docs/spec/terminal.md`; moved 2026-05-07) |
 | Production web app shell (467–509) | `docs/spec/web-shell.md` |
 | Production inventory read-only views (511–540) | `docs/spec/inventory.md` |
 | Production read-only inventory detail panels (541–571) | `docs/spec/inventory.md` |
@@ -136,15 +137,17 @@ deleted. The exact prose is preserved in the destination file.
 
 ## Open questions
 
-- Should `docs/spec/terminal.md` itself be split per-surface in a
-  future slice? It is now ~940 lines / 154 KB. The threshold the user
-  warned about is the AGENTS.md 40 KB session-start budget; SPEC area
-  docs are not loaded at session start, so 940 lines is fine for the
-  steady state. **Multi-review (2026-05-07) flagged this as a Should-fix
-  because an agent that follows SPEC.md → `docs/spec/terminal.md` for
-  any terminal question pulls 154 KB at once.** A future slice may
-  split renderer-adapter contracts to `docs/spec/terminal-adapters.md`
-  or per-adapter files. Tracking, not yet scheduled.
+- ~~Should `docs/spec/terminal.md` itself be split per-surface in a
+  future slice?~~ **Partially addressed (2026-05-07):** renderer adapter
+  contracts moved to `docs/spec/terminal-adapters.md` in branch
+  `docs/split-terminal-renderer-spec`. terminal.md dropped from ~940
+  lines / 154 KB to ~772 lines / ~127 KB; new terminal-adapters.md is
+  ~218 lines / ~33 KB. Multi-review's Should-fix is resolved for the
+  renderer-adapter slice — adapter detail no longer rides every
+  terminal-question read. terminal.md still owns lifecycle, transport,
+  PTY bridge, replay buffer, production UI, paste safety, local
+  recovery, and status refresh; further per-surface splits are not
+  scheduled.
 - `docs/spec/auth.md` is 109 KB. Multi-review (2026-05-07) flagged it
   as a candidate for trimming — implementation-status narrative could
   move to code comments / archive, leaving contract-shape only.

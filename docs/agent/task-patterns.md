@@ -44,8 +44,10 @@ renderer.
 7. Update the Stack table in `AGENTS.md` with the package, version
    pin, and any API caveats (UTF-8 decode requirements, async init,
    asset/WASM wiring, bundle size, tree-shaking flags). Update the
-   relevant `docs/spec/terminal.md` renderer-adapter section with
-   adapter limitations and tree-shaking notes.
+   relevant `docs/spec/terminal-adapters.md` renderer-adapter section
+   with adapter limitations and tree-shaking notes; refresh the
+   summary row in `docs/spec/terminal.md` § "Renderer adapters" if
+   the one-line contract changes.
 8. Verify the production bundle: confirm the new package is
    tree-shaken out of any non-dev build (`sideEffects: false` on the
    adapter, no top-level imports from app code).
