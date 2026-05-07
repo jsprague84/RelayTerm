@@ -32,7 +32,9 @@ This runbook does **not** cover:
 - Auto-deploy (see §13). Every deploy here is operator-triggered.
 - The Tauri v2 desktop and mobile (Android-first) shells. Those live
   under `apps/desktop/` and `apps/mobile/` and have their own release
-  tracks; no CI workflow exists for them yet.
+  tracks; no CI workflow exists for them yet. The staged plan for that
+  future work lives in
+  [`docs/deployment/tauri-ci-release-plan.md`](./tauri-ci-release-plan.md).
 - Kubernetes / Helm / Nomad, multi-node HA, zero-downtime rolling
   deploys, image signing, SBOM / vulnerability scanning, registry
   retention automation, multi-arch images, managed-secrets integrations,

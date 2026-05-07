@@ -238,7 +238,7 @@ TODO — explicit list of features deferred so the agent doesn't "helpfully" imp
 - SCP/SFTP file transfer surface.
 - Multi-user shared sessions / "screen-share."
 - Public-cloud-hosted multi-tenant deployment (v1 is single-tenant Docker Compose).
-- iOS Tauri build (Android first; iOS later). The Tauri desktop and mobile shells (`apps/desktop/`, `apps/mobile/`) ship with no automated CI/build pipeline yet.
+- iOS Tauri build (Android first; iOS later). The Tauri desktop and mobile shells (`apps/desktop/`, `apps/mobile/`) ship with no automated CI/build pipeline yet. (Staged plan: [`docs/deployment/tauri-ci-release-plan.md`](docs/deployment/tauri-ci-release-plan.md).)
 - libghostty-vt state engine swap (planned; xterm.js drives the baseline). The xterm.js baseline adapter (`@relayterm/terminal-xterm`) and the experimental ghostty-web (`@relayterm/terminal-ghostty-web`), restty (`@relayterm/terminal-restty`), and wterm (`@relayterm/terminal-wterm`) adapters have all landed under `packages/terminal-<name>/`.
 - Multi-user / team authentication, role-based access control, and an admin / operator surface. v1 is single-user self-hosted; see [`docs/spec/auth.md`](docs/spec/auth.md) for the rationale.
 - Email-based password reset / "forgot password" flow. Self-hosted operators have DB-level recovery in v1; mail transport is its own scope.
