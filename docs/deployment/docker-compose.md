@@ -650,6 +650,62 @@ The publish step ends at "image is in the registry." Operators
 trigger the deploy by hand (`pull` + `up -d` on the host). Watchtower
 / SSH push / GitOps are separate slices — see §8.
 
+#### 6.4.6 Verified smoke (image-mode)
+
+A first end-to-end image-mode deployment against
+`git.js-node.cc/jsprague/relayterm-{backend,backend-migrate,web}`
+has been exercised by hand with `RELAYTERM_IMAGE_TAG=sha-51a772e`
+(an example tag — your deploys should pin a `:sha-<short>` from a
+specific successful CI publish, or a `:vX.Y.Z` for releases). The
+following observations held; this section captures the scope of what
+a green run looks like, NOT a runner that re-executes on every push.
+
+The smoke covered:
+
+- `docker compose -f deploy/docker-compose.images.example.yml config`
+  rendered cleanly with the env file contract above.
+- `docker compose pull` fetched all three images from the registry.
+  The pull was observed to succeed without `docker login` against
+  `git.js-node.cc` because the relevant package was anonymously
+  pullable at the time. **Recommendation stands**: issue a
+  `read:package`-only Forgejo PAT for the deploy host and
+  `docker login` with it (see §6.4.1) so a future tightening of
+  registry visibility does not break pulls.
+- `docker compose --profile migrate run --rm relayterm-migrate`
+  applied migrations on first run. Re-running the same command was
+  idempotent — `sqlx` skipped already-applied migrations.
+- `docker compose up -d postgres relayterm-backend relayterm-web`
+  brought the stack to `running` + `healthy` for all three services.
+- `curl -i http://127.0.0.1:8081/api/v1/auth/me` returned `401`
+  through the nginx proxy without a session cookie (the expected
+  auth-gate behavior).
+- The SPA was served at `/` with a normal `200`, `index.html` body.
+- `curl -sf http://127.0.0.1:8081/_web_health` returned `ok`.
+- The bootstrap `Origin` guard worked end-to-end: a state-change
+  request without a matching `Origin` was rejected with `403`
+  before reaching the body extractor.
+- An unauthenticated WebSocket connect to
+  `/api/v1/terminal-sessions/:id/ws` reached the backend and was
+  rejected with `401` (the auth gate runs before the upgrade).
+- A targeted log-leakage sweep against the backend stdout for the
+  redaction sentinels (session token, vault internals, terminal
+  I/O, recording bytes) was clean.
+- No source changes were needed to land the smoke.
+
+Two follow-ups surfaced and are tracked separately:
+
+- The duplicate `Content-Type` on `/_web_health` is fixed in this
+  commit. The endpoint now sets `default_type text/plain` and
+  returns a single header.
+- Auto-deploy (CI → host pull/restart) is intentionally deferred —
+  see §6.4.5 and §8.
+
+Future deployments should prefer pinning the immutable
+`:sha-<short>` tag from a known-green CI publish, or the
+`:vX.Y.Z` tag of a tagged release. `:main` is fine for branch-
+tracking dev / staging installs but is mutable on the next push to
+`main`.
+
 ---
 
 ## 7. Smoke / verification checklist
@@ -689,5 +745,10 @@ File these as separate slices when they're needed:
 - Production renderer selector (production stays on the
   `@relayterm/terminal-xterm` baseline; experimental renderers are
   dev-lab-only).
-- Mobile / Tauri packaging — covered by `apps/desktop/` and
-  `apps/mobile/`, not this stack.
+- Tauri v2 desktop / mobile (Android-first) packaging and CI —
+  separate deployment track. The Docker image publish documented
+  here only covers the server (`relayterm-backend`,
+  `relayterm-backend-migrate`) and web (`relayterm-web`)
+  deployment. Desktop and mobile shells live under
+  `apps/desktop/` and `apps/mobile/` respectively and have no CI
+  release workflow yet.

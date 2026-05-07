@@ -94,9 +94,13 @@ server {
     # Server-side healthcheck endpoint for compose / external probes.
     # Distinct from `/healthz` (which proxies to the backend) so a
     # backend outage does not mark the web container unhealthy.
+    #
+    # `default_type` sets the inline `return` body's Content-Type;
+    # `add_header Content-Type ...` here would emit a duplicate
+    # alongside nginx's default `text/html`.
     location = /_web_health {
         access_log off;
+        default_type text/plain;
         return 200 "ok\n";
-        add_header Content-Type text/plain;
     }
 }

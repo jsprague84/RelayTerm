@@ -11,8 +11,13 @@
 # pull. The CI publishes:
 #   * `:main`              — branch-tracking dev / staging installs.
 #   * `:vX.Y.Z`            — release pin.
-#   * `:sha-<short>`       — exact build, used for rollback.
+#   * `:sha-<short>`       — exact build, used for rollback or for
+#                            an immutable production pin.
 # We deliberately do NOT publish `:latest` — pin explicitly.
+#
+# Recommendation: production deploys should prefer the immutable
+# `:sha-<short>` (or `:vX.Y.Z`) tag from a known-green CI publish.
+# `:main` is fine for staging but is mutable on the next push.
 #
 # First-time deploy (postgres is included only on the first start —
 # subsequent upgrades re-use the existing volume and skip the
