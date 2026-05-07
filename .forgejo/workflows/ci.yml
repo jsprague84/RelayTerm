@@ -150,6 +150,15 @@ jobs:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
+      - name: docs contract check
+        # Guards the AGENTS.md / SPEC.md / docs/spec / docs/agent context
+        # split: anchors, high-risk cross-corpus terms, forbidden stale
+        # phrases, and renderer/auth/recording term discoverability.
+        # Pure bash; no node/pnpm/network needed, so it runs BEFORE the
+        # slow node + install steps to fail fast on docs regressions.
+        # Also exposed as `pnpm run check:docs-contracts` for local use.
+        run: bash scripts/check-doc-contracts.sh
+
       - name: setup node 22
         # Node 22 LTS — must match `Dockerfile.web` `ARG NODE_VERSION`.
         # The catthehacker base image ships *a* Node, but pinning here
