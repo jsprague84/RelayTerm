@@ -40,6 +40,7 @@
 | `docs/spec/terminal.md` | Renderer-independent terminal/session/workspace behavior: terminal-session lifecycle, WebSocket attach/detach, terminal-core, live PTY bridge, replay buffer, terminal launch / sessions list / settings / viewport / paste / local recovery / status refresh. Renderer adapter packages are summarized here and fully specified in `terminal-adapters.md`. |
 | `docs/spec/terminal-adapters.md` | Concrete renderer adapter contracts for `terminal-xterm` (production baseline) and `terminal-ghostty-web` / `terminal-restty` / `terminal-wterm` (experimental, dev-only). Created 2026-05-07 in `docs/split-terminal-renderer-spec` to drop terminal.md from ~155 KB to ~127 KB so an agent following SPEC.md → terminal.md no longer pulls 33 KB of adapter detail it doesn't need. |
 | `docs/spec/auth.md` | Credential creation, host-key trust, auth-check, production authentication architecture. |
+| `docs/spec/auth-implementation-history.md` | Per-slice landed-state narrative split out of `auth.md` on 2026-05-07. Append-only as new auth slices land; not normative on its own (the contracts live in `auth.md`). |
 | `docs/spec/inventory.md` | Inventory views, identity / host / profile creation UI, host-key preflight UI, auth-check UI, dashboard, recent activity, server-profile disable/enable backend + audit + UI. |
 | `docs/spec/recording.md` | Load-bearing invariants for durable recording, plus pointer to `docs/terminal-recording.md`. |
 | `docs/spec/web-shell.md` | Production web-app shell chrome and URL routing. |
@@ -148,10 +149,27 @@ deleted. The exact prose is preserved in the destination file.
   PTY bridge, replay buffer, production UI, paste safety, local
   recovery, and status refresh; further per-surface splits are not
   scheduled.
-- `docs/spec/auth.md` is 109 KB. Multi-review (2026-05-07) flagged it
+- ~~`docs/spec/auth.md` is 109 KB. Multi-review (2026-05-07) flagged it
   as a candidate for trimming — implementation-status narrative could
   move to code comments / archive, leaving contract-shape only.
-  Tracking, not yet scheduled.
+  Tracking, not yet scheduled.~~ **Resolved (2026-05-07):** in branch
+  `docs/trim-auth-spec`, the per-slice "✅ Landed" narrative for steps
+  1–13 of "Implementation order", the "Status today" mega-paragraph,
+  the inline `AuthenticatedUser` Rust pseudo-code, the "Active sessions
+  list" landed bullet, the throttling landed sub-bullet, and the legacy
+  `dev@relayterm.local` paragraph were all replaced in place with
+  1–3-sentence summaries that link to the new
+  `docs/spec/auth-implementation-history.md`. auth.md dropped from 104
+  KB / 355 lines to 62 KB / 301 lines (~40% reduction). All 14
+  load-bearing auth contracts (production/dev mode distinction,
+  bootstrap, cookie-backed auth, opaque session model, session_token /
+  password_hash redaction, CSRF/Origin guard, login throttle without
+  user-existence oracle, logout / password-change / session-management
+  semantics, audit-event payload boundaries, deferred work, no
+  remaining dev-auth wording) remain discoverable via grep. Drift
+  policy: when a new auth slice lands, append the slice's status
+  paragraph to `auth-implementation-history.md`; the contract goes in
+  `auth.md`.
 - ~~The `Encountered Lessons` cap of ~20 entries needs an explicit
   rotation policy.~~ **Resolved (2026-05-06):** AGENTS.md "Maintenance
   protocol" now says `archive cap ~10 entries; older lessons graduate
