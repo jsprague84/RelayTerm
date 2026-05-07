@@ -189,6 +189,17 @@ deleted. The exact prose is preserved in the destination file.
   Origin, CSRF, tokio::spawn, recording_purged, terminal_sessions,
   Tauri) shows each rule still present in either AGENTS.md, SPEC.md,
   one of the new docs, or an existing operational doc.
+- The grep smoke is now codified in
+  [`scripts/check-doc-contracts.sh`](../../scripts/check-doc-contracts.sh)
+  (also wired as `pnpm run check:docs-contracts`). Run it after editing
+  AGENTS.md, SPEC.md, `docs/spec/*`, or `docs/agent/*`. It verifies the
+  required files exist, the AGENTS.md and SPEC.md section anchors are
+  intact, the high-risk cross-corpus terms remain discoverable, the
+  stale dev-auth phrasings stay absent, the `docs/spec/*` cross-file
+  links resolve, and the renderer / auth / recording contract terms
+  stay reachable in their respective corpora. It is read-only, runs
+  without network access, and uses only standard shell tools. CI
+  enforcement is intentionally deferred — run it locally for now.
 
 ## Drift policy
 
@@ -198,3 +209,7 @@ When a contract changes:
 2. Update the matching summary in `SPEC.md` or `AGENTS.md`.
 3. Add an entry to this map only if the destination changes (the
    shape of the split moves).
+4. Re-run `pnpm run check:docs-contracts` (which invokes
+   `scripts/check-doc-contracts.sh` from the repo root). If a removed
+   term is intentional, update the script's term list in the same
+   change and note the rationale here.
