@@ -8,31 +8,52 @@
    *  - Built Tauri shell with no valid stored config — render the
    *    bootstrap picker. The browser deployment never reaches this
    *    branch because the predicate short-circuits.
-   *  - Built Tauri shell with a valid stored config — assign
-   *    `window.location` to the configured origin's root and render a
-   *    short "Connecting…" affordance while the WebView reloads. The
-   *    SPA that loads from the configured backend then runs AuthGate
-   *    / AppShell same-site (cookies, CSRF, Origin allowlist all
-   *    work without changes).
+   *  - Built Tauri shell with a valid stored config — schedule a
+   *    `window.location.assign(${origin}/)` and render a brief
+   *    "Connecting…" affordance with a "Change server" button. The
+   *    button cancels the pending navigation, clears the persisted
+   *    config, and returns to the picker so the operator can pick a
+   *    different backend without uninstalling the app or hand-editing
+   *    `localStorage`. Once navigation actually fires, the SPA loads
+   *    from the configured backend and runs AuthGate / AppShell
+   *    same-site (cookies, CSRF, Origin allowlist all work without
+   *    changes).
    *
    * This is the SINGLE production component that consumes the Tauri
    * runtime + handoff helpers. Keeping the runtime branch here means
    * AuthGate / AppShell / api helpers stay Tauri-unaware.
    *
    * Redaction posture: the saved origin is public config; the
-   * component never logs it. The picker component's onSaved callback
-   * triggers the handoff via `window.location.assign`, never via a
-   * thrown Error or console call.
+   * component never logs it. The Change Server reset path only
+   * touches `BACKEND_CONFIG_STORAGE_KEY` (via `clearBackendConfig`),
+   * never any auth / session / SSH-credential storage. The picker
+   * component's onSaved callback triggers the handoff via
+   * `window.location.assign`, never via a thrown Error or console
+   * call.
    */
   import type { Snippet } from "svelte";
   import {
     decideHandoff,
-    type HandoffDecision,
     type NavigationTarget,
   } from "./backendHandoff.js";
   import { isTauriBootstrapEnabled as isTauriBootstrapEnabledDefault } from "./tauriRuntime.js";
-  import type { BackendConfigStorage } from "./backendConfig.js";
+  import {
+    clearBackendConfig,
+    type BackendConfigStorage,
+  } from "./backendConfig.js";
   import TauriBackendBootstrap from "./TauriBackendBootstrap.svelte";
+
+  /**
+   * Internal phase state. Mirrors the three branches of `decideHandoff`
+   * but adds an explicit `connecting` form so the Change Server
+   * affordance can transition straight back to `picker` without
+   * re-running `decideHandoff` (which would still return `navigate`
+   * until storage is cleared, racing the operator's click).
+   */
+  type Phase =
+    | { kind: "passthrough" }
+    | { kind: "picker" }
+    | { kind: "connecting"; targetUrl: string };
 
   interface Props {
     /** What to render once a config is in place (or in the browser
@@ -45,6 +66,12 @@
     storage?: BackendConfigStorage;
     /** Override the navigation target for tests. */
     navigation?: NavigationTarget;
+    /** Delay (ms) before navigation is initiated. Defaults to 0 — the
+     * timer fires on the next event-loop tick so the Connecting splash
+     * mounts before the WebView reloads. Tests inject a positive value
+     * so the Change Server reset path can be exercised before the
+     * timer fires. */
+    navigationDelayMs?: number;
   }
 
   const {
@@ -56,45 +83,93 @@
     navigation = (typeof window !== "undefined"
       ? window.location
       : undefined) as NavigationTarget | undefined,
+    navigationDelayMs = 0,
   }: Props = $props();
 
-  // Initial decision is computed once at mount. Re-evaluating on
-  // every change would race the navigation kick-off; the picker's
-  // onSaved callback drives the explicit transition instead.
-  function initialDecision(): HandoffDecision {
-    if (storage === undefined) {
-      return { kind: "show_picker", reason: "not_tauri_runtime" };
+  function computePhase(): Phase {
+    // `storage === undefined` is the SSR / Node / unit-test misuse case;
+    // the production gate is always supplied with `window.localStorage`.
+    // Falling through to `passthrough` (render children) matches the
+    // "browser deployment never sees the picker" guarantee the rest of
+    // the slice rests on (design § 13). Falling through to `picker`
+    // would mount `TauriBackendBootstrap` without a storage backing.
+    if (storage === undefined) return { kind: "passthrough" };
+    const decision = decideHandoff({ isTauriBootstrapEnabled, storage });
+    if (decision.kind === "show_picker") {
+      return decision.reason === "not_tauri_runtime"
+        ? { kind: "passthrough" }
+        : { kind: "picker" };
     }
-    return decideHandoff({ isTauriBootstrapEnabled, storage });
+    return { kind: "connecting", targetUrl: decision.targetUrl };
   }
 
-  let decision = $state<HandoffDecision>(initialDecision());
-  let connecting = $state(false);
+  let phase = $state<Phase>(computePhase());
+  // Held outside `$state` so reads inside the effect don't establish a
+  // reactive subscription on the timer handle itself; the effect should
+  // re-run on phase changes only, never on timer-handle assignments.
+  let pendingNavigationTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Fire navigation as a side effect of entering the `navigate`
-  // branch. The flag prevents a re-fire if the same decision is
-  // re-emitted (e.g. re-render before the WebView reload completes).
+  function cancelPendingNavigation() {
+    if (pendingNavigationTimer !== null) {
+      clearTimeout(pendingNavigationTimer);
+      pendingNavigationTimer = null;
+    }
+  }
+
   $effect(() => {
-    if (decision.kind === "navigate" && navigation !== undefined && !connecting) {
-      connecting = true;
-      navigation.assign(decision.targetUrl);
+    // Schedule navigation as a side effect of entering the connecting
+    // phase. The timer handle lets the Change Server affordance cancel
+    // the pending handoff before `assign` fires. The returned teardown
+    // also clears the timer if the effect re-runs (phase change) or
+    // the component unmounts — Svelte 5 idiom for resource-owning
+    // effects (per AGENTS.md "Critical gotchas" — `$effect` replaces
+    // `onMount` for derivations, with cleanup via the returned
+    // function).
+    if (
+      phase.kind === "connecting" &&
+      navigation !== undefined &&
+      pendingNavigationTimer === null
+    ) {
+      const target = phase.targetUrl;
+      const nav = navigation;
+      pendingNavigationTimer = setTimeout(() => {
+        pendingNavigationTimer = null;
+        nav.assign(target);
+      }, navigationDelayMs);
+      return () => cancelPendingNavigation();
     }
   });
 
   function handleSaved(_origin: string) {
     if (storage === undefined) return;
-    decision = decideHandoff({ isTauriBootstrapEnabled, storage });
+    phase = computePhase();
+  }
+
+  function handleChangeServer() {
+    cancelPendingNavigation();
+    if (storage !== undefined) {
+      clearBackendConfig(storage);
+    }
+    phase = { kind: "picker" };
   }
 </script>
 
-{#if decision.kind === "show_picker" && decision.reason === "no_config"}
+{#if phase.kind === "picker"}
   <TauriBackendBootstrap {storage} onSaved={handleSaved} />
-{:else if decision.kind === "navigate"}
+{:else if phase.kind === "connecting"}
   <div
-    class="flex min-h-screen items-center justify-center bg-zinc-900 text-zinc-400"
+    class="flex min-h-screen flex-col items-center justify-center gap-6 bg-zinc-900 px-4 text-zinc-400"
     data-testid="tauri-bootstrap-connecting"
   >
     <span class="font-mono text-xs uppercase tracking-wide">Connecting…</span>
+    <button
+      type="button"
+      onclick={handleChangeServer}
+      data-testid="tauri-bootstrap-change-server"
+      class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-zinc-500 hover:text-zinc-100"
+    >
+      Change server
+    </button>
   </div>
 {:else}
   {@render children()}

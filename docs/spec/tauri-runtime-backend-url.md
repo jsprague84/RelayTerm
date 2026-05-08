@@ -13,11 +13,14 @@
 > ([`TauriBackendBootstrap.svelte`](../../apps/web/src/lib/runtime/TauriBackendBootstrap.svelte)),
 > the gate that wraps `AuthGate`
 > ([`ConfiguredBackendGate.svelte`](../../apps/web/src/lib/runtime/ConfiguredBackendGate.svelte))
-> wired into [`App.svelte`](../../apps/web/src/App.svelte), and the
+> wired into [`App.svelte`](../../apps/web/src/App.svelte), the
 > validation-error formatter
-> ([`backendUrlError.ts`](../../apps/web/src/lib/runtime/backendUrlError.ts)).
-> Tauri capability changes were NOT required: capabilities gate IPC,
-> not browser-level navigation, and `core:default` already permits
+> ([`backendUrlError.ts`](../../apps/web/src/lib/runtime/backendUrlError.ts)),
+> and the **"Change server" reset affordance** on the Connecting
+> splash (the gate's button cancels the pending navigation, calls
+> `clearBackendConfig`, and re-renders the picker). Tauri capability
+> changes were NOT required: capabilities gate IPC, not browser-level
+> navigation, and `core:default` already permits
 > `window.location.assign(<configured-origin>)`. Phases D–F (probe
 > header, native store, multi-server, path B) remain explicitly
 > deferred. The launch-smoke modal is now superseded by the picker on
@@ -581,12 +584,23 @@ Implemented modules (phase C):
 - [`apps/web/src/lib/runtime/ConfiguredBackendGate.svelte`](../../apps/web/src/lib/runtime/ConfiguredBackendGate.svelte)
   — top-level gate. Browser deployment renders `children` (AuthGate
   + AppShell) immediately. Built Tauri with no config renders the
-  picker. Built Tauri with a valid config calls
-  `window.location.assign(${origin}/)` and renders a `Connecting…`
-  splash while the WebView reloads. Wired in
+  picker. Built Tauri with a valid config schedules
+  `window.location.assign(${origin}/)` (via a `setTimeout` whose
+  delay is the optional `navigationDelayMs` prop, default `0` — i.e.
+  the next event-loop tick) and renders a `Connecting…` splash with
+  a **"Change server" button** while the WebView reloads. The button
+  cancels the pending navigation timer, calls `clearBackendConfig`,
+  and re-renders the picker so the operator can pick a different
+  backend without uninstalling the app or hand-editing
+  `localStorage`. The reset path only touches
+  `BACKEND_CONFIG_STORAGE_KEY` — no auth / session / SSH-credential
+  storage is involved (none exists in the frontend by way of this
+  slice; design § 8). Wired in
   [`App.svelte`](../../apps/web/src/App.svelte) outside `AuthGate`.
-  No "Change server" affordance in this slice (deferred — operator
-  clears storage / re-launches).
+  Multi-server support and an in-app "switch backend" UX after a
+  successful handoff remain deferred (Phase F) — once the WebView
+  has loaded the remote SPA, "change server" is a future
+  remote-web-shell concern.
 
 Tauri capability changes — NOT required. Capabilities gate IPC
 (Tauri commands), not browser-level navigation. `window.location.assign(url)`
@@ -629,7 +643,7 @@ cookie surface in `crates/relayterm-api` stays untouched.
 |---|---|---|
 | Desktop bundled build — picker render + URL validation + handoff navigation | ⚠ Partially verified (2026-05-08) | Built `target/release/relayterm-desktop` from current `main` (deb + rpm bundles only) and launched the native binary against a local hosted RelayTerm web origin (operator-side Compose stack on a separate project namespace; never published, never committed). With no prior `localStorage` config the Tauri shell rendered the **"Connect to RelayTerm Server"** picker per phase C. Three validator probes passed verbatim against `describeBackendUrlError`: `http://example.com` → `Use https:// for any host other than localhost.`; `https://user:pass@example.com` → `Remove the username/password from the URL — credentials are never part of the server address.`; the local hosted origin was accepted, persisted under `relayterm.backend-config.v1`, and `window.location.assign(${origin}/)` reloaded the WebView at the configured origin where the production RelayTerm web shell rendered. Browser deployment unchanged; `tauri:dev` / `tauri:android:dev` not exercised in this run and gated out by `import.meta.env.DEV` per § 13. |
 | Desktop bundled build — login / auth / terminal session attach | ❌ Not exercised | Out of scope for this smoke. Intentionally not tested; deferred to a later slice. |
-| Desktop bundled build — "Change server" / re-pick affordance | ❌ Not implemented (per § 11 phase C) | Resetting the configured origin in this smoke is a manual `localStorage` clear (or app-data wipe). A built-in "Change server" UI is deferred. |
+| Desktop bundled build — "Change server" / re-pick affordance | ⚠ Implemented; runtime smoke deferred (2026-05-08) | The Connecting splash now renders a "Change server" button (`data-testid="tauri-bootstrap-change-server"` on `ConfiguredBackendGate.svelte`). Click handler cancels the pending navigation timer, calls `clearBackendConfig(storage)`, and transitions back to the picker. Behaviour is pinned by the `Change Server reset flow` block in [`apps/web/tests/backendHandoff.test.ts`](../../apps/web/tests/backendHandoff.test.ts) (clearTimeout cancels a scheduled handoff before `navigation.assign`; only `BACKEND_CONFIG_STORAGE_KEY` is touched; reset → re-save routes through navigate again; sentinel-shaped data never echoes through reset). On-device runtime smoke (operator clicks the button on a built shell, verifies the picker re-renders, types a different URL, observes handoff to the new origin) is deferred to a later interactive smoke. Once navigation has succeeded and the WebView has loaded the remote SPA, in-shell "switch backend" is a future remote-web-shell concern (Phase F). |
 | Android bundled build — picker render + handoff | ❌ Not exercised | Optional second device pass; not run on 2026-05-08. The CI debug-APK smoke covers the build half only; runtime picker / handoff on a physical Android device or emulator remains unverified. |
 
 ### Phase F — later (deferred and not designed here)
@@ -708,7 +722,15 @@ Frontend tests (Svelte + jsdom):
 - Probe success / unreachable / CORS-blocked: the resulting message
   is a function of the typed reason only, never echoes the URL or
   any wire body.
-- "Change server" path: clear → re-render picker.
+- "Change server" path: clear → re-render picker. **Implemented** at
+  the primitive level via the `Change Server reset flow` block in
+  [`apps/web/tests/backendHandoff.test.ts`](../../apps/web/tests/backendHandoff.test.ts):
+  vitest + jsdom + `@testing-library/svelte` are not yet wired into
+  this app's test stack, so the gate's component-level behaviour is
+  pinned by exercising the helpers it composes (clearTimeout cancels
+  a scheduled `navigation.assign`; `clearBackendConfig` only touches
+  `BACKEND_CONFIG_STORAGE_KEY`; reset → re-save still routes through
+  navigate; sentinel-shaped data never leaks through reset).
 - Browser deployment (no Tauri): picker NEVER renders; existing
   `AuthGate` flow is unchanged.
 

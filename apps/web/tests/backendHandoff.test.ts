@@ -7,6 +7,8 @@ import {
 } from "../src/lib/runtime/backendHandoff.js";
 import {
   BACKEND_CONFIG_STORAGE_KEY,
+  clearBackendConfig,
+  loadBackendConfig,
   saveBackendConfig,
   type BackendConfig,
   type BackendConfigStorage,
@@ -234,5 +236,142 @@ describe("performHandoff", () => {
     expect(navigation.calls).toEqual([]);
     expect(JSON.stringify(decision)).not.toContain(SENTINEL_PASSWORD);
     expect(JSON.stringify(decision)).not.toContain("alice");
+  });
+});
+
+/**
+ * Reset-flow tests covering the primitives the Change Server affordance
+ * (ConfiguredBackendGate.svelte → handleChangeServer) relies on.
+ *
+ * The component glues together two well-tested helpers — `clearTimeout`
+ * for the pending navigation handle and `clearBackendConfig` for the
+ * storage slot — so these tests pin the contract at the primitive
+ * level rather than instantiating the Svelte component (vitest +
+ * jsdom + @testing-library/svelte are deliberately not wired into
+ * this app's test stack; design § 14 calls these out as still
+ * deferred). The component remains thin enough that these primitive
+ * tests cover the behaviour that matters: storage gets cleared, the
+ * scheduled navigation never fires, only the documented storage key
+ * is touched, the next save still routes through navigate, and
+ * sentinel-shaped data never leaks through the reset path.
+ */
+describe("Change Server reset flow (gate primitives)", () => {
+  it("clearBackendConfig + decideHandoff returns to show_picker / no_config", () => {
+    const storage = memoryStorage();
+    saveBackendConfig(storage, VALID_CFG);
+    expect(
+      decideHandoff({ isTauriBootstrapEnabled: () => true, storage }).kind,
+    ).toBe("navigate");
+
+    clearBackendConfig(storage);
+
+    expect(
+      decideHandoff({ isTauriBootstrapEnabled: () => true, storage }),
+    ).toEqual({ kind: "show_picker", reason: "no_config" });
+    expect(loadBackendConfig(storage)).toBeNull();
+  });
+
+  it("reset only touches the documented storage key (sibling slots untouched)", () => {
+    const UNRELATED_KEY = "relayterm.unrelated.example";
+    const UNRELATED_VALUE = "preserved-unrelated-value";
+    const storage = memoryStorage({ [UNRELATED_KEY]: UNRELATED_VALUE });
+    saveBackendConfig(storage, VALID_CFG);
+
+    clearBackendConfig(storage);
+
+    expect(storage.snapshot()).toEqual({ [UNRELATED_KEY]: UNRELATED_VALUE });
+  });
+
+  it("reset followed by saving a new origin transitions back to navigate (re-pick path)", () => {
+    const storage = memoryStorage();
+    saveBackendConfig(storage, VALID_CFG);
+    clearBackendConfig(storage);
+
+    const NEW_ORIGIN_CFG: BackendConfig = {
+      version: 1,
+      backendOrigin: "https://relay-2.example.com",
+      savedAt: "2026-05-08T12:30:00.000Z",
+    };
+    saveBackendConfig(storage, NEW_ORIGIN_CFG);
+
+    expect(
+      decideHandoff({ isTauriBootstrapEnabled: () => true, storage }),
+    ).toEqual({
+      kind: "navigate",
+      targetUrl: "https://relay-2.example.com/",
+      config: NEW_ORIGIN_CFG,
+    });
+  });
+
+  it("cancelling a scheduled handoff via clearTimeout prevents navigation.assign", () => {
+    // Pins the contract the gate's `handleChangeServer` relies on:
+    // a setTimeout-scheduled navigation, when cancelled before its
+    // delay elapses, never reaches `navigation.assign`. The gate uses
+    // the exact same setTimeout/clearTimeout pair, gated on the
+    // injectable `navigationDelayMs` prop, to honour the Change
+    // Server affordance.
+    vi.useFakeTimers();
+    try {
+      const storage = memoryStorage();
+      saveBackendConfig(storage, VALID_CFG);
+      const navigation = recordingNavigation();
+      const decision = decideHandoff({
+        isTauriBootstrapEnabled: () => true,
+        storage,
+      });
+      expect(decision.kind).toBe("navigate");
+
+      const target =
+        decision.kind === "navigate" ? decision.targetUrl : "<unreachable>";
+      const handle = setTimeout(() => {
+        navigation.assign(target);
+      }, 100);
+
+      // Operator clicks "Change server" before the timer fires.
+      clearTimeout(handle);
+      clearBackendConfig(storage);
+
+      // Advance well past the original delay; the navigation MUST NOT fire.
+      vi.advanceTimersByTime(1_000);
+
+      expect(navigation.calls).toEqual([]);
+      expect(loadBackendConfig(storage)).toBeNull();
+      expect(
+        decideHandoff({ isTauriBootstrapEnabled: () => true, storage }),
+      ).toEqual({ kind: "show_picker", reason: "no_config" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reset path does not echo sentinel-shaped strings even when storage held suspicious data", () => {
+    // A storage that managed to retain a credential-bearing payload
+    // (e.g. by surviving an old slice's looser drift policy) MUST NOT
+    // leak any of it through the reset path. The reset is a blind
+    // `removeItem` + a fresh `decideHandoff` — neither reads the
+    // suspicious value back into a returned envelope.
+    const storage = memoryStorage({
+      [BACKEND_CONFIG_STORAGE_KEY]: JSON.stringify({
+        version: 1,
+        backendOrigin: `https://alice:${SENTINEL_PASSWORD}@example.com`,
+        savedAt: SENTINEL_SESSION_TOKEN,
+        smuggled: SENTINEL_PRIVATE_KEY,
+      }),
+    });
+
+    clearBackendConfig(storage);
+    const decision = decideHandoff({
+      isTauriBootstrapEnabled: () => true,
+      storage,
+    });
+
+    expect(decision).toEqual({ kind: "show_picker", reason: "no_config" });
+    const serialised = JSON.stringify(decision);
+    expect(serialised).not.toContain(SENTINEL_PRIVATE_KEY);
+    expect(serialised).not.toContain(SENTINEL_SESSION_TOKEN);
+    expect(serialised).not.toContain(SENTINEL_PASSWORD);
+    expect(serialised).not.toContain("alice");
+    // And the storage slot is empty after reset.
+    expect(storage.snapshot()).toEqual({});
   });
 });
