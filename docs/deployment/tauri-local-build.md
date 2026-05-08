@@ -173,6 +173,46 @@ The "universal" debug APK bundles all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x8
 
 > **Signing material is intentionally NOT tracked in the repo.** No `*.jks`, `*.keystore`, `local.properties`, `key.properties`, `keystore.properties`, `.gradle/`, `.cxx/`, or `build/` outputs are committed. Signing for release builds is deferred to a later phase; see [`tauri-ci-release-plan.md`](./tauri-ci-release-plan.md).
 
+### Mobile / Android — local device install + launch smoke
+
+This is a **runtime smoke** for the prebuilt debug APK on a real device or emulator. It proves the APK installs, the launcher activity dispatches, the process stays alive, and the bundled SPA renders inside the Android WebView. It does **not** prove backend connectivity, login, terminal attach, runtime backend URL config, mobile session lifecycle, signing, Play Store readiness, or anything beyond first-frame render.
+
+The verifying contributor connects an Android device with USB debugging enabled (or boots an existing AVD), confirms the device is `device` (not `unauthorized`) in `adb devices -l`, then runs:
+
+```bash
+# Identify the target — pick the right serial if more than one device is attached
+adb devices -l
+
+# Install (replace if already present, do NOT uninstall on signature mismatch
+# without operator approval)
+adb -s <serial> install -r \
+  apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+
+# Launch the LAUNCHER activity
+adb -s <serial> shell monkey -p cc.js_node.relayterm.mobile.debug -c android.intent.category.LAUNCHER 1
+
+# Liveness probe (see "pidof race" troubleshooting note below — re-probe after 1–2s)
+adb -s <serial> shell pidof cc.js_node.relayterm.mobile.debug || true
+adb -s <serial> shell "ps -A | grep relayterm" || true
+adb -s <serial> shell "dumpsys activity activities | grep -E 'mResumedActivity|cc.js_node' | head -20" || true
+
+# Bounded, filtered logcat snapshot — no streaming, no broad capture
+adb -s <serial> logcat -d -t 300 | grep -Ei 'relayterm|tauri|webview|crash|fatal|exception|ANR' || true
+```
+
+**Package id gotcha (debug builds).** `apps/mobile/src-tauri/gen/android/app/build.gradle.kts` sets `applicationIdSuffix = ".debug"` on the debug build type, so the installed package id for the debug APK is **`cc.js_node.relayterm.mobile.debug`**, not the canonical `cc.js_node.relayterm.mobile` from `tauri.conf.json`. All `monkey -p`, `pidof`, and `logcat` filters must use the suffixed id. The launcher activity stays under the unsuffixed namespace at `cc.js_node.relayterm.mobile.MainActivity` (standard Android behaviour — `applicationId` is the install identity, `namespace` is the Java/Kotlin package).
+
+**Expected outcome on a phone with no backend reachable.** The bundled SPA renders a `Cannot Reach RelayTerm` modal with `Cannot reach the backend: Malformed response` and a `Retry` button. This is the **expected** failure path because runtime backend URL / production API base config is deferred (see "Deferred work"). Treat it as a successful render, not a launch failure.
+
+### Mobile / Android — runtime caveats
+
+- **No emulator/device launch was exercised by `tauri android dev`** in this verification slice. The verified runtime path is the prebuilt debug APK + `adb install -r` + `monkey ... LAUNCHER 1`, not the Tauri-managed dev server.
+- **Backend connectivity is not wired** for the bundled (non-dev) shell. Anything past first-frame render — login, identity list, terminal attach, recordings — will fail with a backend-reach error until runtime API base URL configuration lands.
+- **Native secure storage** for SSH credentials (Android Keystore) is not implemented. Do not commission a device for real SSH use against this build.
+- **Mobile session lifecycle** (background → foreground transitions, doze, low-memory kill, push-driven wake) is unverified. The smoke only proves cold-launch render.
+- **Signing / keystore / Play Store / `--aab`** are out of scope for this slice and remain Phase 4+ (see `tauri-ci-release-plan.md`).
+- **Android CI** is not yet wired. The Phase 3 prerequisite is now cleared (build + local launch verified), but the workflow file is future work.
+
 ## Verification performed
 
 | Command | Status on the verifying host |
@@ -196,8 +236,9 @@ The "universal" debug APK bundles all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x8
 | `pnpm --filter @relayterm/desktop tauri:dev` | ❌ Not exercised — opens a GUI window and needs an interactive desktop session. |
 | `pnpm --filter @relayterm/mobile tauri:android:dev` | ❌ Not exercised — needs a connected device or running emulator. |
 | `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` (debug, unsigned, universal APK) | ✅ Verified on the same CachyOS host (Arch-derived Linux, kernel 7.0.3-1-cachyos), 2026-05-07. JDK 17 (`openjdk 17.0.19`), Android SDK at `~/Android/Sdk` (cmdline-tools/latest, platforms/android-36.1, build-tools/{36.1.0,37.0.0}, platform-tools), NDK `30.0.14904198`, and the four `*-linux-android` Rust targets installed; `JAVA_HOME` / `ANDROID_HOME` / `NDK_HOME` exported in the build shell. Tauri reports "Finished 1 APK"; `app-universal-debug.apk` lands at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/` (≈ 437 MB) with libraries for all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`). Required scaffold change: bump `apps/mobile/src-tauri/tauri.conf.json` `version` from `0.0.0` to `0.0.1` (Android packaging rejects `0.0.0`). No keystore, no signing, no AAB, no device install. Verifies local Android packaging only — does NOT verify emulator/device runtime, backend connectivity, mobile session behaviour, signing/release readiness, or Play Store distribution. |
+| `adb install -r app-universal-debug.apk` + `adb shell monkey -p cc.js_node.relayterm.mobile.debug -c android.intent.category.LAUNCHER 1` (local device install + launch smoke) | ✅ Verified on the same CachyOS host, 2026-05-08, against a physical Samsung Galaxy S10e (`SM-G970U`, codename `beyond0q`, serial `R38N500TY3E`) connected over USB with debugging authorised. `adb install -r` reported `Performing Streamed Install` → `Success`; `monkey` reported `Events injected: 1`; `dumpsys activity activities` showed `mResumedActivity: cc.js_node.relayterm.mobile.debug/cc.js_node.relayterm.mobile.MainActivity` (top + resumed); `ps -A` and re-probed `pidof` confirmed the process alive (PID 13565); the bounded filtered logcat snapshot showed zero `crash`/`fatal`/`exception`/`ANR`/`signal 1[0-9]`/`libc:` lines. The bundled SPA rendered inside the Android WebView and surfaced the expected `Cannot Reach RelayTerm` / `Cannot reach the backend: Malformed response` modal — that is the deferred-runtime-backend-URL failure path, not a launch failure. Verifies cold-launch render only — does NOT verify backend connectivity, login/auth, terminal session attach, runtime backend URL config, background/foreground mobile session lifecycle, signing/release readiness, Play Store distribution, or Android CI. |
 
-`tauri:dev` / Android rows are deferred to first-use validation by a contributor with a working desktop session and (for Android) an emulator or device.
+`tauri:dev` / `tauri android dev` rows remain deferred to first-use validation by a contributor with a working desktop session and (for `tauri android dev`) a reusable device/emulator workflow — the local install + launch smoke above proves the APK launches, but does not exercise Tauri's managed dev server.
 
 ## Troubleshooting
 
@@ -207,6 +248,7 @@ The "universal" debug APK bundles all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x8
 - **pnpm filter doesn't find `@relayterm/desktop` or `@relayterm/mobile`.** Confirm the package names in `apps/{desktop,mobile}/package.json` match the `--filter` argument and that `pnpm-workspace.yaml` lists `apps/desktop` and `apps/mobile`.
 - **Backend connectivity in the built (non-dev) shell.** Phase 0 does **not** wire production backend selection. If the bundled SPA shows network errors, that is expected — see "Deferred work".
 - **AppImage strip incompatibility** — `tauri build` ends with `failed to bundle project ´failed to run linuxdeploy´` after producing the `.deb` and `.rpm`. Direct invocation of `~/.cache/tauri/linuxdeploy-x86_64.AppImage` shows repeated `ERROR: Strip call failed: ... unknown type [0x13] section ´.relr.dyn´` lines for libs in `usr/lib/`. Cause: `linuxdeploy` ships a bundled `binutils` whose `strip` predates DT_RELR support, but modern glibc / Arch / CachyOS toolchains emit `.relr.dyn` sections. Workaround: run with `NO_STRIP=true`, e.g. `NO_STRIP=true pnpm --filter @relayterm/desktop tauri:build`. This is an upstream `linuxdeploy` issue; do not change the canonical `tauri build` command in `package.json` to mask it. The `.deb` and `.rpm` are unaffected and remain the recommended Linux distribution targets in this slice.
+- **`pidof` returns empty immediately after `monkey ... LAUNCHER 1`.** The process registers with the kernel slightly after `monkey` returns, so a `pidof <package>` invoked back-to-back with `monkey` can race the registration and produce empty output even on a healthy launch. Confirmed on the Galaxy S10e during the 2026-05-08 launch smoke: re-probing `pidof` (and `ps -A | grep <package>`, and `dumpsys activity activities | grep mResumedActivity`) one or two seconds later all returned a PID and `Resumed:` activity record. The reliable liveness check after a `monkey` launch is `dumpsys activity activities | grep mResumedActivity` (or `pidof` after a brief delay). An empty `pidof` immediately after `monkey` is **not** sufficient evidence of a crash; cross-check with `ps -A` and `dumpsys` before declaring a launch failure.
 
 ## Deferred work
 
