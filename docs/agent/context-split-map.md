@@ -44,6 +44,7 @@
 | `docs/spec/inventory.md` | Inventory views, identity / host / profile creation UI, host-key preflight UI, auth-check UI, dashboard, recent activity, server-profile disable/enable backend + audit + UI. |
 | `docs/spec/recording.md` | Load-bearing invariants for durable recording, plus pointer to `docs/terminal-recording.md`. |
 | `docs/spec/web-shell.md` | Production web-app shell chrome and URL routing. |
+| `docs/spec/tauri-runtime-backend-url.md` | Design-only doc (no implementation yet) for the runtime backend URL chosen by built Tauri desktop/mobile shells. Recommends path A — remote web shell — to keep the existing `SameSite=Strict` cookie + `CsrfGuard` posture unchanged; explicitly defers path B (cross-origin bundled SPA) because it would weaken auth. Created 2026-05-08 in branch `docs/tauri-runtime-backend-url-design` to close `tauri-ci-release-plan.md` § 9 questions 5 and 7 (for path A) and to give the launch-smoke `Cannot Reach RelayTerm` modal a documented next step. |
 
 ## AGENTS.md — sections moved or compacted
 

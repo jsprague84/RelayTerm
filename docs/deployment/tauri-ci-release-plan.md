@@ -461,7 +461,16 @@ others' questions** — keep them sequenced as in § 5.
 5. **Backend URL configuration.** Does each Tauri shell embed a
    build-time backend URL, or is the host configurable at runtime
    from the user's settings panel? Affects whether builds need
-   per-environment baking.
+   per-environment baking. **Design landed:**
+   [`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md)
+   recommends path A (remote web shell — bundled SPA becomes a tiny
+   bootstrap picker; the WebView navigates to the configured backend
+   on save, so the existing same-site cookie / `CsrfGuard` /
+   `Origin`-allowlist contract from
+   [`docs/spec/auth.md`](../spec/auth.md) is unchanged). Path B
+   (bundled SPA + cross-origin API) is explicitly deferred — it would
+   require `SameSite=None`, a CORS layer, and a layer-3 CSRF token,
+   none of which are v1 work.
 6. **Environment identification.** Does a Tauri shell identify
    dev/staging/prod via build-time env, runtime detection, or a
    bundled config? `apps/web` uses build-time `VITE_*`; the Tauri
@@ -469,6 +478,12 @@ others' questions** — keep them sequenced as in § 5.
 7. **Mobile session storage.** Same `HttpOnly; Secure; SameSite=Strict`
    cookie path as the web SPA, or platform-native secure storage
    (Android Keystore, iOS Keychain)? Affects the auth contract.
+   **v1 answer (per
+   [`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md)):**
+   same cookie path as the browser deployment — path A keeps the
+   WebView at the backend's origin so `SameSite=Strict` works as
+   designed. Native secure storage for any future client-side token
+   is its own deferred slice.
 8. **Mobile saved server profiles and SSH identities.** Same
    encrypted vault pathway as the backend's, or a platform-keystore-
    backed pathway?

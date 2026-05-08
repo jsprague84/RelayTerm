@@ -15,6 +15,7 @@
 | [`inventory.md`](inventory.md) | Production inventory views (hosts, identities, server-profiles), detail panels, client-side search/filters, identity generation UI, host & profile creation UI, host-key preflight/trust UI, auth-check UI, dashboard summary + recent activity feed, server-profile disable/enable backend + audit + UI. The lifecycle policy itself stays in `SPEC.md`. |
 | [`recording.md`](recording.md) | Load-bearing invariants for durable recording. The full design lives in [`../terminal-recording.md`](../terminal-recording.md). |
 | [`web-shell.md`](web-shell.md) | Shell chrome (sidebar, topbar, navigation), URL-driven view routing. |
+| [`tauri-runtime-backend-url.md`](tauri-runtime-backend-url.md) | Design (no implementation yet) for how built Tauri desktop/mobile shells choose and persist a backend URL. Recommends path A (remote web shell — bundled SPA becomes a tiny bootstrap picker, the WebView navigates to the configured backend so same-site cookies + `CsrfGuard` work unchanged). Path B (bundled SPA + cross-origin API) is explicitly deferred because it would force `SameSite=None` + a CORS layer + a layer-3 CSRF token. |
 
 ## How to update these
 
