@@ -1,8 +1,13 @@
 # Tauri runtime backend URL — design
 
-> **Status: design only.** No implementation has shipped against this
-> document. The bundled Tauri shells (desktop + mobile) currently render
-> the SPA but cannot reach a backend; the launch smoke
+> **Status: phase B (frontend primitives + tests) implemented; UI,
+> WebView navigation, and Tauri capabilities deferred.** The validator,
+> canonicaliser, derive helpers, and storage round-trip live at
+> [`apps/web/src/lib/runtime/backendConfig.ts`](../../apps/web/src/lib/runtime/backendConfig.ts);
+> the redaction-pinning unit tests live at
+> [`apps/web/tests/backendConfig.test.ts`](../../apps/web/tests/backendConfig.test.ts).
+> The bundled Tauri shells (desktop + mobile) still render the SPA but
+> cannot reach a backend at runtime; the launch smoke
 > ([`docs/deployment/tauri-local-build.md`](../deployment/tauri-local-build.md)
 > § "Mobile / Android — local device install + launch smoke") proves the
 > WebView mounts and surfaces a `Cannot Reach RelayTerm /
@@ -446,8 +451,12 @@ Accept:
 - `https://<host>` for any host. No exceptions; HTTPS is always
   accepted regardless of host.
 - `http://<host>` ONLY when `<host>` is one of `localhost`,
-  `127.0.0.1`, `::1`, `10.0.2.2` (the Android emulator loopback to
-  the host machine), or `0.0.0.0` (for completeness). Any other
+  `127.0.0.1`, `[::1]`, `10.0.2.2` (the Android emulator loopback to
+  the host machine), or `0.0.0.0` (for completeness). The IPv6
+  loopback is matched as the bracketed string `[::1]` because that
+  is what the WHATWG URL API returns from `URL.hostname` for an
+  IPv6 literal — the validator's loopback allow-list operates on
+  the parser's output, not the human-typed form `::1`. Any other
   cleartext URL is rejected — see `url_http_non_localhost` below.
 - Bare origin only: `scheme://host[:port]`. No path other than `/`.
   No query string. No fragment.
@@ -469,14 +478,33 @@ Reject:
   origin only.)
 
 Emit no log line that includes the rejected URL value; collapse to a
-typed reason enum for the UI (`url_unparseable`, `url_userinfo`,
-`url_disallowed_scheme`, `url_path_present`, `url_http_non_localhost`,
-`url_too_long`). The UI maps the enum to a static string. This
-mirrors the existing `LoadError` / `AuthError` redaction posture in
-`apps/web/src/lib/api/`.
+typed reason enum for the UI. The UI maps the enum to a static
+string. This mirrors the existing `LoadError` / `AuthError` redaction
+posture in `apps/web/src/lib/api/`.
 
-`URL_MAX_LEN` is `2048` (a defensible upper bound for an origin; the
-common allow-list URL is well under 100 chars).
+The implemented enum (see `BackendUrlError` in
+[`apps/web/src/lib/runtime/backendConfig.ts`](../../apps/web/src/lib/runtime/backendConfig.ts))
+is more granular than the original sketch — query strings and hash
+fragments collapse to their own reasons rather than sharing a
+`url_path_present` bucket — so the picker can surface the most
+specific message and so the redaction tests can pin each rejection
+path independently:
+
+- `url_empty` — empty / whitespace-only input.
+- `url_too_long` — length exceeds `BACKEND_URL_MAX_LEN`.
+- `url_parse_failed` — `URL` constructor threw.
+- `url_credentials_forbidden` — non-empty `username` and/or `password`.
+- `url_scheme_forbidden` — scheme is not `http:` or `https:`
+  (rejects `javascript:`, `data:`, `file:`, `blob:`, `about:`,
+  `tauri:`, `ftp:`, `ws:`, `wss:`, etc.).
+- `url_http_non_localhost` — `http:` to a host outside the loopback
+  allow-list (`localhost`, `127.0.0.1`, `[::1]`, `10.0.2.2`, `0.0.0.0`).
+- `url_path_forbidden` — path is anything other than `/`.
+- `url_search_forbidden` — non-empty query string.
+- `url_hash_forbidden` — non-empty fragment.
+
+`BACKEND_URL_MAX_LEN` is `2048` (a defensible upper bound for an
+origin; the common allow-list URL is well under 100 chars).
 
 ## 11. Implementation phases
 
@@ -486,18 +514,33 @@ Each phase is its own PR.
 
 This document. No code. No CI change.
 
-### Phase B — frontend URL primitive + validation
+### Phase B — frontend URL primitive + validation ✅ implemented
 
-- `apps/web/src/lib/runtime/backendConfig.ts` — pure helpers:
-  `parseBackendUrl(raw): ParsedBackendUrl | { ok: false, reason }`,
-  `loadBackendConfig(): BackendConfig | null` (reads
-  `localStorage`), `saveBackendConfig(cfg)`, `clearBackendConfig()`.
-- `apps/web/src/lib/runtime/runtime.ts` — single `isTauri()` helper.
-- Unit tests (`apps/web/tests/backendConfig.test.ts`) covering every
-  rejection path + every accept case, including sentinel inputs that
-  embed `private_key` / `session_token` shapes — those MUST surface
-  through the rejection envelope without hitting any log path.
-- No UI yet; no `localStorage` write anywhere production.
+- [`apps/web/src/lib/runtime/backendConfig.ts`](../../apps/web/src/lib/runtime/backendConfig.ts)
+  — pure helpers and an injectable-storage round-trip:
+  `BACKEND_CONFIG_STORAGE_KEY`, `BACKEND_URL_MAX_LEN`,
+  `validateBackendOrigin(input) -> { ok: true, origin } | { ok: false, reason }`,
+  `deriveApiBaseUrl(origin)`, `deriveHealthUrl(origin)`,
+  `deriveWebSocketBaseUrl(origin)`, `serializeBackendConfig(cfg)`,
+  `parseStoredBackendConfig(raw) -> BackendConfig | null`,
+  `loadBackendConfig(storage)`, `saveBackendConfig(storage, cfg)`,
+  `clearBackendConfig(storage)`. Storage is injected through a
+  `BackendConfigStorage` interface; the helpers do not reach for
+  `window.localStorage` directly. The browser deployment never
+  invokes these — the Tauri shell consumer (phase C) binds them to
+  `window.localStorage`.
+- Unit tests live at
+  [`apps/web/tests/backendConfig.test.ts`](../../apps/web/tests/backendConfig.test.ts)
+  and cover every accept / reject branch in § 10, the canonicalisation
+  rules (lower-cased host, default port stripped, trailing slash
+  stripped, whitespace trimmed), the persisted-shape round-trip, the
+  drop-on-drift policy from § 8, and sentinel-string smuggling
+  (`private_key` / `session_token` / password shapes routed through
+  the URL never reach the rejection envelope or the serialised
+  config).
+- **Still deferred to phase C and beyond:** any UI (the picker view),
+  WebView navigation, Tauri capabilities, the `isTauri()` runtime
+  helper, native storage, backend CORS, cookie / CSRF / auth changes.
 
 ### Phase C — Tauri-only bootstrap picker + handoff
 
