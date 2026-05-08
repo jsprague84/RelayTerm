@@ -202,12 +202,25 @@ adb -s <serial> logcat -d -t 300 | grep -Ei 'relayterm|tauri|webview|crash|fatal
 
 **Package id gotcha (debug builds).** `apps/mobile/src-tauri/gen/android/app/build.gradle.kts` sets `applicationIdSuffix = ".debug"` on the debug build type, so the installed package id for the debug APK is **`cc.js_node.relayterm.mobile.debug`**, not the canonical `cc.js_node.relayterm.mobile` from `tauri.conf.json`. All `monkey -p`, `pidof`, and `logcat` filters must use the suffixed id. The launcher activity stays under the unsuffixed namespace at `cc.js_node.relayterm.mobile.MainActivity` (standard Android behaviour — `applicationId` is the install identity, `namespace` is the Java/Kotlin package).
 
-**Expected outcome on a phone with no backend reachable.** The bundled SPA renders a `Cannot Reach RelayTerm` modal with `Cannot reach the backend: Malformed response` and a `Retry` button. This is the **expected** failure path because runtime backend URL / production API base config is deferred (see "Deferred work"). Treat it as a successful render, not a launch failure.
+**Expected outcome on a phone with no backend reachable.** As of the
+phase C runtime-backend-URL slice (see
+[`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md)
+§ "Phase C"), a built Tauri shell with no stored backend URL now
+renders the **Connect to RelayTerm Server** picker instead of
+attempting an unreachable backend call. After saving a valid
+`https://relayterm.example.com`-shaped URL the WebView navigates to
+that origin; the previous `Cannot Reach RelayTerm` /
+`Cannot reach the backend: Malformed response` modal only appears
+afterwards if the configured backend is itself unreachable (DNS,
+network, server down). Treat the picker render as a successful
+launch; treat the post-handoff backend-reach modal as the expected
+failure path for an unreachable saved URL — backend connectivity is
+still a separate, manual smoke.
 
 ### Mobile / Android — runtime caveats
 
 - **No emulator/device launch was exercised by `tauri android dev`** in this verification slice. The verified runtime path is the prebuilt debug APK + `adb install -r` + `monkey ... LAUNCHER 1`, not the Tauri-managed dev server.
-- **Backend connectivity is not wired** for the bundled (non-dev) shell. Anything past first-frame render — login, identity list, terminal attach, recordings — will fail with a backend-reach error until runtime API base URL configuration lands.
+- **Backend connectivity is now configurable for the bundled shell** via the phase C bootstrap picker described in [`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md). On first launch the built Tauri shell shows a single-field "Connect to RelayTerm Server" form; on save it persists a canonical origin to `localStorage` and navigates the WebView there. Backend connectivity itself (login, identity list, terminal attach, recordings) is still subject to the configured server actually being reachable — that remains a separate manual smoke and is NOT verified by the launch test above.
 - **Native secure storage** for SSH credentials (Android Keystore) is not implemented. Do not commission a device for real SSH use against this build.
 - **Mobile session lifecycle** (background → foreground transitions, doze, low-memory kill, push-driven wake) is unverified. The smoke only proves cold-launch render.
 - **Signing / keystore / Play Store / `--aab`** are out of scope for this slice and remain Phase 4+ (see `tauri-ci-release-plan.md`).

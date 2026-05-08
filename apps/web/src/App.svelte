@@ -3,6 +3,7 @@
   import AuthGate from "./lib/app/auth/AuthGate.svelte";
   import DevTerminalWorkbench from "./lib/dev/DevTerminalWorkbench.svelte";
   import TerminalProtocolLab from "./lib/dev/TerminalProtocolLab.svelte";
+  import ConfiguredBackendGate from "./lib/runtime/ConfiguredBackendGate.svelte";
 
   // `import.meta.env.DEV` is statically `true` under `vite dev` / vitest
   // and statically `false` for `vite build` (see vite.config.ts). Vite
@@ -19,19 +20,23 @@
   const isDev = import.meta.env.DEV;
 </script>
 
-<AuthGate>
-  {#snippet children({ user, signOut })}
-    {#if isDev}
-      <AppShell devMode {user} {signOut}>
-        {#snippet devTools()}
-          <div class="flex flex-col gap-4">
-            <TerminalProtocolLab />
-            <DevTerminalWorkbench />
-          </div>
-        {/snippet}
-      </AppShell>
-    {:else}
-      <AppShell {user} {signOut} />
-    {/if}
+<ConfiguredBackendGate>
+  {#snippet children()}
+    <AuthGate>
+      {#snippet children({ user, signOut })}
+        {#if isDev}
+          <AppShell devMode {user} {signOut}>
+            {#snippet devTools()}
+              <div class="flex flex-col gap-4">
+                <TerminalProtocolLab />
+                <DevTerminalWorkbench />
+              </div>
+            {/snippet}
+          </AppShell>
+        {:else}
+          <AppShell {user} {signOut} />
+        {/if}
+      {/snippet}
+    </AuthGate>
   {/snippet}
-</AuthGate>
+</ConfiguredBackendGate>

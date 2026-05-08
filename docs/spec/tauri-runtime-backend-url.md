@@ -1,18 +1,29 @@
 # Tauri runtime backend URL — design
 
-> **Status: phase B (frontend primitives + tests) implemented; UI,
-> WebView navigation, and Tauri capabilities deferred.** The validator,
-> canonicaliser, derive helpers, and storage round-trip live at
+> **Status: phases B and C implemented for path A.** Phase B's
+> validator, canonicaliser, derive helpers, and storage round-trip
+> live at
 > [`apps/web/src/lib/runtime/backendConfig.ts`](../../apps/web/src/lib/runtime/backendConfig.ts);
 > the redaction-pinning unit tests live at
 > [`apps/web/tests/backendConfig.test.ts`](../../apps/web/tests/backendConfig.test.ts).
-> The bundled Tauri shells (desktop + mobile) still render the SPA but
-> cannot reach a backend at runtime; the launch smoke
-> ([`docs/deployment/tauri-local-build.md`](../deployment/tauri-local-build.md)
-> § "Mobile / Android — local device install + launch smoke") proves the
-> WebView mounts and surfaces a `Cannot Reach RelayTerm /
-> Cannot reach the backend: malformed response` modal — that is the
-> deferred-runtime-backend-URL failure path, not a launch failure.
+> Phase C adds the runtime detection + handoff helpers
+> ([`tauriRuntime.ts`](../../apps/web/src/lib/runtime/tauriRuntime.ts),
+> [`backendHandoff.ts`](../../apps/web/src/lib/runtime/backendHandoff.ts)),
+> the picker UI
+> ([`TauriBackendBootstrap.svelte`](../../apps/web/src/lib/runtime/TauriBackendBootstrap.svelte)),
+> the gate that wraps `AuthGate`
+> ([`ConfiguredBackendGate.svelte`](../../apps/web/src/lib/runtime/ConfiguredBackendGate.svelte))
+> wired into [`App.svelte`](../../apps/web/src/App.svelte), and the
+> validation-error formatter
+> ([`backendUrlError.ts`](../../apps/web/src/lib/runtime/backendUrlError.ts)).
+> Tauri capability changes were NOT required: capabilities gate IPC,
+> not browser-level navigation, and `core:default` already permits
+> `window.location.assign(<configured-origin>)`. Phases D–F (probe
+> header, native store, multi-server, path B) remain explicitly
+> deferred. The launch-smoke modal is now superseded by the picker on
+> a built Tauri shell with no stored config; the backend-reach modal
+> still fires for any operator who saves a URL pointing at an
+> unreachable backend (that is the path A failure mode by design).
 >
 > This document fixes the design space *before* code is written. It
 > evaluates two materially different shapes (remote web shell vs.
@@ -542,32 +553,54 @@ This document. No code. No CI change.
   WebView navigation, Tauri capabilities, the `isTauri()` runtime
   helper, native storage, backend CORS, cookie / CSRF / auth changes.
 
-### Phase C — Tauri-only bootstrap picker + handoff
+### Phase C — Tauri-only bootstrap picker + handoff ✅ implemented
 
-- `apps/web/src/lib/runtime/BootstrapShell.svelte` — the picker.
-  Used only when `isTauri() && !loadBackendConfig()`.
-- `apps/web/src/lib/runtime/ConfiguredBackendGate.svelte` — wraps
-  `AuthGate`; on Tauri-mode it ensures `loadBackendConfig()` is set,
-  otherwise renders the picker. On the browser deployment it is a
-  no-op pass-through.
-- A "Change server" surface that calls `clearBackendConfig()` and
-  reloads the WebView. The Tauri shell may need a tiny native side
-  to navigate the WebView to the configured URL on save (Tauri 2's
-  `WebviewWindow::navigate(...)` invoked from a frontend helper via
-  a single, narrow capability — out of scope for this design's
-  recommendation; an alternative is "user restarts the app once
-  after save," which is acceptable for a debug build).
-- Path A handoff: on save, set `localStorage` and trigger
-  `window.location.assign(<configured-url>)`. The WebView is allowed
-  to navigate to a configured remote origin; this requires a Tauri
-  capability row. **`core:default` does NOT include cross-origin
-  WebView navigation** — phase C MUST add a scoped
-  `webview:allow-navigate` (or the equivalent platform-specific
-  capability per Tauri v2 docs at slice-execution time) bounded to
-  the configured origin. The "operator restarts the app once after
-  save" fallback is acceptable for a debug build but should not
-  ship as the production UX.
-- No backend change.
+Implemented modules (phase C):
+
+- [`apps/web/src/lib/runtime/tauriRuntime.ts`](../../apps/web/src/lib/runtime/tauriRuntime.ts)
+  — `isTauriRuntime()` (probes `window.__TAURI_INTERNALS__` /
+  `window.__TAURI__` / `window.isTauri === true`) and
+  `isTauriBootstrapEnabled()` (`isTauriRuntime() && !import.meta.env.DEV`).
+  `import.meta.env.DEV` is read inside the function so Vite's
+  static replacement still dead-code-eliminates the picker out of
+  the dev branch and out of the browser deployment.
+- [`apps/web/src/lib/runtime/backendHandoff.ts`](../../apps/web/src/lib/runtime/backendHandoff.ts)
+  — pure decision + URL construction. `decideHandoff(...)` returns
+  `show_picker / not_tauri_runtime`, `show_picker / no_config`, or
+  `navigate { targetUrl, config }`. `performHandoff(...)` calls
+  `navigation.assign(targetUrl)` on the navigate branch.
+  Storage / navigation are injected so vitest pins every branch
+  without a DOM. Drift on read collapses to `no_config` (design § 8).
+- [`apps/web/src/lib/runtime/TauriBackendBootstrap.svelte`](../../apps/web/src/lib/runtime/TauriBackendBootstrap.svelte)
+  — the single-input picker with the typed-error → static-string
+  formatter ([`backendUrlError.ts`](../../apps/web/src/lib/runtime/backendUrlError.ts)),
+  the public-config note, and the Android-localhost caveat (design
+  § 12). On accept, persists the canonical origin via
+  `saveBackendConfig` and calls `onSaved(origin)`. NO probe network
+  call (deferred per § 11 phase D).
+- [`apps/web/src/lib/runtime/ConfiguredBackendGate.svelte`](../../apps/web/src/lib/runtime/ConfiguredBackendGate.svelte)
+  — top-level gate. Browser deployment renders `children` (AuthGate
+  + AppShell) immediately. Built Tauri with no config renders the
+  picker. Built Tauri with a valid config calls
+  `window.location.assign(${origin}/)` and renders a `Connecting…`
+  splash while the WebView reloads. Wired in
+  [`App.svelte`](../../apps/web/src/App.svelte) outside `AuthGate`.
+  No "Change server" affordance in this slice (deferred — operator
+  clears storage / re-launches).
+
+Tauri capability changes — NOT required. Capabilities gate IPC
+(Tauri commands), not browser-level navigation. `window.location.assign(url)`
+is JS navigation in the WebView and `core:default` already permits
+it; the WebView's CSP is null per `tauri.conf.json`'s
+`security: { csp: null }`. The earlier "phase C MUST add
+`webview:allow-navigate`" speculation is superseded; capability
+manifests in `apps/{desktop,mobile}/src-tauri/capabilities/default.json`
+are unchanged and still ship `core:default` only. A future Rust-side
+`on_navigation` allow-list (plugin builder hook) is recorded as an
+optional hardening for phase F — it is not load-bearing for path A.
+
+No backend change. Path A's whole point is that the auth / CSRF /
+cookie surface in `crates/relayterm-api` stays untouched.
 
 ### Phase D — backend-side acceptance work (path A specific)
 
