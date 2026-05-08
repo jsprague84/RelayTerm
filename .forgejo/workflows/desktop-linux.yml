@@ -1,0 +1,186 @@
+# RelayTerm Forgejo Actions — Linux desktop Tauri CI smoke (Phase 1).
+#
+# Scope:
+#   * Build the Tauri v2 desktop shell on Linux via the catthehacker base
+#     image. Bundle `.deb` + `.rpm` ONLY. Verifies that the desktop crate
+#     compiles, the bundled web SPA links, and the Linux packaging
+#     toolchain stays green on every PR / push-to-main.
+#   * Build-only smoke. No artifact upload. No publish. No release. No
+#     signing. No registry login.
+#
+# Out of scope (intentionally deferred — see
+# `docs/deployment/tauri-ci-release-plan.md` Phase 2+):
+#   * AppImage bundle. Disabled here because `linuxdeploy`'s bundled
+#     `strip` predates DT_RELR (`.relr.dyn`) support and aborts on libs
+#     produced by modern glibc toolchains. Documented under "AppImage
+#     strip incompatibility" in `docs/deployment/tauri-local-build.md`.
+#     The deb/rpm bundles are unaffected.
+#   * Windows / macOS desktop CI.
+#   * Android / iOS mobile CI.
+#   * Code signing (Authenticode, Apple notarization, Android keystore).
+#   * Artifact upload / release publishing.
+#   * Runtime backend-URL selection in the bundled SPA.
+#
+# Relationship to `ci.yml`:
+#   * This workflow file is intentionally SEPARATE from `ci.yml`. The
+#     server / web Docker image build and registry publish path lives
+#     entirely in `ci.yml` and is unaffected by anything here. See
+#     `docs/deployment/tauri-ci-release-plan.md` § 6 ("Forgejo runner
+#     strategy"): "Desktop and mobile workflows must live in workflow
+#     files separate from the existing `ci.yml`." A failure in this
+#     workflow does NOT block server image publishing.
+#
+# Runner pattern (mirrors `ci.yml`):
+#   * `runs-on: docker` with `catthehacker/ubuntu:act-latest`. Same base
+#     image as the rest of CI so JS-based actions (`checkout`,
+#     `setup-node`) work without per-job bootstrap, and so the Linux
+#     dep install step targets a known Ubuntu/Debian package layout.
+#   * Toolchains installed inside the job: Rust via rustup-init, Node
+#     via `setup-node`, pnpm via corepack from `package.json#packageManager`.
+#   * Checkout uses the explicit Forgejo-hosted URL
+#     `https://code.forgejo.org/actions/checkout@v4`, matching the
+#     qshift-validated pattern used by `ci.yml`.
+
+name: desktop-linux
+
+on:
+  push:
+    branches:
+      - main
+    # `v*` tags trigger the same build smoke. This is NOT a release
+    # workflow — it does not sign, publish, or upload artifacts. Tag
+    # builds are included so a release-tag push exercises the same
+    # packaging path as PRs and main pushes.
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+# Cancel an in-flight build for the same ref when a newer push lands —
+# matches the `ci.yml` concurrency policy.
+concurrency:
+  group: desktop-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop-linux-build:
+    name: tauri desktop linux build (deb + rpm)
+    runs-on: docker
+    container:
+      image: catthehacker/ubuntu:act-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Match the `ci.yml` rust-checks job — `-D warnings` keeps Tauri's
+      # own Rust crate (`relayterm-desktop`) honest under the same gate
+      # as the rest of the workspace. Build-only smoke; no `cargo test`
+      # here because the workspace test gate already runs in `ci.yml`.
+      RUSTFLAGS: -D warnings
+      # Hint for `tauri build` that we are non-interactive.
+      CI: "1"
+    steps:
+      - name: checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: install linux desktop tauri build dependencies
+        # Canonical Debian/Ubuntu package list from the Tauri v2
+        # prerequisites doc and `docs/deployment/tauri-local-build.md`
+        # § "Debian / Ubuntu (canonical upstream list)". `pkg-config`
+        # and `libgtk-3-dev` are added because `webkit2gtk-4.1`'s
+        # build-time pkg-config files reference them on Ubuntu 24.04;
+        # without them `cargo build` fails resolving the gtk linkage.
+        # AppImage tooling (`linuxdeploy`, `appimagetool`) is NOT
+        # installed — the build below explicitly bundles `deb,rpm` only.
+        run: |
+          set -eu
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            libgtk-3-dev
+
+      - name: docs contract check
+        # Cheap, pure-bash, no network. Runs BEFORE Rust + Node install
+        # so a docs regression shorts out before consuming a Tauri build
+        # slot — matches the fail-fast ordering in `ci.yml` web-checks.
+        run: bash scripts/check-doc-contracts.sh
+
+      - name: install rust 1.95 (rustup minimal)
+        # Same rustup invocation as `ci.yml` rust-checks. Pin floats with
+        # `Dockerfile.backend` `ARG RUST_VERSION=1.95` and the
+        # `relayterm-desktop` crate inherits the workspace `rust-version`
+        # of 1.85 (the actual MSRV), so the 1.95 pin is a CI-diagnostic
+        # alignment choice, not a feature requirement. `--profile minimal`
+        # without `rustfmt`/`clippy` is intentional — those checks run
+        # workspace-wide in `ci.yml` rust-checks; this job is build-only.
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.95 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
+          "$HOME/.cargo/bin/cargo" --version
+
+      - name: setup node 22
+        uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: enable corepack (pnpm via package.json#packageManager)
+        run: |
+          corepack enable
+          corepack prepare --activate
+          node --version
+          pnpm --version
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: tauri build (deb + rpm only)
+        # Phase 1 intentionally bundles `deb,rpm` only and skips the
+        # AppImage stage; see the workflow header comment. The CLI flag
+        # is `--bundles` (comma-separated). The pnpm filter dispatches
+        # to `apps/desktop/`'s local `@tauri-apps/cli` so this command
+        # is identical to the documented local invocation:
+        #   pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm
+        run: pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm
+
+      - name: list bundle artifacts
+        # Cargo workspaces share a single root `target/`, so the desktop
+        # bundles land at `target/release/...`, NOT
+        # `apps/desktop/src-tauri/target/...`. Documented in
+        # `docs/deployment/tauri-local-build.md` § "Desktop (Linux)".
+        # We glob `*.deb` / `*.rpm` rather than `ls -la <dir>/` so an
+        # empty bundle directory (bundler ran, produced zero files) fails
+        # the step — `ls` against a glob with no matches exits non-zero
+        # under `set -eu` and `failglob` is not required because the
+        # glob expansion errors out the shell builtin call directly.
+        run: |
+          set -eu
+          echo '--- native binary ---'
+          ls -la target/release/relayterm-desktop
+          echo '--- deb bundle ---'
+          ls -la target/release/bundle/deb/*.deb
+          echo '--- rpm bundle ---'
+          ls -la target/release/bundle/rpm/*.rpm
+
+      - name: assert no appimage was produced
+        # Belt-and-braces guard: if a future scaffold change re-enables
+        # the AppImage bundler implicitly (e.g. via `tauri.conf.json`
+        # bundle defaults), this step fails loudly so we don't ship a
+        # broken AppImage from CI. The DT_RELR strip incompatibility is
+        # an upstream `linuxdeploy` issue we are explicitly deferring
+        # until `tauri-ci-release-plan.md` Phase 2+ resolves it.
+        run: |
+          set -eu
+          if [ -d target/release/bundle/appimage ]; then
+            echo "::error::AppImage bundle directory unexpectedly produced; Phase 1 builds deb/rpm only. See docs/deployment/tauri-ci-release-plan.md."
+            exit 1
+          fi

@@ -127,6 +127,11 @@ pnpm --filter @relayterm/desktop tauri:dev
 # Release bundle: produces .deb / .rpm (and AppImage when supported on the host) under target/release/bundle/
 # (Cargo workspaces share a single root `target/`; see the artifact path list below.)
 pnpm --filter @relayterm/desktop tauri:build
+
+# Release bundle, deb + rpm only (matches the Phase 1 Linux desktop CI smoke):
+# Skips the AppImage stage entirely, so the DT_RELR `linuxdeploy` strip
+# incompatibility documented under Troubleshooting cannot be hit.
+pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm
 ```
 
 Artifacts land at the **workspace** target directory, not the per-crate one — Cargo workspaces share a single `target/`:
@@ -175,6 +180,7 @@ Output paths (debug build):
 | `cargo check -p relayterm-mobile` | ✅ Verified (host-target only — Android cross-compile not exercised) |
 | `pnpm --filter @relayterm/mobile tauri:android:init` | ✅ Verified (`gen/android/` scaffold committed from the original Phase 0 run) |
 | `pnpm --filter @relayterm/desktop tauri:build` (binary + `.deb` + `.rpm`) | ✅ Verified on CachyOS (Arch-derived Linux, kernel 7.0.3-1-cachyos), 2026-05-07, with WebKitGTK 4.1 (`webkit2gtk-4.1 2.52.3`) and libayatana-appindicator (`0.5.94`); rustc 1.95.0, pnpm 10.33.0, Node 25.9.0. Built `target/release/relayterm-desktop` (5.8 MB) in ~2m 29s; `RelayTerm_0.0.0_amd64.deb` (2.4 MB) and `RelayTerm-0.0.0-1.x86_64.rpm` (2.4 MB) bundled. Verifies packaging/build only — does NOT verify backend/API connectivity (Phase 0 has no production backend URL wired into the bundled SPA). |
+| `pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm` (deb + rpm only — matches Phase 1 CI smoke) | ✅ Verified on the same CachyOS host, 2026-05-07. Tauri reports "Finished 2 bundles"; only `target/release/bundle/{deb,rpm}/` are populated for this run. The AppImage stage is skipped entirely (no `linuxdeploy` invocation), which avoids the DT_RELR strip incompatibility. This is the exact command run by `.forgejo/workflows/desktop-linux.yml`. |
 | `pnpm --filter @relayterm/desktop tauri:build` (AppImage) | ⚠ Conditional. The AppImage stage of `tauri:build` fails on this CachyOS host because `linuxdeploy`'s bundled `strip` cannot parse the `.relr.dyn` (DT_RELR) ELF section emitted by modern glibc-built libs. Re-running with `NO_STRIP=true pnpm --filter @relayterm/desktop tauri:build` (or invoking `linuxdeploy` directly with `NO_STRIP=true`) produces a working `RelayTerm-x86_64.AppImage` (93 MB). See "AppImage strip incompatibility" under Troubleshooting. This is an upstream packaging-tool host issue, not a Tauri scaffold bug — `package.json` keeps `tauri build` as the canonical command. |
 | `pnpm --filter @relayterm/desktop tauri:dev` | ❌ Not exercised — opens a GUI window and needs an interactive desktop session. |
 | `pnpm --filter @relayterm/mobile tauri:android:dev` | ❌ Not exercised — needs a connected device or running emulator. |

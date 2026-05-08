@@ -192,27 +192,44 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 1 — Linux desktop CI smoke
 
-- New workflow file `.forgejo/workflows/desktop-linux.yml`. Per § 6,
+> **Status (2026-05-07):** Implemented in branch `chore/tauri-desktop-linux-ci-smoke`. New workflow file `.forgejo/workflows/desktop-linux.yml` is separate from `ci.yml` (per § 6) and triggers on `pull_request`, push to `main`, `v*` tag pushes, and `workflow_dispatch`. Runner is the existing Forgejo `docker` runner with `catthehacker/ubuntu:act-latest`. Linux desktop deps install per-run via `apt-get` (see step list below). Build command is `pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm` — bundle set is intentionally `deb,rpm` only; AppImage is deferred (see "Bundle scope" below). Build-only smoke: no artifact upload, no registry publish, no signing. A failure in this workflow does NOT block server image publishing in `ci.yml`.
+
+- Workflow file: `.forgejo/workflows/desktop-linux.yml`. Per § 6,
   desktop and mobile workflows live in workflow files separate from
   the existing `ci.yml`; any exception to this must explicitly revise
   § 6's workflow-separation rule in the same change.
 - Runner: existing Forgejo Docker runner.
 - Container: `catthehacker/ubuntu:act-latest` (matches the rest of CI),
-  with the Phase 4 Debian package list installed in a per-run step
-  initially. Switch to a custom prepared image **only** if per-run
+  with the Linux desktop Tauri package list installed in a per-run
+  step initially. Switch to a custom prepared image **only** if per-run
   install adds more than ~5 minutes of wall time.
-- Build: unsigned `pnpm tauri build` for Linux. Bundle targets per
-  `tauri.conf.json` (decided in Phase 0).
-- Artifact: upload via Forgejo's artifact upload primitive, named
-  `relayterm-desktop-linux-<sha-short>`. **Verify Forgejo's artifact
-  primitive meets needs at Phase 1 time** — if it falls short, defer
-  the upload step and treat the smoke as build-only until an external
-  bucket is sourced.
+- Linux deps installed per run (Debian/Ubuntu names):
+  `libwebkit2gtk-4.1-dev`, `build-essential`, `curl`, `wget`, `file`,
+  `libxdo-dev`, `libssl-dev`, `libayatana-appindicator3-dev`,
+  `librsvg2-dev`, plus `pkg-config` and `libgtk-3-dev` for the
+  webkit2gtk-4.1 link environment on Ubuntu 24.04.
+- Build: unsigned
+  `pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm`.
+- Bundle scope: `deb,rpm` only. AppImage is **deferred** because
+  `linuxdeploy`'s bundled `strip` predates DT_RELR (`.relr.dyn`) ELF
+  section support; libs produced by modern glibc toolchains crash the
+  strip stage. Documented under "AppImage strip incompatibility" in
+  `docs/deployment/tauri-local-build.md` and in the Encountered Lesson
+  dated 2026-05-07 in `AGENTS.md`. The workflow does NOT set
+  `NO_STRIP=true`; instead the build explicitly bundles only `deb,rpm`.
+  An assertion step fails the workflow if a future scaffold change
+  ever re-introduces an AppImage output unexpectedly.
+- Artifact upload: **NOT implemented** in this phase. Phase 1 is
+  build-only smoke. Forgejo artifact upload sufficiency for desktop
+  bundle sizes is still an open question (§ 9 #4) and revisits when
+  Phase 2 lands or when an external bucket is sourced.
 - No registry publish. No `:latest` equivalent. No release tag
   automation in this phase.
-- Trigger: `pull_request` + push-to-main, mirroring the existing
-  `ci.yml` policy. Concurrency: same `cancel-in-progress` shape as
-  `ci.yml`.
+- Trigger: `pull_request` + push-to-`main` + `v*` tags +
+  `workflow_dispatch`, mirroring the existing `ci.yml` policy.
+  Concurrency: same `cancel-in-progress` shape as `ci.yml`, scoped
+  under the `desktop-linux-` group key so it does not interact with
+  `ci.yml`'s `ci-` group.
 
 ### Phase 2 — Windows + macOS desktop
 
