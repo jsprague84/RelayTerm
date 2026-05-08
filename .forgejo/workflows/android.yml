@@ -175,11 +175,31 @@ jobs:
         #                                    invokes for the four
         #                                    `*-linux-android` targets.
         #
-        # `yes | sdkmanager --licenses` accepts the SDK + NDK licences
-        # non-interactively. The licences are content-addressed by
-        # Google; printing `yes` to stdin is the canonical CI pattern
-        # documented by Google and used in the official `setup-android`
-        # action.
+        # License acceptance — SIGPIPE-tolerant `accept_android_licenses`
+        # helper.
+        #   The naive `yes | sdkmanager --licenses` pipeline fails on
+        #   the Forgejo runner under the runner's default shell flags
+        #   (`bash --noprofile --norc -eo pipefail`). After
+        #   `sdkmanager` finishes reading the prompts and closes its
+        #   stdin, `yes` receives SIGPIPE on its next write and exits
+        #   141. Under `pipefail` the pipeline status becomes 141 even
+        #   though `sdkmanager` itself succeeded, and `set -e` then
+        #   aborts the step with exit code 141 — exactly what failed in
+        #   the first Forgejo run of this workflow. The helper below
+        #   wraps the pipe in a `set +e` window, captures
+        #   `${PIPESTATUS[1]}` (sdkmanager's own status, NOT `yes`'s
+        #   141), restores `set -e`, and re-fails the step ONLY if
+        #   sdkmanager's status is non-zero. We do NOT use
+        #   `yes | sdkmanager --licenses || true`, because that would
+        #   silently mask a real `sdkmanager` failure.
+        #   The `--sdk_root` flag is passed explicitly so the helper
+        #   does not depend on `sdkmanager`'s implicit-root resolution
+        #   from its own install path. `${PIPESTATUS[1]}` is Bash-only,
+        #   so the step pins `shell: bash` belt-and-braces (the runner
+        #   already defaults to bash on Linux containers, but explicit
+        #   is better than implicit when the helper is correctness-
+        #   load-bearing).
+        shell: bash
         run: |
           set -eu
           mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -190,7 +210,27 @@ jobs:
           mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
           rm cmdline-tools.zip
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses >/dev/null
+
+          accept_android_licenses() {
+            local log_file
+            log_file="$(mktemp)"
+
+            set +e
+            yes | "$SDKMANAGER" --sdk_root="${ANDROID_HOME}" --licenses >"${log_file}" 2>&1
+            local sdkmanager_status="${PIPESTATUS[1]}"
+            set -e
+
+            cat "${log_file}"
+            rm -f "${log_file}"
+
+            if [ "${sdkmanager_status}" -ne 0 ]; then
+              echo "::error::sdkmanager --licenses failed with status ${sdkmanager_status}"
+              exit "${sdkmanager_status}"
+            fi
+          }
+
+          accept_android_licenses
+
           "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-36" \
