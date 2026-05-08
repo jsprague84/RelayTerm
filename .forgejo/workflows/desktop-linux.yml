@@ -5,8 +5,13 @@
 #     image. Bundle `.deb` + `.rpm` ONLY. Verifies that the desktop crate
 #     compiles, the bundled web SPA links, and the Linux packaging
 #     toolchain stays green on every PR / push-to-main.
-#   * Build-only smoke. No artifact upload. No publish. No release. No
-#     signing. No registry login.
+#   * Upload the produced `.deb` and `.rpm` as a SHORT-LIVED workflow
+#     artifact (14-day retention) for human inspection / download from
+#     the Forgejo Actions UI. This is a SMOKE artifact, not a release
+#     asset: it is unsigned, not attached to any tag as a release asset,
+#     not pushed to any registry, and intended only for ad-hoc download.
+#   * Build-only smoke. No publish. No release. No signing. No registry
+#     login.
 #
 # Out of scope (intentionally deferred — see
 # `docs/deployment/tauri-ci-release-plan.md` Phase 2+):
@@ -18,7 +23,10 @@
 #   * Windows / macOS desktop CI.
 #   * Android / iOS mobile CI.
 #   * Code signing (Authenticode, Apple notarization, Android keystore).
-#   * Artifact upload / release publishing.
+#   * Release publishing (the smoke artifact described under "Scope" is
+#     NOT a release asset — see Phase 4 in the CI/release plan for the
+#     signed-release path).
+#   * Registry / OCI image upload of desktop bundles.
 #   * Runtime backend-URL selection in the bundled SPA.
 #
 # Relationship to `ci.yml`:
@@ -48,9 +56,11 @@ on:
     branches:
       - main
     # `v*` tags trigger the same build smoke. This is NOT a release
-    # workflow — it does not sign, publish, or upload artifacts. Tag
-    # builds are included so a release-tag push exercises the same
-    # packaging path as PRs and main pushes.
+    # workflow — it does not sign or publish, and the smoke artifact
+    # uploaded at the end is short-lived (14-day retention) rather
+    # than attached to the tag as a release asset. Tag builds are
+    # included so a release-tag push exercises the same packaging
+    # path as PRs and main pushes.
     tags:
       - 'v*'
   pull_request:
@@ -184,3 +194,49 @@ jobs:
             echo "::error::AppImage bundle directory unexpectedly produced; Phase 1 builds deb/rpm only. See docs/deployment/tauri-ci-release-plan.md."
             exit 1
           fi
+
+      - name: upload deb + rpm smoke artifact
+        # Forgejo's port of the upstream actions/upload-artifact action.
+        # The upstream `actions/upload-artifact@v4` mirror at
+        # `code.forgejo.org/actions/upload-artifact` documents that "v4
+        # will not work from this mirror" and explicitly redirects to
+        # the patched fork at `code.forgejo.org/forgejo/upload-artifact`,
+        # tagged `v4`. We pin to the major-version tag to track patch
+        # releases automatically; the fork's only active maintenance is
+        # the GHES compatibility patch.
+        #
+        # SMOKE artifact, not a release asset:
+        #   * Unsigned. The Linux desktop bundles are produced without
+        #     any code-signing material — see § 7 ("Security and
+        #     secrets") of `docs/deployment/tauri-ci-release-plan.md`.
+        #   * Short-lived. 14 days matches the Phase 1–3 smoke retention
+        #     in § 8 ("Artifact policy") of the CI release plan.
+        #   * Not attached to a `v*` tag as a release asset and not
+        #     pushed to the OCI registry. Release-asset publishing is
+        #     deferred to Phase 4.
+        #
+        # `path` lists ONLY the `.deb` and `.rpm` globs. Notably absent:
+        # the native binary at `target/release/relayterm-desktop`, the
+        # AppImage directory (the assertion above proves it does not
+        # exist), the `target/` directory wholesale, build logs, and any
+        # `.env` / signing material (none exists in this job, but the
+        # explicit globs prevent a future regression from sweeping one
+        # in). `if-no-files-found: error` fails the step loudly if a
+        # future bundler change moves outputs out from under these
+        # globs, so the workflow surfaces the regression instead of
+        # silently uploading an empty artifact.
+        #
+        # `retention-days: 14` is documented under § 8 ("Artifact
+        # policy") of `docs/deployment/tauri-ci-release-plan.md`. If a
+        # given Forgejo instance configures a shorter
+        # `ARTIFACT_RETENTION_DAYS`, the instance ceiling wins and this
+        # request is silently capped — that is acceptable for a smoke
+        # artifact.
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: relayterm-linux-desktop-${{ github.sha }}
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 14

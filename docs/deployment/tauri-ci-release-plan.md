@@ -192,7 +192,7 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 1 — Linux desktop CI smoke
 
-> **Status (2026-05-07):** Implemented in branch `chore/tauri-desktop-linux-ci-smoke`. New workflow file `.forgejo/workflows/desktop-linux.yml` is separate from `ci.yml` (per § 6) and triggers on `pull_request`, push to `main`, `v*` tag pushes, and `workflow_dispatch`. Runner is the existing Forgejo `docker` runner with `catthehacker/ubuntu:act-latest`. Linux desktop deps install per-run via `apt-get` (see step list below). Build command is `pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm` — bundle set is intentionally `deb,rpm` only; AppImage is deferred (see "Bundle scope" below). Build-only smoke: no artifact upload, no registry publish, no signing. A failure in this workflow does NOT block server image publishing in `ci.yml`.
+> **Status (2026-05-07):** Implemented in branch `chore/tauri-desktop-linux-ci-smoke`, with short-lived deb/rpm artifact upload added in branch `chore/tauri-desktop-linux-artifacts`. Workflow file `.forgejo/workflows/desktop-linux.yml` is separate from `ci.yml` (per § 6) and triggers on `pull_request`, push to `main`, `v*` tag pushes, and `workflow_dispatch`. Runner is the existing Forgejo `docker` runner with `catthehacker/ubuntu:act-latest`. Linux desktop deps install per-run via `apt-get` (see step list below). Build command is `pnpm --filter @relayterm/desktop exec tauri build --bundles deb,rpm` — bundle set is intentionally `deb,rpm` only; AppImage is deferred (see "Bundle scope" below). Build-only smoke with smoke artifact upload: the `.deb` and `.rpm` are uploaded as a 14-day-retention workflow artifact named `relayterm-linux-desktop-<sha>` for inspection, but the workflow does NOT sign, push to the OCI registry, or attach the artifact to a `v*` tag as a release asset. A failure in this workflow does NOT block server image publishing in `ci.yml`.
 
 - Workflow file: `.forgejo/workflows/desktop-linux.yml`. Per § 6,
   desktop and mobile workflows live in workflow files separate from
@@ -219,10 +219,23 @@ Five phases. Each names what it does and what it intentionally defers.
   `NO_STRIP=true`; instead the build explicitly bundles only `deb,rpm`.
   An assertion step fails the workflow if a future scaffold change
   ever re-introduces an AppImage output unexpectedly.
-- Artifact upload: **NOT implemented** in this phase. Phase 1 is
-  build-only smoke. Forgejo artifact upload sufficiency for desktop
-  bundle sizes is still an open question (§ 9 #4) and revisits when
-  Phase 2 lands or when an external bucket is sourced.
+- Artifact upload: short-lived smoke artifact only. The `.deb` and
+  `.rpm` produced by the build are uploaded via
+  `https://code.forgejo.org/forgejo/upload-artifact@v4` (Forgejo's
+  patched fork of `actions/upload-artifact`; the upstream mirror at
+  `code.forgejo.org/actions/upload-artifact` is not Forgejo-compatible
+  for v4) under the artifact name
+  `relayterm-linux-desktop-${{ github.sha }}`. `path` lists only
+  `target/release/bundle/deb/*.deb` and
+  `target/release/bundle/rpm/*.rpm` — the native binary, the AppImage
+  directory, the `target/` tree, build logs, and any signing material
+  are explicitly NOT included. `if-no-files-found: error` fails the
+  step if a future bundler change moves outputs. Retention is
+  `14` days (matches § 8 "Artifact policy"); a Forgejo instance with a
+  shorter `ARTIFACT_RETENTION_DAYS` ceiling silently caps this and
+  that is acceptable for a smoke artifact. The artifact is **not** a
+  release asset: unsigned, not attached to a `v*` tag, not pushed to
+  the OCI registry. Release-asset publishing remains a Phase 4 item.
 - No registry publish. No `:latest` equivalent. No release tag
   automation in this phase.
 - Trigger: `pull_request` + push-to-`main` + `v*` tags +
@@ -349,9 +362,17 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ## 8. Artifact policy
 
-- **Smoke artifacts** (Phases 1–3): retain ~14 days, named
-  `<target>-<sha-short>` (e.g.
-  `relayterm-desktop-linux-9573c3c.AppImage`).
+- **Smoke artifacts** (Phases 1–3): retain ~14 days, uploaded via
+  `https://code.forgejo.org/forgejo/upload-artifact@v4` (Forgejo's
+  patched fork of `actions/upload-artifact`; the upstream mirror is
+  not Forgejo-compatible for v4). Phase 1 names the artifact
+  `relayterm-linux-desktop-${{ github.sha }}` (full SHA, not
+  short-sha — Forgejo Actions does not pre-compute a short SHA in the
+  default context, and the full SHA is unambiguous). Future phase
+  smoke-artifact names should follow the same `<target>-<sha>` shape
+  unless a short-sha is computed earlier in the workflow. Release-asset
+  names (Phase 4+) are governed by the separate `<target>-vX.Y.Z`
+  shape below.
 - **Release artifacts** (Phase 4+): retain at least 1 year, named
   `<target>-vX.Y.Z`, driven by `git tag`.
 - **Never publish a `:latest` equivalent.** Operators pin explicitly,
@@ -377,9 +398,19 @@ others' questions** — keep them sequenced as in § 5.
    `tauri.conf.json`.
 3. **Windows / macOS runners.** Self-hosted, GitHub-hosted via
    bridge, or SaaS? Where do self-hosted hosts live?
-4. **Forgejo artifact upload primitive.** Sufficient for desktop /
-   mobile artifact sizes, or is an external bucket needed? Test in
-   Phase 1.
+4. **Forgejo artifact upload primitive.** Partially answered for
+   Phase 1 Linux desktop: deb + rpm upload via
+   `https://code.forgejo.org/forgejo/upload-artifact@v4` is wired in
+   `.forgejo/workflows/desktop-linux.yml` and produces a single
+   workflow artifact under the configured 14-day retention. As of
+   2026-05-07 the local pre-signing build measured ~2.4 MB deb +
+   ~2.4 MB rpm (~5 MB total); these numbers are a snapshot, not an
+   invariant — they grow as the bundled SPA and native binary grow,
+   and signing (Phase 4+) adds further bytes. Open for later phases:
+   Windows / macOS desktop bundle sizes, signed release-asset
+   attachment to `v*` tags, and Android `.aab` (Phase 3+) sizes —
+   re-evaluate once those land or once an external bucket is
+   warranted by total artifact volume.
 5. **Backend URL configuration.** Does each Tauri shell embed a
    build-time backend URL, or is the host configurable at runtime
    from the user's settings panel? Affects whether builds need
