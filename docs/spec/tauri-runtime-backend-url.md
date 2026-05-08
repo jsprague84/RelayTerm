@@ -623,6 +623,15 @@ cookie surface in `crates/relayterm-api` stays untouched.
   on `10.0.2.2` (emulator) vs LAN IP (physical device) vs VPN.
 - The smoke is host-side, manual. No CI smoke.
 
+#### Phase E — verification log
+
+| Surface | Status | Notes |
+|---|---|---|
+| Desktop bundled build — picker render + URL validation + handoff navigation | ⚠ Partially verified (2026-05-08) | Built `target/release/relayterm-desktop` from current `main` (deb + rpm bundles only) and launched the native binary against a local hosted RelayTerm web origin (operator-side Compose stack on a separate project namespace; never published, never committed). With no prior `localStorage` config the Tauri shell rendered the **"Connect to RelayTerm Server"** picker per phase C. Three validator probes passed verbatim against `describeBackendUrlError`: `http://example.com` → `Use https:// for any host other than localhost.`; `https://user:pass@example.com` → `Remove the username/password from the URL — credentials are never part of the server address.`; the local hosted origin was accepted, persisted under `relayterm.backend-config.v1`, and `window.location.assign(${origin}/)` reloaded the WebView at the configured origin where the production RelayTerm web shell rendered. Browser deployment unchanged; `tauri:dev` / `tauri:android:dev` not exercised in this run and gated out by `import.meta.env.DEV` per § 13. |
+| Desktop bundled build — login / auth / terminal session attach | ❌ Not exercised | Out of scope for this smoke. Intentionally not tested; deferred to a later slice. |
+| Desktop bundled build — "Change server" / re-pick affordance | ❌ Not implemented (per § 11 phase C) | Resetting the configured origin in this smoke is a manual `localStorage` clear (or app-data wipe). A built-in "Change server" UI is deferred. |
+| Android bundled build — picker render + handoff | ❌ Not exercised | Optional second device pass; not run on 2026-05-08. The CI debug-APK smoke covers the build half only; runtime picker / handoff on a physical Android device or emulator remains unverified. |
+
 ### Phase F — later (deferred and not designed here)
 
 - Native `@tauri-apps/plugin-store` migration if `localStorage` is
