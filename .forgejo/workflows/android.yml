@@ -1,0 +1,370 @@
+# RelayTerm Forgejo Actions — Android Tauri CI smoke (Phase 3).
+#
+# Scope:
+#   * Build the Tauri v2 mobile (Android-first) shell on the existing
+#     Forgejo Linux Docker runner via the `catthehacker/ubuntu:act-latest`
+#     base image. Produces a debug, unsigned, universal APK only.
+#     Verifies that the mobile crate compiles on all four Android Rust
+#     targets, the bundled web SPA links into the APK, and the Tauri
+#     Android Gradle/NDK toolchain stays green on every PR / push-to-main.
+#   * Upload the produced `.apk` as a SHORT-LIVED workflow artifact
+#     (14-day retention) for human inspection / download from the
+#     Forgejo Actions UI. This is a SMOKE artifact, not a release asset:
+#     it is unsigned, debug-built, not attached to any tag as a release
+#     asset, not pushed to any registry, and intended only for ad-hoc
+#     download.
+#   * Build-only smoke. No publish. No release. No signing. No keystore.
+#     No Play Store submission. No device or emulator install in CI.
+#
+# Out of scope (intentionally deferred — see
+# `docs/deployment/tauri-ci-release-plan.md` Phase 4+):
+#   * AAB (`--aab`) bundle. The release-distribution path requires a
+#     keystore + Play Console flow and is gated behind Phase 4 (signing)
+#     and Phase 5 (mobile release distribution). An assertion step below
+#     fails the workflow if a future scaffold change ever produces an
+#     AAB unexpectedly from this debug build.
+#   * Code signing (Android keystore, `ANDROID_KEY_*` secret family).
+#     None of these secrets are referenced or required here.
+#   * Device / emulator runtime smoke in CI (`adb install` + `monkey
+#     LAUNCHER 1`). The local equivalent is documented in
+#     `docs/deployment/tauri-local-build.md` § "Mobile / Android — local
+#     device install + launch smoke" and remains a host-side verification.
+#   * Runtime backend-URL selection in the bundled SPA — the bundled
+#     debug APK shows the deferred-runtime-backend-URL `Cannot Reach
+#     RelayTerm` modal at first frame; that is expected behaviour per
+#     the local launch-smoke doc.
+#   * iOS mobile CI (Phase 5+, requires macOS runner + Apple Developer
+#     account).
+#
+# Relationship to `ci.yml` and `desktop-linux.yml`:
+#   * This workflow file is intentionally SEPARATE from both `ci.yml`
+#     (server / web Docker image build + registry publish) and
+#     `desktop-linux.yml` (Tauri Linux desktop deb/rpm smoke). Per § 6
+#     ("Forgejo runner strategy") of
+#     `docs/deployment/tauri-ci-release-plan.md`: "Desktop and mobile
+#     workflows must live in workflow files separate from the existing
+#     `ci.yml`." A failure here does NOT block server image publishing
+#     and does NOT block the Linux desktop bundle build.
+#
+# Runner pattern (mirrors `ci.yml` and `desktop-linux.yml`):
+#   * `runs-on: docker` with `catthehacker/ubuntu:act-latest`. Same base
+#     image as the rest of CI so JS-based actions (`checkout`,
+#     `setup-node`, `upload-artifact`) work without per-job bootstrap,
+#     and so the Linux dep / SDK install steps target a known
+#     Ubuntu/Debian package layout.
+#   * Toolchains installed inside the job: JDK 17 via `apt-get`, Android
+#     SDK + NDK via the Google `commandlinetools-linux` zip + `sdkmanager`,
+#     Rust via rustup-init, four Android Rust targets via `rustup target
+#     add`, Node via `setup-node`, pnpm via corepack from
+#     `package.json#packageManager`.
+#   * Checkout uses the explicit Forgejo-hosted URL
+#     `https://code.forgejo.org/actions/checkout@v4`, matching the
+#     qshift-validated pattern used by `ci.yml` and `desktop-linux.yml`.
+
+name: android
+
+on:
+  push:
+    branches:
+      - main
+    # `v*` tags trigger the same build smoke, mirroring `desktop-linux.yml`.
+    # This is NOT a release workflow — it does not sign, does not produce
+    # an AAB, and the smoke artifact uploaded at the end is short-lived
+    # (14-day retention) rather than attached to the tag as a release
+    # asset. Tag builds are included so a release-tag push exercises the
+    # same packaging path as PRs and main pushes.
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+# Cancel an in-flight build for the same ref when a newer push lands —
+# matches the `ci.yml` and `desktop-linux.yml` concurrency policies.
+# Group key is `android-` prefixed so this concurrency does NOT interact
+# with `ci-` (server/web) or `desktop-linux-` (Linux desktop) groups.
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: tauri android build (debug apk)
+    runs-on: docker
+    container:
+      image: catthehacker/ubuntu:act-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Hint for `tauri build` that we are non-interactive.
+      CI: "1"
+      # Android SDK/NDK install location. `/opt/android-sdk` is writable
+      # in the catthehacker container (CI runs as root) and is outside
+      # the checkout tree so it cannot accidentally leak into the
+      # uploaded artifact via a path glob.
+      ANDROID_HOME: /opt/android-sdk
+      ANDROID_SDK_ROOT: /opt/android-sdk
+      # NDK version pin — must match the local-verified host setup
+      # documented in `docs/deployment/tauri-local-build.md` § "Android
+      # prerequisites". Bumping this pin requires re-verifying the local
+      # APK build smoke and updating that doc in the same change.
+      ANDROID_NDK_VERSION: "30.0.14904198"
+      # NDK_HOME is derived from `$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION`
+      # in the SDK install step below via `$GITHUB_ENV`, NOT hard-coded
+      # here. Forgejo Actions does not interpolate env vars within the
+      # same `env:` block (e.g. `NDK_HOME: $ANDROID_HOME/ndk/...` would
+      # be the literal string), so a hard-coded value would silently
+      # drift the moment `ANDROID_NDK_VERSION` is bumped. Tauri's
+      # Android cross-compile reads `NDK_HOME` directly per the upstream
+      # Tauri v2 prerequisites doc; once exported via `$GITHUB_ENV` it
+      # is visible to every subsequent step.
+      # Pin the Google `cmdline-tools` revision rather than tracking a
+      # rolling URL. Rev 11.0 (`11076708`) works with JDK 17 and is the
+      # widely-cited stable revision for Android CI as of 2026-05-08.
+      # The URL pattern `commandlinetools-linux-<rev>_latest.zip` is
+      # itself stable; only the embedded revision moves.
+      ANDROID_CMDLINE_TOOLS_REV: "11076708"
+    steps:
+      - name: checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: install jdk 17 and unzip dependency
+        # JDK 17 is the verified baseline per
+        # `docs/deployment/tauri-local-build.md` § "Android
+        # prerequisites > JDK guidance". `openjdk-17-jdk-headless` is
+        # sufficient — the Android Gradle Plugin and `sdkmanager` do not
+        # need the GUI Java runtime. `unzip` is required to extract the
+        # cmdline-tools zip in the next step; `curl` and `ca-certificates`
+        # are pulled for the same step but are usually present in
+        # `catthehacker/ubuntu:act-latest`. Listing them explicitly
+        # makes the install step idempotent against future base-image
+        # changes.
+        run: |
+          set -eu
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            openjdk-17-jdk-headless \
+            curl \
+            unzip \
+            ca-certificates
+          java -version
+
+      - name: install android cmdline-tools, sdk packages, and ndk
+        # Standalone `commandlinetools-linux` zip + `sdkmanager`. We do
+        # NOT depend on a third-party `setup-android` action because
+        # Forgejo runner compatibility with such actions is not
+        # guaranteed; an explicit zip + `sdkmanager` flow is portable
+        # across Forgejo / Gitea / GitHub runners.
+        #
+        # The zip extracts as `cmdline-tools/cmdline-tools/` but
+        # `sdkmanager` requires the layout `cmdline-tools/latest/`
+        # (otherwise it errors with "could not determine SDK root"); the
+        # `mv` below normalises that.
+        #
+        # SDK package selection mirrors the locally-verified host setup
+        # documented in `docs/deployment/tauri-local-build.md` § "Android
+        # prerequisites > SDK packages":
+        #   * `platforms;android-36`     — matches `compileSdk = 36` and
+        #                                   `targetSdk = 36` in
+        #                                   `apps/mobile/src-tauri/gen/android/app/build.gradle.kts`.
+        #   * `build-tools;36.0.0`       — matches the AGP requirement
+        #                                   for `compileSdk = 36`.
+        #   * `platform-tools`           — for `aapt`/`apksigner`/`zipalign`
+        #                                   on the Gradle `assembleDebug`
+        #                                   path.
+        #   * `ndk;${ANDROID_NDK_VERSION}` — the cross-compile toolchain
+        #                                    Tauri's mobile builder
+        #                                    invokes for the four
+        #                                    `*-linux-android` targets.
+        #
+        # `yes | sdkmanager --licenses` accepts the SDK + NDK licences
+        # non-interactively. The licences are content-addressed by
+        # Google; printing `yes` to stdin is the canonical CI pattern
+        # documented by Google and used in the official `setup-android`
+        # action.
+        run: |
+          set -eu
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd /tmp
+          curl -fsSL -o cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_REV}_latest.zip"
+          unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          rm cmdline-tools.zip
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          ls -la "$ANDROID_HOME/ndk"
+          # Export NDK_HOME for the rest of the job so Tauri's Android
+          # cross-compile resolves the NDK without a hard-coded path in
+          # the workflow's `env:` block. Derived from the same env vars
+          # the install used, which is the only single source of truth.
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: docs contract check
+        # Cheap, pure-bash, no network. Runs BEFORE Rust + Node install
+        # so a docs regression shorts out before consuming an Android
+        # build slot — matches the fail-fast ordering in
+        # `desktop-linux.yml` and `ci.yml` web-checks.
+        run: bash scripts/check-doc-contracts.sh
+
+      - name: install rust 1.95 (rustup minimal) + android targets
+        # Same rustup invocation as `ci.yml` and `desktop-linux.yml`,
+        # plus the four Android cross-compile targets per the upstream
+        # Tauri v2 Android prerequisites doc. `--profile minimal` skips
+        # rustfmt/clippy — those checks run workspace-wide in `ci.yml`;
+        # this job is build-only.
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.95 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            i686-linux-android \
+            x86_64-linux-android
+          "$HOME/.cargo/bin/rustc" --version
+          "$HOME/.cargo/bin/cargo" --version
+
+      - name: setup node 22
+        uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: enable corepack (pnpm via package.json#packageManager)
+        run: |
+          corepack enable
+          corepack prepare --activate
+          node --version
+          pnpm --version
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: print toolchain versions
+        # Diagnostic snapshot — surfaced in the workflow log so a future
+        # failure can be diffed against a known-green run without
+        # re-running the job in debug mode.
+        run: |
+          set -eu
+          echo '--- java ---'
+          java -version
+          echo '--- rust ---'
+          rustc --version
+          cargo --version
+          echo '--- rust android targets ---'
+          rustup target list --installed | grep android || true
+          echo '--- node / pnpm ---'
+          node --version
+          pnpm --version
+          echo '--- android sdk root ---'
+          ls -la "$ANDROID_HOME"
+          echo '--- android ndk root ---'
+          ls -la "$ANDROID_HOME/ndk"
+          echo '--- android ndk pinned version ---'
+          ls -la "$NDK_HOME" | head -5
+
+      - name: tauri android build (debug, apk, ci)
+        # The exact command verified locally on 2026-05-07 and recorded
+        # in `docs/deployment/tauri-local-build.md` § "Mobile / Android".
+        # `--debug` selects the debug Cargo profile (no signing config
+        # needed); `--apk` skips AAB; `--ci` skips Tauri's interactive
+        # prompts. Do NOT switch to the bare `tauri:android:build` npm
+        # script here — that script defers to release-mode defaults and
+        # is reserved for the eventual signed-AAB Phase 4+ path.
+        run: pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci
+
+      - name: list generated apk
+        # Fails the step if the universal-debug APK is not produced — a
+        # glob with no matches under `set -eu` exits non-zero, which is
+        # the desired behaviour: an empty bundle directory should fail
+        # the workflow loudly rather than silently uploading nothing.
+        run: |
+          set -eu
+          echo '--- apk path ---'
+          ls -la apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/
+          echo '--- apk size ---'
+          du -h apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk
+
+      - name: assert no aab was produced
+        # Belt-and-braces guard: if a future scaffold change re-enables
+        # the AAB bundler implicitly, this step fails loudly so we don't
+        # ship an unsigned AAB out of a debug-APK smoke. AAB output
+        # lives under `outputs/bundle/`; we explicitly verify that
+        # directory does NOT exist. AAB / signed-release path is gated
+        # behind Phase 4+ in `docs/deployment/tauri-ci-release-plan.md`.
+        run: |
+          set -eu
+          if [ -d apps/mobile/src-tauri/gen/android/app/build/outputs/bundle ]; then
+            echo "::error::AAB output directory unexpectedly produced; this workflow builds debug APK only. See docs/deployment/tauri-ci-release-plan.md Phase 4."
+            exit 1
+          fi
+
+      - name: assert no signing or keystore material in build tree
+        # Defense-in-depth check that no signing material has leaked
+        # into the build tree. The artifact upload step below filters by
+        # `*.apk` glob so these would not be uploaded even if present —
+        # but failing the workflow loudly here is a better signal than
+        # silently shipping an APK from a tree that contains keystore
+        # material. `local.properties` is intentionally NOT in the deny
+        # list: Tauri/Gradle generates it to point at `sdk.dir`/`ndk.dir`
+        # and it is benign (and gitignored).
+        run: |
+          set -eu
+          found=$(find apps/mobile -type f \( \
+              -name '*.jks' -o \
+              -name '*.keystore' -o \
+              -name 'keystore.properties' -o \
+              -name 'key.properties' \
+            \) -print 2>/dev/null || true)
+          if [ -n "$found" ]; then
+            echo "::error::Signing or keystore material found in apps/mobile/ build tree:"
+            echo "$found"
+            echo "::error::Refusing to upload artifact. See docs/deployment/tauri-ci-release-plan.md § 7 'Security and secrets'."
+            exit 1
+          fi
+
+      - name: upload debug apk smoke artifact
+        # Forgejo's port of the upstream actions/upload-artifact action.
+        # The upstream `actions/upload-artifact@v4` mirror at
+        # `code.forgejo.org/actions/upload-artifact` documents that "v4
+        # will not work from this mirror" and explicitly redirects to
+        # the patched fork at `code.forgejo.org/forgejo/upload-artifact`,
+        # tagged `v4`. This matches the upload pattern used by
+        # `desktop-linux.yml`.
+        #
+        # SMOKE artifact, not a release asset:
+        #   * Unsigned. The Android debug APK is produced without any
+        #     keystore / signing material — see § 7 ("Security and
+        #     secrets") of `docs/deployment/tauri-ci-release-plan.md`.
+        #   * Short-lived. 14 days matches the Phase 1–3 smoke retention
+        #     in § 8 ("Artifact policy") of the CI release plan.
+        #   * Not attached to a `v*` tag as a release asset and not
+        #     pushed to the OCI registry. Release-asset publishing
+        #     (signed AAB) is deferred to Phase 4+.
+        #
+        # `path` lists ONLY the `*.apk` glob under the universal-debug
+        # output directory. Notably absent: the `outputs/bundle/`
+        # directory (the AAB assertion above proves it does not exist),
+        # the `target/` cross-compile cache, Gradle build caches under
+        # `gen/android/build/`, `local.properties`, and any keystore /
+        # signing material (the assertion above proves none exists).
+        # `if-no-files-found: error` fails the step loudly if a future
+        # bundler change moves outputs out from under this glob.
+        #
+        # `retention-days: 14` is documented under § 8 ("Artifact
+        # policy") of `docs/deployment/tauri-ci-release-plan.md`. If a
+        # given Forgejo instance configures a shorter
+        # `ARTIFACT_RETENTION_DAYS`, the instance ceiling wins and this
+        # request is silently capped — that is acceptable for a smoke
+        # artifact.
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: relayterm-android-debug-${{ github.sha }}
+          path: |
+            apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14

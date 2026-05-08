@@ -211,7 +211,7 @@ adb -s <serial> logcat -d -t 300 | grep -Ei 'relayterm|tauri|webview|crash|fatal
 - **Native secure storage** for SSH credentials (Android Keystore) is not implemented. Do not commission a device for real SSH use against this build.
 - **Mobile session lifecycle** (background → foreground transitions, doze, low-memory kill, push-driven wake) is unverified. The smoke only proves cold-launch render.
 - **Signing / keystore / Play Store / `--aab`** are out of scope for this slice and remain Phase 4+ (see `tauri-ci-release-plan.md`).
-- **Android CI** is not yet wired. The Phase 3 prerequisite is now cleared (build + local launch verified), but the workflow file is future work.
+- **Android CI build smoke** is now wired in `.forgejo/workflows/android.yml` (Phase 3 in `tauri-ci-release-plan.md`). It builds an unsigned debug APK on every PR / push-to-`main` / `v*` tag using the same command documented above and uploads the universal debug APK as a 14-day-retention smoke artifact named `relayterm-android-debug-<sha>`. The CI smoke covers the **build half** of the local pair only; **device/emulator runtime smoke in CI is NOT wired** — `adb install` + `monkey ... LAUNCHER 1` remain a host-side check. Signing, AAB, Play Store distribution, and runtime backend URL configuration also remain Phase 4+ future work.
 
 ## Verification performed
 
@@ -254,7 +254,7 @@ adb -s <serial> logcat -d -t 300 | grep -Ei 'relayterm|tauri|webview|crash|fatal
 
 The following are intentionally out of scope for Phase 0 and tracked in [`tauri-ci-release-plan.md`](./tauri-ci-release-plan.md):
 
-- **Forgejo CI workflows** for desktop or Android builds (no `.forgejo/workflows/` for the Tauri shells in this slice).
+- **Forgejo CI workflows for Windows, macOS, and iOS Tauri builds.** Linux desktop and Android CI smokes are now wired in `.forgejo/workflows/desktop-linux.yml` and `.forgejo/workflows/android.yml` respectively (see `tauri-ci-release-plan.md` Phases 1 and 3); other-platform CI remains deferred.
 - **Code signing**: Tauri updater key, Apple notarization, Google Play upload key, Microsoft Store cert.
 - **App store submission and distribution.**
 - **Custom Tauri IPC commands** and the corresponding capability rows. The capability set is `core:default` only.

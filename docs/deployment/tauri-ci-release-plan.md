@@ -157,7 +157,7 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 0 — scaffold + local-build docs *(strongly recommended next slice; see § 10)*
 
-> **Status (2026-05-08):** Phase 0 implemented in branch `feat/tauri-shell-scaffold`. Both shells are scaffolded with Tauri v2 (CLI 2.11.1, `tauri = 2.11.1`, `tauri-build = 2.6.1`); identifiers are `cc.js-node.relayterm.{desktop,mobile}`; Android `minSdkVersion = 28`; `apps/mobile/src-tauri/gen/android/` is committed; `apps/{desktop,mobile}/src-tauri` are registered as Cargo workspace members. `cargo check --workspace` passes after installing the GTK stack. `pnpm --filter @relayterm/desktop tauri:build` is verified on CachyOS (Linux desktop binary + `.deb` + `.rpm`); the AppImage stage requires `NO_STRIP=true` on this host due to an upstream `linuxdeploy` / `.relr.dyn` strip incompatibility. **Local Android APK build is now also verified** in branch `chore/tauri-android-local-build-smoke`: `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` produces a debug, unsigned, universal APK (≈ 437 MB, all four ABIs) at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`, after a one-line scaffold fix bumping `apps/mobile/src-tauri/tauri.conf.json` `version` from `0.0.0` to `0.0.1` (Android packaging rejects `0.0.0`). **Local Android device install + launch smoke is now also verified** in branch `test/tauri-android-launch-smoke` (2026-05-08, physical Samsung Galaxy S10e over USB): `adb install -r app-universal-debug.apk` succeeds, the LAUNCHER intent dispatches via `adb shell monkey -p cc.js_node.relayterm.mobile.debug -c android.intent.category.LAUNCHER 1`, `dumpsys activity activities` shows the activity resumed, the filtered `logcat` snapshot has zero crash/fatal/ANR, and the bundled SPA renders the expected `Cannot Reach RelayTerm` modal (deferred-runtime-backend-URL failure path, not a launch failure). `tauri:dev`, `tauri android dev`, and the eventual signed `--aab` release path are still not exercised. See [`tauri-local-build.md`](./tauri-local-build.md). With local Linux desktop, local Android APK build, and local Android device launch smoke all verified, **Phase 1 (Linux desktop CI smoke) is now landed (see below) and Phase 3 (Android build smoke) has both its local build and local launch prerequisites cleared** — only the CI workflow file, signing, and Play Store path remain future.
+> **Status (2026-05-08):** Phase 0 implemented in branch `feat/tauri-shell-scaffold`. Both shells are scaffolded with Tauri v2 (CLI 2.11.1, `tauri = 2.11.1`, `tauri-build = 2.6.1`); identifiers are `cc.js-node.relayterm.{desktop,mobile}`; Android `minSdkVersion = 28`; `apps/mobile/src-tauri/gen/android/` is committed; `apps/{desktop,mobile}/src-tauri` are registered as Cargo workspace members. `cargo check --workspace` passes after installing the GTK stack. `pnpm --filter @relayterm/desktop tauri:build` is verified on CachyOS (Linux desktop binary + `.deb` + `.rpm`); the AppImage stage requires `NO_STRIP=true` on this host due to an upstream `linuxdeploy` / `.relr.dyn` strip incompatibility. **Local Android APK build is now also verified** in branch `chore/tauri-android-local-build-smoke`: `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` produces a debug, unsigned, universal APK (≈ 437 MB, all four ABIs) at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`, after a one-line scaffold fix bumping `apps/mobile/src-tauri/tauri.conf.json` `version` from `0.0.0` to `0.0.1` (Android packaging rejects `0.0.0`). **Local Android device install + launch smoke is now also verified** in branch `test/tauri-android-launch-smoke` (2026-05-08, physical Samsung Galaxy S10e over USB): `adb install -r app-universal-debug.apk` succeeds, the LAUNCHER intent dispatches via `adb shell monkey -p cc.js_node.relayterm.mobile.debug -c android.intent.category.LAUNCHER 1`, `dumpsys activity activities` shows the activity resumed, the filtered `logcat` snapshot has zero crash/fatal/ANR, and the bundled SPA renders the expected `Cannot Reach RelayTerm` modal (deferred-runtime-backend-URL failure path, not a launch failure). `tauri:dev`, `tauri android dev`, and the eventual signed `--aab` release path are still not exercised. See [`tauri-local-build.md`](./tauri-local-build.md). With local Linux desktop, local Android APK build, and local Android device launch smoke all verified, **Phase 1 (Linux desktop CI smoke) and Phase 3 (Android build smoke) are now both landed (see below)** — Phase 3's `.forgejo/workflows/android.yml` builds an unsigned debug APK on every PR / push-to-`main` / `v*` tag and uploads it as a 14-day smoke artifact. Signing, AAB, Play Store distribution, and device/emulator runtime smoke in CI remain Phase 4+ future work.
 
 - Generate the desktop and mobile Tauri scaffolds locally, using the
   **official Tauri CLI** for the version pinned in `AGENTS.md`. The
@@ -257,15 +257,63 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 3 — Android build smoke
 
-> **Status (2026-05-08):** Local prerequisites verified across two slices. (1) Local Android **build** prerequisite verified in branch `chore/tauri-android-local-build-smoke` (2026-05-07): the exact build command produces a debug, unsigned, universal APK on a CachyOS host with JDK 17, Android SDK (cmdline-tools/latest, platforms/android-36.1, build-tools/{36.1.0,37.0.0}, platform-tools), NDK `30.0.14904198`, and the four `*-linux-android` Rust targets. (2) Local Android **device launch** prerequisite verified in branch `test/tauri-android-launch-smoke` (2026-05-08, physical Samsung Galaxy S10e over USB): `adb install -r app-universal-debug.apk` plus `adb shell monkey -p cc.js_node.relayterm.mobile.debug -c android.intent.category.LAUNCHER 1` cold-launches the bundled SPA into the Android WebView, the activity is `mResumedActivity`, the filtered `logcat` snapshot has zero crash/fatal/ANR, and the SPA renders the expected `Cannot Reach RelayTerm` deferred-runtime-backend-URL modal. See [`tauri-local-build.md`](./tauri-local-build.md) "Verification performed" rows and "Mobile / Android — local device install + launch smoke". This clears scaffold-, toolchain-, and runtime-uncertainty for Phase 3, but Phase 3 itself (CI workflow + artifact upload) is still future. No CI workflow file, no keystore, no Play Store submission, no runtime backend URL implementation, and no signing was added in the local-smoke slices.
+> **Status (2026-05-08):** Implemented in branch `chore/tauri-android-ci-smoke`. Workflow file `.forgejo/workflows/android.yml` is separate from `ci.yml` and `desktop-linux.yml` (per § 6) and triggers on `pull_request`, push to `main`, `v*` tag pushes, and `workflow_dispatch`. Runner is the existing Forgejo `docker` runner with `catthehacker/ubuntu:act-latest`. JDK 17 (`openjdk-17-jdk-headless`) installs per-run via `apt-get`. Android SDK + NDK install per-run via the Google `commandlinetools-linux-11076708_latest.zip` download + `sdkmanager`, pinning `platforms;android-36`, `build-tools;36.0.0`, `platform-tools`, and `ndk;30.0.14904198` to match the locally-verified host setup. The four `*-linux-android` Rust targets install via `rustup target add`. Build command is the locally-verified `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` — bundle is intentionally `--apk` only; AAB is deferred (see "Bundle scope" below). Build-only smoke with smoke artifact upload: the universal debug `.apk` at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk` is uploaded as a 14-day-retention workflow artifact named `relayterm-android-debug-<sha>` for inspection. The workflow does NOT sign, does NOT collect any keystore secret, does NOT push to the OCI registry, does NOT attach the artifact to a `v*` tag as a release asset, and does NOT install the APK onto a device or emulator in CI. A failure in this workflow does NOT block server image publishing in `ci.yml` or the Linux desktop bundle build in `desktop-linux.yml`. Local prerequisites previously verified across two slices: (1) Local Android **build** verified in branch `chore/tauri-android-local-build-smoke` (2026-05-07): the exact build command produces a debug, unsigned, universal APK on a CachyOS host with JDK 17, Android SDK (cmdline-tools/latest, platforms/android-36.1, build-tools/{36.1.0,37.0.0}, platform-tools), NDK `30.0.14904198`, and the four `*-linux-android` Rust targets. (2) Local Android **device launch** verified in branch `test/tauri-android-launch-smoke` (2026-05-08, physical Samsung Galaxy S10e over USB): `adb install -r app-universal-debug.apk` plus `adb shell monkey -p cc.js_node.relayterm.mobile.debug -c android.intent.category.LAUNCHER 1` cold-launches the bundled SPA into the Android WebView, the activity is `mResumedActivity`, the filtered `logcat` snapshot has zero crash/fatal/ANR, and the SPA renders the expected `Cannot Reach RelayTerm` deferred-runtime-backend-URL modal. See [`tauri-local-build.md`](./tauri-local-build.md) "Verification performed" rows and "Mobile / Android — local device install + launch smoke". The CI workflow added in this phase covers the build half of that local pair only; device/emulator runtime smoke in CI remains deferred.
 
-- Linux runner with JDK 17+, Android SDK, Android NDK, and the
-  Android Rust targets installed. Per-run install initially; promote
-  to a prepared image when per-run install exceeds ~5 minutes of wall
-  time.
-- Build: `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` (unsigned debug, verified locally on 2026-05-07). Confirm current flag set against Tauri docs at Phase 3 time — `--target` filtering and `--apk` vs `--aab` semantics are documented but evolve.
-- Artifact upload as `relayterm-mobile-android-<sha-short>.apk`.
-- **No keystore**. No Play Store submission.
+- Workflow file: `.forgejo/workflows/android.yml`. Per § 6, desktop and
+  mobile workflows live in workflow files separate from the existing
+  `ci.yml`; any exception to this must explicitly revise § 6's
+  workflow-separation rule in the same change.
+- Runner: existing Forgejo Docker runner.
+- Container: `catthehacker/ubuntu:act-latest` (matches the rest of CI),
+  with JDK 17, the Android SDK + NDK, and the four Android Rust targets
+  installed in per-run steps initially. Switch to a custom prepared
+  image **only** if per-run install exceeds ~5 minutes of wall time.
+- JDK installed per run: `openjdk-17-jdk-headless` via `apt-get`.
+- Android SDK packages installed per run via `sdkmanager`:
+  `platform-tools`, `platforms;android-36`, `build-tools;36.0.0`,
+  `ndk;30.0.14904198`. The cmdline-tools revision is pinned to
+  `11076708` (rev 11.0) — bumping requires re-verifying the local APK
+  build smoke and updating
+  `docs/deployment/tauri-local-build.md` § "Android prerequisites".
+- Rust Android targets installed per run via `rustup target add`:
+  `aarch64-linux-android`, `armv7-linux-androideabi`,
+  `i686-linux-android`, `x86_64-linux-android`.
+- Build: unsigned debug APK via
+  `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci`
+  (verified locally on 2026-05-07). Confirm current flag set against
+  Tauri docs when bumping the Tauri pin — `--target` filtering and
+  `--apk` vs `--aab` semantics are documented but evolve.
+- Bundle scope: `--apk` only. AAB is **deferred** to Phase 4+ because
+  AAB distribution requires a signed-release path and Play Console
+  flow, neither of which is in scope here. An assertion step fails the
+  workflow if a future scaffold change ever re-introduces an AAB output
+  unexpectedly. A second assertion step fails the workflow if any
+  keystore / signing material (`*.jks`, `*.keystore`,
+  `keystore.properties`, `key.properties`) appears anywhere under
+  `apps/mobile/` during the build.
+- Artifact upload: short-lived smoke artifact only. The universal
+  debug `.apk` produced by the build is uploaded via
+  `https://code.forgejo.org/forgejo/upload-artifact@v4` (the same
+  Forgejo-patched fork used by `desktop-linux.yml`) under the artifact
+  name `relayterm-android-debug-${{ github.sha }}`. `path` lists only
+  `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk`
+  — the `target/` cross-compile cache, Gradle caches under
+  `gen/android/build/`, `local.properties`, and any keystore / signing
+  material are explicitly NOT included. `if-no-files-found: error`
+  fails the step if a future bundler change moves outputs. Retention
+  is `14` days (matches § 8 "Artifact policy"). The artifact is **not**
+  a release asset: unsigned, debug-built, not attached to a `v*` tag,
+  not pushed to the OCI registry. Release-asset publishing (signed AAB
+  → Play Console) remains a Phase 4+ item.
+- No registry publish. No keystore. No Play Store submission. No
+  device or emulator install in CI. No release tag automation in this
+  phase.
+- Trigger: `pull_request` + push-to-`main` + `v*` tags +
+  `workflow_dispatch`, mirroring the existing `ci.yml` and
+  `desktop-linux.yml` policy. Concurrency: same `cancel-in-progress`
+  shape as the other workflows, scoped under the `android-` group key
+  so it does not interact with `ci.yml`'s `ci-` group or
+  `desktop-linux.yml`'s `desktop-linux-` group.
 
 ### Phase 4 — Signing & release tags
 
