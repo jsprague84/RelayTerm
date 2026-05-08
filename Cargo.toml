@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "apps/backend",
+    "apps/desktop/src-tauri",
+    "apps/mobile/src-tauri",
     "crates/relayterm-core",
     "crates/relayterm-api",
     "crates/relayterm-db",

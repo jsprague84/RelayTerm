@@ -15,9 +15,23 @@ dist/
 .env.*.local
 config/relayterm.local.toml
 
-# Tauri (when we wire it up)
+# Tauri
 src-tauri/target/
 src-tauri/gen/schemas/
+
+# Android signing material and local-build artifacts (defense in depth;
+# Tauri's generated gen/android/.gitignore already excludes most of this).
+# NEVER commit signing keys, keystores, or local SDK paths.
+*.jks
+*.keystore
+**/keystore.properties
+**/key.properties
+**/local.properties
+apps/mobile/src-tauri/gen/android/**/build/
+apps/mobile/src-tauri/gen/android/**/.gradle/
+apps/mobile/src-tauri/gen/android/**/.cxx/
+apps/mobile/src-tauri/gen/android/**/.idea/
+apps/mobile/src-tauri/gen/android/**/captures/
 
 # OS
 .DS_Store

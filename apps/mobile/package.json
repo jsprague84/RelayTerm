@@ -1,0 +1,15 @@
+{
+  "name": "@relayterm/mobile",
+  "private": true,
+  "version": "0.0.0",
+  "description": "RelayTerm Tauri v2 mobile (Android-first) shell — wraps apps/web",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:android:init": "tauri android init",
+    "tauri:android:dev": "tauri android dev",
+    "tauri:android:build": "tauri android build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

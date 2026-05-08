@@ -157,6 +157,8 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 0 — scaffold + local-build docs *(strongly recommended next slice; see § 10)*
 
+> **Status (2026-05-07):** Phase 0 implemented in branch `feat/tauri-shell-scaffold`. Both shells are scaffolded with Tauri v2 (CLI 2.11.1, `tauri = 2.11.1`, `tauri-build = 2.6.1`); identifiers are `cc.js-node.relayterm.{desktop,mobile}`; Android `minSdkVersion = 28`; `apps/mobile/src-tauri/gen/android/` is committed; `apps/{desktop,mobile}/src-tauri` are registered as Cargo workspace members. `cargo check --workspace` passes after installing the GTK stack. `tauri dev` / `tauri build` / `tauri android dev` / `tauri android build` are documented but not exercised in this slice — see [`tauri-local-build.md`](./tauri-local-build.md).
+
 - Generate the desktop and mobile Tauri scaffolds locally, using the
   **official Tauri CLI** for the version pinned in `AGENTS.md`. The
   expected commands are `tauri init` (run inside `apps/desktop/`) and
@@ -182,6 +184,11 @@ Five phases. Each names what it does and what it intentionally defers.
 - **No CI changes in this phase.** The point of Phase 0 is to produce
   a scaffolded, locally-buildable repo state that a later CI phase can
   build against without making scaffold decisions under CI pressure.
+- Local prerequisites, commands, output paths, and the exact set of
+  verifications performed in this slice are recorded in
+  [`tauri-local-build.md`](./tauri-local-build.md). Treat that file as
+  the authoritative entry point for any contributor who wants to do
+  a local desktop or Android build against this scaffold.
 
 ### Phase 1 — Linux desktop CI smoke
 

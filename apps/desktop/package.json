@@ -1,0 +1,14 @@
+{
+  "name": "@relayterm/desktop",
+  "private": true,
+  "version": "0.0.0",
+  "description": "RelayTerm Tauri v2 desktop shell — wraps apps/web",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
