@@ -5,9 +5,10 @@
 ## Status of this slice
 
 - ✅ `apps/desktop/` — Tauri v2 desktop wrapper. `cargo check -p relayterm-desktop` passes on Linux with the GTK stack installed.
+- ✅ `pnpm --filter @relayterm/desktop tauri:build` — verified on CachyOS / Arch with WebKitGTK 4.1 and libayatana-appindicator. Produces the native binary, `.deb`, and `.rpm`. The AppImage stage requires `NO_STRIP=true` on this host (see "AppImage strip incompatibility" below). This verifies packaging/build only — runtime backend connectivity is not exercised because Phase 0 has no production backend URL wired into the bundled SPA.
 - ✅ `apps/mobile/` — Tauri v2 mobile (Android-first) wrapper. `tauri android init` was run on a Linux host with JDK 17, Android SDK, and NDK 30.0.14904198 installed; the generated `gen/android/` Gradle/Kotlin scaffold is committed.
 - ❌ `cargo check -p relayterm-mobile --target aarch64-linux-android` — not exercised on this host; needs the Android Rust target's link environment.
-- ❌ `tauri build` (desktop bundle), `tauri android build` (APK) — not exercised in this slice.
+- ❌ `tauri android build` (APK), `tauri:dev` (desktop GUI) — not exercised in this slice.
 
 ## Frontend reuse model
 
@@ -123,15 +124,19 @@ pnpm install                # installs @tauri-apps/cli for the desktop and mobil
 # Dev: launches the Vite server (apps/web) and a Tauri window pointed at localhost:5173
 pnpm --filter @relayterm/desktop tauri:dev
 
-# Release bundle: produces .deb / .AppImage / .rpm under apps/desktop/src-tauri/target/release/bundle/
+# Release bundle: produces .deb / .rpm (and AppImage when supported on the host) under target/release/bundle/
+# (Cargo workspaces share a single root `target/`; see the artifact path list below.)
 pnpm --filter @relayterm/desktop tauri:build
 ```
 
-Output paths:
+Artifacts land at the **workspace** target directory, not the per-crate one — Cargo workspaces share a single `target/`:
 
-- AppImage: `apps/desktop/src-tauri/target/release/bundle/appimage/RelayTerm_<version>_amd64.AppImage`
-- Debian package: `apps/desktop/src-tauri/target/release/bundle/deb/RelayTerm_<version>_amd64.deb`
-- RPM: `apps/desktop/src-tauri/target/release/bundle/rpm/RelayTerm-<version>-1.x86_64.rpm`
+- Native binary: `target/release/relayterm-desktop`
+- Debian package: `target/release/bundle/deb/RelayTerm_<version>_amd64.deb`
+- RPM: `target/release/bundle/rpm/RelayTerm-<version>-1.x86_64.rpm`
+- AppImage: `target/release/bundle/appimage/RelayTerm-x86_64.AppImage` (only when the AppImage stage succeeds — see "AppImage strip incompatibility" below)
+
+All paths are relative to the repo root. The intermediate `target/release/bundle/{deb,appimage}/RelayTerm_<version>_amd64/` and `target/release/bundle/appimage/RelayTerm.AppDir/` directories are scratch staging areas for the bundlers and are safe to ignore.
 
 ### Mobile / Android
 
@@ -152,9 +157,9 @@ Output paths (debug build):
 
 > **Signing material is intentionally NOT tracked in the repo.** No `*.jks`, `*.keystore`, `local.properties`, `key.properties`, `keystore.properties`, `.gradle/`, `.cxx/`, or `build/` outputs are committed. Signing for release builds is deferred to a later phase; see [`tauri-ci-release-plan.md`](./tauri-ci-release-plan.md).
 
-## Verification performed in this slice
+## Verification performed
 
-| Command | Status on the slice's host |
+| Command | Status on the verifying host |
 |---|---|
 | `pnpm install` | ✅ Verified |
 | `pnpm -r check` | ✅ Verified |
@@ -168,13 +173,14 @@ Output paths (debug build):
 | `bash scripts/check-doc-contracts.sh` | ✅ Verified |
 | `cargo check -p relayterm-desktop` | ✅ Verified |
 | `cargo check -p relayterm-mobile` | ✅ Verified (host-target only — Android cross-compile not exercised) |
-| `pnpm --filter @relayterm/mobile tauri:android:init` | ✅ Verified (`gen/android/` scaffold committed from this run) |
-| `pnpm --filter @relayterm/desktop tauri:dev` | ❌ Not exercised in this slice |
-| `pnpm --filter @relayterm/desktop tauri:build` | ❌ Not exercised in this slice |
-| `pnpm --filter @relayterm/mobile tauri:android:dev` | ❌ Not exercised in this slice |
-| `pnpm --filter @relayterm/mobile tauri:android:build` | ❌ Not exercised in this slice |
+| `pnpm --filter @relayterm/mobile tauri:android:init` | ✅ Verified (`gen/android/` scaffold committed from the original Phase 0 run) |
+| `pnpm --filter @relayterm/desktop tauri:build` (binary + `.deb` + `.rpm`) | ✅ Verified on CachyOS (Arch-derived Linux, kernel 7.0.3-1-cachyos), 2026-05-07, with WebKitGTK 4.1 (`webkit2gtk-4.1 2.52.3`) and libayatana-appindicator (`0.5.94`); rustc 1.95.0, pnpm 10.33.0, Node 25.9.0. Built `target/release/relayterm-desktop` (5.8 MB) in ~2m 29s; `RelayTerm_0.0.0_amd64.deb` (2.4 MB) and `RelayTerm-0.0.0-1.x86_64.rpm` (2.4 MB) bundled. Verifies packaging/build only — does NOT verify backend/API connectivity (Phase 0 has no production backend URL wired into the bundled SPA). |
+| `pnpm --filter @relayterm/desktop tauri:build` (AppImage) | ⚠ Conditional. The AppImage stage of `tauri:build` fails on this CachyOS host because `linuxdeploy`'s bundled `strip` cannot parse the `.relr.dyn` (DT_RELR) ELF section emitted by modern glibc-built libs. Re-running with `NO_STRIP=true pnpm --filter @relayterm/desktop tauri:build` (or invoking `linuxdeploy` directly with `NO_STRIP=true`) produces a working `RelayTerm-x86_64.AppImage` (93 MB). See "AppImage strip incompatibility" under Troubleshooting. This is an upstream packaging-tool host issue, not a Tauri scaffold bug — `package.json` keeps `tauri build` as the canonical command. |
+| `pnpm --filter @relayterm/desktop tauri:dev` | ❌ Not exercised — opens a GUI window and needs an interactive desktop session. |
+| `pnpm --filter @relayterm/mobile tauri:android:dev` | ❌ Not exercised — needs a connected device or running emulator. |
+| `pnpm --filter @relayterm/mobile tauri:android:build` | ❌ Not exercised — Android local build is a separate slice. |
 
-`tauri:dev` / `tauri:build` rows are deferred to first-use validation by a contributor with a working desktop session and (for Android) an emulator or device.
+`tauri:dev` / Android rows are deferred to first-use validation by a contributor with a working desktop session and (for Android) an emulator or device.
 
 ## Troubleshooting
 
@@ -183,6 +189,7 @@ Output paths (debug build):
 - **`tauri android init` fails with NDK / SDK not found.** Confirm `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME` are exported in the shell that runs the command. Tauri reads them from the environment, not from `local.properties`.
 - **pnpm filter doesn't find `@relayterm/desktop` or `@relayterm/mobile`.** Confirm the package names in `apps/{desktop,mobile}/package.json` match the `--filter` argument and that `pnpm-workspace.yaml` lists `apps/desktop` and `apps/mobile`.
 - **Backend connectivity in the built (non-dev) shell.** Phase 0 does **not** wire production backend selection. If the bundled SPA shows network errors, that is expected — see "Deferred work".
+- **AppImage strip incompatibility** — `tauri build` ends with `failed to bundle project ´failed to run linuxdeploy´` after producing the `.deb` and `.rpm`. Direct invocation of `~/.cache/tauri/linuxdeploy-x86_64.AppImage` shows repeated `ERROR: Strip call failed: ... unknown type [0x13] section ´.relr.dyn´` lines for libs in `usr/lib/`. Cause: `linuxdeploy` ships a bundled `binutils` whose `strip` predates DT_RELR support, but modern glibc / Arch / CachyOS toolchains emit `.relr.dyn` sections. Workaround: run with `NO_STRIP=true`, e.g. `NO_STRIP=true pnpm --filter @relayterm/desktop tauri:build`. This is an upstream `linuxdeploy` issue; do not change the canonical `tauri build` command in `package.json` to mask it. The `.deb` and `.rpm` are unaffected and remain the recommended Linux distribution targets in this slice.
 
 ## Deferred work
 
