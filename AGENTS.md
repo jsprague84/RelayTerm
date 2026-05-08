@@ -73,7 +73,7 @@ Training data may suggest older patterns. Per-component depth lives in `.claude/
 - **vite ^7** — minifier `oxc` is default; use `defineConfig(({ command, mode, isSsrBuild }) => ...)` for env-conditional config.
 - **tailwind v4** — `@import "tailwindcss";` (not `@tailwind base/components/utilities`); theme in a CSS `@theme {}` block; install `@tailwindcss/vite`; CLI is `npx @tailwindcss/cli`.
 - **xterm.js v5** — install `@xterm/xterm` (scoped); use `@xterm/addon-fit`, `@xterm/addon-webgl`, `@xterm/addon-serialize`; `term.write(data, cb)` callback signals parse-completion — use it for backpressure when streaming PTY.
-- **tauri v2** — `tauri.conf.json` is split into `app`/`build`/`bundle`/`plugins`; capabilities replace v1 allowlist; `tauri android init` scaffolds under `src-tauri/gen/` (do not edit by hand); mobile builds via `pnpm tauri android build --aab`.
+- **tauri v2** — `tauri.conf.json` is split into `app`/`build`/`bundle`/`plugins`; capabilities replace v1 allowlist; `tauri android init` scaffolds under `src-tauri/gen/` (do not edit by hand). Local Android smoke uses `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` (unsigned debug APK, no keystore needed); `--aab` is the Phase 4+ signed-release / Play Store path and is deliberately NOT the local-smoke command. Android packaging rejects `version: "0.0.0"` in `tauri.conf.json` — must be ≥ `0.0.1` (mobile config is `0.0.1`; desktop stays at `0.0.0` because Linux `.deb`/`.rpm` accept it).
 
 ## Web app defaults (overlay)
 

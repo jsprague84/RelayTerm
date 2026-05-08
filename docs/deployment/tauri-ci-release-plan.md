@@ -157,7 +157,7 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 0 — scaffold + local-build docs *(strongly recommended next slice; see § 10)*
 
-> **Status (2026-05-07):** Phase 0 implemented in branch `feat/tauri-shell-scaffold`. Both shells are scaffolded with Tauri v2 (CLI 2.11.1, `tauri = 2.11.1`, `tauri-build = 2.6.1`); identifiers are `cc.js-node.relayterm.{desktop,mobile}`; Android `minSdkVersion = 28`; `apps/mobile/src-tauri/gen/android/` is committed; `apps/{desktop,mobile}/src-tauri` are registered as Cargo workspace members. `cargo check --workspace` passes after installing the GTK stack. `pnpm --filter @relayterm/desktop tauri:build` is now verified on CachyOS (Linux desktop binary + `.deb` + `.rpm`); the AppImage stage requires `NO_STRIP=true` on this host due to an upstream `linuxdeploy` / `.relr.dyn` strip incompatibility. `tauri:dev`, `tauri android dev`, and `tauri android build` are documented but not exercised. See [`tauri-local-build.md`](./tauri-local-build.md). With local Linux desktop build verified, **Phase 1 (Linux desktop CI smoke) is now ready to start** without scaffold uncertainty.
+> **Status (2026-05-07):** Phase 0 implemented in branch `feat/tauri-shell-scaffold`. Both shells are scaffolded with Tauri v2 (CLI 2.11.1, `tauri = 2.11.1`, `tauri-build = 2.6.1`); identifiers are `cc.js-node.relayterm.{desktop,mobile}`; Android `minSdkVersion = 28`; `apps/mobile/src-tauri/gen/android/` is committed; `apps/{desktop,mobile}/src-tauri` are registered as Cargo workspace members. `cargo check --workspace` passes after installing the GTK stack. `pnpm --filter @relayterm/desktop tauri:build` is verified on CachyOS (Linux desktop binary + `.deb` + `.rpm`); the AppImage stage requires `NO_STRIP=true` on this host due to an upstream `linuxdeploy` / `.relr.dyn` strip incompatibility. **Local Android APK build is now also verified** in branch `chore/tauri-android-local-build-smoke`: `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` produces a debug, unsigned, universal APK (≈ 437 MB, all four ABIs) at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`, after a one-line scaffold fix bumping `apps/mobile/src-tauri/tauri.conf.json` `version` from `0.0.0` to `0.0.1` (Android packaging rejects `0.0.0`). `tauri:dev`, `tauri android dev`, and the eventual signed `--aab` release path are still not exercised. See [`tauri-local-build.md`](./tauri-local-build.md). With local Linux desktop and local Android APK both verified, **Phase 1 (Linux desktop CI smoke) is now landed (see below) and Phase 3 (Android build smoke) has its local prerequisite cleared**.
 
 - Generate the desktop and mobile Tauri scaffolds locally, using the
   **official Tauri CLI** for the version pinned in `AGENTS.md`. The
@@ -257,14 +257,13 @@ Five phases. Each names what it does and what it intentionally defers.
 
 ### Phase 3 — Android build smoke
 
+> **Status (2026-05-07):** Local prerequisite verified in branch `chore/tauri-android-local-build-smoke`. The exact build command produces a debug, unsigned, universal APK on a CachyOS host with JDK 17, Android SDK (cmdline-tools/latest, platforms/android-36.1, build-tools/{36.1.0,37.0.0}, platform-tools), NDK `30.0.14904198`, and the four `*-linux-android` Rust targets — see [`tauri-local-build.md`](./tauri-local-build.md) "Verification performed". This clears scaffold-and-toolchain uncertainty for Phase 3, but Phase 3 itself (CI workflow + artifact upload) is still future. No CI workflow file, no keystore, no Play Store submission was added in the local-smoke slice.
+
 - Linux runner with JDK 17+, Android SDK, Android NDK, and the
   Android Rust targets installed. Per-run install initially; promote
   to a prepared image when per-run install exceeds ~5 minutes of wall
   time.
-- Build: `pnpm tauri android build --apk` (unsigned debug). Confirm
-  current flag set against Tauri docs at Phase 3 time — `--target`
-  filtering and `--apk` vs `--aab` semantics are documented but
-  evolve.
+- Build: `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` (unsigned debug, verified locally on 2026-05-07). Confirm current flag set against Tauri docs at Phase 3 time — `--target` filtering and `--apk` vs `--aab` semantics are documented but evolve.
 - Artifact upload as `relayterm-mobile-android-<sha-short>.apk`.
 - **No keystore**. No Play Store submission.
 

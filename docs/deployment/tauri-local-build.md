@@ -7,8 +7,9 @@
 - ✅ `apps/desktop/` — Tauri v2 desktop wrapper. `cargo check -p relayterm-desktop` passes on Linux with the GTK stack installed.
 - ✅ `pnpm --filter @relayterm/desktop tauri:build` — verified on CachyOS / Arch with WebKitGTK 4.1 and libayatana-appindicator. Produces the native binary, `.deb`, and `.rpm`. The AppImage stage requires `NO_STRIP=true` on this host (see "AppImage strip incompatibility" below). This verifies packaging/build only — runtime backend connectivity is not exercised because Phase 0 has no production backend URL wired into the bundled SPA.
 - ✅ `apps/mobile/` — Tauri v2 mobile (Android-first) wrapper. `tauri android init` was run on a Linux host with JDK 17, Android SDK, and NDK 30.0.14904198 installed; the generated `gen/android/` Gradle/Kotlin scaffold is committed.
-- ❌ `cargo check -p relayterm-mobile --target aarch64-linux-android` — not exercised on this host; needs the Android Rust target's link environment.
-- ❌ `tauri android build` (APK), `tauri:dev` (desktop GUI) — not exercised in this slice.
+- ✅ `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` — verified on CachyOS (Arch-derived Linux) with JDK 17, Android SDK at `~/Android/Sdk`, NDK 30.0.14904198, and the four Android Rust targets (`aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android`). Produces a debug, unsigned, universal APK at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk` (≈ 437 MB; bundles all 4 ABI `.so`s with debuginfo, plus the bundled SPA). Verifies local Android packaging/build only — does NOT verify emulator/device runtime, backend connectivity, mobile session behaviour, signing/release readiness, or Play Store/AAB distribution.
+- ❌ `cargo check -p relayterm-mobile --target aarch64-linux-android` (standalone) — not exercised; the Android cross-compile *is* exercised transitively as part of `tauri android build` (which produced libs for all four ABIs into `target/<android-target>/debug/`), but the explicit standalone `cargo check` against an Android target was not run.
+- ❌ `tauri:dev` (desktop GUI), `tauri android dev` (live device/emulator) — not exercised in this slice.
 
 ## Frontend reuse model
 
@@ -81,11 +82,11 @@ Documented as future work. Not exercised in this slice. See the [Tauri v2 prereq
    ```
    Path: `/usr/lib/jvm/java-17-openjdk`.
 2. **Android SDK + NDK.** Install via Android Studio's SDK Manager *or* via the standalone command-line tools: <https://developer.android.com/studio#command-line-tools-only>. Unzip into `$HOME/Android/Sdk/cmdline-tools/latest/`.
-3. **SDK packages** (verified set used to generate this slice's `gen/android/`):
+3. **SDK packages** (verified set used to generate this slice's `gen/android/` and to produce the local APK on 2026-05-07):
    ```bash
    sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;30.0.14904198"
    ```
-   Tauri's generated `gen/android/app/build.gradle.kts` pins `compileSdk = 36`, `targetSdk = 36`. The NDK version matches whatever directory the CLI finds under `$ANDROID_HOME/ndk/`.
+   Tauri's generated `gen/android/app/build.gradle.kts` pins `compileSdk = 36`, `targetSdk = 36`, `minSdk = 28`. The NDK version matches whatever directory the CLI finds under `$ANDROID_HOME/ndk/`. The Android Gradle Plugin accepts a higher *minor* than `compileSdk` requests — the local APK smoke succeeded against `platforms;android-36.1` and `build-tools;{36.1.0,37.0.0}` already installed on the host (Android Studio's bundled set), without needing to downgrade. Stick with the `android-36` / `build-tools;36.0.0` baseline above for new installs unless a future Tauri scaffold change bumps `compileSdk`.
 4. **Android Rust targets** (Tauri's `--skip-targets-install` flag intentionally leaves this to you):
    ```bash
    rustup target add \
@@ -97,16 +98,17 @@ Documented as future work. Not exercised in this slice. See the [Tauri v2 prereq
 
 ### Environment variables
 
-Add to your shell rc (`~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`):
+The contributor running this slice's verification uses Bash; persist these in `~/.bashrc` or `~/.bash_profile`:
 
 ```bash
+# ~/.bashrc or ~/.bash_profile
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 export ANDROID_HOME="$HOME/Android/Sdk"
 export NDK_HOME="$ANDROID_HOME/ndk/$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -1)"
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 ```
 
-`tauri android dev` and `tauri android build` need all three exported.
+`tauri android dev` and `tauri android build` need all three (`JAVA_HOME`, `ANDROID_HOME`, `NDK_HOME`) exported in the shell that runs them. Other shells (zsh, fish) need their own rc adapted from the snippet above. For a one-shot build without modifying any rc file, the same `export` block works inline in the current Bash session.
 
 ## Local commands
 
@@ -152,13 +154,22 @@ pnpm --filter @relayterm/mobile tauri:android:init
 # Dev: deploys to a connected device or running emulator
 pnpm --filter @relayterm/mobile tauri:android:dev
 
-# Debug APK build
-pnpm --filter @relayterm/mobile tauri:android:build
+# Local debug, unsigned, universal APK (verified — see "Verification performed" below).
+# `--debug` selects the debug Cargo profile (no signing config needed); `--apk` skips
+# AAB; `--ci` skips Tauri's interactive prompts. Use the explicit invocation rather
+# than the bare npm script `tauri:android:build`, which defers to `tauri android
+# build`'s release-mode default and is therefore meant for the eventual signed-AAB
+# release path (Phase 4+ in tauri-ci-release-plan.md), not local smoke.
+pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci
 ```
 
 Output paths (debug build):
 
 - APK: `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`
+
+The "universal" debug APK bundles all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`) into one file along with the Rust libraries built with debuginfo, so it is large (≈ 437 MB on 2026-05-07). Production release builds use `--aab` with split ABIs to ship a much smaller per-device package; that path is **deferred** (no signing in this slice).
+
+> **`version` ≥ `0.0.1` is mandatory for Android.** Tauri rejects `version: "0.0.0"` in `apps/mobile/src-tauri/tauri.conf.json` with `"The default value '0.0.0' is not allowed for Android package and must be at least '0.0.1'"`. The mobile config was bumped to `0.0.1` for this slice. The desktop config keeps `0.0.0` because Linux `.deb`/`.rpm` accept it; if a later phase needs to align desktop and mobile versions, do that as a deliberate version-policy change, not a side-effect of an Android build.
 
 > **Signing material is intentionally NOT tracked in the repo.** No `*.jks`, `*.keystore`, `local.properties`, `key.properties`, `keystore.properties`, `.gradle/`, `.cxx/`, or `build/` outputs are committed. Signing for release builds is deferred to a later phase; see [`tauri-ci-release-plan.md`](./tauri-ci-release-plan.md).
 
@@ -184,7 +195,7 @@ Output paths (debug build):
 | `pnpm --filter @relayterm/desktop tauri:build` (AppImage) | ⚠ Conditional. The AppImage stage of `tauri:build` fails on this CachyOS host because `linuxdeploy`'s bundled `strip` cannot parse the `.relr.dyn` (DT_RELR) ELF section emitted by modern glibc-built libs. Re-running with `NO_STRIP=true pnpm --filter @relayterm/desktop tauri:build` (or invoking `linuxdeploy` directly with `NO_STRIP=true`) produces a working `RelayTerm-x86_64.AppImage` (93 MB). See "AppImage strip incompatibility" under Troubleshooting. This is an upstream packaging-tool host issue, not a Tauri scaffold bug — `package.json` keeps `tauri build` as the canonical command. |
 | `pnpm --filter @relayterm/desktop tauri:dev` | ❌ Not exercised — opens a GUI window and needs an interactive desktop session. |
 | `pnpm --filter @relayterm/mobile tauri:android:dev` | ❌ Not exercised — needs a connected device or running emulator. |
-| `pnpm --filter @relayterm/mobile tauri:android:build` | ❌ Not exercised — Android local build is a separate slice. |
+| `pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci` (debug, unsigned, universal APK) | ✅ Verified on the same CachyOS host (Arch-derived Linux, kernel 7.0.3-1-cachyos), 2026-05-07. JDK 17 (`openjdk 17.0.19`), Android SDK at `~/Android/Sdk` (cmdline-tools/latest, platforms/android-36.1, build-tools/{36.1.0,37.0.0}, platform-tools), NDK `30.0.14904198`, and the four `*-linux-android` Rust targets installed; `JAVA_HOME` / `ANDROID_HOME` / `NDK_HOME` exported in the build shell. Tauri reports "Finished 1 APK"; `app-universal-debug.apk` lands at `apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/` (≈ 437 MB) with libraries for all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`). Required scaffold change: bump `apps/mobile/src-tauri/tauri.conf.json` `version` from `0.0.0` to `0.0.1` (Android packaging rejects `0.0.0`). No keystore, no signing, no AAB, no device install. Verifies local Android packaging only — does NOT verify emulator/device runtime, backend connectivity, mobile session behaviour, signing/release readiness, or Play Store distribution. |
 
 `tauri:dev` / Android rows are deferred to first-use validation by a contributor with a working desktop session and (for Android) an emulator or device.
 
