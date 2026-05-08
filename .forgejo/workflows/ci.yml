@@ -106,6 +106,42 @@ jobs:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
+      - name: install linux desktop tauri build dependencies
+        # Phase 0 of the Tauri rollout added `apps/desktop/src-tauri` and
+        # `apps/mobile/src-tauri` to the root Cargo workspace, so
+        # `cargo clippy --workspace --all-targets --all-features` and
+        # `cargo test --workspace` below now compile the `relayterm-desktop`
+        # and `relayterm-mobile` crates — both transitively depend on
+        # `gtk` / `gdk-sys` / `webkit2gtk-sys`. Without the GTK/WebKit
+        # development headers, clippy fails with:
+        #   Package 'gdk-3.0', required by 'virtual:world', not found
+        #   The system library `gdk-3.0` required by crate `gdk-sys`
+        #   was not found.
+        # `libgtk-3-dev` provides `gdk-3.0.pc`; `libwebkit2gtk-4.1-dev`
+        # provides `webkit2gtk-4.1.pc`; `libayatana-appindicator3-dev`,
+        # `libxdo-dev`, and `librsvg2-dev` cover the rest of Tauri v2's
+        # Linux build prerequisites.
+        #
+        # **Keep this list in sync with `.forgejo/workflows/desktop-linux.yml`
+        # unless deliberately diverging.** Both jobs target the same Tauri
+        # v2 Linux build prerequisites; a divergence here is a bug unless
+        # explicitly justified in the same change.
+        run: |
+          set -eu
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            libgtk-3-dev
+
       - name: install rust 1.95 (rustup minimal + rustfmt + clippy)
         # `--default-toolchain 1.95` is the CI Rust pin and MUST match
         # `Dockerfile.backend` `ARG RUST_VERSION=1.95`. Both
