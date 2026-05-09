@@ -520,6 +520,304 @@ the explicit `2026-MM-DD · <slug>` headings and the inter-entry
 cross-references (`entry above`, `entry below`) rather than on a
 strict overall ordering rule.
 
+### 2026-05-09 · Desktop Tauri staging reconnect / detach / replay smoke
+
+Picks up from the 2026-05-09 first end-to-end staging entry below
+and the 2026-05-09 Android terminal-attach entry above (same VPS
+slot, same image tag `:main`, same throwaway bootstrap user, no
+teardown between runs). Closes the "long-lived reconnect /
+replay-buffer correctness" deferred row from the first 2026-05-09
+entry by walking the production-terminal Detach / Reconnect
+lifecycle on desktop against HTTPS staging — short-detach reconnect
+within the TTL window, replay handshake when output arrives during
+a detach gap, beyond-TTL reaper behaviour, and desktop kill+restart
+via the Sessions-list cross-navigation reconnect. The slice is
+explicitly NOT a session-persistence-across-restart slice: the
+verified behaviour is the in-memory replay ring buffer covering a
+brief gap, not durable session resume.
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Desktop binary:** existing
+`target/release/relayterm-desktop` from the 2026-05-08 build (no
+rebuild — the bundled SPA is only used pre-handoff; the post-handoff
+SPA is fetched fresh from staging). **Throwaway SSH target:**
+`linuxserver/openssh-server:latest` container
+`relayterm-staging-smoke-ssh` joined to
+`relayterm-staging_relayterm-staging-internal` (key-auth-only,
+`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`, listens on **port
+`2222`**, no host port published; user `smoke` with shell
+`/bin/bash`; auto-generated host keys at first start; throwaway —
+torn down at end of run). Same shape as the prior 2026-05-09
+Android terminal-attach entry above; ed25519 host fingerprint
+`SHA256:sF9pMtVqW9pgXfyUd/9of6SEdFUkbLanb8ZgobbX05g`,
+byte-identical to `docker exec ... ssh-keygen -lf
+/config/ssh_host_keys/ssh_host_ed25519_key.pub`. Inventory
+created fresh per the AGENTS.md "Inventory lifecycle and
+destructive-action policy" — Android-smoke `smoke-ssh-android`
+host + `android-smoke-profile` left untouched; created **new**
+host `smoke-ssh-desktop`
+(`802fc0c0-dde6-4e64-babf-7913b0d82b05`,
+`relayterm-staging-smoke-ssh:2222 smoke`) and **new** profile
+`desktop-smoke-profile`
+(`14bfb3d9-141f-4ada-83c8-33ede1217ba3`) bound to the existing
+reused `smoke-id` ed25519 identity
+(`44b5e2be-29c2-4eb0-b6ac-3b4e25ca789d`).
+
+**Pinned contract under test.** The detached-PTY TTL is
+`Duration::from_secs(30)` per
+`crates/relayterm-terminal/src/manager.rs:94 — pub const
+DETACHED_LIVE_PTY_TTL`. Reconnect within that window is documented
+to cancel the scheduled close
+(`crates/relayterm-terminal/src/manager.rs:914-919, 956-970`:
+`cancel_pending_close` runs first, then the row is set back to
+`Active`, then a `Reattached` event is appended). Replay covers
+output frames *after* the client's `last_seen_seq` bookmark; it does
+NOT preserve the renderer's local scrollback — the renderer
+`dispose()` on Detach destroys the xterm.js grid and `mount()` on
+Reconnect creates a fresh canvas
+(`docs/spec/web-shell.md` § "TTL and replay limitations"). A
+backend restart drops every detached PTY AND its replay buffer
+(`docs/spec/terminal.md` § "Output sequence + in-memory replay
+buffer contract").
+
+Setup path mirrored the 2026-05-09 Android terminal-attach entry
+above: inventory CRUD + host-key preflight + trust + auth-check
+driven from the workstation against the staging API with the
+session cookie held in `chmod 600` `/tmp/...cookie`, never echoed
+in any tool output, log, or doc. Bootstrap credentials sourced
+from `/home/ubuntu/docker/relayterm-staging/.bootstrap-credentials`
+on `cloud-edge` and copied to a `chmod 600` local `/tmp/...creds`
+that was `shred -u`'d at end of run. Cookie file shredded at end
+of run.
+
+Verified:
+
+- HTTPS reachability gate (§7.3) re-checked from the workstation
+  before any container or device action: `/` → 200, `/healthz` →
+  200, `/api/v1/auth/me` → 401 JSON. Staging stack carried over
+  without restart from the prior 2026-05-09 entries (`docker
+  compose ps` showed all three services `Up 3 hours (healthy)`).
+- Setup-API path: `POST /api/v1/auth/login` set
+  `relayterm_session` cookie; subsequent
+  `POST /api/v1/hosts` (display_name=`smoke-ssh-desktop`),
+  `POST /api/v1/server-profiles` (name=`desktop-smoke-profile`,
+  bound to `smoke-id`), `POST .../host-key-preflight`
+  (returned `host_key_status: "unknown"` with the new container's
+  ed25519 fingerprint), public-key injection into
+  `/config/.ssh/authorized_keys` (`smoke:users 600`), and
+  `POST .../trust-host-key` (returned `known_host_entry_id
+  7f7d6473-6f61-45c1-8fb8-599c3262c015`) all succeeded.
+  `POST .../auth-check` returned `status: "authentication_succeeded"`,
+  `message: "ssh public-key authentication succeeded; no PTY was
+  allocated and no command was executed"`.
+- **Case A — short detach/reconnect within the TTL window
+  (session `532ffb9b`).** Operator launched the production
+  terminal from `desktop-smoke-profile` via `Sidebar → Server
+  profiles → desktop-smoke-profile → Launch terminal session`,
+  ran `echo relayterm-desktop-reconnect-smoke-start`, `whoami`,
+  `pwd`. Detach → wait ~15s → Reconnect → `echo
+  relayterm-desktop-reconnect-smoke-resumed` round-tripped: input
+  → backend → SSH → bash → output → render. **Replay observation:**
+  the renderer's prior visible state was NOT restored — the canvas
+  was blank after Reconnect because the PTY was idle during the
+  detach window so the replay handshake had zero new frames to
+  emit (`replay_window_lost` was not surfaced; replay simply had
+  nothing past `lastSeenSeq`). This is the documented behaviour:
+  the renderer `dispose()` destroys the local grid; replay is a
+  *resume-the-live-stream* primitive, not a *restore-the-canvas*
+  primitive. Operator subsequently performed two more
+  detach/reconnect cycles before the final detach;
+  `session_events` ground truth (Postgres) confirmed the timing:
+  `attached 20:35:18.570 → detached 20:37:17.389 → attached
+  20:37:33.451 → reattached 20:37:33.454 → detached
+  20:38:26.527 → attached 20:38:33.702 → reattached
+  20:38:33.705 → detached 20:39:45.533 → closed 20:40:15.541`.
+  Each `attached` event was followed within 4 ms by a `reattached`
+  event proving the cancel-pending-close + transition-to-Active
+  path on `manager.rs:919, 956-970` fired correctly. The
+  `closed_at` landed at exactly 30 s after the FINAL detach, not
+  the original detach — TTL cancel works as documented.
+- **Case B — replay handshake observation
+  (session `d44bc691`).** Operator launched a fresh session,
+  backgrounded a 5-tick producer (`( for i in 1 2 3 4 5; do
+  sleep 1; echo "relayterm-replay-tick-$i"; done ) &`),
+  immediately Detached (within ~1 s, before any tick fired on
+  screen), waited ~24 s with the client detached so all 5 ticks
+  emitted to the PTY while the renderer was torn down, then
+  Reconnected. **All five lines `relayterm-replay-tick-1`
+  through `…-5` appeared on the canvas after Reconnect and
+  before any new input** — the in-memory replay ring buffer
+  emitted the held frames through the `replay_start → buffered
+  output → replay_end` handshake on the new attachment.
+  `session_events` confirmed: `attached 20:49:13.166 →
+  detached 20:51:08.026 → attached 20:51:32.551 → reattached
+  20:51:32.554 → detached 20:52:32.650 → closed 20:53:02.661`.
+- **Case C — beyond-TTL reaper behaviour
+  (session `d44bc691`, continued).** After the Case B
+  observations the operator detached again (final detach
+  20:52:32) and let the session sit. The 30 s TTL fired at
+  20:53:02 (closed event). A subsequent **Reconnect** click on
+  the production-terminal toolbar surfaced
+  **"Connection error"** in the UI — the underlying backend
+  session was already reaped, so the new WebSocket attach
+  cannot land. Documented limitation per
+  `docs/spec/web-shell.md` § "TTL and replay limitations" — not
+  a bug.
+- **Case D — desktop kill + restart with a still-live session
+  (session `15c190c9`).** Operator launched a fresh session
+  (`echo relayterm-desktop-restart-pre`); the desktop process
+  (`PID 1399668`) was killed at the workstation; the binary
+  was immediately re-spawned (`PID 1419606`); the bundled SPA
+  re-executed the path-A handoff and landed at the staging
+  origin; the existing same-origin session cookie survived
+  the kill (cookie storage at
+  `~/.local/share/cc.js-node.relayterm.desktop/cookies` is
+  persisted across process death) so AuthGate ran
+  `getCurrentUser()` and rendered AppShell directly with no
+  re-login round-trip. Operator navigated `Sidebar → Sessions`
+  to find the still-live row, but by the time the Sessions list
+  rendered (cookie-attached `GET /api/v1/terminal-sessions`,
+  list refresh, row scan) the session had been reaped: row
+  showed `Closed` with **Open** disabled and the helper text
+  **"cannot be reconnected"** (the spec-pinned literal from
+  `apps/web/src/lib/app/terminal/sessionStatus.ts` /
+  `apps/web/tests/sessionStatus.test.ts`). `session_events`
+  ground truth: `attached 20:59:22.578 → detached
+  21:00:44.412` (the WS dropped at desktop kill) `→ closed
+  21:01:14.421` (TTL fired exactly 30 s later, no reattach
+  events in between). **Operator-UX observation:** the 30 s
+  detached-PTY TTL is shorter than a desktop kill + relaunch
+  + AuthGate-resolve + Sidebar-Sessions-render round-trip
+  (~30 s here, faster on a warm cache, slower on a cold
+  re-login). Cross-navigation reconnect from the Sessions list
+  is therefore an in-process recovery primitive, NOT a
+  restart-recovery primitive. This is consistent with the
+  spec's `docs/spec/terminal.md` § "TTL and replay
+  limitations" — backend restart drops everything; for the
+  desktop side, "process restart that exceeds 30 s" is
+  effectively the same shape as backend restart from the
+  client's perspective.
+- Backend log sweep over 90 minutes of `relayterm-backend`
+  output (workstation `ssh ubuntu@cloud-edge ... docker
+  compose logs --since 90m`): zero hits across the full
+  redaction sentinel set
+  (`csrf_origin_mismatch`, `relayterm_session=[A-Za-z0-9_-]{20,}`,
+  `encrypted_private_key`, `data_b64`, `REDACT-MARKER`,
+  `password=`, `"password"`, `BEGIN OPENSSH`,
+  `BEGIN PRIVATE`). The 8 WARN + 2 ERROR lines in the window
+  were ALL emitted BEFORE the smoke proper (which started with
+  Session A's launch at 20:35:18) and are accounted for: 4 ×
+  `unauthorized request detail=missing session cookie` from
+  pre-login `curl /api/v1/auth/me` reachability checks; 1 ×
+  `Unknown server key` (19:40:11) from a leftover Android-smoke
+  pre-trust auth-check; 3 × `Temporary failure in name
+  resolution` (20:34:36–44 — pty start, preflight, auth-check)
+  during the Docker DNS settling window after the new SSH
+  container's `docker run`, each surfaced as a 502 Bad Gateway.
+  **The smoke proper (Sessions A through D, 20:35 onward) emitted
+  zero ERROR / WARN lines on the WebSocket data plane** — the
+  binary `RTB1` frame path through Traefik to the desktop
+  WebView is silent on errors during normal detach / reconnect
+  / replay / reaper behaviour. Source-of-truth disambiguation
+  on the TTL-after-reattach question used a bounded read-only
+  Postgres query inside the staging Postgres container scoped
+  to the four smoke `session_id`s, returning only `kind` +
+  `recorded_at` (no `payload` dump, since `session_events.payload`
+  can carry attachment metadata; the per-AGENTS.md redaction
+  rule for audit payloads is "public metadata only" but the
+  defensive default for ad-hoc smoke queries is to project
+  away the column). The 28-row event timeline confirmed every
+  reattach cycle wrote a `reattached` event within 4 ms of the
+  matching `attached` event, and every `closed` event landed
+  exactly 30 s after the immediately preceding `detached` (the
+  FINAL detach, not the FIRST).
+
+Deferred (intentional non-goals for this run):
+
+- **Android reconnect / Android mobile background-foreground
+  lifecycle / Android network-flap.** This slice was desktop
+  only; Android terminal attach is verified separately above
+  (2026-05-09 Android terminal attach entry).
+- **Production hostname / production credentials / real
+  production SSH identities** — staging is throwaway by
+  construction (§1).
+- **Long-lived multi-hour reconnect** — every test session
+  here lived 1–5 minutes; the longest was Session A at ~5 min.
+  Multi-hour cookie / session-cookie expiry / WebSocket
+  keep-alive behaviour was not exercised.
+- **Network flap / firewall / mid-session backend kill.**
+  Detach was always client-initiated (Detach button or process
+  kill); no simulated network drop, no `iptables` interference,
+  no `docker compose stop relayterm-backend` mid-session.
+  Whether the backend's TTL reaper survives a backend restart,
+  whether replay survives a backend restart, are both
+  documented as out-of-scope in the spec but not exercised
+  here.
+- **Backend-restart resume of a still-live session.** Per
+  `docs/spec/terminal.md` § "Output sequence + in-memory
+  replay buffer contract" the backend restart drops every
+  detached PTY AND its replay buffer; this is documented but
+  not exercised in this slice.
+- **Alternate renderer adapters** — only
+  `@relayterm/terminal-xterm` baseline was exercised; the
+  experimental ghostty-web / restty / wterm adapters were not.
+- **Recording surface.** `RELAYTERM_TERMINAL_RECORDING__ENABLED=false`
+  on this slot per `.env`; recording chunks did not exist for
+  any smoke session.
+- **Multi-tab / multi-client collaborative attach** — the
+  `AppShell` holds a single `ActiveLaunch`; the entire smoke
+  ran one session at a time.
+- **Mobile portrait sidebar UX** — same deferred-mobile-UX
+  row as the prior 2026-05-09 Android entries; out of scope
+  for desktop.
+
+Drift worth folding back later (non-blocking):
+
+- **API status field vs. event timeline.** The
+  `GET /api/v1/terminal-sessions` payload exposes `status` +
+  `last_seen_at` + `closed_at` per row, but does NOT expose
+  the per-attachment / per-event timeline. During this smoke
+  the `status` field at any single poll showed the
+  most-recent state (often `detached` because the operator
+  was idle in detached state between cycles), and
+  `last_seen_at` reflected the most-recent activity but did
+  NOT chain backward through prior reattach cycles. Reading
+  `last_seen_at` as "the original detach timestamp" without
+  the event timeline produces a false read of "TTL didn't
+  reset on reattach" — exactly the misread that triggered the
+  bounded read-only Postgres-side disambiguation in this run.
+  Surfacing per-attachment events on a `GET .../events` (or
+  similar) authenticated route would let the operator close
+  the loop without dropping into the database; until then,
+  the documented disambiguation is "query `session_events`
+  scoped to the session id, project `kind` + `recorded_at`
+  only". Candidate edit for a future spec slice; not in scope
+  here.
+- **30 s TTL vs. desktop kill+relaunch round-trip.** Case D
+  observed that the kill + relaunch + AuthGate-resolve +
+  Sessions-list-render round-trip exceeds 30 s on a warm
+  cache and a still-valid cookie — i.e. the absolute fastest
+  path. Cross-navigation Sessions-list reconnect is therefore
+  not a viable restart-recovery primitive at the current TTL.
+  Either the TTL needs to be operator-configurable per
+  deployment (the spec already hints at promotion to
+  `AuthRoutesConfig` for the cookie TTL — the same shape
+  could apply to `DETACHED_LIVE_PTY_TTL`), or the runbook
+  should explicitly call out "kill+relaunch loses the
+  session" as a documented limitation. Both are out of scope
+  for this docs-only slice.
+- **Bundled-SPA cache vs. post-handoff SPA freshness.** The
+  desktop binary used here was the 2026-05-08 build; the
+  post-handoff SPA was fetched fresh from staging. The
+  bundled SPA only renders the picker / Connecting splash,
+  so its staleness was inert this run. The "WebKit HTTP cache
+  + nginx immutable assets" Encountered Lesson (2026-05-09)
+  applies only when the served bundle is hot-swapped in place
+  on the staging nginx without a hash change — not the case
+  here. No cache wipe was needed for this run; the staging
+  stack and the served bundle had not changed since the
+  previous 2026-05-09 entries.
+
 ### 2026-05-09 · first end-to-end staging smoke
 
 **VPS host:** `cloud-edge` (`192.168.3.12`).
