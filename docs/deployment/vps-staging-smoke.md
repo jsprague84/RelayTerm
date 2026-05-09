@@ -594,6 +594,159 @@ Drift worth folding back later (non-blocking):
   "No saved config" sub-bullet, but the timing race against the
   splash auto-navigation deserves a louder callout.
 
+### 2026-05-09 · Android Tauri staging handoff + login smoke
+
+Picks up from the 2026-05-09 entry above (same VPS slot, same image
+tag, same throwaway bootstrap user — no teardown between runs).
+Closes the "Android staging smoke" deferred item from that entry's
+"Deferred" list for the handoff + login halves; terminal attach on
+Android remains intentionally deferred (no §8-equivalent for
+mobile yet, and this slice was scoped as docs-only with an explicit
+approval gate before any device action).
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Device:** Samsung Galaxy S10e (model `SM-G970U`, codename
+`beyond0q`, serial `R38N500TY3E`) — the same physical device used
+for the 2026-05-08 Android local-launch smoke recorded in
+[`docs/deployment/tauri-local-build.md`](./tauri-local-build.md).
+**APK:** debug, unsigned, universal, built on the same CachyOS host
+from the `docs/android-staging-handoff-smoke` branch via
+`pnpm --filter @relayterm/mobile exec tauri android build --debug --apk --ci`
+(≈ 548 MB universal at
+`apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`,
+all four ABIs with debuginfo + bundled SPA; tracks the existing
+"≈ 437 MB on 2026-05-07" baseline shape per
+[`docs/deployment/tauri-local-build.md`](./tauri-local-build.md)
+"Verification performed", same scaffold).
+
+Verified:
+
+- HTTPS reachability gate (§7.3) re-checked from the workstation
+  before any device action: `/` → 200 (RelayTerm SPA HTML, HSTS
+  header, no `Set-Cookie`), `/healthz` → 200 JSON, `/api/v1/auth/me`
+  → 401 JSON. Staging stack carried over from the 2026-05-09 run
+  without restart.
+- `adb install -r` of the debug APK reported `Performing Streamed
+  Install` → `Success`; `monkey -p cc.js_node.relayterm.mobile.debug
+  -c android.intent.category.LAUNCHER 1` injected one event;
+  re-probed `pidof` (PID 28072), `ps -A`, and `dumpsys activity
+  activities` confirmed `mResumedActivity:
+  cc.js_node.relayterm.mobile.debug/cc.js_node.relayterm.mobile.MainActivity`
+  with `mFocusedApp` matching. Bounded filtered `logcat -d -t 600`
+  snapshot returned zero `crash` / `fatal` / `exception` / `ANR` /
+  `signal 1[0-9]` / `libc:` lines.
+- Bundled SPA rendered the **"Connect to RelayTerm Server"** picker
+  directly on first launch (no `relayterm.backend-config.v1` in the
+  WebView's `localStorage`, as expected for a fresh install of the
+  debug `applicationId` `cc.js_node.relayterm.mobile.debug`).
+  `https://relayterm-staging.js-node.cc` typed in, **Connect**
+  tapped, the validator accepted the URL (HTTPS, bare origin, no
+  path/query/fragment, no userinfo per
+  [`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md)
+  § 10), the handoff persisted the canonical origin and called
+  `window.location.assign("https://relayterm-staging.js-node.cc/")`,
+  and the WebView reloaded into the staging origin. Same SPA bundle
+  ran again at the post-handoff origin and `ConfiguredBackendGate`
+  short-circuited via `decideHandoff`'s `already_at_backend` branch
+  (closes the same-origin short-circuit verification on a third
+  surface — the `decideHandoff — same-origin short-circuit
+  (already_at_backend)` block in
+  [`apps/web/tests/backendHandoff.test.ts`](../../apps/web/tests/backendHandoff.test.ts)
+  pins the unit-level behaviour). `AuthGate` then ran
+  `getCurrentUser()` → 401 and the SPA rendered `LoginView`.
+- Throwaway bootstrap user from the 2026-05-09 VPS smoke
+  (`/home/ubuntu/docker/relayterm-staging/.bootstrap-credentials`)
+  authenticated cleanly through the Tauri Android WebView.
+  `POST /api/v1/auth/login` set the
+  `relayterm_session` cookie with `HttpOnly; SameSite=Strict; Path=/;
+  Max-Age=2592000; Secure` (separately confirmed via a `curl -i` to
+  the same endpoint with `Origin: https://relayterm-staging.js-node.cc`),
+  the cookie attached on the subsequent `GET /api/v1/auth/me`, and
+  `AuthGate` flipped to `kind: "ready"`. The production
+  `AppShell.svelte` rendered: sidebar with Dashboard / Terminal /
+  Sessions / Server profiles / SSH identities / Settings; top-bar
+  RelayTerm title + Sign-out; Dashboard view showed Backend =
+  `online`, inventory tiles `HOSTS=1`, `SERVER PROFILES=1`,
+  `SSH IDENTITIES=1`, `TERMINAL SESSIONS=1` (carry-over from the
+  2026-05-09 VPS smoke), and recent-activity row
+  `Sign-in succeeded`.
+- Redaction sentinel sweep across 2 000 lines of backend logs over
+  the auth-path window
+  (`csrf_origin_mismatch`, `relayterm_session=[A-Za-z0-9_-]{20,}`,
+  `encrypted_private_key`, `data_b64`, `REDACT-MARKER`, `password`,
+  `ERROR`): zero hits. The 8 `WARN` lines in the window were all
+  expected unauthenticated paths (`bad bootstrap token`,
+  `missing session cookie`, `invalid credentials`) carrying only
+  generic detail strings — no email, password, token, IP, or
+  correlated identifier in any payload.
+- Path A premise extends from desktop bundled handoff (verified
+  2026-05-09 against a throwaway local Compose stack with the
+  `already_at_backend` same-origin short-circuit row in
+  [`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md)
+  § "Phase E — verification log", and against HTTPS staging in the
+  prior § 12 entry above this one) to **Android bundled handoff
+  against HTTPS staging behind Traefik** with **zero** backend / auth
+  / CORS / CSRF / Tauri-capability code change. Same-origin Tauri
+  WebView cookie / `Origin` allow-list flow works for browser-style
+  auth on Android exactly as it does on desktop.
+
+Deferred (intentional non-goals for this run):
+
+- **Android terminal session attach.** No `/api/v1/terminal-sessions`
+  POST, no WebSocket attach, no PTY allocation against any SSH
+  target from the Android device. The runbook step that gates this
+  is the §8 "step 7" optional terminal-attach smoke; no Android
+  equivalent runs by default and none was approved here.
+- Production hostname / production credentials / real production
+  SSH identities — staging is throwaway by construction (§1).
+- Long-lived reconnect / replay-buffer correctness under network
+  flap on mobile.
+- Mobile background → foreground lifecycle, doze, low-memory kill,
+  push-driven wake — `tauri:android:dev` and the `relayterm-mobile`
+  background-session model remain unverified per
+  [`docs/deployment/tauri-local-build.md`](./tauri-local-build.md)
+  "Mobile / Android — runtime caveats".
+- Tauri release-channel signing / Play Store / AAB — Phase 4+ in
+  [`docs/deployment/tauri-ci-release-plan.md`](./tauri-ci-release-plan.md);
+  the verified APK is the debug, unsigned, universal one only.
+- Recording surface. `RELAYTERM_TERMINAL_RECORDING__ENABLED=false`
+  on this slot per `.env`.
+- "Change server" runtime click on the Android shell (the affordance
+  is shipped on the Connecting splash and pinned by the
+  `Change Server reset flow` block in
+  [`apps/web/tests/backendHandoff.test.ts`](../../apps/web/tests/backendHandoff.test.ts);
+  the picker rendered directly on this fresh install so the
+  Connecting splash + reset path was not exercised).
+
+Drift worth folding back later (non-blocking):
+
+- This runbook's §8 ("Tauri desktop smoke") is desktop-specific.
+  Now that the Android bundled handoff + login halves are
+  end-to-end-verified against HTTPS staging, an "§8.X — Tauri
+  Android smoke" companion section (or an explicit "the §8 walk
+  applies symmetrically on Android via `adb install -r` + the
+  picker; same expectations, same redaction sweep") is a candidate
+  edit. Not in scope for this run.
+- **Operator-UX caveat: subaddressed bootstrap email + Android
+  software keyboard.** The bootstrap user on this slot uses a `+`
+  tag (`staging+throwaway-DATETIME@example.com`); on at least
+  Samsung One UI's default keyboard, the `+` lives on a secondary
+  symbols layer and is easy to miss / mistype as `-` while typing
+  on a phone. First sign-in attempt from the device landed
+  `staging-throwaway-...` and surfaced
+  `Sign in failed: invalid credentials` (the runbook's expected
+  reject for a wrong-credentials branch — the throttler key uses
+  `normalize_login_identifier`, so a misspelled email keys a
+  *different* bucket and the correct address is unaffected on the
+  next attempt). Recovery used `adb shell input text` with
+  `KEYCODE_PLUS` (81) and `KEYCODE_AT` (77) splits to feed the
+  literal `+` and `@` past the IME's shell layer. Worth surfacing
+  in a future runbook edit because every operator who types a
+  `+`-tagged staging email on a phone will hit the same trap; a
+  trivial mitigation is to bootstrap staging users without `+`
+  subaddressing (keep `-` separator only). Not in scope for this
+  run.
+
 ---
 
 ## See also
