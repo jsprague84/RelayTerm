@@ -66,6 +66,11 @@
     storage?: BackendConfigStorage;
     /** Override the navigation target for tests. */
     navigation?: NavigationTarget;
+    /** Override the WebView's current page origin for tests. Defaults
+     * to `window.location.origin`. Read once at component init so the
+     * same-origin short-circuit (`already_at_backend`) is stable
+     * across phase recomputes. */
+    currentOrigin?: string;
     /** Delay (ms) before navigation is initiated. Defaults to 0 — the
      * timer fires on the next event-loop tick so the Connecting splash
      * mounts before the WebView reloads. Tests inject a positive value
@@ -83,6 +88,9 @@
     navigation = (typeof window !== "undefined"
       ? window.location
       : undefined) as NavigationTarget | undefined,
+    currentOrigin = typeof window !== "undefined"
+      ? window.location.origin
+      : "",
     navigationDelayMs = 0,
   }: Props = $props();
 
@@ -94,12 +102,13 @@
     // the slice rests on (design § 13). Falling through to `picker`
     // would mount `TauriBackendBootstrap` without a storage backing.
     if (storage === undefined) return { kind: "passthrough" };
-    const decision = decideHandoff({ isTauriBootstrapEnabled, storage });
-    if (decision.kind === "show_picker") {
-      return decision.reason === "not_tauri_runtime"
-        ? { kind: "passthrough" }
-        : { kind: "picker" };
-    }
+    const decision = decideHandoff({
+      isTauriBootstrapEnabled,
+      storage,
+      currentOrigin,
+    });
+    if (decision.kind === "passthrough") return { kind: "passthrough" };
+    if (decision.kind === "show_picker") return { kind: "picker" };
     return { kind: "connecting", targetUrl: decision.targetUrl };
   }
 

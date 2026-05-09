@@ -35,13 +35,32 @@ export interface NavigationTarget {
 }
 
 export type HandoffDecision =
-  /** Bootstrap picker should render. No navigation. */
-  | { kind: "show_picker"; reason: "not_tauri_runtime" | "no_config" }
   /**
-   * Configured backend origin found and validated. The caller (the
-   * gate) is responsible for invoking `navigation.assign(targetUrl)`.
-   * The decision is split from the side effect so tests can inspect
-   * the chosen URL without a navigation actually firing.
+   * Render `children` (AuthGate / AppShell) directly, without picker
+   * or navigation. Two reasons:
+   *  - `not_tauri_runtime` — browser deployment OR `tauri:dev` /
+   *    `tauri:android:dev`. The picker is built-Tauri-shell-only.
+   *  - `already_at_backend` — built Tauri shell where the WebView's
+   *    current origin already byte-equals the saved backend origin.
+   *    Path A's whole point is "the WebView IS at the backend after
+   *    handoff"; once that condition holds, scheduling another
+   *    `window.location.assign(${origin}/)` would loop the page (the
+   *    Tauri WebView injects `__TAURI_INTERNALS__` on remote pages
+   *    too, so the gate runs again at the remote origin and would
+   *    re-fire the handoff against itself). Equality is RFC-6454-byte:
+   *    `localhost` ≠ `127.0.0.1` ≠ `[::1]`, mirroring the
+   *    `relayterm-api` `Origin` allow-list semantics in
+   *    `crates/relayterm-api/src/auth/csrf.rs`.
+   */
+  | { kind: "passthrough"; reason: "not_tauri_runtime" | "already_at_backend" }
+  /** Bootstrap picker should render. No navigation. */
+  | { kind: "show_picker"; reason: "no_config" }
+  /**
+   * Configured backend origin found and validated, and the WebView is
+   * NOT yet at that origin. The caller (the gate) is responsible for
+   * invoking `navigation.assign(targetUrl)`. The decision is split
+   * from the side effect so tests can inspect the chosen URL without
+   * a navigation actually firing.
    */
   | { kind: "navigate"; targetUrl: string; config: BackendConfig };
 
@@ -66,6 +85,18 @@ interface DecideHandoffInput {
   /** Storage to read the persisted config from — usually
    * `window.localStorage` in production, an in-memory shim in tests. */
   storage: BackendConfigStorage;
+  /** WebView's current page origin (e.g. `window.location.origin`).
+   *
+   * Used for the `already_at_backend` short-circuit: when the saved
+   * backend origin byte-equals `currentOrigin`, the WebView is
+   * already at the backend so the gate must NOT re-issue
+   * `window.location.assign(${origin}/)` (that loops). Tests inject
+   * an explicit origin to pin both the bundled origin
+   * (`tauri://localhost`, `http://tauri.localhost`) and the remote
+   * origin without a real WebView. Required (no default) so a
+   * future caller forgetting to wire it fails the type checker
+   * rather than silently re-introducing the loop. */
+  currentOrigin: string;
 }
 
 /**
@@ -73,22 +104,32 @@ interface DecideHandoffInput {
  *
  * Behaviour:
  *  - If the runtime is NOT a built Tauri shell, returns
- *    `{ kind: "show_picker", reason: "not_tauri_runtime" }` — a
- *    sentinel for the caller to render the regular browser path. In
- *    practice the gate uses `isTauriBootstrapEnabled` directly and
- *    only calls this function when that returned `true`; the
- *    `not_tauri_runtime` branch is a safety belt for misuse.
+ *    `{ kind: "passthrough", reason: "not_tauri_runtime" }` — the
+ *    caller renders `children` directly. In practice the gate also
+ *    uses `isTauriBootstrapEnabled` itself; the `not_tauri_runtime`
+ *    branch here is a safety belt for misuse.
  *  - If the runtime is built-Tauri but no valid config exists in
  *    storage, returns `{ kind: "show_picker", reason: "no_config" }`.
  *    Drift on read (canonical-shape mismatch, version mismatch,
  *    invalid origin) collapses to "no config" by way of
  *    `loadBackendConfig`'s drop-on-drift policy (design § 8).
+ *  - If the runtime is built-Tauri AND a valid config exists AND the
+ *    WebView's current origin byte-equals the saved backend origin,
+ *    returns `{ kind: "passthrough", reason: "already_at_backend" }`.
+ *    This breaks a navigate loop that the original Phase C code path
+ *    had: the Tauri v2 WebView injects `__TAURI_INTERNALS__` on
+ *    remote pages too, so the gate runs again at the post-handoff
+ *    origin; without this short-circuit it would schedule another
+ *    `window.location.assign(${origin}/)` and reload the same page
+ *    indefinitely. Origin equality is RFC-6454-byte (mirrors
+ *    `relayterm-api`'s `CsrfGuard` semantics): `localhost` ≠
+ *    `127.0.0.1`, different ports differ, schemes differ.
  *  - Otherwise returns `{ kind: "navigate", targetUrl, config }` for
  *    the caller to assign onto the live `window.location`.
  */
 export function decideHandoff(input: DecideHandoffInput): HandoffDecision {
   if (!input.isTauriBootstrapEnabled()) {
-    return { kind: "show_picker", reason: "not_tauri_runtime" };
+    return { kind: "passthrough", reason: "not_tauri_runtime" };
   }
   const cfg = loadBackendConfig(input.storage);
   if (cfg === null) {
@@ -100,6 +141,9 @@ export function decideHandoff(input: DecideHandoffInput): HandoffDecision {
   const validation = validateBackendOrigin(cfg.backendOrigin);
   if (!validation.ok || validation.origin !== cfg.backendOrigin) {
     return { kind: "show_picker", reason: "no_config" };
+  }
+  if (cfg.backendOrigin === input.currentOrigin) {
+    return { kind: "passthrough", reason: "already_at_backend" };
   }
   return {
     kind: "navigate",
