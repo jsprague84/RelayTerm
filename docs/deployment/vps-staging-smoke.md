@@ -280,9 +280,14 @@ sed -i '/^RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN=/d' .env
 docker compose up -d --no-deps relayterm-backend
 ```
 
-A subsequent `POST /api/v1/auth/bootstrap` now returns `409
-already_bootstrapped` (or `503` if the token is unset) — both are
-safe.
+A subsequent `POST /api/v1/auth/bootstrap` now rejects: with the
+token unset and the backend recreated, the observed reject is `401
+unauthorized` (any submitted token cannot match an unset
+configuration). With the token still set but a first user already
+present, the reject is `409 already_bootstrapped`. `503` shows up
+if the route can't reach the bootstrap service at all (token
+unset *and* misconfigured). All three are safe — the route is no
+longer mintable by a stranger.
 
 ---
 
@@ -308,19 +313,46 @@ Do this on a developer workstation, not on the VPS.
    # See docs/deployment/tauri-local-build.md.
    ```
 
-2. Wipe any stale per-app WebKit cache from a previous local-stack
-   smoke (the WebKitGTK cache + nginx `Cache-Control: immutable`
-   gotcha — see Encountered Lessons 2026-05-09):
+2. (Recommended on the same workstation that ran a previous
+   local-stack smoke against `:main`.) Evict the per-app WebKit HTTP
+   cache so the desktop WebView re-fetches the just-deployed staging
+   bundle instead of replaying a hot-swapped local-stack bundle from
+   cache. This is the WebKitGTK cache + nginx `Cache-Control:
+   immutable` gotcha (Encountered Lesson 2026-05-09). Optional if
+   you are launching from a workstation that has never built or run
+   the desktop shell against another origin:
 
    ```sh
-   rm -rf ~/.local/share/cc.js-node.relayterm.desktop/{WebKitCache,CacheStorage,localstorage}
+   # Caches only — preserves localStorage so the "Change Server"
+   # affordance in step 4 has a saved config to switch FROM.
+   rm -rf ~/.local/share/cc.js-node.relayterm.desktop/{WebKitCache,CacheStorage}
    ```
 
-3. Launch the bundled binary. The bundled shell shows the bootstrap
-   picker (because `localStorage` is empty after step 2).
+3. Launch the bundled binary. Two valid entry states from here — the
+   right one depends on what the bundled shell already has saved:
 
-4. Pick **Change Server** and enter
-   `https://relayterm-staging.js-node.cc`.
+   - **Has a saved config** (e.g. a previous local-stack smoke saved
+     `relayterm.backend-config.v1`): the shell renders the
+     `Connecting…` splash and auto-hands off to that prior origin.
+     Click **Change Server** on the splash before the navigation
+     fires (the click cancels the pending navigation timer and
+     clears the saved config — pinned by the `Change Server reset
+     flow` block in `apps/web/tests/backendHandoff.test.ts`). The
+     picker re-renders. **If the auto-navigation fires before you
+     click** (the timer is short and the saved origin may be a
+     now-dead local-stack URL like `http://localhost:8081`, in
+     which case the WebView lands on a "Could not connect to
+     127.0.0.1: Connection refused" page): kill the shell, also
+     wipe `~/.local/share/cc.js-node.relayterm.desktop/localstorage`
+     so the saved config is gone, and relaunch — the picker now
+     renders directly with no race.
+   - **No saved config** (fresh install, or you also wiped
+     `~/.local/share/cc.js-node.relayterm.desktop/localstorage` in
+     step 2): the picker renders directly. There is no `Connecting…`
+     splash and no **Change Server** button to look for.
+
+4. In the picker input ("Connect to RelayTerm Server"), enter
+   `https://relayterm-staging.js-node.cc` and press **Connect**.
 
 5. The handoff navigates the WebView to that origin. Expect the SPA
    to load, the configured-backend gate to pass (the picker's
@@ -396,6 +428,10 @@ Staging tracks `:main` by default. To pin a known-good earlier
 commit while you investigate a `:main` regression:
 
 ```sh
+# Stop the running backend BEFORE applying migrations, so the live
+# backend never queries against an in-progress schema swap. Postgres
+# stays up.
+docker compose stop relayterm-backend relayterm-web
 sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=sha-abc1234/' .env
 docker compose pull
 docker compose --profile migrate run --rm relayterm-migrate
@@ -465,6 +501,98 @@ and re-stood-up correctly:
       production hostname, never a user-facing domain.
 - [ ] Backend logs greppable for redaction sentinels return clean
       (§8 step 8).
+
+---
+
+## 12. Verification log
+
+A short, append-only record of when this runbook was actually walked
+end-to-end against the live VPS slot. Each entry pins what was
+verified, what was deferred, and any drift between the runbook and
+observed behaviour worth folding into the next iteration.
+
+### 2026-05-09 · first end-to-end staging smoke
+
+**VPS host:** `cloud-edge` (`192.168.3.12`).
+**Compose project:** `relayterm-staging`. **Image tag:** `:main`
+(`relayterm-backend`, `relayterm-backend-migrate`, `relayterm-web`,
+all built from the same CI commit).
+**Origin:** `https://relayterm-staging.js-node.cc`. **Cert:** Cloudflare
+DNS-01, valid; HTTP/2 termination via host Traefik.
+
+Verified:
+
+- `docker compose config` rendered clean (no published Postgres /
+  backend ports; web on `proxy` + `relayterm-staging-internal`;
+  Traefik labels target `Host(\`relayterm-staging.js-node.cc\`)` with
+  `secure-chain@file` and port 80; auth envelope is `production`).
+- 21 sqlx migrations applied via the one-shot `relayterm-migrate`
+  container; no manual schema touch.
+- HTTPS reachability gate (§7.3): `/` → 200, `/healthz` → 200 JSON,
+  `/api/v1/auth/me` → 401 JSON, no redirect to a different host, no
+  `Set-Cookie`, HSTS / CSP / referrer-policy headers all sourced from
+  `secure-chain@file`.
+- Throwaway bootstrap (§7.4) → `201 Created` user record (no
+  `password`, `password_hash`, `encrypted_private_key`, or
+  `private_key` field on the wire). Bootstrap window closed (§7.5).
+- Tauri desktop bundled-shell path-A handoff (§8): picker accepted
+  the staging URL, the WebView navigated, the SPA loaded, login
+  rendered, and login with the throwaway user succeeded.
+- Optional terminal-attach smoke (§8 step 7): a throwaway Alpine +
+  openssh-server container on `relayterm-staging-internal` accepted
+  a managed RelayTerm SSH identity (ed25519, generated in the vault).
+  `host-key-preflight` captured the host key; `trust-host-key`
+  pinned it; `auth-check` returned `authentication_succeeded`. A
+  GUI attach from the desktop shell allocated a PTY through Traefik
+  via the `/api/v1/terminal-sessions/{id}/ws` upgrade and ran
+  `echo relayterm-vps-staging-smoke`, `whoami`, `pwd`. Detach was
+  clean. Throwaway container was torn down at end of run.
+- Redaction sentinel sweep across 4 000 lines of backend logs
+  (`relayterm_session=…`, `encrypted_private_key`, `data_b64`,
+  `REDACT-MARKER`): zero hits.
+
+Deferred (intentional non-goals for this run):
+
+- Production hostname / production credentials / real production
+  SSH identities — staging is throwaway by construction (§1).
+- Long-lived reconnect / replay-buffer correctness under network
+  flap.
+- Android staging smoke. Mobile shell did not exercise the staging
+  origin in this window.
+- Tauri release-channel signing / Play Store / AppImage. Desktop
+  shell ran from the locally-built `target/release/relayterm-desktop`.
+- Recording surface. `RELAYTERM_TERMINAL_RECORDING__ENABLED=false`
+  for this slot per `.env`.
+
+Drift worth folding back later (non-blocking):
+
+- §7.5 ("Close the bootstrap window") claims a subsequent
+  `POST /api/v1/auth/bootstrap` returns `409 already_bootstrapped`
+  or `503`. With the token unset in `.env` and the backend
+  recreated, the observed reject code is `401 unauthorized` —
+  still safe (a stranger cannot bootstrap), but the documented
+  status set should include `401`. Address in the next runbook
+  edit; not blocking for this run.
+- §3 / §4 show the `.env` colocated with the Compose file. The
+  VPS convention here split them: `docker-compose.yml` lives at
+  `/home/ubuntu/docker-compose/relayterm-staging/`, `.env` at
+  `/home/ubuntu/docker/relayterm-staging/`. All compose calls in
+  this run used `--env-file /home/ubuntu/docker/relayterm-staging/.env`
+  to bridge. The split mirrors the existing per-service convention
+  on this host (compose defs vs persistent state). Folding the
+  split into the runbook (or explicitly noting both layouts as
+  acceptable) is a candidate edit.
+- §8 step 2 recommends wiping `WebKitCache,CacheStorage` only,
+  preserving `localStorage` so the **Change Server** affordance is
+  exercisable. In practice, when the saved `relayterm.backend-config.v1`
+  points at a now-dead local-stack origin (here:
+  `http://localhost:8081`), the auto-handoff timer fires before a
+  human can click **Change Server** and the WebView ends at a
+  `Could not connect to 127.0.0.1: Connection refused` page. The
+  recovery path (kill shell, also wipe `localstorage`, relaunch →
+  picker renders directly) is the documented fallback in step 2's
+  "No saved config" sub-bullet, but the timing race against the
+  splash auto-navigation deserves a louder callout.
 
 ---
 

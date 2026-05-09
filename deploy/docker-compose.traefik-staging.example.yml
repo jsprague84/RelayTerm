@@ -161,6 +161,13 @@ services:
       - "traefik.enable=true"
       # Pin the network Traefik should use to talk to this service —
       # required when a service is attached to multiple networks.
+      # NOTE: this differs intentionally from the value in
+      # `deploy/docker-compose.example.yml` (which uses
+      # `relayterm-internal`) and from `docs/deployment/docker-compose.md`
+      # §3.1. That generic example assumes the operator joins Traefik
+      # to the internal compose network manually; on this VPS the host
+      # already runs Traefik with an external `proxy` network, so the
+      # web container joins both and Traefik talks to it over `proxy`.
       - "traefik.docker.network=proxy"
       # Router. The router and service share the name
       # `relayterm-staging` so labels stay readable.
