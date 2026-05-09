@@ -22,6 +22,7 @@ pub(crate) struct Config {
     pub(crate) auth: AuthConfig,
     pub(crate) vault: VaultConfig,
     pub(crate) terminal_recording: TerminalRecordingConfig,
+    pub(crate) terminal_sessions: TerminalSessionsConfig,
 }
 
 #[derive(Debug)]
@@ -468,6 +469,56 @@ pub(crate) mod terminal_recording_defaults {
     pub(crate) const CLEANUP_BATCH_SIZE_MAX: u32 = 10_000;
 }
 
+/// Live-terminal-session orchestration configuration.
+///
+/// Currently exposes a single operator knob: how long a still-allocated
+/// SSH PTY is allowed to linger after every client has detached, before
+/// the orchestrator reaps it.
+///
+/// **Scope is deliberately narrow.** This is a *short-term reconnect
+/// grace window* on a still-live PTY held by the running backend — it
+/// is NOT durable session resume. A backend restart drops every live
+/// PTY regardless of this setting. Long-term persistent sessions
+/// (`tmux`/`screen`-style resurrection across restarts, days-long
+/// retention, durable shell state) are a separate, future
+/// architecture; bumping this value past minutes does not move toward
+/// that — it just keeps remote shells pinned alive longer on this
+/// process. Higher values consume backend RAM, file descriptors, and
+/// the SSH server's PTY budget for the full duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalSessionsConfig {
+    /// Lifetime of a detached live PTY before reap, in whole seconds.
+    /// Bounded `5..=86_400` by [`Config::validate_terminal_sessions`].
+    /// `0` and out-of-range values are a hard boot failure rather than
+    /// a silent fall-through to the default — operator intent and
+    /// runtime state stay aligned.
+    pub(crate) detached_live_pty_ttl_seconds: u64,
+}
+
+/// Numeric defaults / bounds for [`TerminalSessionsConfig`]. Pulled into
+/// constants so the test suite, the example TOML files, and the docs
+/// reference the same source of truth.
+pub(crate) mod terminal_sessions_defaults {
+    /// Default detached-live-PTY TTL. Matches the historical hard-coded
+    /// `relayterm_terminal::DETACHED_LIVE_PTY_TTL` value so a deploy
+    /// that does not touch this knob behaves identically to the
+    /// pre-config baseline.
+    pub(crate) const DETACHED_LIVE_PTY_TTL_SECONDS: u64 = 30;
+    /// Lower bound for the detached-live-PTY TTL. Below this, the
+    /// reconnect grace window is shorter than a typical browser tab
+    /// reload + handoff round-trip, defeating the purpose. `0` is
+    /// rejected separately as "always reap immediately", which would
+    /// surprise every reconnect path.
+    pub(crate) const DETACHED_LIVE_PTY_TTL_SECONDS_MIN: u64 = 5;
+    /// Upper bound for the detached-live-PTY TTL (24h). Anything
+    /// above this almost always indicates a unit confusion (minutes
+    /// vs. seconds), and "live SSH PTY held open for >1 day after
+    /// disconnect" is far past the *short-term reconnect grace*
+    /// scope of this knob — durable persistent sessions are a
+    /// separate, future architecture.
+    pub(crate) const DETACHED_LIVE_PTY_TTL_SECONDS_MAX: u64 = 24 * 60 * 60;
+}
+
 impl Config {
     pub(crate) fn load() -> anyhow::Result<Self> {
         let mut cfg = Self::defaults();
@@ -543,6 +594,10 @@ impl Config {
                         terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS,
                     batch_size: terminal_recording_defaults::CLEANUP_BATCH_SIZE,
                 },
+            },
+            terminal_sessions: TerminalSessionsConfig {
+                detached_live_pty_ttl_seconds:
+                    terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
             },
         }
     }
@@ -716,6 +771,18 @@ impl Config {
             cfg.terminal_recording.cleanup.batch_size = v
                 .parse()
                 .context("RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE")?;
+        }
+        // Live-terminal-session orchestration. Same strict-parse posture
+        // as the recording scalars above: a malformed value is a hard
+        // boot failure rather than a silent fall-through to default, so
+        // operator intent and runtime state stay aligned. The bounds
+        // (positive, in `5..=86_400`) are enforced separately by
+        // `validate_terminal_sessions` after merge — this stage only
+        // checks that the input parses as a `u64`.
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS") {
+            cfg.terminal_sessions.detached_live_pty_ttl_seconds = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS")?;
         }
         Ok(())
     }
@@ -1072,6 +1139,54 @@ impl Config {
         Ok(())
     }
 
+    /// Validate the live-terminal-session orchestration config at boot.
+    ///
+    /// Pure inspection: no filesystem reads, no key consumption, no
+    /// effect on running state. The detached-live-PTY TTL must be
+    /// positive and sit inside the documented `5..=86_400` band — see
+    /// [`terminal_sessions_defaults`] for the rationale on each bound.
+    /// Error messages name the failing field and the rejected numeric
+    /// value (the value is not secret-shaped) but never echo unrelated
+    /// secret-bearing config fields.
+    pub(crate) fn validate_terminal_sessions(&self) -> anyhow::Result<()> {
+        let ttl = self.terminal_sessions.detached_live_pty_ttl_seconds;
+        if ttl == 0 {
+            bail!(
+                "terminal_sessions.detached_live_pty_ttl_seconds must be greater than 0; a \
+                 zero TTL would reap every detached PTY immediately, defeating the reconnect \
+                 grace window"
+            );
+        }
+        if ttl < terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MIN {
+            bail!(
+                "terminal_sessions.detached_live_pty_ttl_seconds = {got} must be >= {min}s; \
+                 sub-{min}s windows are shorter than a typical reconnect round-trip",
+                got = ttl,
+                min = terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MIN,
+            );
+        }
+        if ttl > terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MAX {
+            bail!(
+                "terminal_sessions.detached_live_pty_ttl_seconds = {got} exceeds the hard cap \
+                 of {max}s (24h); values above this almost always indicate a unit confusion \
+                 (minutes vs. seconds), and durable persistent sessions are a separate, \
+                 future architecture",
+                got = ttl,
+                max = terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MAX,
+            );
+        }
+        Ok(())
+    }
+
+    /// Detached-live-PTY TTL as a `Duration`. Production callers pass
+    /// the result into [`relayterm_terminal::TerminalSessionManager::with_detach_ttl`].
+    /// Assumes [`Self::validate_terminal_sessions`] has already passed —
+    /// the value is post-validation, in-range, and a `u64`-as-seconds
+    /// conversion never overflows for any value the validator accepts.
+    pub(crate) fn detached_live_pty_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.terminal_sessions.detached_live_pty_ttl_seconds)
+    }
+
     /// Resolve the configured master key, or return `None` when the vault
     /// is intentionally disabled. Consumes the configured key sources so
     /// the raw base64 string does not linger on the heap for the process
@@ -1118,6 +1233,7 @@ struct FileConfig {
     auth: Option<FileAuthConfig>,
     vault: Option<FileVaultConfig>,
     terminal_recording: Option<FileTerminalRecordingConfig>,
+    terminal_sessions: Option<FileTerminalSessionsConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1257,6 +1373,14 @@ struct FileTerminalRecordingCompressionConfig {
     mode: Option<TerminalRecordingCompressionMode>,
 }
 
+/// File-side mirror of [`TerminalSessionsConfig`]. No secret material —
+/// a derived `Debug` is fine. Each field is `Option` so the merge step
+/// only overrides what the operator explicitly set.
+#[derive(Debug, Default, Deserialize)]
+struct FileTerminalSessionsConfig {
+    detached_live_pty_ttl_seconds: Option<u64>,
+}
+
 impl FileConfig {
     fn merge_into(self, cfg: &mut Config) {
         if let Some(s) = self.server
@@ -1356,6 +1480,11 @@ impl FileConfig {
                 }
             }
         }
+        if let Some(s) = self.terminal_sessions
+            && let Some(ttl) = s.detached_live_pty_ttl_seconds
+        {
+            cfg.terminal_sessions.detached_live_pty_ttl_seconds = ttl;
+        }
     }
 }
 
@@ -1410,6 +1539,10 @@ mod tests {
                         terminal_recording_defaults::CLEANUP_SWEEP_INTERVAL_SECONDS,
                     batch_size: terminal_recording_defaults::CLEANUP_BATCH_SIZE,
                 },
+            },
+            terminal_sessions: TerminalSessionsConfig {
+                detached_live_pty_ttl_seconds:
+                    terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
             },
         }
     }
@@ -2793,5 +2926,133 @@ batch_size = 100
         assert_eq!(cfg.terminal_recording.cleanup.batch_size, 100);
         cfg.validate_terminal_recording()
             .expect("TOML round-trip must validate");
+    }
+
+    // --- Terminal sessions (detached-live-PTY TTL) ------------------
+
+    #[test]
+    fn terminal_sessions_default_ttl_matches_pre_config_constant() {
+        // The default MUST match `relayterm_terminal::DETACHED_LIVE_PTY_TTL`
+        // so a deploy that does not touch this knob behaves identically
+        // to the pre-config baseline. Pinning the seconds value here is
+        // sufficient — the wrapper-side test in
+        // `crates/relayterm-terminal/tests/manager.rs::detach_ttl_default_matches_pinned_constant`
+        // re-asserts the manager-level invariant.
+        let cfg = Config::defaults();
+        assert_eq!(
+            cfg.terminal_sessions.detached_live_pty_ttl_seconds,
+            terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
+        );
+        assert_eq!(
+            cfg.terminal_sessions.detached_live_pty_ttl_seconds,
+            relayterm_terminal::DETACHED_LIVE_PTY_TTL.as_secs(),
+        );
+        cfg.validate_terminal_sessions()
+            .expect("default TTL must validate");
+        assert_eq!(
+            cfg.detached_live_pty_ttl(),
+            relayterm_terminal::DETACHED_LIVE_PTY_TTL,
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_env_override_parses() {
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS",
+                "300",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(cfg.terminal_sessions.detached_live_pty_ttl_seconds, 300);
+        cfg.validate_terminal_sessions().unwrap();
+        assert_eq!(
+            cfg.detached_live_pty_ttl(),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_toml_round_trip() {
+        let raw = r#"
+[terminal_sessions]
+detached_live_pty_ttl_seconds = 600
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert_eq!(cfg.terminal_sessions.detached_live_pty_ttl_seconds, 600);
+        cfg.validate_terminal_sessions()
+            .expect("TOML round-trip must validate");
+    }
+
+    #[test]
+    fn terminal_sessions_env_invalid_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS",
+                "not-a-number",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_zero_ttl_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.detached_live_pty_ttl_seconds = 0;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("detached_live_pty_ttl_seconds") && msg.contains("greater than 0"),
+            "zero TTL must be rejected with a clear message: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_below_min_ttl_rejected() {
+        let mut cfg = empty_cfg();
+        // Just under the documented floor.
+        cfg.terminal_sessions.detached_live_pty_ttl_seconds =
+            terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MIN - 1;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("detached_live_pty_ttl_seconds") && msg.contains(">="),
+            "below-min TTL must name the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_above_max_ttl_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.detached_live_pty_ttl_seconds =
+            terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MAX + 1;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("detached_live_pty_ttl_seconds") && msg.contains("hard cap"),
+            "above-max TTL must name the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_min_and_max_boundaries_validate() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.detached_live_pty_ttl_seconds =
+            terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MIN;
+        cfg.validate_terminal_sessions().expect("min boundary ok");
+        cfg.terminal_sessions.detached_live_pty_ttl_seconds =
+            terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MAX;
+        cfg.validate_terminal_sessions().expect("max boundary ok");
     }
 }

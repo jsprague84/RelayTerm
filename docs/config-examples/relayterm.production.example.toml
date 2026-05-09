@@ -193,3 +193,38 @@ enabled = true
 # sweep_interval_seconds  = 0        # 0 = no periodic schedule;
 #                                    # otherwise 60..=604800
 # batch_size              = 100      # 1..=10000; sessions per tick
+
+# Live-terminal-session orchestration.
+#
+# Currently exposes one operator knob: how long a still-live SSH PTY
+# lingers after the last client detaches before the orchestrator reaps
+# it. Reattach within this window resumes the same shell (sequence-
+# number replay); outside it the PTY closes and the session id
+# surfaces a 409 from the WebSocket upgrade gate.
+#
+# SCOPE — read this before bumping the value. This is a SHORT-TERM
+# RECONNECT GRACE WINDOW on a still-live PTY held by the running
+# backend. It is NOT:
+#   * durable session resume across backend restart (a restart drops
+#     every live PTY regardless of this value);
+#   * tmux/screen-style persistent shells (a separate, future
+#     architecture);
+#   * terminal-recording replay (covered by the
+#     `[terminal_recording]` section above and `docs/spec/recording.md`).
+#
+# Operational impact of higher values: the backend holds the russh
+# Channel, the broadcast/replay buffer, and any associated file
+# descriptors for the full TTL after the last client disconnects. The
+# upstream SSH server also sees the connection as live for the same
+# window. Tune to your deployment's reconnect expectations and PTY
+# budget — a low-traffic single-tenant slot can afford 600–1800s; a
+# busy multi-tenant slot likely should not.
+#
+# Default: 30s (matches the historical hard-coded value). Bounded
+# 5..=86400 (5s..24h). 0 and out-of-range values are a hard boot
+# failure.
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS
+#
+# [terminal_sessions]
+# detached_live_pty_ttl_seconds = 30

@@ -1693,6 +1693,44 @@ async fn detach_ttl_default_matches_pinned_constant() {
     assert_eq!(mgr.detach_ttl(), DETACHED_LIVE_PTY_TTL);
 }
 
+#[tokio::test]
+async fn detach_ttl_custom_value_is_used_for_scheduled_close() {
+    // The operator-configurable knob lands its value through
+    // `with_detach_ttl`. Verify the manager both reports the configured
+    // value AND uses it when computing the close deadline carried by
+    // `DetachInfo`. Pinned because the wiring crosses three layers
+    // (config → main.rs → manager) and a regression that quietly fell
+    // back to the constant would otherwise only surface as a gentle
+    // operator surprise.
+    let custom = std::time::Duration::from_secs(900);
+    let (mgr, _) = build_manager_with_short_ttl(custom);
+    assert_eq!(mgr.detach_ttl(), custom);
+
+    let owner = UserId::new();
+    let session = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _fixture) = fake_start();
+    mgr.start_live_pty(owner, session.id, start).await.unwrap();
+    let attachment = mgr
+        .attach_session(attach_req(owner, session.id))
+        .await
+        .unwrap()
+        .attachment;
+    let outcome = mgr
+        .detach_attachment(owner, session.id, attachment.id, None)
+        .await
+        .unwrap();
+    let info = outcome
+        .detached_pending_close
+        .expect("final detach must schedule a TTL close");
+    let span = info.expires_at - info.detached_at;
+    let span_secs = span.num_seconds();
+    assert_eq!(
+        span_secs,
+        custom.as_secs() as i64,
+        "scheduled close deadline must reflect the configured TTL ({custom:?}); got {span_secs}s",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_of_manager_aborts_ttl_close_task() {
     // Manager drop releases the Arc; the spawned TTL task holds only a

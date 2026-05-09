@@ -45,10 +45,19 @@ async fn main() -> anyhow::Result<()> {
     // staged plan and what each later slice will add.
     cfg.validate_terminal_recording()
         .context("validate terminal recording config")?;
+    // Live-terminal-session orchestration (currently: detached-live-PTY
+    // TTL only). Pure-shape validation; runs alongside the auth and
+    // recording validators so a misconfigured deploy fails fast before
+    // the listener binds. The bound is `5..=86_400` seconds — see
+    // `config::terminal_sessions_defaults` for rationale.
+    cfg.validate_terminal_sessions()
+        .context("validate terminal session config")?;
     info!(
         addr = %cfg.server.bind,
         auth_mode = cfg.auth.mode.as_str(),
         recording_enabled = cfg.terminal_recording.enabled,
+        detached_live_pty_ttl_seconds =
+            cfg.terminal_sessions.detached_live_pty_ttl_seconds,
         "relayterm-backend starting",
     );
 
@@ -237,10 +246,18 @@ async fn main() -> anyhow::Result<()> {
     // refuse to start in that combination so an operator who configured
     // encryption.required does not silently get plaintext.
     let recording_runtime = build_recording_runtime(&cfg, &db)?;
+    // Detached-live-PTY TTL: operator-configurable since this slice;
+    // default matches `relayterm_terminal::DETACHED_LIVE_PTY_TTL` so a
+    // deploy that does not touch the knob behaves identically to the
+    // pre-config baseline. NOT durable session resume — a backend
+    // restart drops every live PTY regardless. See
+    // `config::TerminalSessionsConfig` for the operator contract.
+    let detach_ttl = cfg.detached_live_pty_ttl();
     let terminal_sessions = {
-        let mut mgr = TerminalSessionManager::new(
+        let mut mgr = TerminalSessionManager::with_detach_ttl(
             Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
             Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+            detach_ttl,
         );
         if let Some(runtime) = recording_runtime {
             mgr = mgr.with_recording(runtime);

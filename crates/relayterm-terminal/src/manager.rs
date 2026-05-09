@@ -78,19 +78,27 @@ pub const LIVE_PTY_ATTACH_MESSAGE: &str =
 /// missing bytes; the future replay slice will close the gap.
 const ATTACHMENT_FANOUT_CAPACITY: usize = 256;
 
-/// How long a live PTY is allowed to linger after the last client
-/// detaches before the orchestrator tears it down.
+/// Default for how long a live PTY is allowed to linger after the last
+/// client detaches before the orchestrator tears it down.
 ///
-/// **Conservative on purpose.** Detached persistence is a reconnect
-/// convenience — not durability — and an unbounded value would let a
-/// forgotten tab pin a remote shell open indefinitely. Reconnect within
-/// this window cancels the scheduled close; outside it the PTY closes
-/// and a fresh attach to the same session id surfaces the standard
-/// `409 conflict { entity: "terminal_session" }` from the upgrade gate.
+/// **Conservative on purpose.** Detached persistence is a *short-term
+/// reconnect grace window* on a still-live PTY held by the running
+/// backend — NOT durable session resume. A backend restart drops every
+/// live PTY regardless; long-term persistent sessions
+/// (`tmux`/`screen`-style resurrection) are a separate, future
+/// architecture. Reconnect within this window cancels the scheduled
+/// close; outside it the PTY closes and a fresh attach to the same
+/// session id surfaces the standard `409 conflict { entity:
+/// "terminal_session" }` from the upgrade gate.
 ///
-/// Wire-stable enough that the diagnostic UI surfaces it; if this needs
-/// to become operator-tunable, route it through `AppState` rather than
-/// changing the constant in place.
+/// Operator-tunable via `terminal_sessions.detached_live_pty_ttl_seconds`
+/// in the backend config (env:
+/// `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS`,
+/// bounded `5..=86_400`). The backend wires the configured value
+/// through [`TerminalSessionManager::with_detach_ttl`]; this constant
+/// is the value [`TerminalSessionManager::new`] uses when no explicit
+/// TTL is supplied (test convenience + the documented default the
+/// config layer mirrors).
 pub const DETACHED_LIVE_PTY_TTL: Duration = Duration::from_secs(30);
 
 /// In-memory status for a runtime registry entry.

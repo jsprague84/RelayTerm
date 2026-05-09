@@ -798,14 +798,28 @@ Drift worth folding back later (non-blocking):
   Sessions-list-render round-trip exceeds 30 s on a warm
   cache and a still-valid cookie — i.e. the absolute fastest
   path. Cross-navigation Sessions-list reconnect is therefore
-  not a viable restart-recovery primitive at the current TTL.
-  Either the TTL needs to be operator-configurable per
-  deployment (the spec already hints at promotion to
-  `AuthRoutesConfig` for the cookie TTL — the same shape
-  could apply to `DETACHED_LIVE_PTY_TTL`), or the runbook
-  should explicitly call out "kill+relaunch loses the
-  session" as a documented limitation. Both are out of scope
-  for this docs-only slice.
+  not a viable restart-recovery primitive at the **default**
+  TTL. **Resolved (follow-up slice):** the detached-live-PTY
+  TTL is now operator-configurable —
+  `terminal_sessions.detached_live_pty_ttl_seconds` (env
+  `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS`),
+  default **30 s**, bounded **5..=86 400** (5 s..24 h). Slots
+  that need desktop / mobile reconnect after app restart can
+  set 300–1800 s; resource-constrained slots can keep the
+  default. **Important** — this is a *short-term reconnect
+  grace window* on a still-live PTY held by the running
+  backend; it does NOT make sessions survive a backend
+  restart, and it is NOT durable shell persistence. Higher
+  values consume backend RAM, file descriptors, and the SSH
+  server's PTY budget for the full window. Long-term
+  persistent sessions (`tmux`/`screen`-style resurrection
+  across restarts) remain a separate, future architecture
+  and are explicitly **not** delivered by this knob. See
+  `docs/config-examples/relayterm.production.example.toml`,
+  `deploy/relayterm.env.example`, and the
+  "detached-live-PTY TTL is now operator-configurable"
+  follow-up under
+  `docs/spec/tauri-runtime-backend-url.md` § 11 Phase E.
 - **Bundled-SPA cache vs. post-handoff SPA freshness.** The
   desktop binary used here was the 2026-05-08 build; the
   post-handoff SPA was fetched fresh from staging. The

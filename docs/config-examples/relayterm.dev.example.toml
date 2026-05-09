@@ -126,3 +126,29 @@ enabled = false
 # periodic_sweep_enabled  = false    # default false; flip to true to run Stage B
 # sweep_interval_seconds  = 0        # 0 = no periodic schedule; or 60..=604800
 # batch_size              = 100      # 1..=10000; sessions per sweep iteration
+
+# Live-terminal-session orchestration. Currently exposes one operator
+# knob: how long a still-live SSH PTY lingers after the last client
+# detaches before the orchestrator reaps it. Reattach within this
+# window resumes the same shell; outside it the PTY closes and the
+# session id surfaces a 409 from the WebSocket upgrade gate.
+#
+# This is a SHORT-TERM RECONNECT GRACE WINDOW on a still-live PTY held
+# by the running backend — NOT durable session resume. A backend
+# restart drops every live PTY regardless of this value. Long-term
+# persistent sessions (tmux/screen-style resurrection across restarts,
+# days-long shell retention) are a separate, future architecture;
+# bumping this value past minutes does not move toward that — it just
+# keeps remote shells pinned alive longer on this process. Higher
+# values consume backend RAM, file descriptors, and the SSH server's
+# PTY budget for the full duration.
+#
+# Default: 30s (matches the historical hard-coded value). Bounded
+# 5..=86400 (5s..24h). Use a short value for low-resource deployments;
+# use a longer value such as 300–1800s if desktop/mobile reconnect
+# after app restart is important on this slot.
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS
+#
+# [terminal_sessions]
+# detached_live_pty_ttl_seconds = 30
