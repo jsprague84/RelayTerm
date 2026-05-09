@@ -1,0 +1,191 @@
+# RelayTerm — VPS staging Compose template (Traefik + cloudflare resolver).
+#
+# This file is a template for the js-node.cc VPS staging slot only. It
+# wires `relayterm-web` to the existing host-side Traefik via the
+# external `proxy` network. Postgres and the backend stay on a private
+# internal network; nothing but the web container is reachable from the
+# proxy. There is NO host port mapping — the public ingress is Traefik.
+#
+# Conventions this template assumes (host-side, NOT this repo):
+#   * Traefik is already running on the host.
+#   * It has a `proxy` docker network you join with `external: true`.
+#   * It has an `https` entrypoint terminating TLS with the
+#     `cloudflare` certresolver.
+#   * It has a `secure-chain@file` middleware (HSTS / CSP / sane
+#     defaults) defined in the file provider.
+#   * The deploy host's domain is `js-node.cc`. This staging slot is
+#     pinned to `relayterm-staging.js-node.cc` — deliberately distinct
+#     from the future production hostname.
+#
+# Operator layout (host paths, NOT in git):
+#   /home/ubuntu/docker-compose/relayterm-staging/
+#     docker-compose.yml           (this template, copied)
+#     .env                         (chmod 600; secrets only here)
+#   /home/ubuntu/docker/relayterm-staging/
+#     pgdata/                      (Postgres bind-mount target;
+#                                   alternative to a named volume)
+#
+# Required env (see `relayterm.env.example` for the full contract):
+#   * RELAYTERM_IMAGE_TAG=main              (track branch tip; staging only)
+#   * POSTGRES_USER / _PASSWORD / _DB
+#   * RELAYTERM_AUTH__MODE=production       (production-like envelope)
+#   * RELAYTERM_AUTH__COOKIE_SECURE=true
+#   * RELAYTERM_AUTH__ALLOWED_ORIGINS=https://relayterm-staging.js-node.cc
+#   * RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64
+#   * RELAYTERM_VAULT__ENABLED + RELAYTERM_VAULT__MASTER_KEY_B64
+#   * RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN  (window-only; unset
+#                                                  after bootstrap)
+#
+# First start (from the staging compose dir):
+#   docker login git.js-node.cc
+#   docker compose pull
+#   docker compose --profile migrate run --rm relayterm-migrate
+#   docker compose up -d postgres relayterm-backend relayterm-web
+#
+# Production-mode boot can fail fast if any of the production-auth
+# gates are unsatisfied (allow-list empty, signing key missing, vault
+# key equal to signing key, cookie_secure=false). DO NOT silently flip
+# `RELAYTERM_AUTH__MODE=dev` to "make it boot" — that defeats the
+# point of a production-like staging smoke. Stop and report to the
+# owner instead.
+
+name: relayterm-staging
+
+services:
+  # -------------------------------------------------------------------
+  # Postgres. Internal-only. NEVER add a host port mapping or attach
+  # this service to the `proxy` network.
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+    volumes:
+      - relayterm-staging-pgdata:/var/lib/postgresql/data
+    networks:
+      - relayterm-staging-internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------
+  # One-shot migrations. Pin to the SAME tag as the backend.
+  # -------------------------------------------------------------------
+  relayterm-migrate:
+    profiles: [migrate]
+    image: git.js-node.cc/jsprague/relayterm-backend-migrate:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. main, vX.Y.Z, sha-<short>)}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    networks:
+      - relayterm-staging-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Backend. Internal-only — no host port, not on the `proxy` network.
+  # The web container reverse-proxies `/api/*` and `/healthz` to it.
+  # -------------------------------------------------------------------
+  relayterm-backend:
+    image: git.js-node.cc/jsprague/relayterm-backend:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. main, vX.Y.Z, sha-<short>)}
+    restart: unless-stopped
+    environment:
+      RELAYTERM_SERVER__BIND: 0.0.0.0:8080
+      RELAYTERM_DATABASE__URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RELAYTERM_AUTH__MODE: "${RELAYTERM_AUTH__MODE:-production}"
+      RELAYTERM_AUTH__ALLOWED_ORIGINS: "${RELAYTERM_AUTH__ALLOWED_ORIGINS:?set to https://relayterm-staging.js-node.cc}"
+      RELAYTERM_AUTH__COOKIE_SECURE: "${RELAYTERM_AUTH__COOKIE_SECURE:-true}"
+      RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64: "${RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64:?generate with openssl rand -base64 32}"
+      RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN: "${RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN:-}"
+      RELAYTERM_VAULT__ENABLED: "${RELAYTERM_VAULT__ENABLED:-true}"
+      RELAYTERM_VAULT__MASTER_KEY_B64: "${RELAYTERM_VAULT__MASTER_KEY_B64:?generate with openssl rand -base64 32, must differ from session signing key}"
+      RELAYTERM_TERMINAL_RECORDING__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__ENABLED:-false}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS:-3600}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE:-250}"
+      RUST_LOG: "${RUST_LOG:-relayterm=info,axum=info,sqlx=warn,info}"
+    networks:
+      - relayterm-staging-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1:8080/healthz >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # -------------------------------------------------------------------
+  # Web frontend. The ONLY service on the external `proxy` network.
+  # Traefik routes the public hostname to port 80 of this container
+  # over that network; the internal network carries traffic to the
+  # backend.
+  #
+  # No host port mapping — Traefik is the only ingress. Plain HTTP on
+  # this container is never exposed outside the docker bridge.
+  # -------------------------------------------------------------------
+  relayterm-web:
+    image: git.js-node.cc/jsprague/relayterm-web:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. main, vX.Y.Z, sha-<short>)}
+    restart: unless-stopped
+    environment:
+      RELAYTERM_BACKEND_URL: http://relayterm-backend:8080
+    networks:
+      - relayterm-staging-internal
+      - proxy
+    depends_on:
+      relayterm-backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1/_web_health >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      - "traefik.enable=true"
+      # Pin the network Traefik should use to talk to this service —
+      # required when a service is attached to multiple networks.
+      - "traefik.docker.network=proxy"
+      # Router. The router and service share the name
+      # `relayterm-staging` so labels stay readable.
+      - "traefik.http.routers.relayterm-staging.rule=Host(`relayterm-staging.js-node.cc`)"
+      - "traefik.http.routers.relayterm-staging.entrypoints=https"
+      - "traefik.http.routers.relayterm-staging.tls=true"
+      - "traefik.http.routers.relayterm-staging.tls.certresolver=cloudflare"
+      - "traefik.http.routers.relayterm-staging.service=relayterm-staging"
+      # Host-side `secure-chain@file` middleware. If this chain blocks
+      # the WebSocket upgrade for `/api/v1/terminal-sessions/:id/ws`
+      # OR strips the browser `Origin` (so the backend rejects every
+      # state-change with 403 csrf_origin_mismatch), STOP and report —
+      # do NOT remove the middleware to "make it work."
+      - "traefik.http.routers.relayterm-staging.middlewares=secure-chain@file"
+      - "traefik.http.services.relayterm-staging.loadbalancer.server.port=80"
+
+volumes:
+  relayterm-staging-pgdata:
+
+networks:
+  # Internal, private. Only Postgres + backend + web are attached.
+  relayterm-staging-internal:
+    driver: bridge
+  # External, host-managed. Created by the host's Traefik stack.
+  # We do NOT create or own this network — `external: true` means
+  # `docker compose up` fails fast if it is missing on the host.
+  proxy:
+    external: true
