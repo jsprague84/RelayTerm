@@ -506,10 +506,19 @@ and re-stood-up correctly:
 
 ## 12. Verification log
 
-A short, append-only record of when this runbook was actually walked
+A short, dated record of when this runbook was actually walked
 end-to-end against the live VPS slot. Each entry pins what was
 verified, what was deferred, and any drift between the runbook and
-observed behaviour worth folding into the next iteration.
+observed behaviour worth folding into the next iteration. Existing
+entries are not edited after the fact; later entries cross-reference
+and supersede earlier ones explicitly when needed. Ordering within
+the section is best-effort grouped by date, with same-date runs
+sometimes prepended above earlier runs of the same date when a
+later run depends on an earlier run and a top-down read benefits
+from seeing the dependent context first — readers should rely on
+the explicit `2026-MM-DD · <slug>` headings and the inter-entry
+cross-references (`entry above`, `entry below`) rather than on a
+strict overall ordering rule.
 
 ### 2026-05-09 · first end-to-end staging smoke
 
@@ -593,6 +602,217 @@ Drift worth folding back later (non-blocking):
   picker renders directly) is the documented fallback in step 2's
   "No saved config" sub-bullet, but the timing race against the
   splash auto-navigation deserves a louder callout.
+
+### 2026-05-09 · Android Tauri staging terminal attach smoke
+
+Picks up from the 2026-05-09 Android handoff + login entry below
+(same VPS slot, same image tag, same throwaway bootstrap user, same
+device, no APK rebuild — the existing debug build from the handoff
+slice was reused). Closes the Android-terminal-attach deferred row
+that the 2026-05-09 handoff entry called out as "intentional non-goal
+for this slice". Path A is now verified end-to-end on Android through
+the binary terminal data plane: bundled-shell handoff → login →
+identity / host / profile / preflight / trust / auth-check → WebSocket
+attach → PTY → bash → harmless command round-trip.
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Device:** Samsung Galaxy S10e (`SM-G970U`, codename `beyond0q`,
+serial `R38N500TY3E`) — same physical device + same installed debug
+APK (`cc.js_node.relayterm.mobile.debug`, PID stayed alive across the
+gap between slices).
+**Throwaway SSH target:** `linuxserver/openssh-server:latest`
+container `relayterm-staging-smoke-ssh` joined to
+`relayterm-staging_relayterm-staging-internal` (the same internal
+network the staging backend dials over). Hostname
+`relayterm-staging-smoke-ssh`, sshd port `2222`, **no host port
+published**. User `smoke` (`PUID=1000`, `PGID=1000`,
+`USER_NAME=smoke`, `PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`).
+Auto-generated host keys (RSA / ECDSA / ED25519) at first start; no
+real SSH private key material from any production host. Throwaway
+container; not committed to any image.
+
+**Setup path.** The Android UI was used for the load-bearing surface
+(WebSocket attach + PTY round-trip); the inventory / preflight /
+trust / auth-check setup was driven from the workstation against the
+staging API with a session cookie persisted to a `chmod 600` file
+under `/tmp` and never echoed in any command output or log line.
+Rationale: the inventory CRUD UIs are not Android-specific (the
+desktop smoke already covered them) and copying a long
+`ssh-ed25519 ...` public key off the phone screen onto the SSH
+target's `authorized_keys` is mechanically impractical on a mobile
+keyboard (mirrors the operator-UX caveat from the prior 2026-05-09
+Android handoff entry on subaddressed-email typing). The terminal
+attach itself remained entirely on the phone — that is the surface
+this slice exists to verify.
+
+Verified:
+
+- HTTPS reachability gate (§7.3) re-checked from the workstation
+  before any device or container action: `/` → 200, `/healthz` → 200,
+  `/api/v1/auth/me` → 401 JSON. Staging stack carried over from the
+  prior 2026-05-09 entries without restart.
+- Throwaway SSH target started cleanly on the staging internal
+  network (`docker run -d --name relayterm-staging-smoke-ssh
+  --hostname relayterm-staging-smoke-ssh --network
+  relayterm-staging_relayterm-staging-internal --restart no -e
+  PUID=1000 -e PGID=1000 -e USER_NAME=smoke -e PASSWORD_ACCESS=false
+  -e SUDO_ACCESS=false -e TZ=UTC linuxserver/openssh-server:latest`).
+  Container reached `Up`; sshd listening on `0.0.0.0:2222` and
+  `:::2222` per `netstat` inside the container; user `smoke` with
+  home `/config` and shell `/bin/bash` provisioned by the image's
+  `USER_NAME` env. Container reachability from the staging backend
+  was deferred to RelayTerm's own host-key preflight (which is the
+  only client that matters for the smoke); the staging backend's
+  slim image has neither `nc` nor a `bash` with `/dev/tcp` so a
+  direct shell-level reachability probe was not run.
+- RelayTerm setup via the staging API, with the session cookie kept
+  in `/tmp/relayterm-android-smoke.cookie` (`chmod 600`, never
+  echoed): existing `smoke-id` ed25519 identity from the prior VPS
+  smoke was reused; **new** host `smoke-ssh-android` created
+  pointing at `relayterm-staging-smoke-ssh:2222` user `smoke`; **new**
+  server profile `android-smoke-profile` bound the new host + reused
+  identity. The previous `smoke-ssh` host + `smoke-profile` profile
+  (pointing at the now-removed Alpine container from the first
+  2026-05-09 entry) were left in place rather than mutated, per the
+  AGENTS.md "Inventory lifecycle and destructive-action policy"
+  (`server_profiles` default destructive action is **disable**, not
+  delete; `hosts` delete is blocked while a profile references them).
+  Host-key preflight captured the SSH target's ed25519 host key with
+  fingerprint `SHA256:/Y3n454qkT0GFzN4PilNrfS1ljblIGn9l+nDnnkpfOU`
+  (`host_key_status: "unknown"` as expected on a never-trusted host);
+  fingerprint cross-verified **byte-identical** against the
+  container's own `/config/ssh_host_keys/ssh_host_ed25519_key.pub`
+  via `docker exec ... ssh-keygen -lf`. Trust pinned via
+  `POST /api/v1/server-profiles/<id>/trust-host-key` with
+  `expected_fingerprint` (the field name is `expected_fingerprint`,
+  not `expected_host_key_fingerprint`); response carried
+  `known_host_entry_id` `49804d24-d013-4746-a4d1-3d6bb1529129`.
+  `auth-check` returned `status: "authentication_succeeded"`,
+  `message: "ssh public-key authentication succeeded; no PTY was
+  allocated and no command was executed"`. Public key was injected
+  into `/config/.ssh/authorized_keys` inside the container with
+  `smoke:users` ownership and mode `600` between the preflight and
+  the auth-check steps (preflight does not need authentication;
+  auth-check does).
+- **Terminal session attach + PTY round-trip on Android.** Three
+  successive terminal sessions were launched against
+  `android-smoke-profile` from the Android UI (`Sidebar → Server
+  profiles → android-smoke-profile → Launch terminal session`).
+  The first session paint hit the same cold-start race documented for
+  the desktop smoke ("the initial PS1 was emitted to the PTY before
+  the WebSocket frame pump caught up so the first paint showed only a
+  blinking cursor; one Enter triggered bash to redraw the prompt"
+  — see [`docs/spec/tauri-runtime-backend-url.md`](../spec/tauri-runtime-backend-url.md)
+  Phase E desktop terminal-attach row). Operator typed `ls` to nudge
+  the prompt and got back the bash response (a single empty `ls`
+  output line + the redrawn `relayterm-staging-smoke-ssh:~$ `
+  prompt) — input → backend → SSH → bash → output → render proven
+  end-to-end on Android. Session 1 closed after a screen-sleep + UI
+  dump pause crossed the 30-second detach reaper window; session 2
+  was launched but the workstation-side approval gate added enough
+  latency that the canonical commands missed the reap window again
+  ("Send attempted after session ended" toast on the SPA, audible
+  in the API as `terminal-sessions[].status: "closed"`); session 3
+  was launched + nudged + driven without an interleaved approval
+  gate, and the three canonical commands all round-tripped:
+  - `echo relayterm-android-staging-smoke` → `relayterm-android-staging-smoke`
+  - `whoami` → `smoke`
+  - `pwd` → `/config`
+
+  Session 3's UI status row showed `Status: live` with a fresh
+  `last_seen_at`; canvas rendered correctly in landscape mode at
+  the device's native resolution; input was driven via
+  `adb shell input text` + `KEYCODE_ENTER` (66) (mobile keyboard
+  re-typing was bypassed for the same reason it was for the prior
+  handoff slice's email field). Output was captured via
+  `adb shell screencap` because the WebView's terminal canvas is
+  HTML5 canvas, not native widgets, so `uiautomator dump` does not
+  see terminal contents (a known mobile-smoke evidence-collection
+  caveat — captured here so future runs reach for `screencap` first
+  rather than `uiautomator dump`).
+- Backend log sweep over 1 hour of `relayterm-backend` output
+  (`csrf_origin_mismatch`, `relayterm_session=[A-Za-z0-9_-]{20,}`,
+  `encrypted_private_key`, `data_b64`, `REDACT-MARKER`, `password=`,
+  `ERROR`): zero hits. The 2 `WARN` lines in the window were both
+  expected: one `russh connect failed during auth-check error=Unknown
+  server key` from the very first auth-check call before host-key
+  trust was pinned (later auth-check after trust returned
+  `authentication_succeeded`), and one `unauthorized request
+  detail=missing session cookie` from the workstation's
+  unauthenticated `curl /api/v1/auth/me` in step 1. Both carried
+  generic detail strings only — no email, password, token, IP, or
+  correlated identifier in any payload. **The terminal-data-plane
+  WebSocket attach / detach / re-attach cycles produced zero
+  WARN / ERROR lines at all** — the binary `RTB1` frame path through
+  Traefik to the Android Tauri WebView is silent on errors.
+- Path A premise extends from desktop bundled handoff and Android
+  bundled handoff (both 2026-05-09 against HTTPS staging) into the
+  **Android binary terminal data plane** with **zero** backend / auth
+  / CORS / CSRF / Tauri-capability code change. Same-origin Tauri
+  Android WebView session-cookie / `Origin`-allow-list flow + the
+  `/api/v1/terminal-sessions/{id}/ws` upgrade + `RTB1` frame pump +
+  `russh` PTY allocation work end-to-end through Traefik HTTPS
+  exactly as they do on desktop (per the prior desktop-vs-staging
+  terminal-attach row in the first 2026-05-09 staging entry below).
+
+Deferred (intentional non-goals for this run):
+
+- **Mobile portrait sidebar / layout optimization.** Observed during
+  this run that the production `AppShell.svelte` sidebar consumes
+  most of the visible portrait viewport on the device, leaving the
+  active view (server-profile detail, terminal canvas, identities
+  list) cramped. The smoke remained focused on terminal attach /
+  WebSocket behaviour; mobile-portrait layout work — sidebar collapse
+  / drawer / responsive nav — is out of scope for this slice and is a
+  separate UX pass.
+- **Long-lived reconnect across mobile network changes** (Wi-Fi
+  ↔ LTE handoff, deep sleep, doze, low-memory kill, push-driven
+  wake). Three short sessions were observed to cross the 30-second
+  detach reaper cleanly when left to idle; none was held open long
+  enough to verify the reconnect / replay-buffer correctness path.
+- **Production hostname / production credentials / real production
+  SSH identities** — staging is throwaway by construction (§1).
+- **Tauri release-channel signing / Play Store / AAB** — Phase 4+
+  in [`docs/deployment/tauri-ci-release-plan.md`](./tauri-ci-release-plan.md).
+- **Recording surface.** `RELAYTERM_TERMINAL_RECORDING__ENABLED=false`
+  on this slot per `.env`.
+- **Alternate renderer adapters on Android** (only
+  `@relayterm/terminal-xterm` baseline was exercised; the
+  experimental ghostty-web / restty / wterm adapters were not).
+- **"Change server" runtime click on the Android shell** (still
+  deferred from the prior 2026-05-09 Android handoff entry — the
+  picker did not re-enter on this run because the saved config was
+  already correct).
+
+Drift worth folding back later (non-blocking):
+
+- **Detach reaper window vs interactive-approval latency.** The
+  30-second backend reap-after-detach window can collide with any
+  workstation-side interactive approval prompt (here, an
+  `AskUserQuestion` modal in the operator's IDE) when the operator
+  is driving the phone over `adb`. Two sessions in this run were
+  reaped before the canonical commands could land because the
+  operator-side approval cycle exceeded the reap window. Mitigation
+  for future Android terminal-attach smokes: either (a) batch the
+  approval BEFORE the session is launched and fire commands
+  immediately on attach, or (b) consider a runbook-time toggle to
+  briefly extend the detach reap window during a smoke. The first is
+  what this run actually used (third session). Not a code or backend
+  bug — the 30-second window is correct for the production posture.
+- **`uiautomator dump` does not see WebView canvas content.** All
+  three terminal-attach evidence captures used `adb shell screencap
+  -p` because `uiautomator dump`'s accessibility tree exposes only
+  native widgets, not HTML5 canvas pixels. Worth surfacing in this
+  runbook as the canonical mobile-smoke evidence pattern: dump for
+  chrome (buttons, modals, status rows, EditText focus state) and
+  screencap for terminal-canvas content.
+- **First-paint cold-start race** is now confirmed identical
+  on Android and desktop — same root cause (initial PS1 emitted
+  before the WebSocket frame pump catches up), same workaround (one
+  Enter keystroke nudges bash to redraw). The desktop terminal-attach
+  row in the spec's Phase E log already documents this; folding the
+  Android observation into a single shared note (rather than
+  re-stating per-platform) is a candidate edit.
 
 ### 2026-05-09 · Android Tauri staging handoff + login smoke
 
