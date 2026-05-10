@@ -19,7 +19,7 @@ use relayterm_core::ids::{
     TerminalRecordingChunkId, TerminalRecordingMarkerId, TerminalSessionAttachmentId,
     TerminalSessionId, UserId, UserSessionId,
 };
-use relayterm_core::known_host::KnownHostEntry;
+use relayterm_core::known_host::{KnownHostEntry, KnownHostRevocationReason};
 use relayterm_core::password_credential::PasswordCredential;
 use relayterm_core::repository::RepositoryError;
 use relayterm_core::server_profile::ServerProfile;
@@ -242,6 +242,9 @@ pub(crate) struct KnownHostEntryRow {
     pub first_seen_at: DateTime<Utc>,
     pub trusted_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<Uuid>,
+    pub revoked_reason_code: Option<String>,
+    pub replaced_by_id: Option<Uuid>,
 }
 
 impl KnownHostEntryRow {
@@ -252,6 +255,14 @@ impl KnownHostEntryRow {
                 self.key_type
             ))
         })?;
+        let revoked_reason_code = match self.revoked_reason_code.as_deref() {
+            None => None,
+            Some(tag) => Some(KnownHostRevocationReason::from_str_tag(tag).ok_or_else(|| {
+                RepositoryError::Database(format!(
+                    "row integrity: known_host_entry.revoked_reason_code unknown ({tag})",
+                ))
+            })?),
+        };
         Ok(KnownHostEntry {
             id: KnownHostEntryId::from_uuid(self.id),
             host_id: HostId::from_uuid(self.host_id),
@@ -261,6 +272,9 @@ impl KnownHostEntryRow {
             first_seen_at: self.first_seen_at,
             trusted_at: self.trusted_at,
             revoked_at: self.revoked_at,
+            revoked_by: self.revoked_by.map(UserId::from_uuid),
+            revoked_reason_code,
+            replaced_by_id: self.replaced_by_id.map(KnownHostEntryId::from_uuid),
         })
     }
 }

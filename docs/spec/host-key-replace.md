@@ -1,7 +1,29 @@
 # Host-key replace (revoke-and-replace) — design
 
-> Status: **design-only**, no implementation yet. Branch:
-> `docs/host-key-repin-design`.
+> Status: **Phase 1 (schema + repository foundation) implemented;**
+> route, frontend helpers, UI, and staging smoke deferred to phases
+> 2–5.
+>
+> Phase 1 landed as `feat/known-host-revoke-metadata`:
+> - Migration `20260510000022_known_host_entries_revoke_metadata.sql`
+>   adds `revoked_by`, `revoked_reason_code`, `replaced_by_id`, plus
+>   the `known_host_entries_revoked_reason_chk` and
+>   `known_host_entries_revoked_columns_set_together` CHECK
+>   constraints.
+> - `KnownHostRevocationReason` enum
+>   (`crates/relayterm-core/src/known_host.rs`) and the repository
+>   inputs `ReplaceActivePin` / `ReplacedKnownHostEntries`
+>   (`crates/relayterm-core/src/repository.rs`).
+> - `KnownHostEntryRepository::replace_active_pin` trait method +
+>   `PgKnownHostEntryRepository::replace_active_pin` impl
+>   (`crates/relayterm-db/src/repositories/known_host_entry.rs`),
+>   transactional (`SELECT … FOR UPDATE` → INSERT new → UPDATE old).
+>   Audit emission is NOT in the repository; it lands with the route
+>   slice (see § R7 option (a) below for the planned shape).
+> - Repository tests in `crates/relayterm-db/tests/repositories.rs`
+>   cover happy path, fingerprint-mismatch, no-active-pin,
+>   already-revoked old pin, previously-revoked new fingerprint,
+>   all four reason codes, scoping, and both CHECK constraints.
 >
 > This doc proposes an explicit, auditable operator flow to revoke an
 > active pinned host key and trust a new one in its place — without
@@ -681,7 +703,7 @@ tests on slices that touch DB or audit.
 
 | # | Branch | What lands | Tests |
 |---|---|---|---|
-| 1 | `feat/known-host-revoke-metadata` | Migration + the three new columns + the two CHECK constraints + Rust row mapping + `KnownHostRevocationReason` enum + `replace_active_pin` repository primitive + repository unit tests. **No route, no UI.** | Repository unit tests; sqlx prepare. |
+| 1 ✅ | `feat/known-host-revoke-metadata` | **Landed.** Migration `20260510000022_known_host_entries_revoke_metadata.sql` + the three new columns + the two CHECK constraints + Rust row mapping + `KnownHostRevocationReason` enum + `replace_active_pin` repository primitive + repository tests. **No route, no UI.** | Repository tests in `crates/relayterm-db/tests/repositories.rs`. The project uses runtime sqlx queries, so no `.sqlx/` prepare cache. |
 | 2 | `feat/replace-host-key-route` | The `POST /api/v1/server-profiles/:id/replace-host-key` route + DTOs + audit emission + integration tests. **No UI yet.** | Route integration tests; redaction-sentinel scan. |
 | 3 | `feat/replace-host-key-api-helpers` | `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid`. Pure helpers, vitest only. **No component edits yet.** | vitest. |
 | 4 | `feat/replace-host-key-ui` | `HostKeyPanel.svelte` modal + button gate; threading through to the API helper. | Component tests once a harness exists; static-text scan as a fallback. |

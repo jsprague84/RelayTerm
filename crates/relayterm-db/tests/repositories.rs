@@ -24,14 +24,16 @@
 use chrono::{Duration, Utc};
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::UserSessionId;
+use relayterm_core::known_host::KnownHostRevocationReason;
 use relayterm_core::repository::{
     AuditEventRepository, CreateAuditEvent, CreateHost, CreateKnownHostEntry,
     CreatePasswordCredential, CreateServerProfile, CreateSessionEvent, CreateSshIdentity,
     CreateTerminalRecordingChunk, CreateTerminalRecordingMarker, CreateTerminalSession,
     CreateTerminalSessionAttachment, CreateUser, CreateUserSession, HostRepository,
     KnownHostEntryRepository, PasswordCredentialRepository, PurgeRecordingForRetention,
-    RepositoryError, ServerProfileRepository, SessionEventRepository, SshIdentityRepository,
-    TerminalRecordingRepository, TerminalSessionRepository, UserRepository, UserSessionRepository,
+    ReplaceActivePin, RepositoryError, ServerProfileRepository, SessionEventRepository,
+    SshIdentityRepository, TerminalRecordingRepository, TerminalSessionRepository, UserRepository,
+    UserSessionRepository,
 };
 use relayterm_core::session_event::SessionEventKind;
 use relayterm_core::ssh_identity::SshKeyType;
@@ -551,11 +553,22 @@ async fn known_host_entry_record_trusted_rejects_revoked_row(pool: PgPool) {
         })
         .await
         .unwrap();
-    sqlx::query("UPDATE known_host_entries SET revoked_at = NOW() WHERE id = $1")
-        .bind(entry.id.into_uuid())
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Set the full revoke metadata in one UPDATE so the schema CHECK
+    // `known_host_entries_revoked_columns_set_together` is satisfied.
+    // A partial UPDATE here would correctly fail at the DB layer; that
+    // partial-CHECK behaviour is pinned by its own test below.
+    sqlx::query(
+        "UPDATE known_host_entries
+         SET revoked_at          = NOW(),
+             revoked_by          = $2,
+             revoked_reason_code = 'operator_other'
+         WHERE id = $1",
+    )
+    .bind(entry.id.into_uuid())
+    .bind(user.id.into_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let err = repo
         .record_trusted(CreateKnownHostEntry {
@@ -616,6 +629,548 @@ async fn known_host_entry_record_trusted_stamps_existing_untrusted_row(pool: PgP
     assert!(
         trusted.trusted_at.is_some(),
         "record_trusted must stamp the row"
+    );
+}
+
+// ----------------------------------------------------------------------
+// KnownHostEntry — replace_active_pin (host-key replace flow)
+// ----------------------------------------------------------------------
+
+const REPLACE_OLD_FP: &str = "SHA256:replace-old-fp";
+const REPLACE_NEW_FP: &str = "SHA256:replace-new-fp";
+const REPLACE_OLD_PUBKEY: &[u8] = b"ssh-ed25519 AAAA-OLD-host-key";
+const REPLACE_NEW_PUBKEY: &[u8] = b"ssh-ed25519 AAAA-NEW-host-key";
+
+async fn seed_active_pin(
+    pool: &PgPool,
+    host_id: relayterm_core::ids::HostId,
+) -> relayterm_core::known_host::KnownHostEntry {
+    PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: REPLACE_OLD_FP.to_owned(),
+            public_key: REPLACE_OLD_PUBKEY.to_vec(),
+        })
+        .await
+        .expect("seed active pin")
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_happy_path(pool: PgPool) {
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+    let active = seed_active_pin(&pool, host.id).await;
+
+    let result = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .expect("replace_active_pin happy path");
+
+    // Old row: revoked, revoked_by = caller, reason set, replaced_by_id
+    // points at new row.
+    assert_eq!(result.revoked_old.id, active.id);
+    assert!(
+        result.revoked_old.revoked_at.is_some(),
+        "old row must be revoked",
+    );
+    assert_eq!(result.revoked_old.revoked_by, Some(user.id));
+    assert_eq!(
+        result.revoked_old.revoked_reason_code,
+        Some(KnownHostRevocationReason::ServerReinstalled),
+    );
+    assert_eq!(
+        result.revoked_old.replaced_by_id,
+        Some(result.trusted_new.id),
+        "replaced_by_id must point at the new row",
+    );
+
+    // New row: trusted, not revoked, no replaced_by_id.
+    assert_ne!(result.trusted_new.id, active.id, "new row must be distinct");
+    assert!(result.trusted_new.trusted_at.is_some());
+    assert!(result.trusted_new.revoked_at.is_none());
+    assert!(result.trusted_new.revoked_by.is_none());
+    assert!(result.trusted_new.revoked_reason_code.is_none());
+    assert!(result.trusted_new.replaced_by_id.is_none());
+    assert_eq!(result.trusted_new.fingerprint_sha256, REPLACE_NEW_FP);
+    assert_eq!(result.trusted_new.public_key, REPLACE_NEW_PUBKEY.to_vec());
+    assert_eq!(result.trusted_new.host_id, host.id);
+
+    // Re-read both rows directly to confirm the writes committed.
+    let old_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_OLD_FP)
+        .await
+        .unwrap()
+        .expect("old row persists post-commit");
+    assert_eq!(old_persisted, result.revoked_old);
+
+    let new_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_NEW_FP)
+        .await
+        .unwrap()
+        .expect("new row persists post-commit");
+    assert_eq!(new_persisted, result.trusted_new);
+
+    // The host's known-host list is exactly two entries now.
+    let listed = repo.list_for_host(host.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_rejects_wrong_expected_old_fingerprint(pool: PgPool) {
+    // Caller's expected_old_fingerprint does not match the active pin.
+    // Repository must refuse with active_pin_mismatch and leave the DB
+    // unchanged.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+    let active = seed_active_pin(&pool, host.id).await;
+
+    let err = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: "SHA256:not-the-active-fp".to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepositoryError::Conflict { entity: "known_host_entry", ref constraint }
+                if constraint == "active_pin_mismatch",
+        ),
+        "expected active_pin_mismatch, got: {err:?}",
+    );
+
+    // Old row is unchanged; new row never inserted.
+    let old_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_OLD_FP)
+        .await
+        .unwrap()
+        .expect("old row remains");
+    assert_eq!(old_persisted, active);
+    assert!(
+        repo.find_by_fingerprint(host.id, REPLACE_NEW_FP)
+            .await
+            .unwrap()
+            .is_none(),
+        "new row must not have been inserted",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_rejects_when_no_active_pin(pool: PgPool) {
+    // Same wire shape as the mismatch case: zero rows match the SELECT
+    // FOR UPDATE filter (host has no trusted, non-revoked pins). The
+    // repository collapses both subcases into active_pin_mismatch so the
+    // route layer's conflict envelope is the single source of truth for
+    // how the SPA differentiates them.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let err = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepositoryError::Conflict { entity: "known_host_entry", ref constraint }
+                if constraint == "active_pin_mismatch",
+        ),
+        "expected active_pin_mismatch when no active pin exists, got: {err:?}",
+    );
+
+    assert!(repo.list_for_host(host.id).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_rejects_when_old_pin_already_revoked(pool: PgPool) {
+    // A previously-trusted pin that was already revoked is no longer
+    // active. SELECT FOR UPDATE filters by `revoked_at IS NULL`, so the
+    // call surfaces as active_pin_mismatch and writes nothing.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+    let active = seed_active_pin(&pool, host.id).await;
+
+    sqlx::query(
+        "UPDATE known_host_entries
+         SET revoked_at          = NOW(),
+             revoked_by          = $2,
+             revoked_reason_code = 'operator_other'
+         WHERE id = $1",
+    )
+    .bind(active.id.into_uuid())
+    .bind(user.id.into_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepositoryError::Conflict { entity: "known_host_entry", ref constraint }
+                if constraint == "active_pin_mismatch",
+        ),
+        "expected active_pin_mismatch on already-revoked old pin, got: {err:?}",
+    );
+
+    // No new row got inserted.
+    assert!(
+        repo.find_by_fingerprint(host.id, REPLACE_NEW_FP)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_rejects_when_new_fingerprint_was_previously_revoked(pool: PgPool) {
+    // Defence against the revoked-and-reappearing fingerprint shape: a
+    // host whose active pin is X, with a separate pre-existing revoked
+    // row for fingerprint Y, must NOT allow a replace X→Y. Recovery
+    // from a revoked entry is a deliberate admin-only future surface.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let active = seed_active_pin(&pool, host.id).await;
+
+    // Seed an unrelated revoked row at the to-be-trusted fingerprint.
+    let revoked = repo
+        .create(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            public_key: REPLACE_NEW_PUBKEY.to_vec(),
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE known_host_entries
+         SET revoked_at          = NOW(),
+             revoked_by          = $2,
+             revoked_reason_code = 'operator_other'
+         WHERE id = $1",
+    )
+    .bind(revoked.id.into_uuid())
+    .bind(user.id.into_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepositoryError::Conflict { entity: "known_host_entry", ref constraint }
+                if constraint == "new_fingerprint_revoked",
+        ),
+        "expected new_fingerprint_revoked, got: {err:?}",
+    );
+
+    // Active pin unchanged; revoked row unchanged.
+    let active_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_OLD_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_persisted, active);
+    assert!(
+        active_persisted.revoked_at.is_none(),
+        "active pin must remain active",
+    );
+    let revoked_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_NEW_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revoked_persisted.id, revoked.id);
+    assert!(revoked_persisted.revoked_at.is_some());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_rejects_when_new_fingerprint_already_active(pool: PgPool) {
+    // Defence against a duplicate-trust shape: an active (non-revoked)
+    // row already exists at the proposed new fingerprint. The unique
+    // index on (host_id, fingerprint_sha256) would otherwise fire on
+    // INSERT and produce a generic conflict; the repository surfaces a
+    // stable typed constraint so the Phase 2 route layer can key its
+    // wire envelope off it.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+
+    let active = seed_active_pin(&pool, host.id).await;
+
+    // Seed a second active (trusted, non-revoked) row at the
+    // to-be-trusted fingerprint. Real flows would never produce this
+    // because every trust path enforces "one active pin per host", but
+    // the repository contract MUST refuse it cleanly anyway.
+    let already_trusted = repo
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            public_key: REPLACE_NEW_PUBKEY.to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(already_trusted.trusted_at.is_some());
+    assert!(already_trusted.revoked_at.is_none());
+
+    let err = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepositoryError::Conflict { entity: "known_host_entry", ref constraint }
+                if constraint == "new_fingerprint_already_active",
+        ),
+        "expected new_fingerprint_already_active, got: {err:?}",
+    );
+
+    // Both rows are unchanged: the original active pin is still active,
+    // and the duplicate row is still active. No partial revoke.
+    let active_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_OLD_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_persisted, active);
+    let dup_persisted = repo
+        .find_by_fingerprint(host.id, REPLACE_NEW_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dup_persisted, already_trusted);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_accepts_all_reason_codes(pool: PgPool) {
+    // Each of the four canonical reason codes round-trips through the
+    // repository, the schema CHECK, and the row → domain mapping. Pinned
+    // here so a future schema change that adds or renames a code is
+    // detected immediately.
+    for reason in [
+        KnownHostRevocationReason::ServerReinstalled,
+        KnownHostRevocationReason::HostKeyRotated,
+        KnownHostRevocationReason::LabTargetRecreated,
+        KnownHostRevocationReason::OperatorOther,
+    ] {
+        let user = make_user(&pool).await;
+        let host = make_host(&pool, &user).await;
+        let repo = PgKnownHostEntryRepository::new(pool.clone());
+        seed_active_pin(&pool, host.id).await;
+
+        let result = repo
+            .replace_active_pin(ReplaceActivePin {
+                host_id: host.id,
+                expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+                new_key_type: SshKeyType::Ed25519,
+                new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+                new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+                revoked_by: user.id,
+                reason_code: reason,
+            })
+            .await
+            .unwrap_or_else(|err| panic!("reason {reason:?} should be accepted, got: {err:?}"));
+
+        assert_eq!(result.revoked_old.revoked_reason_code, Some(reason));
+    }
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn known_host_entries_check_rejects_invalid_reason_code(pool: PgPool) {
+    // Defence-in-depth: a hand-crafted UPDATE that bypasses the
+    // repository must still be rejected by the schema CHECK. Pins the
+    // accept-list at the DB layer so a future code path that builds
+    // SQL outside the repository can't sneak a bad value in.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let active = seed_active_pin(&pool, host.id).await;
+
+    let err = sqlx::query(
+        "UPDATE known_host_entries
+         SET revoked_at          = NOW(),
+             revoked_by          = $2,
+             revoked_reason_code = 'operator_freeform'
+         WHERE id = $1",
+    )
+    .bind(active.id.into_uuid())
+    .bind(user.id.into_uuid())
+    .execute(&pool)
+    .await
+    .expect_err("CHECK known_host_entries_revoked_reason_chk must reject unknown code");
+
+    let db_err = err
+        .as_database_error()
+        .expect("driver returned a database error");
+    assert_eq!(
+        db_err.constraint(),
+        Some("known_host_entries_revoked_reason_chk"),
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn known_host_entries_check_rejects_partial_revoke_metadata(pool: PgPool) {
+    // The "set together" CHECK is the second-line guard against a
+    // future code path that forgets to write all three columns
+    // atomically. Verified directly against the DB so a regression in
+    // the repository can't slip past.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let active = seed_active_pin(&pool, host.id).await;
+
+    // revoked_at set, but revoked_by + revoked_reason_code NULL.
+    let err = sqlx::query("UPDATE known_host_entries SET revoked_at = NOW() WHERE id = $1")
+        .bind(active.id.into_uuid())
+        .execute(&pool)
+        .await
+        .expect_err("partial revoke must violate CHECK");
+    let db_err = err
+        .as_database_error()
+        .expect("driver returned a database error");
+    assert_eq!(
+        db_err.constraint(),
+        Some("known_host_entries_revoked_columns_set_together"),
+    );
+
+    // revoked_by set, revoked_at NULL.
+    let err = sqlx::query("UPDATE known_host_entries SET revoked_by = $2 WHERE id = $1")
+        .bind(active.id.into_uuid())
+        .bind(user.id.into_uuid())
+        .execute(&pool)
+        .await
+        .expect_err("revoked_by without revoked_at must violate CHECK");
+    let db_err = err
+        .as_database_error()
+        .expect("driver returned a database error");
+    assert_eq!(
+        db_err.constraint(),
+        Some("known_host_entries_revoked_columns_set_together"),
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_is_scoped_to_host_id(pool: PgPool) {
+    // Two hosts each have an active pin with the same fingerprint
+    // string. A replace targeting host A must never touch host B's pin.
+    let user = make_user(&pool).await;
+    let host_a = make_host(&pool, &user).await;
+    let host_b = PgHostRepository::new(pool.clone())
+        .create(CreateHost {
+            owner_id: user.id,
+            display_name: validate_host_display_name("Other host").unwrap(),
+            hostname: validate_hostname("other-1.internal.example.com").unwrap(),
+            port: validate_ssh_port(22).unwrap(),
+            default_username: validate_ssh_username("deploy").unwrap(),
+        })
+        .await
+        .unwrap();
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+    let pin_a = seed_active_pin(&pool, host_a.id).await;
+    let pin_b = seed_active_pin(&pool, host_b.id).await;
+
+    repo.replace_active_pin(ReplaceActivePin {
+        host_id: host_a.id,
+        expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+        new_key_type: SshKeyType::Ed25519,
+        new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+        new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+        revoked_by: user.id,
+        reason_code: KnownHostRevocationReason::HostKeyRotated,
+    })
+    .await
+    .expect("replace on host A");
+
+    // Host A: old revoked, new trusted.
+    let host_a_old = repo
+        .find_by_fingerprint(host_a.id, REPLACE_OLD_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host_a_old.revoked_at.is_some());
+    assert_eq!(host_a_old.id, pin_a.id);
+    let host_a_new = repo
+        .find_by_fingerprint(host_a.id, REPLACE_NEW_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host_a_new.trusted_at.is_some());
+    assert!(host_a_new.revoked_at.is_none());
+
+    // Host B: completely untouched.
+    let host_b_pin = repo
+        .find_by_fingerprint(host_b.id, REPLACE_OLD_FP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(host_b_pin, pin_b);
+    assert!(host_b_pin.revoked_at.is_none());
+    assert!(
+        repo.find_by_fingerprint(host_b.id, REPLACE_NEW_FP)
+            .await
+            .unwrap()
+            .is_none(),
+        "host B must not have a row at the new fingerprint",
     );
 }
 

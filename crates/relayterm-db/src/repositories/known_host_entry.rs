@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use relayterm_core::ids::HostId;
 use relayterm_core::known_host::KnownHostEntry;
-use relayterm_core::repository::{CreateKnownHostEntry, KnownHostEntryRepository, RepositoryError};
+use relayterm_core::repository::{
+    CreateKnownHostEntry, KnownHostEntryRepository, ReplaceActivePin, ReplacedKnownHostEntries,
+    RepositoryError,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -9,6 +12,11 @@ use crate::error::map_sqlx_error;
 use crate::rows::KnownHostEntryRow;
 
 const ENTITY: &str = "known_host_entry";
+
+/// `SELECT` projection used by every read in this module. Listed once so a
+/// future column add only touches this constant + [`KnownHostEntryRow`].
+const KNOWN_HOST_ENTRY_COLUMNS: &str = "id, host_id, key_type, fingerprint_sha256, public_key, \
+    first_seen_at, trusted_at, revoked_at, revoked_by, revoked_reason_code, replaced_by_id";
 
 #[derive(Debug, Clone)]
 pub struct PgKnownHostEntryRepository {
@@ -26,42 +34,38 @@ impl PgKnownHostEntryRepository {
 impl KnownHostEntryRepository for PgKnownHostEntryRepository {
     async fn create(&self, input: CreateKnownHostEntry) -> Result<KnownHostEntry, RepositoryError> {
         let id = Uuid::new_v4();
-        let row: KnownHostEntryRow = sqlx::query_as(
-            r#"
-            INSERT INTO known_host_entries (
+        let sql = format!(
+            "INSERT INTO known_host_entries (
                 id, host_id, key_type, fingerprint_sha256, public_key
             )
             VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, host_id, key_type, fingerprint_sha256, public_key,
-                      first_seen_at, trusted_at, revoked_at
-            "#,
-        )
-        .bind(id)
-        .bind(input.host_id.into_uuid())
-        .bind(input.key_type.as_str())
-        .bind(&input.fingerprint_sha256)
-        .bind(&input.public_key)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+            RETURNING {KNOWN_HOST_ENTRY_COLUMNS}",
+        );
+        let row: KnownHostEntryRow = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(input.host_id.into_uuid())
+            .bind(input.key_type.as_str())
+            .bind(&input.fingerprint_sha256)
+            .bind(&input.public_key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
 
         row.try_into_domain()
     }
 
     async fn list_for_host(&self, host_id: HostId) -> Result<Vec<KnownHostEntry>, RepositoryError> {
-        let rows: Vec<KnownHostEntryRow> = sqlx::query_as(
-            r#"
-            SELECT id, host_id, key_type, fingerprint_sha256, public_key,
-                   first_seen_at, trusted_at, revoked_at
+        let sql = format!(
+            "SELECT {KNOWN_HOST_ENTRY_COLUMNS}
             FROM known_host_entries
             WHERE host_id = $1
-            ORDER BY first_seen_at ASC
-            "#,
-        )
-        .bind(host_id.into_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+            ORDER BY first_seen_at ASC",
+        );
+        let rows: Vec<KnownHostEntryRow> = sqlx::query_as(&sql)
+            .bind(host_id.into_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
 
         rows.into_iter()
             .map(KnownHostEntryRow::try_into_domain)
@@ -73,19 +77,17 @@ impl KnownHostEntryRepository for PgKnownHostEntryRepository {
         host_id: HostId,
         fingerprint_sha256: &str,
     ) -> Result<Option<KnownHostEntry>, RepositoryError> {
-        let row: Option<KnownHostEntryRow> = sqlx::query_as(
-            r#"
-            SELECT id, host_id, key_type, fingerprint_sha256, public_key,
-                   first_seen_at, trusted_at, revoked_at
+        let sql = format!(
+            "SELECT {KNOWN_HOST_ENTRY_COLUMNS}
             FROM known_host_entries
-            WHERE host_id = $1 AND fingerprint_sha256 = $2
-            "#,
-        )
-        .bind(host_id.into_uuid())
-        .bind(fingerprint_sha256)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+            WHERE host_id = $1 AND fingerprint_sha256 = $2",
+        );
+        let row: Option<KnownHostEntryRow> = sqlx::query_as(&sql)
+            .bind(host_id.into_uuid())
+            .bind(fingerprint_sha256)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
 
         row.map(KnownHostEntryRow::try_into_domain).transpose()
     }
@@ -107,32 +109,157 @@ impl KnownHostEntryRepository for PgKnownHostEntryRepository {
         // instead of misreporting success. Recovery from a revoked entry
         // is a deliberate operator action; there is no implicit path.
         let id = Uuid::new_v4();
-        let row: Option<KnownHostEntryRow> = sqlx::query_as(
-            r#"
-            INSERT INTO known_host_entries (
+        let sql = format!(
+            "INSERT INTO known_host_entries (
                 id, host_id, key_type, fingerprint_sha256, public_key, trusted_at
             )
             VALUES ($1, $2, $3, $4, $5, NOW())
             ON CONFLICT (host_id, fingerprint_sha256) DO UPDATE
                 SET trusted_at = COALESCE(known_host_entries.trusted_at, EXCLUDED.trusted_at)
                 WHERE known_host_entries.revoked_at IS NULL
-            RETURNING id, host_id, key_type, fingerprint_sha256, public_key,
-                      first_seen_at, trusted_at, revoked_at
-            "#,
-        )
-        .bind(id)
-        .bind(input.host_id.into_uuid())
-        .bind(input.key_type.as_str())
-        .bind(&input.fingerprint_sha256)
-        .bind(&input.public_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+            RETURNING {KNOWN_HOST_ENTRY_COLUMNS}",
+        );
+        let row: Option<KnownHostEntryRow> = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(input.host_id.into_uuid())
+            .bind(input.key_type.as_str())
+            .bind(&input.fingerprint_sha256)
+            .bind(&input.public_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
 
         let row = row.ok_or_else(|| RepositoryError::Conflict {
             entity: ENTITY,
             constraint: "revoked".to_owned(),
         })?;
         row.try_into_domain()
+    }
+
+    async fn replace_active_pin(
+        &self,
+        input: ReplaceActivePin,
+    ) -> Result<ReplacedKnownHostEntries, RepositoryError> {
+        // Single transaction: lock the active pin, refuse if either the
+        // active row is gone / mismatched OR a revoked row already
+        // exists for the new fingerprint, then INSERT the new row and
+        // UPDATE the old row. Either both writes commit or neither does.
+        // Audit emission is the route handler's responsibility, wired in
+        // a follow-on slice (docs/spec/host-key-replace.md § R7).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        // 1. Lock the active row matching (host_id, expected_old_fingerprint,
+        //    revoked_at IS NULL, trusted_at IS NOT NULL). `FOR UPDATE`
+        //    serialises against any concurrent replace targeting the same
+        //    row. Zero rows collapses "no active pin" and "active pin
+        //    mismatch" into a single typed conflict — the route layer
+        //    reads the active pin again before calling this and surfaces
+        //    the precise SPA copy.
+        let select_active_sql = format!(
+            "SELECT {KNOWN_HOST_ENTRY_COLUMNS}
+            FROM known_host_entries
+            WHERE host_id = $1
+              AND fingerprint_sha256 = $2
+              AND revoked_at IS NULL
+              AND trusted_at IS NOT NULL
+            FOR UPDATE",
+        );
+        let old_row: Option<KnownHostEntryRow> = sqlx::query_as(&select_active_sql)
+            .bind(input.host_id.into_uuid())
+            .bind(&input.expected_old_fingerprint)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+        let old_row = old_row.ok_or_else(|| RepositoryError::Conflict {
+            entity: ENTITY,
+            constraint: "active_pin_mismatch".to_owned(),
+        })?;
+
+        // 2. TOCTOU-close: re-assert that no row exists for (host_id,
+        //    new_fingerprint_sha256) inside the open transaction. Postgres
+        //    READ COMMITTED is sufficient — a committed concurrent revoke
+        //    is visible to a fresh SELECT. Distinguish revoked vs.
+        //    non-revoked existing rows so the route layer can surface
+        //    captured_revoked vs. duplicate-trust precisely. Otherwise
+        //    the unique index on (host_id, fingerprint_sha256) would
+        //    fire on the INSERT and produce a generic conflict.
+        let select_existing_sql = format!(
+            "SELECT {KNOWN_HOST_ENTRY_COLUMNS}
+            FROM known_host_entries
+            WHERE host_id = $1 AND fingerprint_sha256 = $2",
+        );
+        let existing_new: Option<KnownHostEntryRow> = sqlx::query_as(&select_existing_sql)
+            .bind(input.host_id.into_uuid())
+            .bind(&input.new_fingerprint_sha256)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+        if let Some(existing) = existing_new {
+            let constraint = if existing.revoked_at.is_some() {
+                "new_fingerprint_revoked"
+            } else {
+                "new_fingerprint_already_active"
+            };
+            return Err(RepositoryError::Conflict {
+                entity: ENTITY,
+                constraint: constraint.to_owned(),
+            });
+        }
+
+        // 3. INSERT the new pin. `trusted_at = NOW()`, `revoked_at = NULL`,
+        //    `replaced_by_id = NULL` by default. Any constraint failure
+        //    here (FK on host_id, key_type CHECK, etc.) bubbles through
+        //    map_sqlx_error and ROLLBACKs the entire tx.
+        let new_id = Uuid::new_v4();
+        let insert_new_sql = format!(
+            "INSERT INTO known_host_entries (
+                id, host_id, key_type, fingerprint_sha256, public_key, trusted_at
+            )
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            RETURNING {KNOWN_HOST_ENTRY_COLUMNS}",
+        );
+        let new_row: KnownHostEntryRow = sqlx::query_as(&insert_new_sql)
+            .bind(new_id)
+            .bind(input.host_id.into_uuid())
+            .bind(input.new_key_type.as_str())
+            .bind(&input.new_fingerprint_sha256)
+            .bind(&input.new_public_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        // 4. UPDATE the old row with the full revoke metadata atomically.
+        //    The schema CHECK `known_host_entries_revoked_columns_set_together`
+        //    is the defence-in-depth backstop: it would refuse a partial
+        //    UPDATE here. Because we lock the row in step 1, a concurrent
+        //    revoke of the same row is impossible inside this tx.
+        let update_old_sql = format!(
+            "UPDATE known_host_entries
+            SET revoked_at          = NOW(),
+                revoked_by          = $2,
+                revoked_reason_code = $3,
+                replaced_by_id      = $4
+            WHERE id = $1
+            RETURNING {KNOWN_HOST_ENTRY_COLUMNS}",
+        );
+        let revoked_old_row: KnownHostEntryRow = sqlx::query_as(&update_old_sql)
+            .bind(old_row.id)
+            .bind(input.revoked_by.into_uuid())
+            .bind(input.reason_code.as_str())
+            .bind(new_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        tx.commit().await.map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        Ok(ReplacedKnownHostEntries {
+            revoked_old: revoked_old_row.try_into_domain()?,
+            trusted_new: new_row.try_into_domain()?,
+        })
     }
 }

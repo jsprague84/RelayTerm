@@ -291,6 +291,9 @@ mod tests {
             first_seen_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             trusted_at: trusted.then(|| Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap()),
             revoked_at: revoked.then(|| Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap()),
+            revoked_by: None,
+            revoked_reason_code: None,
+            replaced_by_id: None,
         }
     }
 

@@ -20,7 +20,7 @@ use crate::ids::{
     AuditEventId, HostId, ServerProfileId, SessionEventId, SshIdentityId,
     TerminalSessionAttachmentId, TerminalSessionId, UserId, UserSessionId,
 };
-use crate::known_host::KnownHostEntry;
+use crate::known_host::{KnownHostEntry, KnownHostRevocationReason};
 use crate::password_credential::PasswordCredential;
 use crate::server_profile::ServerProfile;
 use crate::session_event::{SessionEvent, SessionEventKind};
@@ -137,6 +137,49 @@ pub struct CreateKnownHostEntry {
     pub key_type: SshKeyType,
     pub fingerprint_sha256: String,
     pub public_key: Vec<u8>,
+}
+
+/// Repository input for atomically revoking the active trusted host-key
+/// pin and inserting a fresh trusted pin in its place.
+///
+/// Used exclusively by the host-key replace flow
+/// (`docs/spec/host-key-replace.md`). The repository primitive enforces
+/// the transactional invariants — `SELECT … FOR UPDATE` of the active
+/// row, `expected_old_fingerprint` match, single-COMMIT — but does NOT
+/// emit audit rows. Audit emission is wired by the route slice that
+/// owns the calling handler (see `docs/spec/host-key-replace.md` § R7
+/// option (a) for the future shape).
+///
+/// `Debug` is derived: every field is a public-safe primitive.
+/// `expected_old_fingerprint` and `new_fingerprint_sha256` are SHA-256
+/// fingerprint strings (the public form of the host key); `new_public_key`
+/// is the OpenSSH wire-format public key bytes (also public).
+#[derive(Debug, Clone)]
+pub struct ReplaceActivePin {
+    pub host_id: HostId,
+    /// The fingerprint the caller is consenting to revoke. The repository
+    /// MUST refuse the call if this does not byte-equal the active row's
+    /// `fingerprint_sha256`.
+    pub expected_old_fingerprint: String,
+    pub new_key_type: SshKeyType,
+    pub new_fingerprint_sha256: String,
+    /// OpenSSH-format public key bytes for the new pin.
+    pub new_public_key: Vec<u8>,
+    /// Operator-of-record for the revoke. Persisted on the old row's
+    /// `revoked_by` column.
+    pub revoked_by: UserId,
+    pub reason_code: KnownHostRevocationReason,
+}
+
+/// Repository output for [`KnownHostEntryRepository::replace_active_pin`].
+///
+/// Both rows reflect the post-commit state: `revoked_old.revoked_at`,
+/// `revoked_by`, `revoked_reason_code`, and `replaced_by_id` are all set;
+/// `trusted_new.trusted_at` is set and `revoked_at` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacedKnownHostEntries {
+    pub revoked_old: KnownHostEntry,
+    pub trusted_new: KnownHostEntry,
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +435,51 @@ pub trait KnownHostEntryRepository: Send + Sync {
         &self,
         input: CreateKnownHostEntry,
     ) -> Result<KnownHostEntry, RepositoryError>;
+
+    /// Atomically revoke the active trusted pin and insert a new trusted
+    /// pin for the same host. Either both writes commit or neither does.
+    /// Used exclusively by the host-key replace flow
+    /// (`docs/spec/host-key-replace.md` § R7).
+    ///
+    /// Transaction shape:
+    /// 1. `SELECT … FOR UPDATE` the row matching `(host_id,
+    ///    expected_old_fingerprint, revoked_at IS NULL,
+    ///    trusted_at IS NOT NULL)`.
+    /// 2. INSERT the new row with `trusted_at = NOW()`.
+    /// 3. UPDATE the old row: `revoked_at = NOW()`, `revoked_by =
+    ///    input.revoked_by`, `revoked_reason_code = input.reason_code`,
+    ///    `replaced_by_id = <new id>`.
+    /// 4. COMMIT.
+    ///
+    /// Refusal contract:
+    /// - [`RepositoryError::Conflict`] with constraint
+    ///   `"active_pin_mismatch"` if step 1 finds zero rows. This collapses
+    ///   the "no active pin" and "active pin's fingerprint differs"
+    ///   subcases into one wire reason — the route layer's typed envelope
+    ///   may further differentiate them with read-only re-queries before
+    ///   calling this method.
+    /// - [`RepositoryError::Conflict`] with constraint
+    ///   `"new_fingerprint_revoked"` if a row already exists for
+    ///   `(host_id, new_fingerprint_sha256)` with `revoked_at IS NOT
+    ///   NULL`. A revoked-and-reappearing fingerprint MUST refuse
+    ///   re-trust through this path; recovery is a deliberate
+    ///   admin-only future surface.
+    /// - [`RepositoryError::Conflict`] with constraint
+    ///   `"new_fingerprint_already_active"` if a non-revoked row already
+    ///   exists for `(host_id, new_fingerprint_sha256)`. The unique
+    ///   index on `(host_id, fingerprint_sha256)` blocks the duplicate
+    ///   insert in any case; this typed mapping gives the route layer a
+    ///   stable error surface.
+    ///
+    /// The repository does NOT emit audit rows. The route handler that
+    /// owns the call is responsible for the paired `host_key_revoked`
+    /// + `host_key_accepted` audit emission (see
+    /// `docs/spec/host-key-replace.md` § R2). Audit emission is wired
+    /// in the follow-on route slice; this primitive is storage-only.
+    async fn replace_active_pin(
+        &self,
+        input: ReplaceActivePin,
+    ) -> Result<ReplacedKnownHostEntries, RepositoryError>;
 }
 
 #[async_trait]
