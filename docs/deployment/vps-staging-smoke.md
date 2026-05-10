@@ -520,6 +520,260 @@ the explicit `2026-MM-DD · <slug>` headings and the inter-entry
 cross-references (`entry above`, `entry below`) rather than on a
 strict overall ordering rule.
 
+### 2026-05-10 · Android host-key replacement (revoke-and-replace) staging smoke
+
+Follow-up verification of the host-key replacement flow walked
+end-to-end through the **Tauri Android WebView** on a physical
+Samsung Galaxy S10e (model SM-G970U, Android 12), against the same
+published `:main` lockstep that the
+`2026-05-10 · Host-key replacement (revoke-and-replace) staging
+smoke` entry below already smoked via the workstation Playwright
+browser. The web bundle was identical between the two runs (same
+served `index-vIMOoKa7.js`, served from web image
+`sha256:2977d9a4…` against backend image `sha256:22e092f8…` —
+both built 2026-05-10 18:36-18:37 UTC, ~20 min after the Phase 4
+merge `3000105 Add host key replacement UI`). This slice confirms
+the same SPA bundle renders, gates, and submits the Replace flow
+through Tauri's Android WebView on a physical device, and that the
+backend produces byte-identical DB + audit state to the web smoke
+when driven from the phone.
+
+**APK state.** The previously-installed debug APK on the S10e
+(`cc.js_node.relayterm.mobile.debug` `versionName=0.0.1`
+`versionCode=1`, last update `2026-05-09 13:26`) predated the Phase
+1 schema migration; rebuilt locally via the canonical command
+`pnpm --filter @relayterm/mobile exec tauri android build --debug
+--apk --ci` (≈ 548 MB universal debug APK at
+`apps/mobile/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`),
+installed over the prior install with `adb install -r` (replace,
+keep `localStorage` — the saved backend config carried the staging
+origin from a prior session). Same JDK 17 / Android SDK / NDK
+30.0.14904198 / four-`*-linux-android` Rust targets host setup
+documented in [`tauri-local-build.md`](./tauri-local-build.md);
+build finished green with one `Finished 1 APK at: …
+app-universal-debug.apk` line. Tree stayed clean
+(`git status` showed no changes) — no scaffold edits required.
+
+**Operator user / login.** Reused the existing throwaway bootstrap
+user `staging-throwaway-20260509173230` (same one the prior
+2026-05-09 / 2026-05-10 entries below use); the auto-login cookie
+from a prior phone session was still valid, so reaching the app
+shell required zero credential handling on the workstation. No new
+bootstrap. No production credentials.
+
+**Throwaway SSH target.** Fresh `linuxserver/openssh-server:latest`
+container `relayterm-staging-android-repin-smoke-ssh` (distinct
+name from the prior 2026-05-10 Phase 5 web smoke's
+`relayterm-staging-repin-smoke-ssh` so the two runs do not collide,
+and so the inventory rows the prior smoke left in place per
+AGENTS.md "Inventory lifecycle and destructive-action policy" are
+not re-touched), joined to
+`relayterm-staging_relayterm-staging-internal`, key-auth only
+(`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`), internal SSH port
+2222, no host port published, user `smoke`, `authorized_keys`
+populated from the existing managed `smoke-id` ed25519 identity's
+**public** key only (read from staging Postgres on `cloud-edge`
+via `psql … encode(public_key,'escape')`, never left the host).
+
+**Inventory.** Brand-new host `android-repin-smoke-host`
+(`eb4a7b14-02c0-4376-becf-231806d997a0`) + brand-new server
+profile `android-repin-smoke-profile`
+(`960ed94f-17de-4658-b0f6-cd4f9a980316`), both created through the
+Android UI, bound to the existing reused `smoke-id` ed25519
+identity (`44b5e2be-29c2-4eb0-b6ac-3b4e25ca789d`). Prior smokes'
+inventory left intact per the same AGENTS.md policy.
+
+Verified end-to-end on staging (timestamps from the nginx access
+log + the SSH target's `/config/logs/openssh/current`; SPA flow
+driven manually on the SM-G970U):
+
+- **HTTPS reachability gate (§7.3) re-checked from the workstation
+  before any device or container action.** `/` → 200 (last-modified
+  `Sun, 10 May 2026 18:37:22 GMT`, matches the new web image build
+  time), `/healthz` → 200 `{"status":"ok"}` (content-length 15),
+  `/api/v1/auth/me` → 401
+  `{"error":{"code":"unauthorized",...}}` from outside the SPA.
+  Staging stack carried over from the prior entry below without
+  restart. Backend route presence cross-checked from the
+  workstation: `POST /api/v1/server-profiles/<id>/replace-host-key`
+  → 403 `csrf_origin_mismatch` (route wired, CSRF guard sits ahead
+  of the body extractor, not a 404).
+- **APK install + cold launch on the SM-G970U.**
+  `adb -s R38N500TY3E install -r app-universal-debug.apk` →
+  `Success`; `dumpsys package` confirmed
+  `versionCode=1 versionName=0.0.1 lastUpdateTime=2026-05-10
+  17:29:15`; cold launch via
+  `adb … shell monkey -p cc.js_node.relayterm.mobile.debug -c
+  android.intent.category.LAUNCHER 1` dispatched
+  `MainActivity` to `mResumedActivity` (pid 19203); bounded
+  `logcat -d -t 200` filter showed zero `F/`-tagged FATAL lines /
+  zero ANR / zero RelayTerm-owned exception. Saved backend config
+  from prior session pointed at the staging origin already.
+- **Initial trust path against the new throwaway target.** Phone
+  preflight (`22:44:45`, POST `…/host-key-preflight` → 200 from the
+  Android WebView UA `Mozilla/5.0 (Linux; Android 12; SM-G970U
+  Build/SP1A.210812.016; wv) AppleWebKit/537.36 …
+  Chrome/147.0.7727.138 Mobile Safari/537.36`) returned `unknown`
+  with the initial host fingerprint
+  `SHA256:VTHIC7Eu0wwzKvxTpFawX3o8f26UAkWPcfvCsj5pCaM`,
+  cross-verified byte-identical against the container's own
+  `/config/ssh_host_keys/ssh_host_ed25519_key.pub` via `docker exec
+  … ssh-keygen -lf`. Trust pinned via `POST .../trust-host-key`
+  (`22:45:21`, → 200); panel transitioned to `Trusted` with the
+  inline success banner; `known_host_entries` row
+  `0ee311db-46a5-466f-8cd5-ac12effcee36` recorded with
+  `trusted_at = 2026-05-10 22:45:21.761002+00`,
+  `revoked_at = NULL`.
+- **Initial auth-check failed; mobile-keyboard surface bug.**
+  First `auth-check` attempts at `22:45:28`, `22:45:41`, `22:47:28`,
+  `22:49:06` all returned `authentication_failed` with the SPA
+  message "host key trusted pin, but the server rejected the
+  configured SSH identity for the configured username." Root cause
+  was surfaced by the SSH target's sshd log
+  (`/config/logs/openssh/current`): `Invalid user Smoke from
+  172.21.0.3` (capital **S**). The Android soft-keyboard
+  auto-capitalized the first character when the operator typed
+  `smoke` into the host **Default username** input
+  (`apps/web/src/lib/app/views/ServersView.svelte:774-786`); the
+  input is missing the `autocapitalize="none"` /
+  `autocorrect="off"` attributes that would suppress the behaviour
+  in mobile WebViews. Linux usernames are case-sensitive, so the
+  pubkey was never consulted (sshd rejects unknown users before
+  the publickey method runs). **Workaround applied:** one-row
+  staging-side Postgres
+  `UPDATE hosts SET default_username='smoke', updated_at=now()
+  WHERE display_name='android-repin-smoke-host' AND
+  default_username='Smoke'` (corrects the typo, does not touch any
+  host-key-related table, produces no audit row). After the
+  correction, sshd recorded `Accepted publickey for smoke from
+  172.21.0.3 port 50762 ssh2: ED25519
+  SHA256:94RI7NEnKZyw/xn7XJgqmFpb5xstD+YK+GnwuOLWbPc` and the SPA
+  `auth-check` succeeded (`22:56:04`, → 200,
+  `status: authentication_succeeded`). **This is a mobile-input
+  UX defect, not a Replace-flow defect**, and is deferred (see
+  "Deferred" list below) per this slice's docs-only scope.
+- **Trigger changed host key.** Throwaway target destroyed and
+  recreated with identical container name / hostname / port / user
+  / `authorized_keys` (sha256 of the file remained `c27fbb59…`,
+  i.e. byte-identical); new ed25519 host fingerprint
+  `SHA256:Bld6MEAx6/FX7CedywJEX+dAsZZwVLdCUBIKvvHCoy0` captured via
+  `docker exec relayterm-staging-android-repin-smoke-ssh ssh-keygen
+  -lf /config/ssh_host_keys/ssh_host_ed25519_key.pub` for
+  cross-reference against the SPA result.
+- **`changed` preflight + Replace affordance gating on Android.**
+  Re-run preflight on the phone (`22:58:06`, POST
+  `…/host-key-preflight` → 200) — badge flipped to `Changed`,
+  captured fingerprint matched the new host fingerprint, the
+  normal Trust affordance was absent (not just disabled), and the
+  `Replace trusted host key…` affordance appeared. Replace modal
+  opened cleanly in Android portrait mode (no clipping, no scroll
+  trap, modal usable on the SM-G970U display); the operator
+  visually verified the old fingerprint, the new fingerprint, the
+  four-tag reason picker, the typed-`REPLACE` confirmation field,
+  and the submit-disabled gating (disabled until reason picked
+  AND `REPLACE` typed exactly). Selected reason
+  `lab/staging target recreated` (→ `reason_code =
+  lab_target_recreated`), typed `REPLACE`, button enabled.
+  Forbidden TOFU vocabulary scan (`Force trust`, `Override`,
+  `Ignore warning`, `Disable check`, `auto-trust`) is carried by
+  the Phase 5 web smoke entry below — same SPA bundle, no
+  rebuild — so the modal rendered on the Android WebView inherits
+  the zero-hit result by transitivity; no separate scan was run.
+- **Replace 200 + paired audit verified end-to-end.** Submitting
+  produced a single `POST
+  /api/v1/server-profiles/960ed94f-17de-4658-b0f6-cd4f9a980316/replace-host-key
+  → 200` at `23:01:51`. The old `known_host_entries` row
+  `0ee311db-46a5-466f-8cd5-ac12effcee36` received `revoked_at =
+  2026-05-10 23:01:51.735176+00`, `revoked_by =
+  f968b6f5-9cfc-46ae-b735-bc0f95465b5b` (the throwaway bootstrap
+  user), `revoked_reason_code = lab_target_recreated`, and
+  `replaced_by_id` pointing at the new row
+  `1b2d58fb-274d-49d6-a864-3f6318ac7621`; the new row received
+  `trusted_at` at the SAME timestamp as the old row's `revoked_at`
+  (atomic-tx property, microsecond-equal at
+  `23:01:51.735176+00`), `revoked_at = NULL`, `revoked_by = NULL`,
+  `revoked_reason_code = NULL`, `replaced_by_id = NULL`. Audit
+  table carried exactly one `host_key_revoked` AND exactly one
+  `host_key_accepted` for the host, both at the same
+  `recorded_at = 23:01:51.735176+00`, both `actor_id =
+  f968b6f5-9cfc-46ae-b735-bc0f95465b5b`, payloads cross-linked via
+  the counterparty's `known_host_entry_id` and fingerprints.
+  Payload-key enumeration on both rows showed exactly the seven
+  canonical keys (`host_id`, `known_host_entry_id`,
+  `replacement_known_host_entry_id`, `old_fingerprint`,
+  `new_fingerprint`, `key_type`, `reason_code`) and nothing else —
+  byte-identical shape to the prior web smoke's audit rows.
+- **Post-replace SPA + auth-check + terminal attach on Android.**
+  Panel advanced to the trusted/replaced state showing the new
+  fingerprint and the modal closed. Post-replace `POST
+  .../auth-check → 200` at `23:02:57` with `status:
+  authentication_succeeded`. Terminal launch on the same profile
+  reached an interactive session on the phone; the three harmless
+  smoke commands `echo relayterm-android-repin-replaced-smoke` /
+  `whoami` / `pwd` rendered the expected output (the echo line,
+  `smoke`, `/config`) and the session was ended cleanly from the
+  Android UI.
+- **Backend + web + Android log redaction sweep clean.** Zero
+  `ERROR` / `WARN` lines in the backend during the 45-minute smoke
+  window; zero hits in backend or nginx logs on the sentinel set
+  (`session_token`, `token_hash`, `password`, `cookie`,
+  `encrypted_private_key`, `private_key`, `data_b64`,
+  `REDACT-MARKER`). Zero 5xx in the nginx error log over the same
+  window. Bounded Android `adb logcat -d -t 1000` filter for
+  `relayterm|tauri|webview|fatal|ANR|^F/|signal 1[0-9]|exception`
+  showed zero `F/`-tagged FATAL lines, zero ANR, zero crash signal
+  attributable to RelayTerm (`pid 19203`); a handful of unrelated
+  Samsung-system `System.err: java.io.IOException: write failed:
+  EBUSY` lines came from `pid 1112` (a SoC-system process, not
+  RelayTerm), so they were excluded from the smoke's failure
+  criteria. The wire timeline in the nginx access log matched the
+  phone walk exactly: preflight (200) → trust (200) → auth-check
+  (200, body `authentication_failed` × 4 across `22:45:28`,
+  `22:45:41`, `22:47:28`, `22:49:06`) → preflight (200) →
+  auth-check (200, body `authentication_succeeded` at `22:56:04`
+  after the `default_username` correction) → preflight (200, body
+  `changed` at `22:58:06`) → replace-host-key (200 at `23:01:51`)
+  → auth-check (200 post-replace at `23:02:57`).
+
+Workstation checks before stop-before-commit:
+
+- `pnpm run check:docs-contracts`: clean.
+- `pnpm -r check` (svelte-check + tsc, 315 files / 0 errors / 0
+  warnings): clean.
+- `git diff --check`: clean (no whitespace defects; only the two
+  doc files modified).
+
+Deferred (intentional non-goals for this run):
+
+- **Mobile-input UX fix on the host create form.** Adding
+  `autocapitalize="none"` / `autocorrect="off"` /
+  `inputmode="text"` to
+  `apps/web/src/lib/app/views/ServersView.svelte:774-786` (and any
+  sibling Linux-identifier inputs that share the same input
+  shape — `Hostname`, `Default username`, profile
+  `username_override`, identity `Name`) is a separate small slice;
+  deferred per this slice's docs-only scope. Workaround for this
+  smoke was a one-row staging Postgres
+  `UPDATE hosts SET default_username='smoke' …`. The defect is
+  not specific to the Replace flow — any host-create or username
+  edit done through the Tauri Android WebView is vulnerable to
+  the same auto-capitalize behaviour, so the fix belongs to the
+  inventory-form input shape and not to `HostKeyPanel.svelte`.
+- **Mobile portrait-sidebar UX.** The known portrait-mode
+  sidebar-consumes-viewport issue did not bite the Replace flow
+  on the SM-G970U here (modal opened cleanly, reason picker and
+  confirmation field were both reachable without sidebar
+  interference); deferred for the broader mobile UX slice as
+  previously planned.
+- **SSH CA / host-certificate trust; admin or cross-user replace;
+  bulk replace; hard delete of `known_host_entries` rows;
+  production hostname / production credentials / real production
+  SSH identities; CI / signing / AAB / Play Store work.** Same
+  deferred set as the Phase 5 web smoke below.
+- **Source-code or CI change.** None made; this is a docs-only
+  follow-up slice. The mobile-keyboard input fix is a separate
+  slice if approved.
+
 ### 2026-05-10 · Host-key replacement (revoke-and-replace) staging smoke
 
 Closes the **"Operator-initiated TOFU re-pin / revoke-and-replace

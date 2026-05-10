@@ -373,6 +373,29 @@
 >   work; no backend, schema, or repository change; no CI change;
 >   no source-code change.
 >
+> Phase 5 follow-up landed as `docs/android-host-key-replace-smoke`
+> (2026-05-10): the same Phase 4 `HostKeyPanel.svelte` bundle that
+> the Phase 5 web smoke pinned was re-exercised end-to-end through
+> the **Tauri Android WebView** on a physical Samsung Galaxy S10e
+> against the same published `:main` lockstep (no rebuild — same
+> served `index-vIMOoKa7.js`). Initial trust on a fresh throwaway
+> target → recreate target → `changed` preflight on the phone →
+> Replace modal (gating / typed-`REPLACE` / four-tag reason picker)
+> → `replace-host-key` 200 → paired `host_key_revoked` +
+> `host_key_accepted` audit rows with byte-identical payload shape
+> to the web smoke → post-replace `auth-check` → terminal attach
+> with `echo` / `whoami` / `pwd` all succeeded. The smoke surfaced
+> exactly one mobile-keyboard UX issue unrelated to the Replace
+> surface itself (Android soft-keyboard auto-capitalized the host
+> "Default username" input from `smoke` to `Smoke`, causing the
+> first `auth-check` attempts to fail with `authentication_failed`
+> against the SSH target's `Invalid user Smoke …` rejection until
+> the case was corrected); detail and the deferred mobile-input fix
+> are recorded in
+> [`vps-staging-smoke.md`](../deployment/vps-staging-smoke.md) §
+> "2026-05-10 · Android host-key replacement (revoke-and-replace)
+> staging smoke". No source-code, schema, repository, or CI change.
+>
 > This doc proposes an explicit, auditable operator flow to revoke an
 > active pinned host key and trust a new one in its place — without
 > weakening the TOFU posture defined in
@@ -1063,6 +1086,7 @@ tests on slices that touch DB or audit.
 | 3 ✅ | `feat/replace-host-key-api-helpers` | **Landed.** `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid` + `replacementReasonOptions`. Pure helpers, vitest only. **No component edits yet.** | vitest (`apps/web/tests/replaceHostKeyApi.test.ts`, 40 cases). |
 | 4 ✅ | `feat/replace-host-key-ui` | **Landed.** Backend: `HostKeyPreflightResponse.active_pin_fingerprint` (Phase 4 enabler). SPA: parser update + `decideReplaceSubmit` / `synthesizePostReplacePreflight` helpers + `HostKeyPanel.svelte` modal + button gate + success/error states. **No schema or repository change.** | Backend integration tests for `active_pin_fingerprint` on `changed` / `unknown` / `trusted`; vitest helper tests + static-template scan in `apps/web/tests/hostKeyPanelReplace.test.ts`. |
 | 5 ✅ | `docs/host-key-replace-staging-smoke` | **Landed.** One throwaway-target staging smoke against published `:main` lockstep (post-Phase-4); SPA walk pinned the changed-key detection + Replace modal + paired audit + post-replace auth-check + terminal attach; backend / web log + sentinel sweep clean. Closes the `vps-staging-smoke.md` deferred note. No source-code or CI change. | Manual smoke; doc-contracts guard. |
+| 5b ✅ | `docs/android-host-key-replace-smoke` | **Landed.** Phase 5 follow-up — same Phase 4 SPA bundle re-walked end-to-end through the Tauri Android WebView on a physical SM-G970U against the same `:main` lockstep. Initial trust → recreate → `changed` preflight → Replace modal → 200 → paired audit (byte-identical payload shape to the web smoke) → post-replace auth-check → terminal attach all succeeded; backend / web / nginx / Android logcat sentinel sweep clean. Surfaced one mobile-input UX defect on `ServersView.svelte` host-create username field (auto-capitalize), recorded as a deferred follow-up. No source-code or CI change. | Manual smoke on physical Android device; doc-contracts guard. |
 
 Splitting this way keeps each PR's blast radius small, lets the
 schema land before any caller depends on it, and lets the route
