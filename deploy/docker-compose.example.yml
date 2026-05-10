@@ -124,6 +124,11 @@ services:
       RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS:-3600}"
       RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE:-250}"
 
+      # Detached-live-PTY TTL — short-term reconnect grace window on a
+      # still-live PTY. Default 30s; bounded 5..=86400. NOT durable
+      # session resume across backend restart.
+      RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS: "${RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS:-30}"
+
       # Tracing. The backend honors `RUST_LOG` via tracing_subscriber's
       # env filter. Default keeps app-level info on, dependencies at
       # warn.
