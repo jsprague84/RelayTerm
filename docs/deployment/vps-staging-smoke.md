@@ -709,6 +709,298 @@ Drift worth folding back later (intentional non-goals for this run):
   the workspace-preferred equivalent) is a useful future investment;
   the static scan is the smallest maintainable pin until then.
 
+### 2026-05-10 · Closed-session empty-state reconnect fix verified against published `:main` web image
+
+Closes the **"Drift worth folding back later — Promote `:main`
+post-merge"** follow-up explicitly called out in the entry above.
+The follow-up branch landed as
+`fc80b5a Fix closed session empty-state reconnect`; this run pins
+that the registry-published `:main` web image emitted by the post-merge
+Forgejo Actions run contains the fix and that staging serves it
+cleanly without the prior `docker cp` hot-replace. Same VPS slot
+`relayterm-staging`, same hostname
+`relayterm-staging.js-node.cc`, same throwaway bootstrap user, same
+managed `smoke-id` ed25519 identity reused. Postgres untouched.
+
+This entry is **smoke + docs-only**. No source changes. No backend,
+session-lifecycle, schema, WebSocket-protocol, auth-envelope, Tauri
+shell, or CI changes.
+
+**Verification path.** Driven via Playwright MCP against
+`https://relayterm-staging.js-node.cc` directly, NOT through the
+Tauri desktop WebView. Rationale: the closed-session empty-state
+regression lives in the server-served SPA after handoff, so the
+post-handoff UI path is the same code path the Tauri shell would
+load from this URL. This entry verifies the **published web UI
+path**; it does NOT re-verify Tauri WebView post-handoff behaviour.
+The 2026-05-10 entry above already covered the Tauri handoff +
+behavioural regression-pin during the follow-up-fix iteration.
+
+**Forgejo CI publish (from `git.js-node.cc/api/v1/repos/jsprague/RelayTerm/actions/tasks`):**
+the `publish images (forgejo registry)` workflow for head SHA
+`fc80b5a1a6b33335b58a979e5612713418811564` ran as workflow_id 504,
+status `success`, completed `2026-05-10T00:49:22-05:00` (UTC
+`2026-05-10T05:49:22Z`). The four upstream gates (`rust checks`,
+`web checks`, `docker build`, `desktop linux build`, `tauri android
+build`) all green for the same SHA.
+
+**Registry digests at `:main` (Forgejo container registry,
+post-publish):**
+
+```
+git.js-node.cc/jsprague/relayterm-backend:main
+  sha256:5971ab3a74985466f1c25f5000df71dbc7e96d4217489b04e217dcbb102cf215
+
+git.js-node.cc/jsprague/relayterm-backend-migrate:main
+  sha256:a0b77846c3f984806737c255a6ad83289b5cc70242500bef537e8e3ece98e4bf
+
+git.js-node.cc/jsprague/relayterm-web:main
+  sha256:5b38fbf3c1c06ae549e4763eef7ee645472ca10da79b145246a3ce6bc2580cad
+```
+
+These three digests are the manifest-blob digests as advertised by
+the registry's `docker-content-digest` response header for
+`HEAD /v2/jsprague/<repo>/manifests/main` (Bearer-token auth scoped
+`repository:<repo>:pull`); they match byte-identically what `docker
+images --digests …:main` reports after the host-side pull.
+
+**Pre-refresh staging state (snapshot before the post-merge
+re-pull):**
+
+- `relayterm-staging-relayterm-web-1` was running image-id
+  `sha256:da785804b26827d4d1119486463a04f1664acf6a51cd34b4bbe9016945e7febc`,
+  container created `2026-05-10T05:22:02Z` (~27 min before the
+  publish workflow finished). The running container also carried the
+  hot-replaced bundle from the entry above (a `docker cp` of
+  `apps/web/dist/.` into the container's `/usr/share/nginx/html/`).
+
+**Post-refresh staging state (after `compose pull` +
+`up --force-recreate`):**
+
+- `relayterm-staging-relayterm-web-1` image-id
+  `sha256:5b38fbf3c1c06ae549e4763eef7ee645472ca10da79b145246a3ce6bc2580cad`,
+  container created `2026-05-10T05:58:06Z` — byte-equal to the
+  `:main` manifest config digest above.
+- `relayterm-staging-relayterm-backend-1` image-id
+  `sha256:5971ab3a74985466f1c25f5000df71dbc7e96d4217489b04e217dcbb102cf215`,
+  container created `2026-05-10T05:58:06Z` — byte-equal to the
+  `:main` manifest config digest above.
+- `relayterm-staging-postgres-1` left untouched
+  (`postgres:17-alpine`, up 13 h).
+- Migrate ran via the `migrate` profile, exited code `0`
+  (idempotent — no migrations to apply).
+
+The only host-side commands that mutated container state were:
+
+```sh
+# On cloud-edge:
+cd /home/ubuntu/docker-compose/relayterm-staging
+docker compose --env-file /home/ubuntu/docker/relayterm-staging/.env \
+  -p relayterm-staging pull postgres relayterm-backend relayterm-web
+docker compose --env-file /home/ubuntu/docker/relayterm-staging/.env \
+  -p relayterm-staging --profile migrate pull relayterm-migrate
+docker compose --env-file /home/ubuntu/docker/relayterm-staging/.env \
+  -p relayterm-staging --profile migrate up \
+  --no-deps --abort-on-container-exit \
+  --exit-code-from relayterm-migrate relayterm-migrate
+docker compose --env-file /home/ubuntu/docker/relayterm-staging/.env \
+  -p relayterm-staging up -d \
+  --no-deps --force-recreate --pull never \
+  relayterm-backend relayterm-web
+```
+
+`--force-recreate` is load-bearing: a plain `up -d` would have
+preserved the running web container (since the env hash and image
+tag both look unchanged at the compose-config level), and the
+hot-replaced bundle would have stayed in its overlay layer. With
+`--force-recreate` the old container is torn down and a fresh
+one is constructed from the just-pulled image, evicting the
+`docker cp` overlay.
+
+**HTTPS reachability gate (§7.3) post-refresh:**
+
+```
+curl -I  https://relayterm-staging.js-node.cc/             → 200
+curl -i  https://relayterm-staging.js-node.cc/healthz      → 200 {"status":"ok"}
+curl -i  https://relayterm-staging.js-node.cc/api/v1/auth/me
+                                                            → 401 unauthorized
+```
+
+`/`'s `last-modified` header is
+`Sun, 10 May 2026 05:49:13 GMT` — exactly within the publish
+workflow's run window
+(`2026-05-10T00:44:44 → 00:49:22 -05:00` local =
+`2026-05-10T05:44:44 → 05:49:22Z` UTC), confirming the served HTML
+is the registry-published artifact and not the prior hot-replace.
+
+**Bundle-string verification of the served JS:**
+
+The single Vite-emitted bundle is `/assets/index-BADxlpqn.js`
+(content-hash filename; immutable; `cache-control: public,
+immutable`; `last-modified: 2026-05-10T05:49:13Z`). MD5 of the
+served bytes (`c36b63a6ea3a805919e7bfad56e1603b`) matches MD5 of
+`/usr/share/nginx/html/assets/index-BADxlpqn.js` inside
+`relayterm-staging-relayterm-web-1` byte-for-byte. The bundle
+contains both stable user-facing strings from the closed-session
+fix series (Python `re.search` against the served bytes — bash
+`grep -E` against the same file silently dropped both matches in
+this shell, hence the Python crosscheck — both are present
+exactly once):
+
+- `"This session is closed and cannot be reconnected. Launch a
+  new session from the originating server profile."`
+  (`RECONNECT_CLOSED_MESSAGE` in
+  `apps/web/src/lib/app/terminal/terminalLaunch.ts`, shipped in
+  commit `0804083 Fix closed session reconnect affordance`).
+- `"Reconnect is not available from the current state."`
+  (`RECONNECT_INELIGIBLE_MESSAGE`, same file, same commit).
+
+Comments are stripped by minification, so the `{#key
+activeLaunch?.sessionId ?? "empty"}` wrapper from `fc80b5a` is not
+directly grep-able by its source comment; the behavioural pin
+below covers it.
+
+**Inventory used for the UX smoke (Playwright MCP):**
+
+- **Throwaway SSH target.** `linuxserver/openssh-server:latest`
+  container `relayterm-staging-smoke-ssh` joined to
+  `relayterm-staging_relayterm-staging-internal` (key-auth-only,
+  `PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`, port `2222`, no
+  host port published, user `smoke` with `/bin/bash`, throwaway).
+  The previous container from the entry above was already torn
+  down per its cleanup; this run started a fresh one whose
+  ed25519 host fingerprint is
+  `SHA256:uDf/HiRD80z22jUge0TGRKV1BejRuSixVn0rReMajLY`,
+  byte-identical to `docker exec ... ssh-keygen -lf
+  /config/ssh_host_keys/ssh_host_ed25519_key.pub`.
+- **Inventory.** Brand-new host `smoke-ssh-published-uxsmoke`
+  (`e0f9ae64-d3ce-49cf-ac52-2d55bfc901c3`,
+  `relayterm-staging-smoke-ssh:2222 smoke`) and brand-new profile
+  `published-uxsmoke-profile`
+  (`07ddbfe7-9fa6-42e2-a3f4-6b9d38fbc953`) bound to the existing
+  reused `smoke-id` ed25519 identity
+  (`44b5e2be-29c2-4eb0-b6ac-3b4e25ca789d`). Existing
+  `smoke-ssh-uxsmoke-v2` / `ux-smoke-profile-v2` (from the
+  closed-session empty-state follow-up-fix entry above),
+  `smoke-ssh-custom-ttl-desktop` / `custom-ttl-smoke-profile`,
+  `smoke-ssh-desktop` / `desktop-smoke-profile`, and the
+  Android-smoke inventory were left intact per the AGENTS.md
+  "Inventory lifecycle and destructive-action policy" — re-using
+  the prior `smoke-ssh-uxsmoke-v2` host would have failed
+  host-key preflight against the new container's freshly-generated
+  keys (RelayTerm refuses to silently overwrite a pinned key, and
+  there is no operator route to clear `known_host_entries` on
+  purpose; the supported flow is "create a new host + profile",
+  consistent with the same observation in the entry above and the
+  prior 2026-05-10 custom-TTL entry below).
+
+Inventory CRUD (host + profile creation) was driven via
+`fetch('/api/v1/...', { credentials: 'include' })` from inside
+the Playwright-controlled page; the session cookie ridealong is
+automatic and the same `CsrfGuard` / `Origin` checks apply as for
+the production SPA. Public-key install onto the throwaway SSH
+target was a `docker exec` into the container's
+`/config/.ssh/authorized_keys`. Host-key preflight + trust +
+auth-check were exercised through the SPA's normal buttons.
+
+**End-to-end UX smoke (the load-bearing surface for this entry):**
+
+The flow exercises the operator-visible regression and pins that it
+is no longer reachable through the registry-published bundle.
+
+1. Login via `/api/v1/auth/login` (Playwright UI fill of the
+   `/login` form) succeeded — Dashboard rendered, banner showed
+   `staging-throwaway-20260509173230`.
+2. Inventory POSTs (host + profile) returned `201`.
+3. Host-key preflight returned the new container's ed25519
+   fingerprint
+   `SHA256:uDf/HiRD80z22jUge0TGRKV1BejRuSixVn0rReMajLY`; pasted
+   into the confirmation textbox; **Trust this host key** turned
+   the row into `Trusted ed25519`.
+4. Auth-check returned `Authenticated 2026-05-10T06:12:38.999288997Z`
+   ("SSH public-key authentication succeeded for the configured
+   username. No PTY was allocated and no command was executed.").
+5. **Launch terminal** routed to `/terminal`; phase reached
+   `attached`; xterm DOM rows present; `localStorage` had
+   `relayterm.active-terminal.v1 =
+   {"session_id":"50168a0f-209e-4576-8b5f-ee8cb0f3fccb",...,
+   "profile_label":"published-uxsmoke-profile","cols":80,"rows":24}`.
+6. Sent the harmless command via xterm's IME composition pathway
+   (the `.xterm-helper-textarea` is hidden so a direct `fill`
+   times out; dispatching a `compositionstart` /
+   `input(isComposing=true)` / `compositionend` sequence is the
+   well-supported xterm.js entry point for multi-char input on
+   non-CJK keyboards):
+
+   ```sh
+   echo relayterm-published-web-closed-ux-smoke
+   ```
+
+   The remote shell echoed both the input line and the output
+   line, then the prompt `relayterm-staging-smoke-ssh:~$`
+   re-rendered.
+7. Clicked **End session**. Network panel showed no further
+   `POST /api/v1/...attach` and no fresh `wss://` open after the
+   click — i.e. no doomed reconnect attempt was made.
+8. Empty state rendered. The "Terminal workspace" pane showed the
+   "Launch a terminal from a server profile." copy and the three
+   bullet helpers (`Server profiles → pick → Launch terminal`,
+   `host-key trust + auth-check first`, `~30s detached survival`)
+   — and **NO "Reconnect last session" affordance anywhere** in
+   the empty-state region. The DOM `Array.from(main.querySelectorAll('button')).map(b=>b.textContent)`
+   contained no `Reconnect last session` button. Pre-fix this
+   was a reproducible operator-visible regression on the
+   empty-state path; post-fix it is gone.
+9. `localStorage.getItem('relayterm.active-terminal.v1')` was
+   `null` after End — confirming `clearActiveSession()` ran in
+   `handleSessionClosed`. Combined with #8, this is the load-bearing
+   evidence that AppShell's `{#key activeLaunch?.sessionId ?? "empty"}`
+   wrapper around `<TerminalView>` is in the served bundle and
+   takes effect: the launch transition `non-null → null` rotated
+   the key value from the session id to `"empty"`, unmounted
+   `TerminalView`, and the freshly-mounted instance re-read
+   `loadActiveSession()` against the now-empty localStorage.
+
+What this entry deliberately does NOT claim:
+
+- It does NOT re-verify the Tauri desktop WebView post-handoff
+  path. The SPA code path is the same in both surfaces, but the
+  entry above already covered the Tauri shell against the same
+  staging origin during the follow-up-fix iteration; this entry
+  pins only the registry-published web bundle on the browser
+  surface.
+- It does NOT re-verify Android. The Android Tauri shell is on
+  the same SPA bundle once it hands off, so the same conclusion
+  follows by code-share — but this run did not exercise it.
+
+Workstation checks before stop-before-commit:
+
+- `git diff --check`: clean.
+- `pnpm run check:docs-contracts`: clean.
+- `pnpm -r check` (svelte-check + tsc): clean.
+
+Drift worth folding back later (intentional non-goals for this
+run):
+
+- **WebSocket request panel filtering.** `mcp__playwright__browser_network_requests`
+  with the regex `attach|wss` returned an empty list even with
+  `static: true` — the panel may not include WebSocket frames
+  in this version of the MCP server. The "no doomed reconnect
+  attempt" claim above is grounded in the unfiltered HTTP
+  request log (no `POST /attach` and no fresh `GET /ws/...`
+  after End) plus the empty-state DOM lacking any Reconnect
+  affordance to drive one. A Tauri-shell DevTools verification
+  would catch this directly via the Network tab; defer until
+  the next desktop-shell smoke that has reason to revisit the
+  surface.
+- **Single Vite bundle.** `apps/web/dist` ships exactly one JS
+  asset (`index-BADxlpqn.js`) and one CSS asset
+  (`index-Bl1jKMB5.css`). String greps like the one used here
+  remain a good smoke-time backstop. If we later split the
+  bundle (route-based chunks, vendor split), update this
+  procedure to grep the chunk that owns `lib/app/terminal/*`
+  rather than the entry bundle.
+
 ### 2026-05-10 · Desktop Tauri staging custom detached-live-PTY TTL smoke
 
 Picks up from the 2026-05-09 desktop reconnect smoke entry below
