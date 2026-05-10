@@ -357,6 +357,41 @@ The backend's config schema accepts both `*_B64` and `*_FILE` for the
 session signing key and the vault master key — pick whichever fits
 your secret-store contract.
 
+### 4.6 Deploy config contract guard
+
+`scripts/check-doc-contracts.sh` (also exposed as
+`pnpm run check:docs-contracts` and gated by Forgejo CI) now verifies
+that every operator env knob in the deploy matrix is plumbed
+consistently across:
+
+- `deploy/relayterm.env.example`
+- `deploy/docker-compose.example.yml` (build-mode)
+- `deploy/docker-compose.images.example.yml` (image-mode)
+- `deploy/docker-compose.traefik-staging.example.yml` (VPS staging)
+- `docs/config-examples/relayterm.production.example.toml`
+- `docs/config-examples/relayterm.dev.example.toml`
+
+When adding a new operator-set backend env knob, the contract is:
+
+1. Document it in `deploy/relayterm.env.example` (with a `CHANGE_ME_*`
+   placeholder if it carries a secret).
+2. Wire it as an `environment:` mapping in **all** Compose templates
+   that ship with this repo (build-mode, image-mode, Traefik staging).
+3. Document the TOML key form in both `docs/config-examples/*.toml`
+   examples — bare leaf assignment under the right `[section]` is the
+   normal form; an `# Env: RELAYTERM_*` comment is acceptable too.
+4. Add the env name to the matrix in
+   [`scripts/check-doc-contracts.sh`](../../scripts/check-doc-contracts.sh)
+   under the section headed "Deploy config plumbing — env var × file
+   matrix".
+
+Per-file intentional omissions (e.g. the dev TOML deliberately omits
+`RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64`) are encoded in the matrix
+by leaving the var out of the relevant loop with a justifying comment
+— never a silent skip. The 2026-05-09 detached-PTY-TTL drift (env
+file + two of three Compose templates wired, third missed silently)
+is the bug class this guard exists to prevent.
+
 ---
 
 ## 5. Building images locally
