@@ -16,6 +16,7 @@
 | [`recording.md`](recording.md) | Load-bearing invariants for durable recording. The full design lives in [`../terminal-recording.md`](../terminal-recording.md). |
 | [`web-shell.md`](web-shell.md) | Shell chrome (sidebar, topbar, navigation), URL-driven view routing. |
 | [`tauri-runtime-backend-url.md`](tauri-runtime-backend-url.md) | Design (no implementation yet) for how built Tauri desktop/mobile shells choose and persist a backend URL. Recommends path A (remote web shell — bundled SPA becomes a tiny bootstrap picker, the WebView navigates to the configured backend so same-site cookies + `CsrfGuard` work unchanged). Path B (bundled SPA + cross-origin API) is explicitly deferred because it would force `SameSite=None` + a CORS layer + a layer-3 CSRF token. |
+| [`host-key-replace.md`](host-key-replace.md) | Design (no implementation yet) for the operator-initiated revoke-and-replace flow over `known_host_entries`. Adds `POST /api/v1/server-profiles/:id/replace-host-key`, three columns to `known_host_entries` (`revoked_by`, `revoked_reason_code`, `replaced_by_id`) with paired CHECK constraints, a transactional repository primitive, and an explicit confirm-and-replace UX inside `HostKeyPanel`. Reuses the existing `host_key_revoked` + `host_key_accepted` audit kinds — no enum migration. Preserves TOFU: never auto-overwrites; never silently re-trusts a revoked fingerprint; old pins are revoked, never deleted. |
 
 ## How to update these
 

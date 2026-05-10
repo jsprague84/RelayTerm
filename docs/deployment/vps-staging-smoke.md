@@ -1323,6 +1323,23 @@ Drift worth folding back later (non-blocking):
   fingerprint changed and accept the new one" intent recorded as
   a `host_key_replaced` audit row carrying public metadata only.
   Candidate edit for a future product slice; out of scope here.
+  **Design landed (no implementation yet):** the operator
+  revoke-and-replace flow is now specified in
+  [`docs/spec/host-key-replace.md`](../spec/host-key-replace.md)
+  on branch `docs/host-key-repin-design`. The route name
+  `revoke-and-replace-host-key` and the audit kind
+  `host_key_replaced` proposed earlier in this paragraph are
+  superseded by that design — the agreed shape is `POST
+  /api/v1/server-profiles/:id/replace-host-key` plus a paired
+  audit emission of `host_key_revoked` + `host_key_accepted`
+  (both kinds already exist in `audit_events_kind_chk`, so no
+  enum migration is needed). The design also commits to the
+  schema additions (`revoked_by` / `revoked_reason_code` /
+  `replaced_by_id` on `known_host_entries`) and the
+  typed-`REPLACE` modal UX. Backend route, repository primitive,
+  and SPA wiring will land in the rollout PRs enumerated in that
+  doc; this smoke entry will pin the staging-side verification
+  on the final PR.
 - **Image-tag-vs-commit drift visibility at smoke start.** This
   run discovered ~halfway through that the running staging
   backend image (`sha256:596d8c270d…`, built `2026-05-09T17:05:07Z`)
