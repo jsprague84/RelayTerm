@@ -636,6 +636,17 @@ export interface HostKeyPreflightResponse {
   /** `SHA256:<base64>` form. Public-ish security metadata; safe to
    * display deliberately. */
   host_key_fingerprint: string;
+  /**
+   * Public fingerprint of the active pinned entry on this host, populated
+   * by the backend ONLY when {@link host_key_status} is `"changed"`.
+   * `null` for `"unknown"` (no active pin) and `"trusted"` (the captured
+   * key already matches the active pin). Wired solely to enable the
+   * host-key replace flow without a separate known-host-entries fetch
+   * (see `docs/spec/host-key-replace.md` § R6). Older server builds may
+   * omit the field entirely; the parser collapses both omitted and
+   * explicit-null to `null`.
+   */
+  active_pin_fingerprint: string | null;
   /** Static, server-supplied human-facing message keyed to the status.
    * The backend wires this from a fixed string per status — no operator
    * detail is interpolated. The UI is free to use it but does not
@@ -663,6 +674,19 @@ export function parseHostKeyPreflightResponse(
   if (!HOST_KEY_STATUSES.has(r.host_key_status as HostKeyStatus)) {
     return null;
   }
+  // `active_pin_fingerprint` is optional for back-compat with older
+  // server builds. Accept null OR string OR omitted (treated as null).
+  // Anything else is a type-shape error and rejects the whole row.
+  let activePinFingerprint: string | null = null;
+  if (
+    r.active_pin_fingerprint !== undefined &&
+    r.active_pin_fingerprint !== null
+  ) {
+    if (typeof r.active_pin_fingerprint !== "string") {
+      return null;
+    }
+    activePinFingerprint = r.active_pin_fingerprint;
+  }
   // Construct field-by-field. A stray `encrypted_private_key` /
   // `private_key` on `r` cannot reach the returned object because no
   // path here copies it.
@@ -674,6 +698,7 @@ export function parseHostKeyPreflightResponse(
     host_key_status: r.host_key_status as HostKeyStatus,
     host_key_type: r.host_key_type as SshKeyType,
     host_key_fingerprint: r.host_key_fingerprint,
+    active_pin_fingerprint: activePinFingerprint,
     message: r.message,
   };
 }

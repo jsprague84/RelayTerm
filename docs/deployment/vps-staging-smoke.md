@@ -1339,7 +1339,15 @@ Drift worth folding back later (non-blocking):
   typed-`REPLACE` modal UX. Backend route, repository primitive,
   and SPA wiring will land in the rollout PRs enumerated in that
   doc; this smoke entry will pin the staging-side verification
-  on the final PR.
+  on the final PR. **Update (Phase 4 ready):** Phases 1-4 of the
+  design are now landed (schema, route, API helpers, UI).
+  `HostKeyPanel.svelte` carries the `Replace trusted host key…`
+  affordance + typed-`REPLACE` modal end-to-end against the live
+  backend route. The next staging smoke (Phase 5) is the
+  remaining deferred work — pin the operator-initiated
+  revoke-and-replace flow against a recreated throwaway target
+  and confirm the paired audit pair shows up cleanly in the
+  audit feed.
 - **Image-tag-vs-commit drift visibility at smoke start.** This
   run discovered ~halfway through that the running staging
   backend image (`sha256:596d8c270d…`, built `2026-05-09T17:05:07Z`)

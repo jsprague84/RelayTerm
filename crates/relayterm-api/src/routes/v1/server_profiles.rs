@@ -394,6 +394,41 @@ async fn host_key_preflight(
     let result = state.preflight.preflight(req, &known).await?;
     let host_key_status: HostKeyStatusWire = result.status.into();
 
+    // When status is `Changed`, expose the active pin's fingerprint so
+    // the SPA can offer the host-key replace flow without a separate
+    // known-host-entries fetch. The active pin is the row that flagged
+    // the change: same key_type as the captured key, non-revoked,
+    // already trusted, with a fingerprint that differs from the captured
+    // one. We surface ONLY the public fingerprint string — no public-key
+    // bytes, no row id, no audit data. For `Unknown` and `Trusted` the
+    // field stays `None`: an unknown host has no pin to replace, and a
+    // trusted host has nothing to consent to revoke.
+    //
+    // `find()` returns the first matching row. Today the
+    // `replace_active_pin` repository invariant + the trust route's
+    // refusal to overwrite a `changed` pin guarantee at most one
+    // active, trusted, non-revoked row per `(host_id, key_type)` —
+    // so there is exactly one candidate to surface. The
+    // `host_key_replace` design (`docs/spec/host-key-replace.md` § R5)
+    // and the `replace_active_pin`'s `FOR UPDATE` lock keep that
+    // invariant on the write path; if a future code path were to
+    // intentionally allow multiple active rows of the same key type,
+    // this projection would need to revisit how it resolves the
+    // displayed "old" fingerprint for the SPA.
+    let active_pin_fingerprint = if matches!(host_key_status, HostKeyStatusWire::Changed) {
+        known
+            .iter()
+            .find(|e| {
+                e.revoked_at.is_none()
+                    && e.trusted_at.is_some()
+                    && e.key_type == result.captured.key_type
+                    && e.fingerprint_sha256 != result.captured.fingerprint_sha256
+            })
+            .map(|e| e.fingerprint_sha256.clone())
+    } else {
+        None
+    };
+
     Ok(Json(HostKeyPreflightResponse {
         profile_id: profile.id,
         host_id: host.id,
@@ -402,6 +437,7 @@ async fn host_key_preflight(
         host_key_status,
         host_key_type: result.captured.key_type,
         host_key_fingerprint: result.captured.fingerprint_sha256,
+        active_pin_fingerprint,
         message: HostKeyPreflightResponse::message_for(host_key_status),
     }))
 }

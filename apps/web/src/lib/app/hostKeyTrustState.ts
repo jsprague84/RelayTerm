@@ -24,6 +24,8 @@ import {
   type HostKeyPreflightResponse,
   type HostKeyReplacementReasonCode,
   type HostKeyStatus,
+  type ReplaceHostKeyRequest,
+  type ReplaceHostKeyResponse,
 } from "../api/serverProfiles.js";
 
 /** Short, deliberately-conservative status label for the UI badge. */
@@ -291,5 +293,92 @@ export function replaceGateForPreflight(
     kind: "ok",
     old_fingerprint: activePinFingerprint,
     new_fingerprint: preflight.host_key_fingerprint,
+  };
+}
+
+/**
+ * Submit-time decision for the host-key replace modal. Combines every
+ * gate the operator must pass through ({@link replaceGateForPreflight},
+ * the closed reason-code accept-list, and the typed-`REPLACE`
+ * confirmation) into one dispatch site so the component never builds a
+ * partially-validated request.
+ *
+ * On `ready`, the embedded {@link ReplaceHostKeyRequest} is wire-shape
+ * complete and may be passed straight to `replaceHostKey(...)` — the
+ * `expected_old_fingerprint` is sourced from the preflight's active-pin
+ * field, the `expected_new_fingerprint` from the captured fingerprint,
+ * and `reason_code` from the validated picker selection. Refusal
+ * variants tell the UI which gate failed so the existing modal copy /
+ * helper text can light up the correct field.
+ */
+export type ReplaceSubmitDecision =
+  | {
+      kind: "blocked";
+      reason:
+        | "not_changed_status"
+        | "missing_active_pin"
+        | "invalid_old_fingerprint_shape"
+        | "invalid_new_fingerprint_shape"
+        | "invalid_reason_code"
+        | "confirmation_mismatch";
+    }
+  | { kind: "ready"; request: ReplaceHostKeyRequest };
+
+export function decideReplaceSubmit(
+  preflight: HostKeyPreflightResponse,
+  reasonCode: string | null,
+  confirmInput: string,
+): ReplaceSubmitDecision {
+  const gate = replaceGateForPreflight(
+    preflight,
+    preflight.active_pin_fingerprint,
+  );
+  if (gate.kind !== "ok") {
+    return { kind: "blocked", reason: gate.kind };
+  }
+  if (!reasonCodeIsValid(reasonCode ?? "")) {
+    return { kind: "blocked", reason: "invalid_reason_code" };
+  }
+  if (!replaceConfirmationMatches(confirmInput)) {
+    return { kind: "blocked", reason: "confirmation_mismatch" };
+  }
+  return {
+    kind: "ready",
+    request: {
+      expected_old_fingerprint: gate.old_fingerprint,
+      expected_new_fingerprint: gate.new_fingerprint,
+      reason_code: reasonCode as HostKeyReplacementReasonCode,
+    },
+  };
+}
+
+/**
+ * Synthesize a `host_key_status: "trusted"` preflight response from the
+ * original `changed` preflight + the successful replace response. The
+ * panel uses this to advance the badge / fingerprint area to the new
+ * pin without an extra round-trip.
+ *
+ * Builds the result field-by-field — a stray `private_key` /
+ * `encrypted_private_key` / `cookie` / `session_token` / `token_hash`
+ * smuggled onto the {@link ReplaceHostKeyResponse} fixture cannot reach
+ * the synthesized object because no path here copies it. The
+ * `active_pin_fingerprint` is reset to `null` because the replace flow
+ * is no longer applicable from the synthetic state — there is now
+ * nothing to replace.
+ */
+export function synthesizePostReplacePreflight(
+  preflight: HostKeyPreflightResponse,
+  replacement: ReplaceHostKeyResponse,
+): HostKeyPreflightResponse {
+  return {
+    profile_id: preflight.profile_id,
+    host_id: preflight.host_id,
+    hostname: preflight.hostname,
+    port: preflight.port,
+    host_key_status: "trusted",
+    host_key_type: replacement.host_key_type,
+    host_key_fingerprint: replacement.trusted_fingerprint,
+    active_pin_fingerprint: null,
+    message: preflight.message,
   };
 }

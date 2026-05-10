@@ -50,8 +50,14 @@ const PREFLIGHT_FIXTURE: HostKeyPreflightResponse = {
   host_key_status: "unknown",
   host_key_type: "ed25519",
   host_key_fingerprint: VALID_FP,
+  active_pin_fingerprint: null,
   message: "host key not yet pinned; KEX-stage probe only",
 };
+
+// Distinct fingerprint for the active pin in changed-status fixtures —
+// the captured fingerprint stays at VALID_FP while the active pin's
+// fingerprint differs, mirroring the backend's classification rule.
+const VALID_FP_OLD = "SHA256:OLDfpxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
 const TRUST_FIXTURE: TrustHostKeyResponse = {
   known_host_entry_id: ENTRY_ID,
@@ -137,6 +143,42 @@ describe("parseHostKeyPreflightResponse", () => {
     expect(parseHostKeyPreflightResponse(null)).toBeNull();
     expect(parseHostKeyPreflightResponse("nope")).toBeNull();
     expect(parseHostKeyPreflightResponse(42)).toBeNull();
+  });
+
+  it("captures active_pin_fingerprint when status is changed", () => {
+    const parsed = parseHostKeyPreflightResponse({
+      ...PREFLIGHT_FIXTURE,
+      host_key_status: "changed",
+      active_pin_fingerprint: VALID_FP_OLD,
+    });
+    expect(parsed).not.toBeNull();
+    expect(parsed?.active_pin_fingerprint).toBe(VALID_FP_OLD);
+  });
+
+  it("collapses missing active_pin_fingerprint to null (back-compat)", () => {
+    // Older server builds will not ship the field. The parser MUST accept
+    // such responses and surface the missing field as `null` so the
+    // replace flow's gate falls back to `missing_active_pin` cleanly.
+    const { active_pin_fingerprint: _omit, ...withoutField } =
+      PREFLIGHT_FIXTURE;
+    const parsed = parseHostKeyPreflightResponse(withoutField);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.active_pin_fingerprint).toBeNull();
+  });
+
+  it("rejects active_pin_fingerprint values that are neither string nor null", () => {
+    expect(
+      parseHostKeyPreflightResponse({
+        ...PREFLIGHT_FIXTURE,
+        active_pin_fingerprint: 42,
+      }),
+    ).toBeNull();
+    expect(
+      parseHostKeyPreflightResponse({
+        ...PREFLIGHT_FIXTURE,
+        active_pin_fingerprint: { fp: VALID_FP_OLD },
+      }),
+    ).toBeNull();
   });
 });
 

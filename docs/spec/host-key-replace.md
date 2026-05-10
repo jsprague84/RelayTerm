@@ -1,7 +1,7 @@
 # Host-key replace (revoke-and-replace) — design
 
-> Status: **Phase 1 + Phase 2 + Phase 3 implemented;** UI and staging
-> smoke deferred to phases 4–5.
+> Status: **Phase 1 + Phase 2 + Phase 3 + Phase 4 implemented;**
+> Phase 5 staging smoke remains deferred.
 >
 > Phase 1 landed as `feat/known-host-revoke-metadata`:
 > - Migration `20260510000022_known_host_entries_revoke_metadata.sql`
@@ -187,6 +187,114 @@
 >   modal, no fetch from any view — Phase 4 picks those up. The Phase
 >   3 helpers are pure / vitest-only by design (rollout table § "5
 >   small, separately-mergeable PRs").
+>
+> Phase 4 landed as `feat/replace-host-key-ui`:
+> - **Backend enabler.** `HostKeyPreflightResponse` gained one optional
+>   field `active_pin_fingerprint: Option<String>`
+>   (`crates/relayterm-api/src/dto/preflight.rs`). The preflight handler
+>   populates it ONLY when status is `changed`, deriving the value from
+>   the `known` list it already loads — same key type as the captured
+>   key, non-revoked, already trusted, fingerprint differs from the
+>   captured one (`crates/relayterm-api/src/routes/v1/server_profiles.rs::host_key_preflight`).
+>   The field is `null` for `unknown` and `trusted` outcomes. This is
+>   the smallest possible response addition; no new route, no schema
+>   change, no repository change. Existing clients that omit the field
+>   continue to work — the SPA's parser collapses missing-or-null to
+>   `null` and falls back to `replaceGate.kind = missing_active_pin`.
+>   The redaction posture is preserved: only the public SHA-256
+>   fingerprint string crosses the wire — no public-key bytes, no row
+>   id, no audit data.
+> - **DTO + parser.** `HostKeyPreflightResponse.active_pin_fingerprint:
+>   string | null` on the SPA side
+>   (`apps/web/src/lib/api/serverProfiles.ts`). The
+>   `parseHostKeyPreflightResponse` helper builds the field-by-field
+>   DTO so a stray `private_key` / `encrypted_private_key` smuggled
+>   onto the wire cannot reach the returned object. Pinned by the
+>   parser tests in `apps/web/tests/hostKeyApi.test.ts` (back-compat:
+>   missing field collapses to null; rejection: non-string non-null
+>   types).
+> - **New pure helpers** in `apps/web/src/lib/app/hostKeyTrustState.ts`:
+>   - `decideReplaceSubmit(preflight, reasonCode, confirmInput)` — the
+>     single submit-time decision: combines `replaceGateForPreflight`,
+>     `reasonCodeIsValid`, and `replaceConfirmationMatches`. Returns
+>     `{ kind: "ready", request }` when every gate passes, with the
+>     wire request body assembled from the preflight's
+>     `active_pin_fingerprint` + captured fingerprint + selected reason.
+>     Otherwise `{ kind: "blocked", reason }` naming the gate that
+>     refused. The component never builds a partially-validated
+>     request.
+>   - `synthesizePostReplacePreflight(preflight, replacement)` —
+>     derives a `host_key_status: "trusted"` preflight from the
+>     original + the successful replace response so the panel advances
+>     the badge / fingerprint area to the new pin without an extra
+>     round-trip. Builds the result field-by-field; sentinel-tested
+>     against `private_key` / `encrypted_private_key` / `cookie` /
+>     `session_token` / `token_hash`.
+> - **Panel wiring** in `apps/web/src/lib/app/views/HostKeyPanel.svelte`:
+>   - "Replace trusted host key…" button rendered ONLY under the
+>     `changed_refused` branch AND only when the preflight's
+>     `active_pin_fingerprint` is well-shaped. Invisible (not just
+>     disabled) for `unknown`, `trusted`, and changed-without-active-pin
+>     outcomes — gated by `replacementSummary !== null` which mirrors
+>     `replaceGateForPreflight(...).kind === "ok"`.
+>   - Modal (inline `role="dialog"` block) shows hostname:port,
+>     `Revoking` old fingerprint, `New` fingerprint with key-type
+>     label, reason picker (`<select>` bound to
+>     `replacementReasonOptions()`), `Type REPLACE to confirm` text
+>     input, `Replace pin` submit, `Cancel` button, optional error
+>     band rendered through `describeReplaceHostKeyError`.
+>   - Submit posts via `replaceHostKey(profileId, request)`. On 2xx,
+>     `panelState` advances to `replaced` with the synthesized post-
+>     replace preflight (status=trusted, fingerprint=trusted, key_type
+>     from response). On non-2xx, the modal stays open with the typed
+>     error summary; the operator can fix the form / re-run preflight.
+>     The TOFU posture is preserved: there is no "Force trust" /
+>     "Override" / "Ignore" affordance — those words are explicitly
+>     forbidden in the panel template (pinned by the static-template
+>     scan in `tests/hostKeyPanelReplace.test.ts`).
+>   - The normal Trust button continues to refuse `changed` keys.
+>     The replace affordance is the ONLY operator-sanctioned recovery
+>     path from a `changed` outcome.
+> - **Tests.**
+>   - `apps/web/tests/hostKeyApi.test.ts` — parser round-trip + back-
+>     compat + invalid-type rejection for `active_pin_fingerprint`.
+>   - `apps/web/tests/replaceHostKeyApi.test.ts` — exhaustive coverage
+>     of `decideReplaceSubmit` (every refusal reason; ready-path
+>     request shape) and `synthesizePostReplacePreflight` (shape +
+>     sentinel scan against pollution from a hostile replacement
+>     response).
+>   - `apps/web/tests/hostKeyPanelReplace.test.ts` — static-template
+>     scan: every wire-bearing testid is present
+>     (`host-key-replace-button`, `host-key-replace-modal`,
+>     `host-key-replace-old-fingerprint`,
+>     `host-key-replace-new-fingerprint`,
+>     `host-key-replace-reason-select`,
+>     `host-key-replace-confirm-input`,
+>     `host-key-replace-confirm-mismatch`,
+>     `host-key-replace-submit`, `host-key-replace-cancel`,
+>     `host-key-replace-error`, `host-key-replaced-success`); required
+>     copy strings appear; forbidden words (`Force trust`, `Override`,
+>     `Ignore warning`, `Disable check`, `auto-trust`) never appear;
+>     no sentinel field name (`private_key`, `encrypted_private_key`,
+>     `password`, `cookie`, `session_token`, `token_hash`) lands in
+>     the static template; the picker iterates the canonical option
+>     list; the modal carries `role="dialog"` + `aria-modal` +
+>     `aria-labelledby`. Composition tests mirror the panel's
+>     visibility / submit-disabled rules without needing a full
+>     component harness.
+>   - Backend integration tests in `crates/relayterm-api/tests/api.rs`:
+>     `preflight_changed_when_pinned_fingerprint_differs` now asserts
+>     the `active_pin_fingerprint` echoes the active pin's
+>     fingerprint; `preflight_unknown_when_no_known_host_entries` /
+>     `preflight_trusted_when_pinned_entry_matches` pin the field as
+>     `null` on those code paths.
+> - **No new top-level dependency.** No new tracing, no new test
+>   harness, no new fetch wrapper. The component composes existing
+>   helpers + the existing `replaceHostKey` API helper.
+> - **What this PR does NOT do** (deliberately): no staging smoke
+>   (Phase 5); no SSH CA / host-certificate trust; no admin or bulk
+>   replace; no known-host-entries listing endpoint; no `Tauri`
+>   shell changes; no schema migration; no repository change.
 >
 > This doc proposes an explicit, auditable operator flow to revoke an
 > active pinned host key and trust a new one in its place — without
@@ -876,7 +984,7 @@ tests on slices that touch DB or audit.
 | 1 ✅ | `feat/known-host-revoke-metadata` | **Landed.** Migration `20260510000022_known_host_entries_revoke_metadata.sql` + the three new columns + the two CHECK constraints + Rust row mapping + `KnownHostRevocationReason` enum + `replace_active_pin` repository primitive + repository tests. **No route, no UI.** | Repository tests in `crates/relayterm-db/tests/repositories.rs`. The project uses runtime sqlx queries, so no `.sqlx/` prepare cache. |
 | 2 ✅ | `feat/replace-host-key-route` | **Landed.** The `POST /api/v1/server-profiles/:id/replace-host-key` route + `ReplaceHostKeyRequest` / `ReplaceHostKeyResponse` DTOs + paired-audit emission inside `replace_active_pin` (option (a)) + integration tests. **No UI yet.** | Route integration tests in `crates/relayterm-api/tests/api.rs` (`replace_host_key_*`); redaction-sentinel scan via `AUDIT_FORBIDDEN_SUBSTRINGS`; repository-level audit + atomic-rollback tests in `crates/relayterm-db/tests/repositories.rs`. |
 | 3 ✅ | `feat/replace-host-key-api-helpers` | **Landed.** `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid` + `replacementReasonOptions`. Pure helpers, vitest only. **No component edits yet.** | vitest (`apps/web/tests/replaceHostKeyApi.test.ts`, 40 cases). |
-| 4 | `feat/replace-host-key-ui` | `HostKeyPanel.svelte` modal + button gate; threading through to the API helper. | Component tests once a harness exists; static-text scan as a fallback. |
+| 4 ✅ | `feat/replace-host-key-ui` | **Landed.** Backend: `HostKeyPreflightResponse.active_pin_fingerprint` (Phase 4 enabler). SPA: parser update + `decideReplaceSubmit` / `synthesizePostReplacePreflight` helpers + `HostKeyPanel.svelte` modal + button gate + success/error states. **No schema or repository change.** | Backend integration tests for `active_pin_fingerprint` on `changed` / `unknown` / `trusted`; vitest helper tests + static-template scan in `apps/web/tests/hostKeyPanelReplace.test.ts`. |
 | 5 | `chore/replace-host-key-staging-smoke` | One throwaway-target smoke run; update the deferred note in `vps-staging-smoke.md`; final docs sweep on `auth.md`, `inventory.md`, `SPEC.md`. | Manual smoke; doc-contracts guard. |
 
 Splitting this way keeps each PR's blast radius small, lets the

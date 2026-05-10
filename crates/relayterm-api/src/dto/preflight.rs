@@ -62,6 +62,16 @@ pub(crate) struct HostKeyPreflightResponse {
     pub host_key_status: HostKeyStatusWire,
     pub host_key_type: SshKeyType,
     pub host_key_fingerprint: String,
+    /// Public fingerprint of the active pinned entry on this host, when
+    /// status is [`HostKeyStatusWire::Changed`]. `None` for `Unknown`
+    /// (no active pin OR revoked-and-reappearing) and for `Trusted` (the
+    /// captured fingerprint already matches the active pin, so there is
+    /// nothing to "replace"). Carries ONLY the public SHA-256 fingerprint
+    /// string — no public-key bytes, no key-type override, no
+    /// `known_host_entries` row internals. Wired solely to enable the
+    /// SPA's host-key replace flow without a separate known-host listing
+    /// endpoint (see `docs/spec/host-key-replace.md` § R6 / Phase 4).
+    pub active_pin_fingerprint: Option<String>,
     /// Short, user-facing message explaining the status. Static per
     /// status — no operator detail leaks here. Phrasing is deliberate:
     /// the messages name *only* what the host-key probe proved (KEX

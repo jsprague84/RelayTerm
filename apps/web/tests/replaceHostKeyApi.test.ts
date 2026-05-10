@@ -9,10 +9,12 @@ import {
   type ReplaceHostKeyResponse,
 } from "../src/lib/api/serverProfiles.js";
 import {
+  decideReplaceSubmit,
   reasonCodeIsValid,
   replaceConfirmationMatches,
   replaceGateForPreflight,
   replacementReasonOptions,
+  synthesizePostReplacePreflight,
 } from "../src/lib/app/hostKeyTrustState.js";
 
 /**
@@ -64,6 +66,7 @@ const PREFLIGHT_CHANGED: HostKeyPreflightResponse = {
   host_key_status: "changed",
   host_key_type: "ed25519",
   host_key_fingerprint: NEW_FP,
+  active_pin_fingerprint: OLD_FP,
   message: "host key changed; trust route refuses",
 };
 
@@ -229,6 +232,138 @@ describe("replaceGateForPreflight", () => {
         OLD_FP,
       ),
     ).toEqual({ kind: "invalid_new_fingerprint_shape" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decideReplaceSubmit
+// ---------------------------------------------------------------------------
+
+describe("decideReplaceSubmit", () => {
+  it("returns ready with the wire request when every gate passes", () => {
+    const decision = decideReplaceSubmit(
+      PREFLIGHT_CHANGED,
+      "server_reinstalled",
+      "REPLACE",
+    );
+    expect(decision).toEqual({
+      kind: "ready",
+      request: {
+        expected_old_fingerprint: OLD_FP,
+        expected_new_fingerprint: NEW_FP,
+        reason_code: "server_reinstalled",
+      },
+    });
+  });
+
+  it("blocks when the preflight is not in changed status", () => {
+    expect(
+      decideReplaceSubmit(
+        { ...PREFLIGHT_CHANGED, host_key_status: "unknown" },
+        "server_reinstalled",
+        "REPLACE",
+      ),
+    ).toEqual({ kind: "blocked", reason: "not_changed_status" });
+    expect(
+      decideReplaceSubmit(
+        { ...PREFLIGHT_CHANGED, host_key_status: "trusted" },
+        "server_reinstalled",
+        "REPLACE",
+      ),
+    ).toEqual({ kind: "blocked", reason: "not_changed_status" });
+  });
+
+  it("blocks when active_pin_fingerprint is missing", () => {
+    expect(
+      decideReplaceSubmit(
+        { ...PREFLIGHT_CHANGED, active_pin_fingerprint: null },
+        "server_reinstalled",
+        "REPLACE",
+      ),
+    ).toEqual({ kind: "blocked", reason: "missing_active_pin" });
+  });
+
+  it("blocks when the reason code is null or invalid", () => {
+    expect(
+      decideReplaceSubmit(PREFLIGHT_CHANGED, null, "REPLACE"),
+    ).toEqual({ kind: "blocked", reason: "invalid_reason_code" });
+    expect(
+      decideReplaceSubmit(
+        PREFLIGHT_CHANGED,
+        "server-reinstalled" as unknown as null,
+        "REPLACE",
+      ),
+    ).toEqual({ kind: "blocked", reason: "invalid_reason_code" });
+  });
+
+  it("blocks when the typed confirmation is not exact REPLACE", () => {
+    for (const input of ["", "replace", " REPLACE ", "REPLACE\n", "REPLACEx"]) {
+      expect(
+        decideReplaceSubmit(
+          PREFLIGHT_CHANGED,
+          "server_reinstalled",
+          input,
+        ),
+      ).toEqual({ kind: "blocked", reason: "confirmation_mismatch" });
+    }
+  });
+
+  it("checks gates in a stable, helpful order", () => {
+    // Status gate fires before reason / confirmation, so a unknown-status
+    // preflight + bad inputs surfaces the most useful blocker.
+    expect(
+      decideReplaceSubmit(
+        { ...PREFLIGHT_CHANGED, host_key_status: "unknown" },
+        null,
+        "",
+      ),
+    ).toEqual({ kind: "blocked", reason: "not_changed_status" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// synthesizePostReplacePreflight
+// ---------------------------------------------------------------------------
+
+describe("synthesizePostReplacePreflight", () => {
+  it("derives a trusted preflight from the original preflight + replacement response", () => {
+    const synthetic = synthesizePostReplacePreflight(
+      PREFLIGHT_CHANGED,
+      RESPONSE_FIXTURE,
+    );
+    expect(synthetic.profile_id).toBe(PREFLIGHT_CHANGED.profile_id);
+    expect(synthetic.host_id).toBe(PREFLIGHT_CHANGED.host_id);
+    expect(synthetic.hostname).toBe(PREFLIGHT_CHANGED.hostname);
+    expect(synthetic.port).toBe(PREFLIGHT_CHANGED.port);
+    // The captured-key fields advance to the newly-trusted pin.
+    expect(synthetic.host_key_status).toBe("trusted");
+    expect(synthetic.host_key_type).toBe(RESPONSE_FIXTURE.host_key_type);
+    expect(synthetic.host_key_fingerprint).toBe(
+      RESPONSE_FIXTURE.trusted_fingerprint,
+    );
+    // The replace flow is no longer applicable on the synthesized state —
+    // there is now nothing to replace.
+    expect(synthetic.active_pin_fingerprint).toBeNull();
+  });
+
+  it("does not echo private_key / encrypted_private_key / password / cookie / token fields", () => {
+    const polluted = {
+      ...RESPONSE_FIXTURE,
+      private_key: "RELAY_SENTINEL_REPLACE_PRIVATE_KEY_9302",
+      encrypted_private_key: "RELAY_SENTINEL_REPLACE_ENCRYPTED_PRIVATE_KEY_9303",
+      password: "RELAY_SENTINEL_REPLACE_PASSWORD_9304",
+      cookie: "RELAY_SENTINEL_REPLACE_COOKIE_9305",
+      session_token: "RELAY_SENTINEL_REPLACE_SESSION_TOKEN_9306",
+      token_hash: "RELAY_SENTINEL_REPLACE_TOKEN_HASH_9307",
+    } as ReplaceHostKeyResponse;
+    const synthetic = synthesizePostReplacePreflight(
+      PREFLIGHT_CHANGED,
+      polluted,
+    );
+    const serialised = JSON.stringify(synthetic);
+    for (const sentinel of FORBIDDEN_SUBSTRINGS) {
+      expect(serialised).not.toContain(sentinel);
+    }
   });
 });
 

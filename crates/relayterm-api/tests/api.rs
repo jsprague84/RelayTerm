@@ -1618,6 +1618,10 @@ async fn preflight_unknown_when_no_known_host_entries(pool: PgPool) {
     assert_eq!(body["host_key_fingerprint"], "SHA256:fake-fp");
     assert_eq!(body["port"], 22);
     assert_eq!(body["hostname"], "host-1.example.com");
+    // No active pin exists when status is `unknown` — the field MUST
+    // be null on this code path so the SPA never offers the replace
+    // affordance for first-time-seen / revoked-and-reappearing keys.
+    assert!(body["active_pin_fingerprint"].is_null());
 
     // No private-key material leaks via the preflight response.
     let raw = body.to_string();
@@ -1672,6 +1676,9 @@ async fn preflight_trusted_when_pinned_entry_matches(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = read_body(resp).await;
     assert_eq!(body["host_key_status"], "trusted");
+    // The active pin matches the captured key, so the replace flow is
+    // not applicable — the field MUST be null on the trusted path.
+    assert!(body["active_pin_fingerprint"].is_null());
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -1714,6 +1721,11 @@ async fn preflight_changed_when_pinned_fingerprint_differs(pool: PgPool) {
     let body = read_body(resp).await;
     assert_eq!(body["host_key_status"], "changed");
     assert_eq!(body["host_key_fingerprint"], new_fp);
+    // Phase 4 enabler: changed preflight echoes the active pin's
+    // fingerprint so the SPA can offer the replace flow without a
+    // separate known-host-entries fetch (see
+    // `docs/spec/host-key-replace.md` § R6 / Phase 4 notes).
+    assert_eq!(body["active_pin_fingerprint"], "SHA256:OLD-fp");
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
