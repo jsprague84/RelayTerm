@@ -520,6 +520,370 @@ the explicit `2026-MM-DD · <slug>` headings and the inter-entry
 cross-references (`entry above`, `entry below`) rather than on a
 strict overall ordering rule.
 
+### 2026-05-10 · Desktop Tauri staging custom detached-live-PTY TTL smoke
+
+Picks up from the 2026-05-09 desktop reconnect smoke entry below
+(same VPS slot `relayterm-staging`, same hostname
+`relayterm-staging.js-node.cc`, same throwaway bootstrap user, same
+managed `smoke-id` ed25519 identity reused). Closes the "30 s TTL
+vs. desktop kill+relaunch round-trip" follow-up from that entry's
+"Drift worth folding back later" — the operator-configurable knob
+is now reachable end-to-end through the staging Compose stack and
+its runtime behaviour is verified against the desktop Tauri shell.
+
+This entry is **smoke + plumbing-fix**, not a product feature
+expansion: the configurable-TTL knob already shipped in commit
+`e28b009 Make detached live PTY TTL configurable`. What this run
+landed in addition to the smoke is a one-line wiring fix in the
+Compose templates that the original commit missed.
+
+**Pinned contract under test.** `terminal_sessions.detached_live_pty_ttl_seconds`
+(env `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS`),
+default **30 s**, bounded **5..=86 400** (5 s..24 h), staging value
+for this run **300 s**. Validator rejects 0 / out-of-range as a hard
+boot failure. The knob is a *short-term reconnect grace window* on
+a still-live PTY held by the running backend; it does NOT survive a
+backend restart and is NOT durable shell persistence — see the
+"SCOPE — read this before bumping the value" preamble in
+[`docs/config-examples/relayterm.production.example.toml`](../config-examples/relayterm.production.example.toml).
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Image tag:** `:main`, lockstep upgrade from
+`sha256:596d8c270d…` (built `2026-05-09T17:05:07Z`, predates
+`e28b009` by ~5 h 26 min) to
+`sha256:1f641be800…` (built `2026-05-09T22:58:54Z`, +27 min after
+`e28b009` committed `2026-05-09T22:31:16Z`). Migrate run was a no-op
+(21 in DB equals 21 in repo at this commit). Postgres untouched.
+**Desktop binary:** existing
+`target/release/relayterm-desktop` from the 2026-05-08 build (no
+rebuild — the bundled SPA is only used pre-handoff; the post-handoff
+SPA is fetched fresh from staging at the new web image's hash).
+**Throwaway SSH target:** `linuxserver/openssh-server:latest`
+container `relayterm-staging-smoke-ssh` joined to
+`relayterm-staging_relayterm-staging-internal` (key-auth-only,
+`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`, port `2222`, no host
+port published, user `smoke` with `/bin/bash`, throwaway, torn
+down at end of run); ed25519 host fingerprint
+`SHA256:5E9r10JlhWoS4zxPepLju3ooCnw1OA65tfqPeLw6QqU`,
+byte-identical to `docker exec ... ssh-keygen -lf
+/config/ssh_host_keys/ssh_host_ed25519_key.pub`.
+
+**Inventory:** brand-new host `smoke-ssh-custom-ttl-desktop`
+(`5eac7b62-1bb3-42ce-b556-6744a3b4af5e`,
+`relayterm-staging-smoke-ssh:2222 smoke`) and brand-new profile
+`custom-ttl-smoke-profile`
+(`a250def7-be02-4492-bd44-8e33716b8181`) bound to the existing
+reused `smoke-id` ed25519 identity
+(`44b5e2be-29c2-4eb0-b6ac-3b4e25ca789d`). Existing
+`smoke-ssh-desktop` host + `desktop-smoke-profile` profile (from
+the 2026-05-09 reconnect smoke) and the prior Android-smoke
+inventory were left intact per the AGENTS.md "Inventory lifecycle
+and destructive-action policy" — see also the TOFU re-pin
+observation under "Drift worth folding back later" below for why
+the smoke pivoted to a new host/profile rather than re-using the
+existing `desktop-smoke-profile` row.
+
+Setup-API path drove from `cloud-edge` itself with the session
+cookie persisted to `/tmp/relayterm-custom-ttl.cookie` (`chmod 600`,
+never echoed). Bootstrap credentials sourced from
+`/home/ubuntu/docker/relayterm-staging/.bootstrap-credentials`
+(format: `email=… password=… created_utc=…`, parsed key-by-key into
+shell vars and shipped as a JSON body via `python3 -m json` over
+env interpolation, never echoed). Cookie file shredded at end of
+run.
+
+Plumbing fix landed on this branch:
+
+- The configurable-TTL commit `e28b009` added
+  `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS` to
+  [`deploy/relayterm.env.example`](../../deploy/relayterm.env.example)
+  and to the TOML example
+  [`docs/config-examples/relayterm.production.example.toml`](../config-examples/relayterm.production.example.toml),
+  but did NOT add the matching `${VAR:-30}` interpolation row to
+  either Compose template, so the knob could be set in `.env` but
+  the container's `environment:` map never propagated it. Verified
+  on the on-VPS stack: `docker exec ... env | grep
+  ^RELAYTERM_TERMINAL_SESSIONS__` returned no match before the
+  fix.
+- Patched
+  [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
+  and
+  [`deploy/docker-compose.example.yml`](../../deploy/docker-compose.example.yml)
+  with one line each, mirroring the existing recording-knob shape:
+  `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS:
+  "${RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS:-30}"`.
+  The default `30` matches the historical hard-coded value, so any
+  existing operator who does NOT override in `.env` sees no change.
+- Mirrored on the on-VPS file
+  `/home/ubuntu/docker-compose/relayterm-staging/docker-compose.yml`
+  (with a `.bak.<unix-ts>` snapshot first); subsequent
+  `docker compose up -d --no-deps --force-recreate relayterm-backend`
+  surfaced the env in the container, and the upgraded backend image
+  added the value to its first-line startup log:
+  `relayterm-backend starting addr=0.0.0.0:8080 auth_mode="production"
+  recording_enabled=false detached_live_pty_ttl_seconds=300`.
+
+Verified:
+
+- HTTPS reachability gate (§7.3) re-checked from the workstation
+  before any container action: `/` → 200, `/healthz` → 200 JSON,
+  `/api/v1/auth/me` → 401 JSON. Re-checked AGAIN post lockstep
+  pull + recreate: same three responses, byte-identical headers
+  (HSTS / CSP / referrer-policy from `secure-chain@file`).
+- Force-recreate of `relayterm-backend` after the env-var
+  appendage to `.env` initially appeared to succeed but
+  `docker exec ... env` still showed the new key absent — the
+  Compose template's `environment:` block did not reference it
+  (root cause of the plumbing fix above). After the
+  one-line patch + a second `--force-recreate` cycle, the env
+  var landed in the container; backend reached `(healthy)` in
+  ~10 s; container image at this point was still
+  `sha256:596d8c270d…` and predates `e28b009`, so the configured
+  300 was accepted by the deserializer but the runtime kept the
+  hard-coded 30 s TTL. Lockstep `docker compose pull` + idempotent
+  migrate (no-op at 21 / 21) + `docker compose up -d --no-deps
+  --force-recreate relayterm-backend relayterm-web` brought both
+  containers to `sha256:1f641be800…` /
+  `sha256:<new web>` ; the new backend's startup log carried the
+  `detached_live_pty_ttl_seconds=300` field.
+- Inventory CRUD: `POST /api/v1/hosts` → 201 (host id above);
+  `POST /api/v1/server-profiles` → 201 (profile id above) bound to
+  the reused identity. `POST .../host-key-preflight` returned
+  `host_key_status: "unknown"` with the new container's ed25519
+  fingerprint (matches the host-side `ssh-keygen -lf`); subsequent
+  `POST .../trust-host-key` with the same `expected_fingerprint`
+  returned a fresh `known_host_entry_id`
+  (`f4a91f89-e9fd-4d69-8e76-3a8d29f59249`); subsequent
+  `POST .../auth-check` returned `status:
+  "authentication_succeeded"`, `message: "ssh public-key
+  authentication succeeded; no PTY was allocated and no command
+  was executed"`. Public key was injected into
+  `/config/.ssh/authorized_keys` inside the container with
+  `smoke:users` ownership and mode `600` between preflight and
+  auth-check.
+- **Case A — short detach/reconnect within the configured TTL
+  window** (session `aa7d2809-b539-4a2f-95eb-91cd59325d4c`).
+  Operator launched the production terminal from
+  `custom-ttl-smoke-profile` via `Sidebar → Server profiles →
+  custom-ttl-smoke-profile → Launch terminal session`, ran
+  `echo relayterm-custom-ttl-start`, Detach → wait → Reconnect →
+  `echo relayterm-custom-ttl-resumed` round-tripped. `session_events`
+  ground truth: `attached 00:05:41.026 → detached 00:06:04.567 →
+  attached 00:07:08.801 → reattached 00:07:08.803`. Detach gap =
+  **64.234 s**, comfortably above the old 30 s default (would have
+  reaped) and below the new 300 s configured TTL (still alive);
+  `reattached` event fired within **2.4 ms** of `attached` proving
+  the cancel-pending-close + transition-to-Active path on
+  `crates/relayterm-terminal/src/manager.rs:914-919, 956-970`
+  fired correctly with a non-default TTL.
+- **Case C — replay during detach** (same session
+  `aa7d2809-…`). Operator ran
+  `( for i in 1 2 3 4 5; do sleep 1; echo "relayterm-custom-ttl-replay-$i"; done ) &`,
+  Detached, waited with the client torn down so all 5 ticks emitted
+  while no client was rendering, then Reconnected; **all five lines
+  `relayterm-custom-ttl-replay-1` through `…-5` rendered on the
+  canvas after Reconnect and before any new input** — the
+  in-memory replay ring buffer emitted held frames through the
+  `replay_start → buffered output → replay_end` handshake on the
+  new attachment. `session_events` for the replay portion: `detached
+  00:08:15.500 → attached 00:11:19.173 → reattached 00:11:19.175`,
+  detach gap = **183.7 s** (≈ 6 × the old default; would have
+  reaped 5 × over). A second tighter cycle (`detached 00:11:51.396
+  → attached 00:12:10.967 → reattached 00:12:10.969`, gap **19.6 s**)
+  exercised the same code path. Replay is a *resume-the-live-stream*
+  primitive — the renderer `dispose()` on Detach destroys the
+  xterm.js grid; the live stream's reattachment replays output
+  past `lastSeenSeq` only, not local scrollback. Same documented
+  behaviour as the 2026-05-09 entry.
+- **Case D — beyond-configured-TTL reaper, observed inadvertently**
+  (same session `aa7d2809-…`). After the Case A and Case C cycles
+  the operator detached and the discussion of Case B's tighter
+  retry path ran longer than the 300 s window. `session_events`:
+  `detached 00:13:11.065 → closed 00:18:11.077`, exactly
+  **300.012 s** later. The reaper fires at the configured TTL,
+  not the old default — strong end-to-end evidence the knob is
+  load-bearing on both the reattach-cancel and the
+  reaper-schedule paths. A subsequent **Reconnect** click in the
+  desktop UI for this session id surfaced the
+  `apps/web/src/lib/app/terminal/sessionStatus.ts` "cannot be
+  reconnected" helper text — same documented limitation as the
+  2026-05-09 entry, just observed at the new TTL boundary.
+  No explicit "wait 5 minutes" was scheduled for this case.
+- **Case B — desktop kill + relaunch reconnect within configured
+  TTL** (fresh session
+  `b67717e5-875d-499c-9f2c-0f4c3ae7f6f3`, second attempt). The
+  first Case-B attempt overshot the window: original session
+  `aa7d2809-…` was reaped by the configured TTL before the
+  operator's `kill+relaunch+handoff+AuthGate+Sessions-list-render`
+  round-trip completed (same operator-UX bottleneck the 2026-05-09
+  entry noted at 30 s). Retry path used a fresh session against
+  `custom-ttl-smoke-profile` plus tighter cadence: operator
+  Detached → workstation `pkill -f
+  /home/jsprague/dev/RelayTerm/target/release/relayterm-desktop$` +
+  `nohup … &` (PID `1503908` → `1511854`, kill+relaunch elapsed
+  **5 s** wall-clock) → operator navigated splash → AuthGate-cookie
+  → AppShell → Sidebar Sessions → Open. `session_events`:
+  `attached 00:31:47.312 → detached 00:32:10.428 → attached
+  00:32:47.254 → reattached 00:32:47.256`, detach gap = **36.8 s**
+  including the desktop process restart, `reattached` within
+  **2 ms** of `attached`. The cookie persisted across the kill
+  (storage at
+  `~/.local/share/cc.js-node.relayterm.desktop/cookies` survives
+  process death; same observation as the 2026-05-09 Case D
+  reattempt) so AuthGate skipped LoginView. Sessions-list
+  cross-navigation reconnect succeeded — the prior smoke's "Case
+  D" finding (kill+relaunch+nav round-trip exceeds 30 s default)
+  is now **resolved at 300 s** for the typical desktop, while
+  remaining a real consideration for any deployment that keeps the
+  default. Operators tuning this knob for restart-recovery should
+  pick a value ≥ "operator's slowest expected
+  bootstrap+nav round-trip" + a margin, not just "longer than 30 s".
+- Backend log sweep over **2 hours** of `relayterm-backend`
+  output covering pre-upgrade + post-upgrade + Cases A through D
+  (workstation `ssh ubuntu@cloud-edge ... docker compose logs
+  --since 2h`): zero hits across the full redaction sentinel set
+  (`csrf_origin_mismatch`, `relayterm_session=[A-Za-z0-9_-]{20,}`,
+  `encrypted_private_key`, `data_b64`, `REDACT-MARKER`,
+  `password=`, `"password"`, `BEGIN OPENSSH`, `BEGIN PRIVATE`).
+  Zero `WARN` lines and zero `ERROR` lines in the same window
+  — the binary `RTB1` frame path through Traefik to the desktop
+  WebView is silent on errors during normal detach / reconnect /
+  replay / reaper / process-restart-and-reattach behaviour at
+  the configured TTL. Source-of-truth disambiguation on every
+  TTL-after-reattach question used a bounded read-only Postgres
+  query inside the staging Postgres container scoped to one
+  `session_id` at a time, returning only `kind` + `recorded_at`
+  (no `payload` dump — same defensive default as the 2026-05-09
+  entry).
+
+Deferred (intentional non-goals for this run):
+
+- **Durable long-term session persistence** (`tmux`/`screen`-style
+  resurrection across backend restart). The configurable knob is
+  a *short-term reconnect grace window* on a still-live PTY held
+  by the running backend; a backend restart drops every detached
+  PTY AND its replay buffer per
+  [`docs/spec/terminal.md`](../spec/terminal.md) § "Output
+  sequence + in-memory replay buffer contract". Long-term
+  persistent sessions remain a separate, future architecture and
+  are explicitly NOT delivered by this knob.
+- **Backend restart survival.** Not exercised in this slice; the
+  staging stack was recreated mid-smoke (twice — once for the
+  initial env-var attempt, once for the lockstep image upgrade)
+  but the recreate happened BEFORE Cases A–D and left the
+  pre-existing terminal sessions dormant; each Case used a fresh
+  session.
+- **Android reconnect / Android handoff after backend restart.**
+  Step 7's optional Android handoff/auth sanity was deferred —
+  the desktop smoke covered the configurable-TTL knob in full,
+  and nothing in this slice changed any Android-relevant surface
+  beyond the lockstep image refresh which has the same shape on
+  desktop and mobile. Android terminal attach + Android mobile
+  background-foreground / network-flap remain deferred from
+  prior runs.
+- **Mobile portrait sidebar UX** — same deferred-mobile-UX row
+  as the prior 2026-05-09 Android entries; out of scope for
+  desktop and out of scope here.
+- **Production hostname / production credentials / real production
+  SSH identities** — staging is throwaway by construction (§1).
+- **Tauri release-channel signing / Play Store / AAB / AppImage
+  release notes** — Phase 4+ in
+  [`docs/deployment/tauri-ci-release-plan.md`](./tauri-ci-release-plan.md).
+- **Recording surface.** `RELAYTERM_TERMINAL_RECORDING__ENABLED=false`
+  on this slot per `.env`; recording chunks did not exist for any
+  smoke session.
+- **Alternate renderer adapters** — only
+  `@relayterm/terminal-xterm` baseline was exercised; the
+  experimental ghostty-web / restty / wterm adapters were not.
+- **Multi-tab / multi-client collaborative attach** — single
+  session at a time throughout.
+- **Operator-initiated TOFU re-pin / revoke-and-replace surface**
+  (see "Drift worth folding back later" below).
+- **CI / signing / auth / CORS / CSRF behaviour changes** — none
+  in scope, none made.
+
+Drift worth folding back later (non-blocking):
+
+- **Compose template plumbing for new env knobs.** This run's
+  load-bearing finding: the configurable-TTL commit `e28b009`
+  added the env var to the `.env` and TOML examples but missed
+  both Compose templates AND the implicitly-distributed runbook
+  Compose. The template-template gap is a recurring shape (every
+  `RELAYTERM_…` env knob requires THREE coordinated edits — the
+  Rust config struct, the `.env`/TOML examples, AND the
+  `${VAR:-default}` interpolation row in
+  [`deploy/docker-compose.example.yml`](../../deploy/docker-compose.example.yml)
+  and
+  [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml));
+  consider a future CI / pre-commit check that grep-cross-references
+  the three to guarantee they stay aligned. Out of scope for this
+  smoke; flagged for a future tooling slice. The on-VPS Compose
+  drift is operator-side, but if the released `:main` deploy
+  templates ship correctly, the on-VPS file mostly follows from
+  copy-and-`docker compose pull` discipline at upgrade time.
+- **Operator-initiated TOFU re-pin / revoke-and-replace.** When a
+  throwaway SSH target is recreated and the existing
+  `desktop-smoke-profile` saw `host_key_status: "changed"` against
+  the new fingerprint, `POST .../trust-host-key` correctly returned
+  **409 `host_key_conflict`** and refused to overwrite the active
+  pin (per the route handler at
+  [`crates/relayterm-api/src/routes/v1/server_profiles.rs:454-459`](../../crates/relayterm-api/src/routes/v1/server_profiles.rs):
+  *"an active pin exists with a different fingerprint, which we
+  never auto-overwrite"*; same handler's source comment notes
+  *"Recovery from a revoked entry is a separate, deliberate
+  operator action that does not exist yet"*). The smoke pivoted
+  to a fresh host + fresh profile bound to the same identity
+  rather than weakening TOFU; existing inventory rows were left
+  intact per AGENTS.md "Inventory lifecycle and destructive-action
+  policy". A purpose-built `POST
+  /api/v1/server-profiles/:id/revoke-and-replace-host-key` (or
+  similar) operator surface would let routine re-pinning happen
+  without inventory clutter, with explicit "I acknowledge the
+  fingerprint changed and accept the new one" intent recorded as
+  a `host_key_replaced` audit row carrying public metadata only.
+  Candidate edit for a future product slice; out of scope here.
+- **Image-tag-vs-commit drift visibility at smoke start.** This
+  run discovered ~halfway through that the running staging
+  backend image (`sha256:596d8c270d…`, built `2026-05-09T17:05:07Z`)
+  predated the configurable-TTL commit `e28b009` (committed
+  `2026-05-09T22:31:16Z`) by ~5 h 26 min. The runbook's §5 "Pull
+  the images" assumes the operator pulls before bringing up; on a
+  long-lived staging slot, the running image can drift behind the
+  branch tip without any surface signal. A simple
+  `docker compose pull` + image-digest-printed pre-flight before
+  every smoke (or a runbook §7.3 addition documenting the digest
+  check) would catch this. The runbook §10 lockstep rule already
+  pins the discipline; surfacing it in the smoke gate is the
+  candidate edit.
+- **Default detached-PTY TTL value — keep at 30 s in the
+  templates, override per-deployment.** The `:-30` default in
+  the new template lines matches the historical hard-coded
+  value. The 30 s default is still sane for a default-posture
+  deployment (lower backend RAM / fd / SSH-PTY-budget consumption,
+  faster reaper-of-orphan); 300 s should be a *slot-specific
+  override* for slots that need restart-recovery, not a global
+  default-bump. This is the explicit posture in
+  `docs/config-examples/relayterm.production.example.toml`'s
+  "SCOPE — read this before bumping the value" preamble; calling
+  it out here so future operators reading this entry don't
+  conclude "300 s should be the default" from the smoke results.
+- **Restart-recovery TTL sizing rule of thumb.** The Case-B
+  retry's 36.8 s detach gap (including `pkill` + relaunch +
+  splash + AuthGate + Sessions-render + Open click) suggests a
+  practical floor of ~60–120 s for desktop restart-recovery. The
+  300 s value used here is generous; a deployment that wants
+  restart-recovery without paying the full 300 s of held PTY +
+  fd budget could pick 60–120 s safely on a warm-cookie path. A
+  longer value makes sense when LoginView round-trips on an
+  expired cookie are routine. The two example configs already give
+  range guidance in their preambles
+  ([`docs/config-examples/relayterm.production.example.toml`](../config-examples/relayterm.production.example.toml)
+  cites `600–1800s`;
+  [`deploy/relayterm.env.example`](../../deploy/relayterm.env.example)
+  cites `300–1800s`); a future tooling slice could reconcile the
+  two and fold in this slice's measured 36.8 s "kill+relaunch+nav"
+  observation as a sizing rationale. Not in scope here.
+
 ### 2026-05-09 · Desktop Tauri staging reconnect / detach / replay smoke
 
 Picks up from the 2026-05-09 first end-to-end staging entry below
