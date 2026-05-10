@@ -520,6 +520,203 @@ the explicit `2026-MM-DD · <slug>` headings and the inter-entry
 cross-references (`entry above`, `entry below`) rather than on a
 strict overall ordering rule.
 
+### 2026-05-10 · Host-key replacement (revoke-and-replace) staging smoke
+
+Closes the **"Operator-initiated TOFU re-pin / revoke-and-replace
+surface"** deferred row carried forward from the
+`2026-05-10 · Desktop Tauri staging custom detached-live-PTY TTL
+smoke` entry below. Pins the Phase 5 staging-side verification of
+the design in
+[`docs/spec/host-key-replace.md`](../spec/host-key-replace.md) —
+Phases 1–4 (schema, route, API helpers, UI) had already landed; this
+slice is the manual smoke that walks the operator-sanctioned recovery
+path against a recreated throwaway target on the published `:main`
+lockstep.
+
+This entry is **smoke + docs-only**. No source-code changes. No
+backend, session-lifecycle, schema, repository, WebSocket-protocol,
+auth-envelope, Tauri-shell, or CI changes.
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Image lockstep (post-Phase 4):** backend
+`sha256:22e092f824b44f6e8bc27194c9453411663570a9f7d5ef98fb470db036d7d7c6`
+(built `2026-05-10T18:36:55Z`), web
+`sha256:2977d9a4191c01964487d38038ad6e1718c7b8378850c3f0ad88ec297f9d33df`
+(built `2026-05-10T18:37:22Z`), migrate
+`sha256:d2b3ca084f25aebde1ffa242f8bea29a73e761b9994aa5abe0983c4a2cd3efcc`
+(built `2026-05-10T18:37:06Z`) — all built ~20 min after the Phase 4
+merge `3000105 Add host key replacement UI` (`2026-05-10T18:16:43Z`).
+The fresh web bundle is `index-vIMOoKa7.js` and embeds all eleven
+canonical `host-key-replace-*` testids (`-button`, `-cancel`,
+`-confirm-input`, `-confirm-mismatch`, `-error`, `-modal`,
+`-new-fingerprint`, `-old-fingerprint`, `-reason-select`, `-submit`,
+`-title`). Stack was lockstep-recreated via
+`docker compose --env-file ~/docker/relayterm-staging/.env up -d
+--force-recreate --no-deps relayterm-backend relayterm-web`; Postgres
+was not touched apart from the idempotent migrate
+`20260510000022 known host entries revoke metadata` (the Phase 1 row
+the schema needed).
+**Throwaway SSH target:** `linuxserver/openssh-server:latest`
+container `relayterm-staging-repin-smoke-ssh`, joined to
+`relayterm-staging_relayterm-staging-internal`, key-auth only
+(`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`), internal SSH port
+`2222`, no host port published, user `smoke`, authorized_keys
+populated from the existing managed `smoke-id` ed25519 identity's
+**public** key only. The container was deliberately destroyed and
+recreated mid-smoke so its ed25519 host key changed by construction
+(the load-bearing property for this run).
+**Inventory:** brand-new host `repin-smoke-host` and brand-new
+profile `repin-smoke-profile` bound to the existing reused `smoke-id`
+ed25519 identity. The prior smokes' inventory was left intact per
+AGENTS.md "Inventory lifecycle and destructive-action policy".
+**Operator user:** the existing throwaway bootstrap user
+`staging-throwaway-20260509173230` (same one used by the prior
+2026-05-09 / 2026-05-10 entries). No new bootstrap. No production
+credentials handled.
+
+Verified end-to-end on staging (timestamps from the nginx access
+log; SPA flow driven via the playwright MCP browser):
+
+- **HTTPS reachability gate after lockstep recreate.** `/` → 200
+  (last-modified matches the new web image build time), `/healthz`
+  → 200 `{"status":"ok"}`, `/api/v1/auth/me` → 401
+  `{"error":{"code":"unauthorized",...}}` from outside the SPA. The
+  staging slot was already up under the prior `:main` build before
+  this run; only `relayterm-backend` + `relayterm-web` were
+  recreated.
+- **Initial trust path against the new throwaway target.** Run
+  preflight (`19:22:06`, POST `…/host-key-preflight` → 200) — badge
+  rendered `Not trusted`, status `unknown`, fingerprint
+  `SHA256:jeSIUDEj8fk4VtCMU1JokJcCjmeKxRL4/FLcu36GYtI`, no Replace
+  affordance visible (correct — replace MUST be invisible for
+  unknown / trusted, not just disabled). Trust path: paste captured
+  fingerprint into `host-key-confirm-input`, click
+  `host-key-trust-button` (`19:22:32`, POST `…/trust-host-key` →
+  200); panel transitioned to `Trusted` with the inline
+  `host-key-trusted-success` banner. `auth-check` (`19:23:09`, POST
+  `…/auth-check` → 200) returned `authentication_succeeded` with
+  the expected success copy ("SSH public-key authentication
+  succeeded for the configured username. No PTY was allocated and
+  no command was executed.").
+- **Trigger changed host key.** Throwaway target destroyed and
+  recreated with identical container name, hostname, port, user, and
+  `authorized_keys`; new ed25519 host fingerprint
+  `SHA256:XEWlwegwUAgs3rM9+JcnhChoxvnzt89tBbOfbXDk5V0` captured via
+  `docker exec relayterm-staging-repin-smoke-ssh ssh-keygen -lf
+  /config/ssh_host_keys/ssh_host_ed25519_key.pub` for cross-reference
+  against the SPA result.
+- **`changed` preflight + Replace affordance gating.** Re-run
+  preflight (`19:23:44`, POST `…/host-key-preflight` → 200) — badge
+  flipped to `Changed`, captured fingerprint matched the new host
+  fingerprint, and the deliberate `host-key-changed-refused` notice
+  rendered ("RelayTerm refuses to overwrite a pinned host key
+  automatically. Investigate before retrying — server reinstallation,
+  key rotation, or a man-in-the-middle are all possible
+  explanations."). The normal Trust button was **absent** from the
+  panel (invisible, not just disabled). The new
+  `host-key-replace-button` ("Replace trusted host key…") appeared
+  and was the only operator-sanctioned recovery affordance. A
+  static template scan of the rendered panel for the spec's
+  forbidden words (`Force trust`, `Override`, `Ignore warning`,
+  `Disable check`, `auto-trust`) returned zero hits.
+- **Replace modal contract pinned.** Clicking the affordance opened
+  the modal with `role="dialog"`, `aria-modal="true"`, and
+  `aria-labelledby="host-key-replace-title"`; the title element read
+  "Replace trusted host key". `host-key-replace-old-fingerprint`
+  carried `SHA256:jeSI…36GYtI` (the active pin), and
+  `host-key-replace-new-fingerprint` carried `SHA256:XEWl…XDk5V0`
+  (the captured fingerprint) under the `ed25519` key-type label.
+  The reason picker exposed exactly the four canonical wire tags
+  (`server_reinstalled`, `host_key_rotated`, `lab_target_recreated`,
+  `operator_other`) plus the placeholder. The confirmation input
+  required the byte-exact uppercase `REPLACE`; lowercase `replace`
+  triggered the inline `host-key-replace-confirm-mismatch` helper
+  ("Type the literal word REPLACE in uppercase to enable the
+  action.") AND left `host-key-replace-submit` disabled. Picking a
+  reason alone — submit still disabled. Picking
+  `lab_target_recreated` AND typing uppercase `REPLACE` — submit
+  enabled, button label `Replace pin`, cancel label `Cancel`.
+- **Replace submit + atomic-tx audit pair.** Clicking
+  `host-key-replace-submit` issued a single `POST
+  /api/v1/server-profiles/:id/replace-host-key` (`19:36:44`, → 200,
+  response shape mapped through `parseReplaceHostKeyResponse`). The
+  modal closed; the panel advanced to the `replaced` state with the
+  `host-key-replaced-success` banner ("Host key replaced. Run
+  auth-check below to confirm…"); the badge rendered `Trusted` and
+  the displayed fingerprint pinned the new pin
+  `SHA256:XEWl…XDk5V0` via the synthesized post-replace preflight.
+  Direct DB inspection (read-only, safe-keys-only) confirmed both
+  rows of the atomic transition:
+  - **Old `known_host_entries` row** received `revoked_at =
+    2026-05-10 19:36:44.900327+00`, `revoked_by` = the caller's user
+    id, `revoked_reason_code = lab_target_recreated`, and
+    `replaced_by_id` pointing at the new row. `trusted_at` (the
+    original trust moment) was preserved.
+  - **New `known_host_entries` row** received `trusted_at =
+    2026-05-10 19:36:44.900327+00` (byte-identical timestamp to the
+    revoke — atomic-tx property), `revoked_at = NULL`,
+    `replaced_by_id = NULL`.
+  - **Audit pair** in the same transaction: exactly one
+    `host_key_revoked` AND exactly one `host_key_accepted` for the
+    host within the smoke window, both `recorded_at` at the same
+    instant `19:36:44.900327+00`, both `actor_id = caller`. Each
+    payload carried exactly the seven canonical safe keys
+    (`host_id`, `known_host_entry_id`,
+    `replacement_known_host_entry_id`, `old_fingerprint`,
+    `new_fingerprint`, `key_type`, `reason_code`) — verified by
+    enumerating `jsonb_object_keys(payload)`. The two payloads
+    cross-link: each row's `known_host_entry_id` is the entry the
+    row is "about" and `replacement_known_host_entry_id` is the
+    counterparty's id.
+  - **Redaction sentinel scan** of both payload `::text` casts
+    returned zero hits for `private_key`, `encrypted_private_key`,
+    `password`, `cookie`, `session_token`, `token_hash`,
+    `public_key`, `client_info`, `banner`. Each payload was 397
+    bytes — public metadata only.
+- **Post-replace auth-check + terminal attach.** Re-run auth-check
+  (`19:38:03`, POST `…/auth-check` → 200) returned
+  `authentication_succeeded` — credentials work against the new
+  pin. Terminal launch on the same profile reached
+  `production-terminal-phase = "live"`; three harmless commands
+  were run through the production xterm (`echo
+  relayterm-repin-replaced-smoke`, `whoami`, `pwd`) and produced
+  the expected output (`relayterm-repin-replaced-smoke`, `smoke`,
+  `/config`). Session ended cleanly via
+  `production-terminal-close`; the component unmounted.
+- **Backend + web log redaction sweep clean.** The nginx access
+  log's wire timeline matched the SPA walk exactly (preflight →
+  trust → auth-check → preflight changed → replace-host-key →
+  auth-check). Zero `ERROR` lines in the backend during the smoke
+  window. Zero sentinel hits in either log stream on the set
+  `session_token`, `token_hash`, `password`, `cookie`,
+  `encrypted_private_key`, `private_key`, `data_b64`,
+  `REDACT-MARKER`.
+
+Workstation checks before stop-before-commit:
+
+- `pnpm run check:docs-contracts`: clean.
+- `pnpm -r check` (svelte-check + tsc): clean.
+- `git diff --check`: clean.
+
+Deferred (intentional non-goals for this run):
+
+- **SSH CA / host-certificate trust.** Separate future trust model;
+  out of scope for this surface per `docs/spec/host-key-replace.md`
+  § "Non-goals".
+- **Admin / cross-user replace; bulk replace.** Surface stays
+  owner-scoped + single-profile.
+- **Hard delete of `known_host_entries`.** Old rows are revoked,
+  never dropped; admin-only future work.
+- **Production hostname / production credentials / real production
+  SSH identities.** Staging is throwaway by construction (§1).
+- **Tauri release-channel / Android-specific replace smoke.**
+  Same `HostKeyPanel.svelte` ships via `apps/web`, so the bundled-
+  shell behaviour follows automatically; a Tauri-shell-specific
+  walk is deferred until the next desktop / Android slice that
+  exercises the Replace affordance through a WebView.
+- **Source-code or CI change.** None made; this is a manual-smoke
+  + docs-only slice.
+
 ### 2026-05-10 · Closed-session reconnect empty-state UX smoke + follow-up fix
 
 Picks up from the 2026-05-09 desktop reconnect smoke entry below
@@ -1279,7 +1476,9 @@ Deferred (intentional non-goals for this run):
 - **Multi-tab / multi-client collaborative attach** — single
   session at a time throughout.
 - **Operator-initiated TOFU re-pin / revoke-and-replace surface**
-  (see "Drift worth folding back later" below).
+  (see "Drift worth folding back later" below). **Closed**
+  `2026-05-10` by the `Host-key replacement (revoke-and-replace)
+  staging smoke` entry above.
 - **CI / signing / auth / CORS / CSRF behaviour changes** — none
   in scope, none made.
 
@@ -1347,7 +1546,15 @@ Drift worth folding back later (non-blocking):
   remaining deferred work — pin the operator-initiated
   revoke-and-replace flow against a recreated throwaway target
   and confirm the paired audit pair shows up cleanly in the
-  audit feed.
+  audit feed. **Update (Phase 5 complete):** the staging smoke
+  ran on `2026-05-10` and is recorded as
+  `2026-05-10 · Host-key replacement (revoke-and-replace)
+  staging smoke` above. Changed-key detection, the Replace
+  modal (gating + copy), the paired
+  `host_key_revoked` + `host_key_accepted` audit rows in the
+  same transaction, post-replace `auth-check`, and a terminal
+  attach against the new pin were all verified end-to-end against
+  the published `:main` lockstep. The deferred note is closed.
 - **Image-tag-vs-commit drift visibility at smoke start.** This
   run discovered ~halfway through that the running staging
   backend image (`sha256:596d8c270d…`, built `2026-05-09T17:05:07Z`)

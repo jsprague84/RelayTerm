@@ -1,7 +1,8 @@
 # Host-key replace (revoke-and-replace) — design
 
-> Status: **Phase 1 + Phase 2 + Phase 3 + Phase 4 implemented;**
-> Phase 5 staging smoke remains deferred.
+> Status: **Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 complete.**
+> The slice is fully landed end-to-end against published `:main` on
+> the VPS staging slot.
 >
 > Phase 1 landed as `feat/known-host-revoke-metadata`:
 > - Migration `20260510000022_known_host_entries_revoke_metadata.sql`
@@ -295,6 +296,82 @@
 >   (Phase 5); no SSH CA / host-certificate trust; no admin or bulk
 >   replace; no known-host-entries listing endpoint; no `Tauri`
 >   shell changes; no schema migration; no repository change.
+>
+> Phase 5 landed as `docs/host-key-replace-staging-smoke`:
+> - **One throwaway-target staging smoke.** Pinned against the
+>   published `:main` lockstep (backend image
+>   `sha256:22e092f8…`, web image `sha256:2977d9a4…`,
+>   migrate image `sha256:d2b3ca08…`, all built ~20 min after the
+>   Phase 4 merge `3000105 Add host key replacement UI`). Staging
+>   slot `relayterm-staging` on `cloud-edge`; origin
+>   `https://relayterm-staging.js-node.cc`; reused the existing
+>   throwaway user (`staging-throwaway-20260509173230`) and the
+>   existing managed `smoke-id` ed25519 identity. Postgres untouched
+>   apart from the idempotent Phase 1 migrate
+>   (`20260510000022 known host entries revoke metadata`). Throwaway
+>   target was a fresh `linuxserver/openssh-server:latest` container
+>   on the staging-internal network, key-auth only, no host port
+>   published; recreated mid-smoke to flip its ed25519 host key.
+> - **Walk verified against the SPA.** `repin-smoke-host` +
+>   `repin-smoke-profile` created against the new throwaway target;
+>   preflight → `unknown`; trust path → `trusted`; auth-check →
+>   `authentication_succeeded`. Throwaway target then recreated
+>   (same name / hostname / port / user / authorized_keys) so the
+>   ed25519 host key changed by construction; preflight returned
+>   `changed`, the `host-key-changed-refused` notice was rendered,
+>   the normal Trust button was NOT present (invisible, not just
+>   disabled), and the `Replace trusted host key…` affordance
+>   appeared. The modal carried the correct `role="dialog"` /
+>   `aria-modal="true"` / `aria-labelledby="host-key-replace-title"`,
+>   the four-tag reason picker + placeholder, the typed-`REPLACE`
+>   confirmation gate, and a `Replace pin` / `Cancel` button pair.
+>   Submit-disabled gating verified at every boundary (reason alone
+>   refused, lowercase `replace` refused with helper text, uppercase
+>   `REPLACE` + reason enabled). Forbidden-word static scan of the
+>   panel template (`Force trust`, `Override`, `Ignore warning`,
+>   `Disable check`, `auto-trust`) returned zero hits on the live
+>   bundle.
+> - **Replace 200 + paired audit verified end-to-end.** Submitting
+>   `lab_target_recreated` reason + `REPLACE` confirmation produced
+>   a single `POST /api/v1/server-profiles/:id/replace-host-key →
+>   200` (visible in the nginx access log at `19:36:44`). The old
+>   `known_host_entries` row received `revoked_at`, `revoked_by`,
+>   `revoked_reason_code = lab_target_recreated`, and
+>   `replaced_by_id` pointing at the new row; the new row received
+>   `trusted_at` at the SAME timestamp as the old row's `revoked_at`
+>   (atomic-tx property). Audit table carried exactly one
+>   `host_key_revoked` AND exactly one `host_key_accepted` for the
+>   host, both at the same `recorded_at`, both `actor_id = caller`,
+>   payloads cross-linked via the counterparty's
+>   `known_host_entry_id` and fingerprints. Sentinel scan of both
+>   payloads against `private_key`, `encrypted_private_key`,
+>   `password`, `cookie`, `session_token`, `token_hash`,
+>   `public_key`, `client_info`, `banner` returned zero hits;
+>   payload-key enumeration confirmed exactly the seven canonical
+>   keys (`host_id`, `known_host_entry_id`,
+>   `replacement_known_host_entry_id`, `old_fingerprint`,
+>   `new_fingerprint`, `key_type`, `reason_code`) and nothing else.
+> - **Post-replace SPA + auth-check + terminal attach.** The panel
+>   advanced to `replaced` (badge `Trusted`, fingerprint = new pin),
+>   the success banner rendered ("Host key replaced. Run auth-check
+>   below…"), and the modal closed. Post-replace `POST .../auth-check
+>   → 200` with `status: authentication_succeeded`. Terminal launch
+>   on the same profile reached `phase = "live"`; the three harmless
+>   commands `echo relayterm-repin-replaced-smoke` / `whoami` / `pwd`
+>   each rendered their expected output (the echo line,
+>   `smoke`, `/config`) and the session was ended cleanly through
+>   the SPA.
+> - **Backend + web log redaction sweep clean.** Zero `ERROR` lines
+>   in the backend during the smoke window; zero hits in either log
+>   stream on the sentinel set above. The wire timeline in the
+>   nginx access log matched the SPA walk exactly: preflight (200)
+>   → trust (200) → auth-check (200) → preflight (200, captured the
+>   `changed` outcome) → replace-host-key (200) → auth-check (200).
+> - **What this slice does NOT do** (deliberately): no SSH CA /
+>   host-certificate trust; no admin or bulk replace; no production
+>   credentials; no real production SSH identities; no Tauri-shell
+>   work; no backend, schema, or repository change; no CI change;
+>   no source-code change.
 >
 > This doc proposes an explicit, auditable operator flow to revoke an
 > active pinned host key and trust a new one in its place — without
@@ -985,7 +1062,7 @@ tests on slices that touch DB or audit.
 | 2 ✅ | `feat/replace-host-key-route` | **Landed.** The `POST /api/v1/server-profiles/:id/replace-host-key` route + `ReplaceHostKeyRequest` / `ReplaceHostKeyResponse` DTOs + paired-audit emission inside `replace_active_pin` (option (a)) + integration tests. **No UI yet.** | Route integration tests in `crates/relayterm-api/tests/api.rs` (`replace_host_key_*`); redaction-sentinel scan via `AUDIT_FORBIDDEN_SUBSTRINGS`; repository-level audit + atomic-rollback tests in `crates/relayterm-db/tests/repositories.rs`. |
 | 3 ✅ | `feat/replace-host-key-api-helpers` | **Landed.** `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid` + `replacementReasonOptions`. Pure helpers, vitest only. **No component edits yet.** | vitest (`apps/web/tests/replaceHostKeyApi.test.ts`, 40 cases). |
 | 4 ✅ | `feat/replace-host-key-ui` | **Landed.** Backend: `HostKeyPreflightResponse.active_pin_fingerprint` (Phase 4 enabler). SPA: parser update + `decideReplaceSubmit` / `synthesizePostReplacePreflight` helpers + `HostKeyPanel.svelte` modal + button gate + success/error states. **No schema or repository change.** | Backend integration tests for `active_pin_fingerprint` on `changed` / `unknown` / `trusted`; vitest helper tests + static-template scan in `apps/web/tests/hostKeyPanelReplace.test.ts`. |
-| 5 | `chore/replace-host-key-staging-smoke` | One throwaway-target smoke run; update the deferred note in `vps-staging-smoke.md`; final docs sweep on `auth.md`, `inventory.md`, `SPEC.md`. | Manual smoke; doc-contracts guard. |
+| 5 ✅ | `docs/host-key-replace-staging-smoke` | **Landed.** One throwaway-target staging smoke against published `:main` lockstep (post-Phase-4); SPA walk pinned the changed-key detection + Replace modal + paired audit + post-replace auth-check + terminal attach; backend / web log + sentinel sweep clean. Closes the `vps-staging-smoke.md` deferred note. No source-code or CI change. | Manual smoke; doc-contracts guard. |
 
 Splitting this way keeps each PR's blast radius small, lets the
 schema land before any caller depends on it, and lets the route
