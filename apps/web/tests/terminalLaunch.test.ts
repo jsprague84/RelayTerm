@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildAttachWsUrl,
+  classifyReconnectAttempt,
   computeWorkspaceEnablement,
   DETACHED_TTL_MS,
   derivePhase,
@@ -8,6 +9,8 @@ import {
   describeWorkspaceError,
   phaseLabel,
   phaseTone,
+  RECONNECT_CLOSED_MESSAGE,
+  RECONNECT_INELIGIBLE_MESSAGE,
   safeClearViewport,
   safeFit,
   safeFocus,
@@ -127,14 +130,29 @@ describe("computeWorkspaceEnablement", () => {
     expect(e.clear).toBe(true);
   });
 
-  it("enables reconnect from detached/closed/error only when lastSeenSeq > 0", () => {
-    for (const p of ["detached", "closed", "error"] as const) {
+  it("enables reconnect from detached/error only when lastSeenSeq > 0", () => {
+    for (const p of ["detached", "error"] as const) {
       expect(
         computeWorkspaceEnablement({ phase: p, lastSeenSeq: 0 }).reconnect,
       ).toBe(false);
       expect(
         computeWorkspaceEnablement({ phase: p, lastSeenSeq: 1 }).reconnect,
       ).toBe(true);
+    }
+  });
+
+  it("disables reconnect from a closed phase regardless of lastSeenSeq", () => {
+    // Closed sessions cannot be re-attached; the orchestrator dropped
+    // the runtime. A reconnect would open a WebSocket that fails. The
+    // production workspace must keep the affordance disabled across
+    // every bookmark value — the staging-smoke "End session → Reconnect
+    // → connection error" UX bug came from a closed phase still
+    // satisfying the reconnect predicate when `lastSeenSeq > 0`.
+    for (const seq of [0, 1, 99, 1_000_000]) {
+      expect(
+        computeWorkspaceEnablement({ phase: "closed", lastSeenSeq: seq })
+          .reconnect,
+      ).toBe(false);
     }
   });
 
@@ -179,6 +197,52 @@ describe("computeWorkspaceEnablement", () => {
       expect(e.focus).toBe(false);
       expect(e.fit).toBe(false);
       expect(e.clear).toBe(false);
+    }
+  });
+});
+
+describe("classifyReconnectAttempt (launch-guard)", () => {
+  // Defence in depth: even if a stale click slips past the disabled
+  // Reconnect button (concurrent state-change race, future regression
+  // that re-enables it), the imperative click handler MUST refuse to
+  // open a WebSocket against a closed session. The classifier is the
+  // pure boundary the click handler delegates to; the test pins both
+  // the decision table AND the user-facing copy.
+
+  it("blocks a closed-phase reconnect with a non-technical message", () => {
+    const result = classifyReconnectAttempt({ phase: "closed" });
+    expect(result.kind).toBe("blocked");
+    if (result.kind !== "blocked") return;
+    expect(result.summary).toBe(RECONNECT_CLOSED_MESSAGE);
+    // The message must be honest about the cause and avoid the generic
+    // "connection error" shape the bug originally produced.
+    expect(result.summary.toLowerCase()).toContain("closed");
+    expect(result.summary.toLowerCase()).toContain("cannot be reconnected");
+    expect(result.summary.toLowerCase()).not.toContain("websocket");
+  });
+
+  it("permits a reconnect from detached/error", () => {
+    for (const p of ["detached", "error"] as const) {
+      expect(classifyReconnectAttempt({ phase: p }).kind).toBe("permit");
+    }
+  });
+
+  it("blocks a reconnect from idle/creating/connecting/attached/replaying with the generic ineligible message", () => {
+    for (const p of [
+      "idle",
+      "creating",
+      "connecting",
+      "attached",
+      "replaying",
+    ] as const) {
+      const result = classifyReconnectAttempt({ phase: p });
+      expect(result.kind).toBe("blocked");
+      if (result.kind !== "blocked") return;
+      // Closed gets a phase-specific message; the rest fall back to a
+      // generic "not eligible" string so a stale click on a transient
+      // phase does not produce a misleading "session closed" copy.
+      expect(result.summary).toBe(RECONNECT_INELIGIBLE_MESSAGE);
+      expect(result.summary).not.toBe(RECONNECT_CLOSED_MESSAGE);
     }
   });
 });

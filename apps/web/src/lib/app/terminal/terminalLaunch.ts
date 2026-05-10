@@ -154,11 +154,19 @@ export interface WorkspaceEnablement {
 }
 
 const ATTACHED_PHASES = new Set<WorkspacePhase>(["attached", "replaying"]);
-const RECONNECTABLE_PHASES = new Set<WorkspacePhase>([
-  "detached",
-  "closed",
-  "error",
-]);
+/**
+ * Phases from which the workspace's `Reconnect` button MAY re-attach.
+ * `closed` is deliberately excluded: the orchestrator dropped the
+ * runtime, the wire `attach` is guaranteed to fail, and the operator
+ * just sees a generic "connection error" with no recovery path. The
+ * staging-smoke "End session → Reconnect → connection error" UX bug
+ * came from `closed` previously satisfying this predicate.
+ *
+ * `error` stays in: a transport blip / decode glitch may resolve on a
+ * second try, and the wire-side failure surfaces cleanly through
+ * {@link describeWorkspaceError} otherwise.
+ */
+const RECONNECTABLE_PHASES = new Set<WorkspacePhase>(["detached", "error"]);
 
 export function computeWorkspaceEnablement(
   input: WorkspaceEnablementInput,
@@ -174,6 +182,57 @@ export function computeWorkspaceEnablement(
     fit: attached,
     clear: attached,
   };
+}
+
+/**
+ * Operator-facing message rendered when the workspace refuses a stale
+ * reconnect click against a closed session. Centralised so the helper
+ * test can pin the copy and a future regression that swaps it for the
+ * generic "connection error" string trips the test.
+ */
+export const RECONNECT_CLOSED_MESSAGE =
+  "This session is closed and cannot be reconnected. Launch a new session from the originating server profile.";
+
+/**
+ * Operator-facing fallback message rendered when the workspace refuses
+ * a reconnect click from a phase that is neither closed nor in the
+ * reconnectable set (idle / creating / connecting / attached /
+ * replaying). Exported so the helper test pins the copy and a future
+ * "be helpful and merge it into the closed-message" regression trips
+ * the test.
+ */
+export const RECONNECT_INELIGIBLE_MESSAGE =
+  "Reconnect is not available from the current state.";
+
+export interface ReconnectAttemptInput {
+  phase: WorkspacePhase;
+}
+
+export type ReconnectAttemptDecision =
+  | { kind: "permit" }
+  | { kind: "blocked"; summary: string };
+
+/**
+ * Classify a `Reconnect` click against the current workspace phase.
+ *
+ * Defence in depth alongside {@link computeWorkspaceEnablement}: the
+ * button is disabled for `closed` already, but if a state-change race
+ * or future regression re-enables it, the imperative click handler
+ * delegates here and refuses to open the WebSocket. Returning a
+ * structured decision (instead of a boolean) lets the workspace
+ * surface honest copy — "this session is closed" — instead of the
+ * generic "connection error" the staging-smoke bug produced.
+ */
+export function classifyReconnectAttempt(
+  input: ReconnectAttemptInput,
+): ReconnectAttemptDecision {
+  if (input.phase === "closed") {
+    return { kind: "blocked", summary: RECONNECT_CLOSED_MESSAGE };
+  }
+  if (RECONNECTABLE_PHASES.has(input.phase)) {
+    return { kind: "permit" };
+  }
+  return { kind: "blocked", summary: RECONNECT_INELIGIBLE_MESSAGE };
 }
 
 /**

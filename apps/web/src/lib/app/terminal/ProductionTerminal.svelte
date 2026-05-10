@@ -44,6 +44,7 @@
   import "@relayterm/terminal-xterm/styles";
   import {
     buildAttachWsUrl,
+    classifyReconnectAttempt,
     computeWorkspaceEnablement,
     DETACHED_TTL_MS,
     derivePhase,
@@ -449,6 +450,17 @@
   }
 
   async function reconnectClicked() {
+    // Defence in depth: the button is disabled when
+    // `enablement.reconnect` is false (closed phase, idle, etc.), but a
+    // state-change race could leave a stale enabled click in flight.
+    // Refuse to teardown the renderer / open a fresh WebSocket on a
+    // closed session; surface honest copy instead of the generic
+    // "connection error" the staging-smoke bug produced.
+    const decision = classifyReconnectAttempt({ phase });
+    if (decision.kind === "blocked") {
+      lastError = decision.summary;
+      return;
+    }
     // `attach()` bumps the generation itself; we still teardown first
     // so the `client === null` guard inside attach passes.
     teardownLocal({ keepRenderer: false });
