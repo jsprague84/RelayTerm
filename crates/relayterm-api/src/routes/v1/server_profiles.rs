@@ -9,7 +9,7 @@ use relayterm_core::host::Host;
 use relayterm_core::ids::{ServerProfileId, UserId};
 use relayterm_core::repository::{
     AuditEventRepository, CreateAuditEvent, CreateKnownHostEntry, HostRepository,
-    KnownHostEntryRepository, ServerProfileRepository, SshIdentityRepository,
+    KnownHostEntryRepository, ReplaceActivePin, ServerProfileRepository, SshIdentityRepository,
 };
 use relayterm_core::server_profile::ServerProfile;
 use relayterm_core::ssh_identity::SshIdentity;
@@ -21,7 +21,8 @@ use crate::AppState;
 use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::auth_check::{AuthCheckResponse, AuthCheckStatusWire};
 use crate::dto::preflight::{
-    HostKeyPreflightResponse, HostKeyStatusWire, TrustHostKeyRequest, TrustHostKeyResponse,
+    HostKeyPreflightResponse, HostKeyStatusWire, ReplaceHostKeyRequest, ReplaceHostKeyResponse,
+    TrustHostKeyRequest, TrustHostKeyResponse,
 };
 use crate::dto::server_profile::{CreateServerProfileRequest, ServerProfileResponse};
 use crate::error::ApiError;
@@ -36,6 +37,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/{id}/enable", post(enable))
         .route("/{id}/host-key-preflight", post(host_key_preflight))
         .route("/{id}/trust-host-key", post(trust_host_key))
+        .route("/{id}/replace-host-key", post(replace_host_key))
         .route("/{id}/auth-check", post(auth_check))
 }
 
@@ -503,6 +505,198 @@ async fn trust_host_key(
         host_key_fingerprint: entry.fingerprint_sha256,
         trusted_at,
     }))
+}
+
+/// `POST /api/v1/server-profiles/:id/replace-host-key`.
+///
+/// Atomically revokes the active pinned host key and trusts a new one.
+/// The replace flow is the operator-sanctioned recovery path from the
+/// `changed` outcome the regular `trust-host-key` route refuses — it
+/// preserves the TOFU posture (no auto-overwrite) by requiring BOTH the
+/// active pin's fingerprint AND the freshly-captured fingerprint AND a
+/// canonical reason code.
+///
+/// Order of operations (see `docs/spec/host-key-replace.md` § R5):
+/// 1. `CsrfGuard` first — reject bad-Origin requests before any DB or
+///    body work.
+/// 2. Validate request shape (fingerprint format, reason-code accept-list).
+/// 3. Resolve `(profile, host, identity)` scoped to the caller — foreign
+///    or missing collapses to byte-identical 404.
+/// 4. Refuse if the profile is disabled (mirrors trust / preflight /
+///    auth-check / launch guards).
+/// 5. Decrypt the identity (vault must be configured).
+/// 6. Run a fresh probe to capture the current host key.
+/// 7. Initial-shape checks against the in-memory known-host list:
+///    - `captured_unchanged` if probe matches the active pin (no-op).
+///    - `captured_mismatch` if probe differs from `expected_new_fingerprint`.
+///    - `captured_revoked` if a revoked row already exists for the
+///      captured fingerprint.
+/// 8. Call `replace_active_pin` — repository serialises around the active
+///    row's `FOR UPDATE` lock and emits the paired audit rows in the
+///    same transaction. An audit-insert failure rolls the row mutations
+///    back; the route surfaces it as a 500.
+async fn replace_host_key(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(id): Path<ServerProfileId>,
+    Json(req): Json<ReplaceHostKeyRequest>,
+) -> Result<Json<ReplaceHostKeyResponse>, ApiError> {
+    // 1. Validate input BEFORE any DB or network work — a garbage body
+    //    must not reach the probe / vault / repository.
+    let validated = req.validated()?;
+
+    // 2. Owner-scoped resolve. Cross-user existence collapses to 404.
+    let user_id = user.user_id();
+    let (profile, host, identity) = resolve_owned_profile(&state, user_id, id).await?;
+
+    // 3. Disabled profiles cannot be replaced — re-enable first. Mirrors
+    //    the launch / trust / auth-check / preflight guards. Replace must
+    //    not be a sneaky bypass.
+    if profile.is_disabled() {
+        return Err(server_profile_disabled_conflict());
+    }
+
+    // 4. Decrypt the identity for the probe. The plaintext lives in a
+    //    `Zeroizing<Vec<u8>>` and never crosses another `await` boundary
+    //    after the `preflight.preflight` call returns.
+    let pem = decrypt_identity(&state, &identity)?;
+
+    // 5. Fresh capture. Mirror the username / port / hostname computation
+    //    used by `host_key_preflight` and `trust_host_key` so all three
+    //    routes probe the same target.
+    let username = profile
+        .username_override
+        .as_ref()
+        .map_or_else(|| host.default_username.as_str(), |u| u.as_str())
+        .to_owned();
+    let hostname = host.hostname.as_str().to_owned();
+    let known = state.db.known_host_entries().list_for_host(host.id).await?;
+    let preflight_req = HostKeyPreflightRequest {
+        host_id: host.id,
+        hostname,
+        port: host.port.get(),
+        username,
+        private_key_pem: pem,
+    };
+    let result = state.preflight.preflight(preflight_req, &known).await?;
+
+    // 6. Initial-shape checks (§ R5 step 6). The order matters: each
+    //    branch produces a precise SPA copy keyed off the typed reason.
+    //
+    //    - `captured_unchanged` first: if the probe matches the active
+    //      pin the host has not actually changed; replace is a no-op.
+    //      Surfacing this distinct from a stale `expected_new_fingerprint`
+    //      lets the SPA say "the host key didn't change — your preflight
+    //      result is stale" without the operator second-guessing the
+    //      request body.
+    //    - `captured_mismatch` next: the probe captured a different key
+    //      than the operator just confirmed in their preflight modal.
+    //      The host could have rotated again mid-flow, OR a BGP-shaped
+    //      MITM is in progress — either way, do not write.
+    //    - `captured_revoked` last: a revoked row already exists for
+    //      the captured fingerprint. A revoked-and-reappearing key MUST
+    //      refuse re-trust through this path; recovery is a deliberate
+    //      admin-only future surface (mirrors the symmetric guard in
+    //      `trust_host_key`).
+    if result.captured.fingerprint_sha256 == validated.expected_old_fingerprint {
+        return Err(ApiError::Conflict {
+            entity: "host_key",
+            reason: Some("captured_unchanged"),
+        });
+    }
+    if result.captured.fingerprint_sha256 != validated.expected_new_fingerprint {
+        return Err(ApiError::Conflict {
+            entity: "host_key",
+            reason: Some("captured_mismatch"),
+        });
+    }
+    if known.iter().any(|e| {
+        e.key_type == result.captured.key_type
+            && e.fingerprint_sha256 == result.captured.fingerprint_sha256
+            && e.revoked_at.is_some()
+    }) {
+        return Err(ApiError::Conflict {
+            entity: "host_key",
+            reason: Some("captured_revoked"),
+        });
+    }
+
+    // 7. Atomic replace + paired audit. The repository's `replace_active_pin`
+    //    locks the active row, refuses if `expected_old_fingerprint` does
+    //    not match (collapses no-active-pin AND active-pin-mismatch into
+    //    the same typed conflict), inserts the new trusted row, updates
+    //    the old row's revoke metadata, AND appends both audit rows —
+    //    all in one transaction. The repository's TOCTOU close re-checks
+    //    the captured fingerprint inside the open transaction; an audit
+    //    failure rolls the row mutations back.
+    let replaced = state
+        .db
+        .known_host_entries()
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: validated.expected_old_fingerprint.clone(),
+            new_key_type: result.captured.key_type,
+            new_fingerprint_sha256: result.captured.fingerprint_sha256.clone(),
+            new_public_key: result.captured.public_key.clone(),
+            revoked_by: user_id,
+            reason_code: validated.reason_code,
+        })
+        .await
+        .map_err(map_replace_repository_error)?;
+
+    let trusted_at = replaced.trusted_new.trusted_at.ok_or_else(|| {
+        ApiError::Internal("known_host_entry.trusted_at NULL after replace_active_pin".to_owned())
+    })?;
+
+    Ok(Json(ReplaceHostKeyResponse {
+        profile_id: profile.id,
+        host_id: host.id,
+        revoked_known_host_entry_id: replaced.revoked_old.id,
+        revoked_fingerprint: replaced.revoked_old.fingerprint_sha256.clone(),
+        trusted_known_host_entry_id: replaced.trusted_new.id,
+        trusted_fingerprint: replaced.trusted_new.fingerprint_sha256.clone(),
+        host_key_type: replaced.trusted_new.key_type,
+        trusted_at,
+    }))
+}
+
+/// Map a [`RepositoryError`] returned by `replace_active_pin` to a typed
+/// [`ApiError`]. The repository emits three relevant `Conflict`
+/// constraints — `active_pin_mismatch`, `new_fingerprint_revoked`, and
+/// `new_fingerprint_already_active` — each surfaced through a stable
+/// `host_key` 409 reason so the SPA can render precise copy without
+/// scraping the wire `message`. Anything else flows through the generic
+/// `RepositoryError → ApiError` path (e.g. a Database driver failure
+/// turns into a 500).
+///
+/// The wire reasons match the spec table (§ R4); the third reason
+/// (`new_fingerprint_already_active`) is impossible in normal flow today
+/// — the `captured_unchanged` / `captured_mismatch` checks above already
+/// ensure the captured fingerprint is fresh AND distinct from the active
+/// pin — but the repository contract is the load-bearing source of
+/// truth, so we surface it explicitly for forward compatibility.
+fn map_replace_repository_error(err: relayterm_core::repository::RepositoryError) -> ApiError {
+    use relayterm_core::repository::RepositoryError;
+    if let RepositoryError::Conflict {
+        entity: "known_host_entry",
+        constraint,
+    } = &err
+    {
+        let reason = match constraint.as_str() {
+            "active_pin_mismatch" => Some("active_pin_mismatch"),
+            "new_fingerprint_revoked" => Some("captured_revoked"),
+            "new_fingerprint_already_active" => Some("new_fingerprint_already_active"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return ApiError::Conflict {
+                entity: "host_key",
+                reason: Some(reason),
+            };
+        }
+    }
+    err.into()
 }
 
 /// `POST /api/v1/server-profiles/:id/auth-check`.

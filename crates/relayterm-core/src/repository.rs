@@ -145,10 +145,12 @@ pub struct CreateKnownHostEntry {
 /// Used exclusively by the host-key replace flow
 /// (`docs/spec/host-key-replace.md`). The repository primitive enforces
 /// the transactional invariants — `SELECT … FOR UPDATE` of the active
-/// row, `expected_old_fingerprint` match, single-COMMIT — but does NOT
-/// emit audit rows. Audit emission is wired by the route slice that
-/// owns the calling handler (see `docs/spec/host-key-replace.md` § R7
-/// option (a) for the future shape).
+/// row, `expected_old_fingerprint` match, single-COMMIT — AND emits the
+/// paired `host_key_revoked` + `host_key_accepted` audit rows inside the
+/// same transaction (option (a) per § R7 of the design doc, mirroring
+/// `TerminalRecordingRepository::purge_for_retention`). Audit failure
+/// inside the transaction ROLLBACKs the row mutations: replace + audit
+/// land together or neither does.
 ///
 /// `Debug` is derived: every field is a public-safe primitive.
 /// `expected_old_fingerprint` and `new_fingerprint_sha256` are SHA-256
@@ -471,11 +473,14 @@ pub trait KnownHostEntryRepository: Send + Sync {
     ///   insert in any case; this typed mapping gives the route layer a
     ///   stable error surface.
     ///
-    /// The repository does NOT emit audit rows. The route handler that
-    /// owns the call is responsible for the paired `host_key_revoked`
-    /// + `host_key_accepted` audit emission (see
-    /// `docs/spec/host-key-replace.md` § R2). Audit emission is wired
-    /// in the follow-on route slice; this primitive is storage-only.
+    /// The repository emits the paired `host_key_revoked` +
+    /// `host_key_accepted` audit rows inside the SAME transaction as
+    /// the row mutations (option (a) per `docs/spec/host-key-replace.md`
+    /// § R7). Both rows carry `actor_id = input.revoked_by` and a
+    /// host-anchored, public-metadata-only payload (see § R2). An
+    /// audit-insert failure ROLLBACKs the row mutations; replace +
+    /// audit land together or neither does. This mirrors
+    /// `TerminalRecordingRepository::purge_for_retention` exactly.
     async fn replace_active_pin(
         &self,
         input: ReplaceActivePin,

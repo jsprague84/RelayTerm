@@ -1,8 +1,7 @@
 # Host-key replace (revoke-and-replace) — design
 
-> Status: **Phase 1 (schema + repository foundation) implemented;**
-> route, frontend helpers, UI, and staging smoke deferred to phases
-> 2–5.
+> Status: **Phase 1 + Phase 2 implemented;** frontend helpers, UI, and
+> staging smoke deferred to phases 3–5.
 >
 > Phase 1 landed as `feat/known-host-revoke-metadata`:
 > - Migration `20260510000022_known_host_entries_revoke_metadata.sql`
@@ -18,12 +17,105 @@
 >   `PgKnownHostEntryRepository::replace_active_pin` impl
 >   (`crates/relayterm-db/src/repositories/known_host_entry.rs`),
 >   transactional (`SELECT … FOR UPDATE` → INSERT new → UPDATE old).
->   Audit emission is NOT in the repository; it lands with the route
->   slice (see § R7 option (a) below for the planned shape).
 > - Repository tests in `crates/relayterm-db/tests/repositories.rs`
 >   cover happy path, fingerprint-mismatch, no-active-pin,
 >   already-revoked old pin, previously-revoked new fingerprint,
 >   all four reason codes, scoping, and both CHECK constraints.
+>
+> Phase 2 landed as `feat/replace-host-key-route`:
+> - Route `POST /api/v1/server-profiles/:id/replace-host-key`
+>   (`crates/relayterm-api/src/routes/v1/server_profiles.rs::replace_host_key`)
+>   wired with the canonical `_csrf: CsrfGuard` → `AuthenticatedUser`
+>   → `Path` → `Json` extractor order. Owner-scoped resolve via the
+>   shared `resolve_owned_profile` helper, so foreign / missing
+>   profiles collapse to byte-identical 404. Disabled profiles refuse
+>   with the standard `server_profile disabled` 409 (mirrors the
+>   trust / preflight / auth-check / launch guards).
+> - Request / response DTOs `ReplaceHostKeyRequest` /
+>   `ReplaceHostKeyResponse` and the validator
+>   `ReplaceHostKeyRequest::validated()`
+>   (`crates/relayterm-api/src/dto/preflight.rs`) enforce the
+>   `SHA256:<base64>` fingerprint shape and the four-tag reason-code
+>   accept-list AT THE BOUNDARY before any DB / network work.
+> - **Atomicity decision: option (a) per § R7.** The repository's
+>   `replace_active_pin` now emits the paired `host_key_revoked` +
+>   `host_key_accepted` audit rows inside the same transaction as
+>   the row mutations. An audit-insert failure ROLLBACKs the row
+>   writes; replace + audit land together or neither does. This
+>   mirrors `TerminalRecordingRepository::purge_for_retention`
+>   exactly. The `ReplaceActivePin` input shape did NOT need to grow:
+>   the repository assembles both audit payloads field-by-field from
+>   the primitives already on the input (`host_id`, `revoked_by`,
+>   `reason_code`, the resulting `revoked_old` / `trusted_new` rows).
+> - **Audit payload (host-anchored, public-only).** Each row carries
+>   `actor_id = revoked_by` and a payload of `{ host_id,
+>   known_host_entry_id, replacement_known_host_entry_id,
+>   old_fingerprint, new_fingerprint, key_type, reason_code }`. The
+>   two payloads cross-link via `replacement_known_host_entry_id`
+>   (each row's `known_host_entry_id` is the row it is "about"; the
+>   `replacement_*` field is the counterparty). NO public-key bytes,
+>   NO hostnames / ports / banners, NO operator-supplied free text,
+>   NO russh / DB error text. Sentinel-tested against
+>   `AUDIT_FORBIDDEN_SUBSTRINGS` on every replace path.
+> - **Race-safety / preflight re-check.** The route runs a fresh
+>   `state.preflight.preflight(...)` inside the handler and asserts
+>   `captured_unchanged` / `captured_mismatch` / `captured_revoked`
+>   BEFORE calling the repository. The repository then
+>   `SELECT … FOR UPDATE`s the active row inside the open
+>   transaction — two concurrent replaces collapse to "exactly one
+>   succeeds" with no double-revoke and no double-trust.
+> - **Wire failure modes** (per § R4):
+>   - `400 invalid_input`: malformed fingerprint shape OR reason code
+>     outside the four-tag accept-list.
+>   - `401 unauthorized`: missing / invalid session cookie.
+>   - `403 csrf_origin_mismatch`: shared CsrfGuard fires before any
+>     DB / body work (pinned by
+>     `replace_host_key_returns_403_with_bad_origin_before_body_parse`).
+>   - `404 not_found`: missing OR foreign-owned profile, byte-
+>     identical body / status.
+>   - `409 server_profile disabled`.
+>   - `409 host_key active_pin_mismatch`: the active row's
+>     fingerprint does not match `expected_old_fingerprint` (or no
+>     active pin exists — collapsed by the repository's
+>     `FOR UPDATE` select per design).
+>   - `409 host_key captured_unchanged`: probe matched the active
+>     pin (no-op).
+>   - `409 host_key captured_mismatch`: probe captured a different
+>     fingerprint than `expected_new_fingerprint`.
+>   - `409 host_key captured_revoked`: a revoked row already exists
+>     for the captured fingerprint.
+>   - `409 host_key new_fingerprint_already_active`: forward-compat
+>     for a future code path that races a duplicate trust through
+>     this primitive (currently impossible because of the
+>     `captured_*` checks above).
+>   - `502 bad_gateway`: probe failure (static `"bad gateway"` body
+>     so peer banners / topology never leak).
+>   - `503 service_unavailable`: vault disabled.
+> - **Test coverage** (`crates/relayterm-api/tests/api.rs`,
+>   `replace_host_key_*`): happy path with paired-audit assertion +
+>   sentinel scan; each conflict reason; 400 on each malformed shape;
+>   401 / 403 / 404; 502 / 503; profile-disabled; the trust route
+>   still refuses `changed` keys (TOFU posture pin); foreign-owned
+>   404 byte-identical to a genuine 404; `assert_no_replace_audit`
+>   helper proves NO `host_key_*` audit row lands on any refused
+>   replace. Repository tests
+>   (`crates/relayterm-db/tests/repositories.rs`,
+>   `replace_active_pin_*`) gain an audit-shape assertion and an
+>   atomic-rollback assertion (forced via an FK violation on a
+>   phantom `revoked_by`).
+> - **Pre-existing test-fixture fix:** Phase 1's `revoke_entry` test
+>   helper in `crates/relayterm-api/tests/api.rs` only set
+>   `revoked_at`, which violates the
+>   `known_host_entries_revoked_columns_set_together` CHECK added in
+>   the same migration. The helper now writes the full triple
+>   (`revoked_at`, `revoked_by`, `revoked_reason_code = 'operator_other'`)
+>   and the previously-broken
+>   `trust_host_key_refuses_to_re_trust_a_revoked_fingerprint` /
+>   `preflight_treats_revoked_match_as_unknown` /
+>   `auth_check_blocks_when_host_key_revoked` /
+>   `terminal_session_create_blocks_revoked_pin` tests are restored.
+>   This was masked because the affected tests are gated on the
+>   `postgres-tests` feature.
 >
 > This doc proposes an explicit, auditable operator flow to revoke an
 > active pinned host key and trust a new one in its place — without
@@ -286,9 +378,16 @@ mirrored by a `zod`/`valibot` shape on the web side):
   "revoked_fingerprint": "SHA256:…",
   "trusted_known_host_entry_id": "…",
   "trusted_fingerprint": "SHA256:…",
+  "host_key_type": "ed25519",
   "trusted_at": "2026-…"
 }
 ```
+
+`host_key_type` echoes the captured key-type tag so a follow-on
+`describeReplaceHostKeyResponse` SPA helper does not have to re-parse
+the fingerprint string for an audit-feed badge. Mirrors the
+`TrustHostKeyResponse` shape that already ships
+(`crates/relayterm-api/src/dto/preflight.rs::TrustHostKeyResponse`).
 
 The response carries only public-side identifiers and the public
 fingerprints. No `public_key` byte blob. No vault payloads. No host
@@ -704,7 +803,7 @@ tests on slices that touch DB or audit.
 | # | Branch | What lands | Tests |
 |---|---|---|---|
 | 1 ✅ | `feat/known-host-revoke-metadata` | **Landed.** Migration `20260510000022_known_host_entries_revoke_metadata.sql` + the three new columns + the two CHECK constraints + Rust row mapping + `KnownHostRevocationReason` enum + `replace_active_pin` repository primitive + repository tests. **No route, no UI.** | Repository tests in `crates/relayterm-db/tests/repositories.rs`. The project uses runtime sqlx queries, so no `.sqlx/` prepare cache. |
-| 2 | `feat/replace-host-key-route` | The `POST /api/v1/server-profiles/:id/replace-host-key` route + DTOs + audit emission + integration tests. **No UI yet.** | Route integration tests; redaction-sentinel scan. |
+| 2 ✅ | `feat/replace-host-key-route` | **Landed.** The `POST /api/v1/server-profiles/:id/replace-host-key` route + `ReplaceHostKeyRequest` / `ReplaceHostKeyResponse` DTOs + paired-audit emission inside `replace_active_pin` (option (a)) + integration tests. **No UI yet.** | Route integration tests in `crates/relayterm-api/tests/api.rs` (`replace_host_key_*`); redaction-sentinel scan via `AUDIT_FORBIDDEN_SUBSTRINGS`; repository-level audit + atomic-rollback tests in `crates/relayterm-db/tests/repositories.rs`. |
 | 3 | `feat/replace-host-key-api-helpers` | `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid`. Pure helpers, vitest only. **No component edits yet.** | vitest. |
 | 4 | `feat/replace-host-key-ui` | `HostKeyPanel.svelte` modal + button gate; threading through to the API helper. | Component tests once a harness exists; static-text scan as a fallback. |
 | 5 | `chore/replace-host-key-staging-smoke` | One throwaway-target smoke run; update the deferred note in `vps-staging-smoke.md`; final docs sweep on `auth.md`, `inventory.md`, `SPEC.md`. | Manual smoke; doc-contracts guard. |

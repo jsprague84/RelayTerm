@@ -1174,6 +1174,157 @@ async fn replace_active_pin_is_scoped_to_host_id(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_emits_paired_audit_rows_in_same_transaction(pool: PgPool) {
+    // Option (a) per `docs/spec/host-key-replace.md` § R7: the
+    // repository emits both `host_key_revoked` and `host_key_accepted`
+    // audit rows inside the same transaction as the row mutations. The
+    // payloads cross-link via `replacement_known_host_entry_id` and
+    // carry only public-safe metadata.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+    let active = seed_active_pin(&pool, host.id).await;
+
+    let result = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: user.id,
+            reason_code: KnownHostRevocationReason::HostKeyRotated,
+        })
+        .await
+        .unwrap();
+
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let revoked: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::HostKeyRevoked)
+        .collect();
+    let accepted: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::HostKeyAccepted)
+        .collect();
+    assert_eq!(revoked.len(), 1, "want one host_key_revoked: {recent:?}");
+    assert_eq!(accepted.len(), 1, "want one host_key_accepted: {recent:?}");
+    let r = &revoked[0].payload;
+    let a = &accepted[0].payload;
+
+    // Both rows reference the caller and carry the host-anchored ids.
+    assert_eq!(revoked[0].actor_id, Some(user.id));
+    assert_eq!(accepted[0].actor_id, Some(user.id));
+    assert_eq!(r["host_id"].as_str().unwrap(), host.id.to_string());
+    assert_eq!(a["host_id"].as_str().unwrap(), host.id.to_string());
+
+    // Cross-link: `host_key_revoked` self-references the OLD entry; its
+    // `replacement_*` field points at the NEW entry. Inverse for accepted.
+    assert_eq!(
+        r["known_host_entry_id"].as_str().unwrap(),
+        active.id.to_string(),
+    );
+    assert_eq!(
+        r["replacement_known_host_entry_id"].as_str().unwrap(),
+        result.trusted_new.id.to_string(),
+    );
+    assert_eq!(
+        a["known_host_entry_id"].as_str().unwrap(),
+        result.trusted_new.id.to_string(),
+    );
+    assert_eq!(
+        a["replacement_known_host_entry_id"].as_str().unwrap(),
+        active.id.to_string(),
+    );
+
+    // Public-only fingerprint shape persisted on both rows.
+    assert_eq!(r["old_fingerprint"], REPLACE_OLD_FP);
+    assert_eq!(r["new_fingerprint"], REPLACE_NEW_FP);
+    assert_eq!(a["old_fingerprint"], REPLACE_OLD_FP);
+    assert_eq!(a["new_fingerprint"], REPLACE_NEW_FP);
+    assert_eq!(r["key_type"], "ed25519");
+    assert_eq!(a["key_type"], "ed25519");
+    assert_eq!(r["reason_code"], "host_key_rotated");
+    assert_eq!(a["reason_code"], "host_key_rotated");
+
+    // Public-key bytes (whether wire-format or base64) MUST NOT appear
+    // in the payload — the fingerprint already identifies the key.
+    let raw = format!("{r}\n{a}");
+    assert!(
+        !raw.contains("public_key"),
+        "audit payloads must not include the public key bytes: {raw}",
+    );
+    assert!(
+        !raw.contains("AAAA-OLD"),
+        "audit payloads must not include OpenSSH-format key bytes: {raw}",
+    );
+    assert!(
+        !raw.contains("AAAA-NEW"),
+        "audit payloads must not include OpenSSH-format key bytes: {raw}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_active_pin_audit_rolls_back_when_audit_insert_fails(pool: PgPool) {
+    // Atomicity: if the paired audit insert fails inside the
+    // transaction, the row mutations roll back. Pinned by passing a
+    // `revoked_by` that does NOT exist in `users` — the FK on
+    // `audit_events.actor_id` fires AFTER the known_host_entries
+    // INSERT/UPDATE, forcing a ROLLBACK.
+    let user = make_user(&pool).await;
+    let host = make_host(&pool, &user).await;
+    let repo = PgKnownHostEntryRepository::new(pool.clone());
+    let active = seed_active_pin(&pool, host.id).await;
+
+    // Caller id with no matching `users` row — synthesizes an audit
+    // FK violation downstream of the row mutations.
+    let phantom_user_id = relayterm_core::ids::UserId::from(uuid::Uuid::new_v4());
+
+    let err = repo
+        .replace_active_pin(ReplaceActivePin {
+            host_id: host.id,
+            expected_old_fingerprint: REPLACE_OLD_FP.to_owned(),
+            new_key_type: SshKeyType::Ed25519,
+            new_fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            new_public_key: REPLACE_NEW_PUBKEY.to_vec(),
+            revoked_by: phantom_user_id,
+            reason_code: KnownHostRevocationReason::ServerReinstalled,
+        })
+        .await
+        .expect_err("audit FK violation must surface");
+    assert!(
+        matches!(err, RepositoryError::Database(_)),
+        "expected RepositoryError::Database, got: {err:?}",
+    );
+
+    // The active row is still trusted, no new row was committed: the
+    // entire transaction rolled back.
+    let entries = repo.list_for_host(host.id).await.unwrap();
+    assert_eq!(entries.len(), 1, "rollback: only the active row remains");
+    assert_eq!(entries[0].id, active.id);
+    assert!(entries[0].trusted_at.is_some());
+    assert!(entries[0].revoked_at.is_none());
+
+    // No audit rows landed.
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let any: Vec<_> = recent
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AuditEventKind::HostKeyRevoked | AuditEventKind::HostKeyAccepted,
+            )
+        })
+        .collect();
+    assert!(
+        any.is_empty(),
+        "rollback: no audit rows expected, got: {any:?}"
+    );
+}
+
 // ----------------------------------------------------------------------
 // TerminalSession
 // ----------------------------------------------------------------------

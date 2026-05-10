@@ -2080,12 +2080,31 @@ async fn preflight_returns_503_when_vault_disabled(pool: PgPool) {
 
 /// Helper: drive a row in the `known_host_entries` table to revoked.
 /// Used to exercise the "revoked must never be silently re-trusted" rule.
-async fn revoke_entry(pool: &PgPool, entry_id: relayterm_core::ids::KnownHostEntryId) {
-    sqlx::query("UPDATE known_host_entries SET revoked_at = NOW() WHERE id = $1")
-        .bind(entry_id.into_uuid())
-        .execute(pool)
-        .await
-        .expect("revoke entry");
+///
+/// Writes the FULL revoke metadata triple (`revoked_at`, `revoked_by`,
+/// `revoked_reason_code`) so the row passes the
+/// `known_host_entries_revoked_columns_set_together` CHECK introduced in
+/// the Phase 1 host-key-replace migration. `operator_other` is the
+/// canonical "no-narrative-attached" tag — using it here mirrors how a
+/// future admin "revoke without replace" surface would back-fill an
+/// orphaned revoke.
+async fn revoke_entry(
+    pool: &PgPool,
+    entry_id: relayterm_core::ids::KnownHostEntryId,
+    revoked_by: UserId,
+) {
+    sqlx::query(
+        "UPDATE known_host_entries
+         SET revoked_at = NOW(),
+             revoked_by = $2,
+             revoked_reason_code = 'operator_other'
+         WHERE id = $1",
+    )
+    .bind(entry_id.into_uuid())
+    .bind(revoked_by.into_uuid())
+    .execute(pool)
+    .await
+    .expect("revoke entry");
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -2116,7 +2135,7 @@ async fn trust_host_key_refuses_to_re_trust_a_revoked_fingerprint(pool: PgPool) 
         })
         .await
         .unwrap();
-    revoke_entry(&pool, seeded.id).await;
+    revoke_entry(&pool, seeded.id, user_id).await;
 
     let resp = app
         .oneshot(json_post(
@@ -2169,7 +2188,7 @@ async fn preflight_treats_revoked_match_as_unknown(pool: PgPool) {
         })
         .await
         .unwrap();
-    revoke_entry(&pool, seeded.id).await;
+    revoke_entry(&pool, seeded.id, user_id).await;
 
     let resp = app
         .oneshot(json_post(
@@ -2229,6 +2248,964 @@ async fn preflight_response_message_does_not_overclaim_auth_or_session_readiness
     assert!(
         !lower.contains("session is ready") && !lower.contains("ready to use"),
         "message must not imply session readiness: {message}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Replace-host-key (revoke-and-replace)
+//
+// `POST /api/v1/server-profiles/:id/replace-host-key`. Atomically revokes
+// the active pinned host key and trusts a new one in its place, with a
+// strict-enum reason code and paired `host_key_revoked` +
+// `host_key_accepted` audit rows. The route never auto-overwrites: the
+// caller MUST pass both expected_old and expected_new fingerprints, and
+// the freshly-captured probe fingerprint MUST match expected_new before
+// any DB mutation. See `docs/spec/host-key-replace.md` § R1–R7.
+// ----------------------------------------------------------------------
+
+const REPLACE_OLD_FP: &str = "SHA256:replace-route-OLD";
+const REPLACE_NEW_FP: &str = "SHA256:replace-route-NEW";
+
+/// Provision a profile with an OLD active pin already trusted, returning
+/// (profile_id, host_id, old_entry_id). The fake probe is configured to
+/// return REPLACE_NEW_FP so a `host-key-preflight` would classify as
+/// `changed` — this is the canonical setup for the replace flow.
+async fn make_profile_with_active_pin(
+    pool: &PgPool,
+    user_id: UserId,
+    name: &str,
+    hostname: &str,
+) -> (
+    relayterm_core::ids::ServerProfileId,
+    relayterm_core::ids::HostId,
+    relayterm_core::ids::KnownHostEntryId,
+) {
+    let profile_id = make_owned_profile(pool, user_id, &test_vault(), name, hostname).await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let entry = PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: profile.host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: REPLACE_OLD_FP.to_owned(),
+            public_key: b"ssh-ed25519 OLD-host-key".to_vec(),
+        })
+        .await
+        .unwrap();
+    (profile_id, profile.host_id, entry.id)
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_happy_path_revokes_old_and_trusts_new_with_paired_audit(pool: PgPool) {
+    // The probe captures NEW. The caller posts (OLD, NEW, reason). The
+    // route must:
+    //   1. revoke the OLD row (revoked_at, revoked_by=caller, reason set,
+    //      replaced_by_id pointing at the new row),
+    //   2. insert a fresh trusted row for NEW,
+    //   3. emit two audit rows (`host_key_revoked` then `host_key_accepted`)
+    //      cross-linked via the counterparty entry id and fingerprint.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, host_id, old_entry_id) =
+        make_profile_with_active_pin(&pool, user_id, "replace-happy", "replace-happy.example.com")
+            .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "server_reinstalled",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["profile_id"].as_str().unwrap(), profile_id.to_string());
+    assert_eq!(body["host_id"].as_str().unwrap(), host_id.to_string());
+    assert_eq!(
+        body["revoked_known_host_entry_id"].as_str().unwrap(),
+        old_entry_id.to_string(),
+    );
+    assert_eq!(body["revoked_fingerprint"], REPLACE_OLD_FP);
+    assert_eq!(body["trusted_fingerprint"], REPLACE_NEW_FP);
+    assert!(body["trusted_known_host_entry_id"].is_string());
+    let new_entry_id = body["trusted_known_host_entry_id"].as_str().unwrap();
+    assert_ne!(new_entry_id, old_entry_id.to_string());
+    assert!(body["trusted_at"].is_string());
+
+    // Response carries no key material.
+    let raw = body.to_string();
+    for forbidden in [
+        "encrypted_private_key",
+        "private_key",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "public_key",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "replace response must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // Old row revoked with full metadata; new row trusted.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    let old_row = entries.iter().find(|e| e.id == old_entry_id).unwrap();
+    let new_row = entries.iter().find(|e| e.id != old_entry_id).unwrap();
+    assert!(old_row.revoked_at.is_some(), "old row must be revoked");
+    assert_eq!(old_row.revoked_by, Some(user_id));
+    assert_eq!(
+        old_row.revoked_reason_code,
+        Some(relayterm_core::known_host::KnownHostRevocationReason::ServerReinstalled),
+    );
+    assert_eq!(old_row.replaced_by_id, Some(new_row.id));
+    assert!(new_row.trusted_at.is_some());
+    assert!(new_row.revoked_at.is_none());
+    assert_eq!(new_row.fingerprint_sha256, REPLACE_NEW_FP);
+
+    // Paired audit rows. Both with actor_id = caller, both cross-linked.
+    let audit = PgAuditEventRepository::new(pool.clone());
+    let recent = audit.recent(50).await.unwrap();
+    let revoked: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::HostKeyRevoked)
+        .collect();
+    let accepted: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::HostKeyAccepted)
+        .collect();
+    assert_eq!(
+        revoked.len(),
+        1,
+        "expected one host_key_revoked: {recent:?}"
+    );
+    assert_eq!(
+        accepted.len(),
+        1,
+        "expected one host_key_accepted: {recent:?}",
+    );
+    let revoked_event = revoked[0];
+    let accepted_event = accepted[0];
+    assert_eq!(revoked_event.actor_id, Some(user_id));
+    assert_eq!(accepted_event.actor_id, Some(user_id));
+
+    // Both payloads carry the host-anchored cross-link.
+    let r = &revoked_event.payload;
+    assert_eq!(r["host_id"].as_str().unwrap(), host_id.to_string());
+    assert_eq!(
+        r["known_host_entry_id"].as_str().unwrap(),
+        old_entry_id.to_string(),
+    );
+    assert_eq!(
+        r["replacement_known_host_entry_id"].as_str().unwrap(),
+        new_row.id.to_string(),
+    );
+    assert_eq!(r["old_fingerprint"], REPLACE_OLD_FP);
+    assert_eq!(r["new_fingerprint"], REPLACE_NEW_FP);
+    assert_eq!(r["reason_code"], "server_reinstalled");
+    assert_eq!(r["key_type"], "ed25519");
+    assert_audit_payload_redacted(r, AuditEventKind::HostKeyRevoked);
+
+    let a = &accepted_event.payload;
+    assert_eq!(a["host_id"].as_str().unwrap(), host_id.to_string());
+    assert_eq!(
+        a["known_host_entry_id"].as_str().unwrap(),
+        new_row.id.to_string(),
+    );
+    assert_eq!(
+        a["replacement_known_host_entry_id"].as_str().unwrap(),
+        old_entry_id.to_string(),
+    );
+    assert_eq!(a["old_fingerprint"], REPLACE_OLD_FP);
+    assert_eq!(a["new_fingerprint"], REPLACE_NEW_FP);
+    assert_eq!(a["reason_code"], "server_reinstalled");
+    assert_eq!(a["key_type"], "ed25519");
+    assert_audit_payload_redacted(a, AuditEventKind::HostKeyAccepted);
+
+    // Pair-ordering: revoked is recorded BEFORE accepted (the spec says
+    // "in order, in the same DB transaction" — newest-first list means
+    // accepted appears earlier in `recent`).
+    assert!(
+        accepted_event.recorded_at >= revoked_event.recorded_at,
+        "accepted audit row must be recorded at-or-after revoked",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_rejects_when_active_pin_does_not_match_expected_old(pool: PgPool) {
+    // The active pin is OLD; the caller posts a different expected_old.
+    // Repository serialises around the FOR UPDATE select; the route
+    // collapses `no_active_pin` and `active_pin_mismatch` into one wire
+    // reason. Either way: 409, no DB mutation, no audit row.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, host_id, old_entry_id) =
+        make_profile_with_active_pin(&pool, user_id, "replace-old", "replace-old.example.com")
+            .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": "SHA256:NOT-THE-ACTIVE-PIN",
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "host_key_rotated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("host_key") && msg.contains("active_pin_mismatch"),
+        "expected active_pin_mismatch reason, got: {msg}",
+    );
+
+    // DB unchanged: original row still active, no new row, no audit.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, old_entry_id);
+    assert!(entries[0].revoked_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_rejects_when_no_active_pin_exists(pool: PgPool) {
+    // Distinct subcase of active_pin_mismatch (per spec § R4 / R5):
+    // the host has zero active trusted pins. The repository's
+    // `FOR UPDATE` select returns zero rows and the constraint mapping
+    // collapses it onto the same `active_pin_mismatch` wire reason —
+    // pinned here so a future split into a separate `no_active_pin`
+    // wire code is detected.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    // Build a profile WITHOUT any known_host_entries — `make_owned_profile`
+    // does not seed pins; we deliberately do not call `record_trusted`.
+    let profile_id = make_owned_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "replace-no-pin",
+        "replace-no-pin.example.com",
+    )
+    .await;
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .get(profile_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let host_id = profile.host_id;
+    assert!(
+        PgKnownHostEntryRepository::new(pool.clone())
+            .list_for_host(host_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "precondition: host must have zero pins for this test",
+    );
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "host_key_rotated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("host_key") && msg.contains("active_pin_mismatch"),
+        "no-active-pin subcase must collapse to active_pin_mismatch, got: {msg}",
+    );
+
+    // No row landed; no audit row landed.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert!(entries.is_empty(), "no rows must be inserted: {entries:?}");
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_concurrent_calls_with_same_expected_old_yield_one_winner(pool: PgPool) {
+    // Race-safety smoke (spec § R8 backend-integration list): two
+    // concurrent calls with the same `expected_old_fingerprint` must
+    // produce exactly one success and exactly one
+    // `409 active_pin_mismatch`. The repository's `FOR UPDATE` lock
+    // serialises them; the loser sees the row already revoked AND the
+    // active pin already advanced. No double-revoke; no double-trust.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, host_id, old_entry_id) =
+        make_profile_with_active_pin(&pool, user_id, "replace-race", "replace-race.example.com")
+            .await;
+
+    let body = json!({
+        "expected_old_fingerprint": REPLACE_OLD_FP,
+        "expected_new_fingerprint": REPLACE_NEW_FP,
+        "reason_code": "lab_target_recreated",
+    });
+    let uri = format!("/api/v1/server-profiles/{profile_id}/replace-host-key");
+    let app_a = app.clone();
+    let app_b = app;
+    let body_a = body.clone();
+    let body_b = body;
+    let cookie_a = cookie.clone();
+    let cookie_b = cookie;
+    let uri_a = uri.clone();
+    let uri_b = uri;
+
+    let (resp_a, resp_b) = tokio::join!(
+        async move {
+            app_a
+                .oneshot(json_post(&uri_a, body_a, &cookie_a))
+                .await
+                .unwrap()
+        },
+        async move {
+            app_b
+                .oneshot(json_post(&uri_b, body_b, &cookie_b))
+                .await
+                .unwrap()
+        },
+    );
+
+    let mut statuses = [resp_a.status(), resp_b.status()];
+    statuses.sort_by_key(StatusCode::as_u16);
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "exactly one winner expected, got: {statuses:?}",
+    );
+
+    // Loser carries the active_pin_mismatch wire reason.
+    let loser_resp = if resp_a.status() == StatusCode::CONFLICT {
+        resp_a
+    } else {
+        resp_b
+    };
+    let loser_body = read_body(loser_resp).await;
+    assert_eq!(loser_body["error"]["code"], "conflict");
+    let loser_msg = loser_body["error"]["message"].as_str().unwrap();
+    assert!(
+        loser_msg.contains("host_key") && loser_msg.contains("active_pin_mismatch"),
+        "loser must surface active_pin_mismatch, got: {loser_msg}",
+    );
+
+    // DB end-state: exactly one revoke + one new active pin (no
+    // double-revoke, no double-trust). The new active row is unique;
+    // the old row is revoked-and-pointed-at the new one.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2, "want exactly 2 rows: {entries:?}");
+    let old_row = entries.iter().find(|e| e.id == old_entry_id).unwrap();
+    let new_row = entries.iter().find(|e| e.id != old_entry_id).unwrap();
+    assert!(old_row.revoked_at.is_some());
+    assert_eq!(old_row.replaced_by_id, Some(new_row.id));
+    assert!(new_row.trusted_at.is_some());
+    assert!(new_row.revoked_at.is_none());
+
+    // Audit: exactly ONE `host_key_revoked` and exactly ONE
+    // `host_key_accepted` row. Two of either would prove a write
+    // raced past the lock.
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(50)
+        .await
+        .unwrap();
+    let revoked: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::HostKeyRevoked)
+        .collect();
+    let accepted: Vec<_> = recent
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::HostKeyAccepted)
+        .collect();
+    assert_eq!(revoked.len(), 1, "race must produce one revoke: {recent:?}");
+    assert_eq!(
+        accepted.len(),
+        1,
+        "race must produce one accept: {recent:?}",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_rejects_when_captured_does_not_match_expected_new(pool: PgPool) {
+    // The probe captures NEW. The caller posts a different expected_new.
+    // Race-safety: the freshly-captured fingerprint MUST match what the
+    // operator confirmed in the preceding preflight. Mismatch → 409.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, host_id, old_entry_id) =
+        make_profile_with_active_pin(&pool, user_id, "replace-cap", "replace-cap.example.com")
+            .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": "SHA256:STALE-NEW-FP",
+                "reason_code": "lab_target_recreated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("host_key") && msg.contains("captured_mismatch"),
+        "expected captured_mismatch reason, got: {msg}",
+    );
+
+    // DB unchanged.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, old_entry_id);
+    assert!(entries[0].revoked_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_rejects_when_captured_is_unchanged(pool: PgPool) {
+    // The probe captures the CURRENT active pin (host hasn't actually
+    // changed). Replace is a no-op; surface 409 with `captured_unchanged`
+    // so the SPA copy doesn't pretend a key rotation happened.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_OLD_FP).await;
+    let (profile_id, host_id, _) = make_profile_with_active_pin(
+        &pool,
+        user_id,
+        "replace-unchanged",
+        "replace-unchanged.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                // Caller asserts NEW; probe says OLD; the
+                // captured_unchanged check fires before captured_mismatch.
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "operator_other",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("host_key") && msg.contains("captured_unchanged"),
+        "expected captured_unchanged reason, got: {msg}",
+    );
+
+    // DB unchanged.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].revoked_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_refuses_to_re_trust_a_revoked_fingerprint(pool: PgPool) {
+    // A revoked row exists for (host, NEW). The probe captures NEW. The
+    // route must refuse with `captured_revoked` BEFORE any tx write.
+    // Symmetric with trust-host-key's revoked-aware guard.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, host_id, _old_id) = make_profile_with_active_pin(
+        &pool,
+        user_id,
+        "replace-revoked",
+        "replace-revoked.example.com",
+    )
+    .await;
+    // Seed a revoked row for the captured fingerprint.
+    let seeded = PgKnownHostEntryRepository::new(pool.clone())
+        .create(CreateKnownHostEntry {
+            host_id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: REPLACE_NEW_FP.to_owned(),
+            public_key: b"ssh-ed25519 NEW-revoked".to_vec(),
+        })
+        .await
+        .unwrap();
+    revoke_entry(&pool, seeded.id, user_id).await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "server_reinstalled",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("host_key") && msg.contains("captured_revoked"),
+        "expected captured_revoked reason, got: {msg}",
+    );
+
+    // DB unchanged: revoked row still revoked + untrusted; old pin still
+    // the active one.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    let revoked = entries.iter().find(|e| e.id == seeded.id).unwrap();
+    assert!(revoked.revoked_at.is_some());
+    assert!(revoked.trusted_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_rejects_invalid_reason_code(pool: PgPool) {
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, _host_id, _) = make_profile_with_active_pin(
+        &pool,
+        user_id,
+        "replace-reason",
+        "replace-reason.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "operator_freeform",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_rejects_malformed_fingerprint_shapes(pool: PgPool) {
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, _host_id, _) = make_profile_with_active_pin(
+        &pool,
+        user_id,
+        "replace-malformed",
+        "replace-malformed.example.com",
+    )
+    .await;
+
+    // Missing SHA256: prefix on old.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": "MD5:not-supported",
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "host_key_rotated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Missing SHA256: prefix on new.
+    let resp2 = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": "garbage",
+                "reason_code": "host_key_rotated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_returns_401_without_session_cookie(pool: PgPool) {
+    let (app, user_id, _probe, _cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, _host_id, _) =
+        make_profile_with_active_pin(&pool, user_id, "replace-401", "replace-401.example.com")
+            .await;
+
+    let resp = app
+        .oneshot(json_post_no_auth(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "host_key_rotated",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_returns_403_with_bad_origin_before_body_parse(pool: PgPool) {
+    // The shared CsrfGuard extractor must fire BEFORE any DB / body work.
+    // Pass a malformed body alongside a disallowed Origin: 403, not 400.
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, _host_id, _) =
+        make_profile_with_active_pin(&pool, user_id, "replace-csrf", "replace-csrf.example.com")
+            .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/v1/server-profiles/{profile_id}/replace-host-key"
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://attacker.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from("{not-json"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_foreign_owned_profile_returns_indistinguishable_404(pool: PgPool) {
+    // A valid request body addressed to another user's profile must
+    // collapse to a 404 byte-identical to a genuine 404.
+    let other_user = create_user(&pool, "other").await;
+    let (foreign_id, _foreign_host, _) =
+        make_profile_with_active_pin(&pool, other_user, "foreign", "foreign.example.com").await;
+
+    let (app, _user, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let bogus = uuid::Uuid::new_v4();
+    let body_v = json!({
+        "expected_old_fingerprint": REPLACE_OLD_FP,
+        "expected_new_fingerprint": REPLACE_NEW_FP,
+        "reason_code": "server_reinstalled",
+    });
+
+    let bogus_resp = app
+        .clone()
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{bogus}/replace-host-key"),
+            body_v.clone(),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let bogus_status = bogus_resp.status();
+    let bogus_body = read_body(bogus_resp).await;
+    assert_eq!(bogus_status, StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{foreign_id}/replace-host-key"),
+            body_v,
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), bogus_status);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body, bogus_body,
+        "cross-user replace 404 must match a genuine 404",
+    );
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_blocks_when_profile_is_disabled(pool: PgPool) {
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), REPLACE_NEW_FP).await;
+    let (profile_id, host_id, _) = make_profile_with_active_pin(
+        &pool,
+        user_id,
+        "replace-disabled",
+        "replace-disabled.example.com",
+    )
+    .await;
+    PgServerProfileRepository::new(pool.clone())
+        .set_disabled_at(profile_id, user_id, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "server_reinstalled",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("server_profile") && msg.contains("disabled"),
+        "expected server_profile disabled, got: {msg}",
+    );
+    // No mutation, no audit.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].revoked_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_returns_502_on_probe_failure(pool: PgPool) {
+    // Probe error → 502, no DB mutation, no audit.
+    let user_id = create_user(&pool, "dev").await;
+    let probe: Arc<dyn SshHostKeyProbe> = Arc::new(ErrorProbe(ProbeError::Unreachable));
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(probe)),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+    let (profile_id, host_id, _) = make_profile_with_active_pin(
+        &pool,
+        user_id,
+        "replace-probe-fail",
+        "replace-probe-fail.example.com",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/replace-host-key"),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "host_key_rotated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "bad_gateway");
+    assert_eq!(body["error"]["message"], "bad gateway");
+
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].revoked_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_returns_503_when_vault_disabled(pool: PgPool) {
+    let user_id = create_user(&pool, "dev").await;
+    let probe = FakeProbe::new(captured_for_test(REPLACE_NEW_FP));
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
+    let state = AppState {
+        db,
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(Arc::new(probe))),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+
+    // Build a profile + host + ID directly (vault is None so we can't
+    // round-trip a vault-issued identity here; opaque bytes suffice for
+    // reaching the vault-check guard).
+    let host = PgHostRepository::new(pool.clone())
+        .create(CreateHost {
+            owner_id: user_id,
+            display_name: validate_host_display_name("Vaultless").unwrap(),
+            hostname: validate_hostname("v-replace.example.com").unwrap(),
+            port: validate_ssh_port(22).unwrap(),
+            default_username: validate_ssh_username("deploy").unwrap(),
+        })
+        .await
+        .unwrap();
+    let identity = PgSshIdentityRepository::new(pool.clone())
+        .create(CreateSshIdentity {
+            owner_id: user_id,
+            name: "vaultless-replace".to_owned(),
+            key_type: SshKeyType::Ed25519,
+            public_key: b"ssh-ed25519 PUB".to_vec(),
+            encrypted_private_key: b"opaque".to_vec(),
+            fingerprint_sha256: format!("SHA256:vaultless-{}", uuid::Uuid::new_v4()),
+        })
+        .await
+        .unwrap();
+    let profile = PgServerProfileRepository::new(pool.clone())
+        .create(CreateServerProfile {
+            owner_id: user_id,
+            name: relayterm_core::validation::validate_profile_name("vaultless-replace").unwrap(),
+            host_id: host.id,
+            ssh_identity_id: identity.id,
+            username_override: None,
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    PgKnownHostEntryRepository::new(pool.clone())
+        .record_trusted(CreateKnownHostEntry {
+            host_id: host.id,
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: REPLACE_OLD_FP.to_owned(),
+            public_key: b"ssh-ed25519 OLD".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{}/replace-host-key", profile.id),
+            json!({
+                "expected_old_fingerprint": REPLACE_OLD_FP,
+                "expected_new_fingerprint": REPLACE_NEW_FP,
+                "reason_code": "host_key_rotated",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+    assert_no_replace_audit(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn replace_host_key_does_not_affect_normal_trust_route_behavior_for_changed_keys(
+    pool: PgPool,
+) {
+    // The replace route is additive: the regular trust-host-key route
+    // continues to refuse a `changed` key with 409 and writes nothing.
+    // This pin protects the TOFU posture from a future regression that
+    // wires the replace logic into the normal trust path.
+    let new_fp = "SHA256:trust-stays-strict";
+    let (app, user_id, _probe, cookie) = setup_with_fake_probe(pool.clone(), new_fp).await;
+    let (profile_id, host_id, _old_id) =
+        make_profile_with_active_pin(&pool, user_id, "trust-strict", "trust-strict.example.com")
+            .await;
+
+    let resp = app
+        .oneshot(json_post(
+            &format!("/api/v1/server-profiles/{profile_id}/trust-host-key"),
+            json!({ "expected_fingerprint": new_fp }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // Old pin still active; no new entry; no host_key_* audit.
+    let entries = PgKnownHostEntryRepository::new(pool.clone())
+        .list_for_host(host_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].fingerprint_sha256, REPLACE_OLD_FP);
+    assert!(entries[0].revoked_at.is_none());
+    assert_no_replace_audit(&pool).await;
+}
+
+/// Assert that NO `host_key_revoked` and NO `host_key_accepted` audit
+/// rows have been written. Used by every non-happy-path test so a
+/// future regression that emits a "best-effort" audit on a refused
+/// replace trips this assertion immediately.
+async fn assert_no_replace_audit(pool: &PgPool) {
+    let recent = PgAuditEventRepository::new(pool.clone())
+        .recent(200)
+        .await
+        .unwrap();
+    let any: Vec<_> = recent
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AuditEventKind::HostKeyRevoked | AuditEventKind::HostKeyAccepted,
+            )
+        })
+        .collect();
+    assert!(
+        any.is_empty(),
+        "no host_key_* audit rows expected on refused replace, got: {any:?}",
     );
 }
 
@@ -2521,7 +3498,7 @@ async fn auth_check_blocks_when_matching_known_host_is_revoked(pool: PgPool) {
         })
         .await
         .unwrap();
-    revoke_entry(&pool, seeded.id).await;
+    revoke_entry(&pool, seeded.id, user_id).await;
 
     let resp = app
         .oneshot(json_post(
@@ -3181,7 +4158,7 @@ async fn create_terminal_session_with_revoked_only_pin_returns_409(pool: PgPool)
         })
         .await
         .unwrap();
-    revoke_entry(&pool, seeded.id).await;
+    revoke_entry(&pool, seeded.id, user_id).await;
 
     let resp = app
         .oneshot(json_post(

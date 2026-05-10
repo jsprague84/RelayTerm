@@ -15,6 +15,7 @@
 
 use chrono::{DateTime, Utc};
 use relayterm_core::ids::{HostId, KnownHostEntryId, ServerProfileId};
+use relayterm_core::known_host::KnownHostRevocationReason;
 use relayterm_core::ssh_identity::SshKeyType;
 use relayterm_ssh::HostKeyStatus;
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,119 @@ pub(crate) struct TrustHostKeyResponse {
     pub trusted_at: DateTime<Utc>,
 }
 
+/// Request body for `POST /server-profiles/:id/replace-host-key`.
+///
+/// The caller must echo BOTH fingerprints (the active pin they consent to
+/// revoke AND the captured fingerprint they confirmed in the preceding
+/// `changed` preflight) and pick one of the canonical
+/// [`KnownHostRevocationReason`] codes. Free-text reason notes are
+/// deliberately not part of the schema (see
+/// `docs/spec/host-key-replace.md` § R3 — the enum is the only operator
+/// input persisted, removing the free-text channel that could smuggle
+/// secrets into `audit_events.payload`).
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReplaceHostKeyRequest {
+    pub expected_old_fingerprint: String,
+    pub expected_new_fingerprint: String,
+    /// Wire tag (`server_reinstalled`, `host_key_rotated`,
+    /// `lab_target_recreated`, `operator_other`). Validated by
+    /// [`Self::validated`].
+    pub reason_code: String,
+}
+
+/// Validated, type-safe shape derived from a [`ReplaceHostKeyRequest`].
+/// Constructed by [`ReplaceHostKeyRequest::validated`] AFTER the
+/// fingerprint shape and reason-code accept-list checks pass — every
+/// field is safe to forward to the repository / SSH layers without
+/// re-validation.
+pub(crate) struct ReplaceHostKeyValidatedRequest {
+    pub expected_old_fingerprint: String,
+    pub expected_new_fingerprint: String,
+    pub reason_code: KnownHostRevocationReason,
+}
+
+impl ReplaceHostKeyRequest {
+    /// Validate every input field BEFORE any DB or network work.
+    ///
+    /// - Both fingerprints go through the same shape rules as the
+    ///   `trust-host-key` route's `validated_expected_fingerprint` — the
+    ///   error messages name which field tripped so a CLI client gets a
+    ///   precise diagnostic, but the wire envelope still collapses to
+    ///   `invalid_input`.
+    /// - `reason_code` is matched against the
+    ///   [`KnownHostRevocationReason::from_str_tag`] accept-list. Any
+    ///   value outside the four canonical tags returns 400 — this is
+    ///   the API-layer mirror of the `known_host_entries_revoked_reason_chk`
+    ///   schema CHECK.
+    pub(crate) fn validated(&self) -> Result<ReplaceHostKeyValidatedRequest, ApiError> {
+        let expected_old_fingerprint =
+            validate_fingerprint(&self.expected_old_fingerprint, "expected_old_fingerprint")?
+                .to_owned();
+        let expected_new_fingerprint =
+            validate_fingerprint(&self.expected_new_fingerprint, "expected_new_fingerprint")?
+                .to_owned();
+        let reason_code = KnownHostRevocationReason::from_str_tag(self.reason_code.as_str())
+            .ok_or_else(|| {
+                ApiError::Validation("reason_code is not a recognised value".to_owned())
+            })?;
+        Ok(ReplaceHostKeyValidatedRequest {
+            expected_old_fingerprint,
+            expected_new_fingerprint,
+            reason_code,
+        })
+    }
+}
+
+/// Successful response from `POST /server-profiles/:id/replace-host-key`.
+///
+/// Carries only public-side identifiers and the public fingerprints. No
+/// `public_key` byte blob; no vault payloads; no host banner; no raw
+/// error text. The reason code is intentionally NOT echoed — it lives in
+/// the audit row, where its visibility is bounded by the audit-feed UI.
+#[derive(Debug, Serialize)]
+pub(crate) struct ReplaceHostKeyResponse {
+    pub profile_id: ServerProfileId,
+    pub host_id: HostId,
+    pub revoked_known_host_entry_id: KnownHostEntryId,
+    pub revoked_fingerprint: String,
+    pub trusted_known_host_entry_id: KnownHostEntryId,
+    pub trusted_fingerprint: String,
+    pub host_key_type: SshKeyType,
+    pub trusted_at: DateTime<Utc>,
+}
+
+/// Validate a single SHA-256 fingerprint string against the same shape
+/// rules `trust-host-key` enforces. Lifted into a free function so both
+/// the `expected_old_fingerprint` and `expected_new_fingerprint` paths
+/// share one body.
+///
+/// `field` is included in the validation message so a CLI client gets a
+/// precise diagnostic even though the wire `code` is the same
+/// `invalid_input` either way.
+fn validate_fingerprint<'a>(value: &'a str, field: &'static str) -> Result<&'a str, ApiError> {
+    // 7 prefix chars + at least one byte of digest material.
+    const MIN_LEN: usize = 8;
+    // SHA256 base64 (43) + prefix (7) plus generous slack for whatever
+    // exotic encoding a future caller might invent.
+    const MAX_LEN: usize = 128;
+    if !value.starts_with("SHA256:") {
+        return Err(ApiError::Validation(format!(
+            "{field} must start with 'SHA256:'"
+        )));
+    }
+    if value.len() < MIN_LEN || value.len() > MAX_LEN {
+        return Err(ApiError::Validation(format!(
+            "{field} length is out of range"
+        )));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ApiError::Validation(format!(
+            "{field} must not contain whitespace or control characters"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +320,101 @@ mod tests {
             req.validated_expected_fingerprint(),
             Err(ApiError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn replace_request_validates_fingerprints_and_reason_code() {
+        let v = ReplaceHostKeyRequest {
+            expected_old_fingerprint: "SHA256:OLD-fp".to_owned(),
+            expected_new_fingerprint: "SHA256:NEW-fp".to_owned(),
+            reason_code: "server_reinstalled".to_owned(),
+        }
+        .validated()
+        .expect("valid replace request");
+        assert_eq!(v.expected_old_fingerprint, "SHA256:OLD-fp");
+        assert_eq!(v.expected_new_fingerprint, "SHA256:NEW-fp");
+        assert_eq!(v.reason_code, KnownHostRevocationReason::ServerReinstalled);
+    }
+
+    #[test]
+    fn replace_request_rejects_each_canonical_failure_mode() {
+        // Bad old fingerprint shape.
+        let r = ReplaceHostKeyRequest {
+            expected_old_fingerprint: "MD5:nope".to_owned(),
+            expected_new_fingerprint: "SHA256:NEW".to_owned(),
+            reason_code: "host_key_rotated".to_owned(),
+        };
+        let Err(ApiError::Validation(msg)) = r.validated() else {
+            panic!("expected Validation error");
+        };
+        assert!(
+            msg.contains("expected_old_fingerprint"),
+            "field name must be in message: {msg}",
+        );
+
+        // Bad new fingerprint shape.
+        let r = ReplaceHostKeyRequest {
+            expected_old_fingerprint: "SHA256:OLD".to_owned(),
+            expected_new_fingerprint: "garbage".to_owned(),
+            reason_code: "host_key_rotated".to_owned(),
+        };
+        let Err(ApiError::Validation(msg)) = r.validated() else {
+            panic!("expected Validation error");
+        };
+        assert!(msg.contains("expected_new_fingerprint"));
+
+        // Reason code outside the four-tag accept-list.
+        let r = ReplaceHostKeyRequest {
+            expected_old_fingerprint: "SHA256:OLD".to_owned(),
+            expected_new_fingerprint: "SHA256:NEW".to_owned(),
+            reason_code: "operator_freeform".to_owned(),
+        };
+        let Err(ApiError::Validation(msg)) = r.validated() else {
+            panic!("expected Validation error");
+        };
+        assert!(msg.contains("reason_code"));
+
+        // Empty reason code.
+        let r = ReplaceHostKeyRequest {
+            expected_old_fingerprint: "SHA256:OLD".to_owned(),
+            expected_new_fingerprint: "SHA256:NEW".to_owned(),
+            reason_code: String::new(),
+        };
+        assert!(matches!(r.validated(), Err(ApiError::Validation(_))));
+
+        // Whitespace inside fingerprint.
+        let r = ReplaceHostKeyRequest {
+            expected_old_fingerprint: "SHA256:OLD".to_owned(),
+            expected_new_fingerprint: "SHA256:NEW \nfp".to_owned(),
+            reason_code: "operator_other".to_owned(),
+        };
+        assert!(matches!(r.validated(), Err(ApiError::Validation(_))));
+    }
+
+    #[test]
+    fn replace_request_accepts_all_four_canonical_reason_codes() {
+        for (tag, expected) in [
+            (
+                "server_reinstalled",
+                KnownHostRevocationReason::ServerReinstalled,
+            ),
+            (
+                "host_key_rotated",
+                KnownHostRevocationReason::HostKeyRotated,
+            ),
+            (
+                "lab_target_recreated",
+                KnownHostRevocationReason::LabTargetRecreated,
+            ),
+            ("operator_other", KnownHostRevocationReason::OperatorOther),
+        ] {
+            let r = ReplaceHostKeyRequest {
+                expected_old_fingerprint: "SHA256:OLD".to_owned(),
+                expected_new_fingerprint: "SHA256:NEW".to_owned(),
+                reason_code: tag.to_owned(),
+            };
+            let v = r.validated().unwrap();
+            assert_eq!(v.reason_code, expected, "tag {tag} did not parse");
+        }
     }
 }

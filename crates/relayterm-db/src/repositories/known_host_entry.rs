@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::HostId;
 use relayterm_core::known_host::KnownHostEntry;
 use relayterm_core::repository::{
@@ -12,6 +13,7 @@ use crate::error::map_sqlx_error;
 use crate::rows::KnownHostEntryRow;
 
 const ENTITY: &str = "known_host_entry";
+const ENTITY_AUDIT: &str = "audit_event";
 
 /// `SELECT` projection used by every read in this module. Listed once so a
 /// future column add only touches this constant + [`KnownHostEntryRow`].
@@ -142,10 +144,15 @@ impl KnownHostEntryRepository for PgKnownHostEntryRepository {
     ) -> Result<ReplacedKnownHostEntries, RepositoryError> {
         // Single transaction: lock the active pin, refuse if either the
         // active row is gone / mismatched OR a revoked row already
-        // exists for the new fingerprint, then INSERT the new row and
-        // UPDATE the old row. Either both writes commit or neither does.
-        // Audit emission is the route handler's responsibility, wired in
-        // a follow-on slice (docs/spec/host-key-replace.md § R7).
+        // exists for the new fingerprint, INSERT the new row, UPDATE
+        // the old row, then APPEND the paired `host_key_revoked` +
+        // `host_key_accepted` audit rows. Either every write commits or
+        // none do (option (a) per `docs/spec/host-key-replace.md` § R7,
+        // mirrors `TerminalRecordingRepository::purge_for_retention`).
+        // An audit-insert failure ROLLBACKs the row mutations: a
+        // partial-success orphan (replace without audit) is the worst
+        // possible shape on a security-sensitive replace, so the design
+        // is deliberately fail-closed.
         let mut tx = self
             .pool
             .begin()
@@ -254,6 +261,72 @@ impl KnownHostEntryRepository for PgKnownHostEntryRepository {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        // 5. Paired audit rows (`host_key_revoked` then
+        //    `host_key_accepted`) inside the SAME transaction
+        //    (`docs/spec/host-key-replace.md` § R2 / R7 option (a)).
+        //    Payloads are built field-by-field from public-safe
+        //    primitives — host_id, the two known-host-entry ids,
+        //    fingerprints (the public form of the host key), key_type,
+        //    and the operator-supplied reason_code. NEVER the public
+        //    key bytes (the fingerprint already identifies the key),
+        //    NEVER the host's hostname/port (those are downstream of
+        //    host_id), NEVER any russh / DB error text, NEVER any
+        //    operator-supplied free text (the schema's `reason_code`
+        //    enum is the only operator input persisted).
+        //
+        //    The two payloads cross-link via `replacement_known_host_entry_id`
+        //    so an audit feed can present the pair as a single intent
+        //    (§ R2). An audit-insert failure flows through
+        //    `map_sqlx_error` and bubbles out of this function; `tx`
+        //    drops without committing, so neither audit row AND
+        //    neither row mutation lands. Sentinel-string redaction
+        //    tests in the API test crate (`AUDIT_FORBIDDEN_SUBSTRINGS`)
+        //    are the second-line guard.
+        let key_type_str = input.new_key_type.as_str();
+        let reason_code_str = input.reason_code.as_str();
+        let revoked_payload = serde_json::json!({
+            "host_id": input.host_id.into_uuid(),
+            "known_host_entry_id": old_row.id,
+            "replacement_known_host_entry_id": new_id,
+            "old_fingerprint": &input.expected_old_fingerprint,
+            "new_fingerprint": &input.new_fingerprint_sha256,
+            "key_type": key_type_str,
+            "reason_code": reason_code_str,
+        });
+        let accepted_payload = serde_json::json!({
+            "host_id": input.host_id.into_uuid(),
+            "known_host_entry_id": new_id,
+            "replacement_known_host_entry_id": old_row.id,
+            "old_fingerprint": &input.expected_old_fingerprint,
+            "new_fingerprint": &input.new_fingerprint_sha256,
+            "key_type": key_type_str,
+            "reason_code": reason_code_str,
+        });
+        let revoked_audit_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO audit_events (id, actor_id, kind, payload, remote_addr)
+             VALUES ($1, $2, $3, $4, NULL)",
+        )
+        .bind(revoked_audit_id)
+        .bind(input.revoked_by.into_uuid())
+        .bind(AuditEventKind::HostKeyRevoked.as_str())
+        .bind(&revoked_payload)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY_AUDIT, e))?;
+        let accepted_audit_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO audit_events (id, actor_id, kind, payload, remote_addr)
+             VALUES ($1, $2, $3, $4, NULL)",
+        )
+        .bind(accepted_audit_id)
+        .bind(input.revoked_by.into_uuid())
+        .bind(AuditEventKind::HostKeyAccepted.as_str())
+        .bind(&accepted_payload)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY_AUDIT, e))?;
 
         tx.commit().await.map_err(|e| map_sqlx_error(ENTITY, e))?;
 
