@@ -520,6 +520,195 @@ the explicit `2026-MM-DD · <slug>` headings and the inter-entry
 cross-references (`entry above`, `entry below`) rather than on a
 strict overall ordering rule.
 
+### 2026-05-10 · Closed-session reconnect empty-state UX smoke + follow-up fix
+
+Picks up from the 2026-05-09 desktop reconnect smoke entry below
+(same VPS slot `relayterm-staging`, same hostname
+`relayterm-staging.js-node.cc`, same throwaway bootstrap user, same
+managed `smoke-id` ed25519 identity reused). The starting goal was a
+quick verification that commit
+`0804083 Fix closed session reconnect affordance` resolved the
+operator-visible "End session → Reconnect → connection error" UX
+bug on staging. The smoke surfaced that the helper fix is correct in
+its narrow scope but does not in fact address the operator-visible
+path, and the run was pivoted into a focused follow-up source fix in
+the same branch.
+
+This entry is **smoke + scoped follow-up fix**, not a product feature
+expansion. No backend changes. No session-lifecycle, schema,
+WebSocket-protocol, or auth-envelope changes. No Tauri-shell or CI
+changes. The follow-up is two files in the production web shell plus
+one regression-pin test.
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Image tag:** `:main`, refreshed from
+`sha256:a904f55473…` (built `2026-05-10T01:39:28Z`, predates fix
+`0804083` by ~47 min) to
+`sha256:da78580...` (built `2026-05-10T02:55:34Z`, ~28 min after
+`0804083` committed). Migrate run was a no-op. Postgres untouched.
+**Desktop binary:** existing `target/release/relayterm-desktop` from
+the 2026-05-08 build (no rebuild — the bundled SPA is only used
+pre-handoff; the post-handoff SPA is fetched fresh from staging).
+**Throwaway SSH target:** `linuxserver/openssh-server:latest`
+container `relayterm-staging-smoke-ssh` joined to
+`relayterm-staging_relayterm-staging-internal` (key-auth-only,
+`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`, port `2222`, no host
+port published, user `smoke`, throwaway, torn down at end of run);
+ed25519 host fingerprint
+`SHA256:K4QL+yWXpMUGcf8gUbwLdDBIQ9ouiDHSuTH179XTKCU`, byte-identical
+to `docker exec ... ssh-keygen -lf
+/config/ssh_host_keys/ssh_host_ed25519_key.pub`.
+
+**Inventory:** brand-new host `smoke-ssh-uxsmoke-v2` and brand-new
+profile `ux-smoke-profile-v2` bound to the existing reused
+`smoke-id` ed25519 identity. Existing `smoke-ssh-desktop` /
+`desktop-smoke-profile` (from the 2026-05-09 reconnect smoke) and
+the Android-smoke inventory were left intact per the AGENTS.md
+"Inventory lifecycle and destructive-action policy" — re-using the
+prior profile would have failed host-key preflight against the new
+container's freshly-generated keys (RelayTerm refuses to silently
+overwrite a pinned key, and there is no operator route to clear
+`known_host_entries` on purpose; the supported flow is "create a
+new host + profile").
+
+What the original-fix smoke verified:
+
+- `0804083`'s helper-level invariants are sound. The commit's
+  `computeWorkspaceEnablement` change makes the `production-terminal-reconnect`
+  button disabled when `phase === "closed"`, and `classifyReconnectAttempt`
+  blocks a `closed`-phase click with a non-technical message. Both are
+  pinned by `apps/web/tests/terminalLaunch.test.ts`.
+
+What the smoke discovered the original fix does NOT cover:
+
+- After `End session`, `ProductionTerminal.svelte` fires
+  `onSessionClosed?.()`, which `AppShell.svelte`'s
+  `handleSessionClosed` services by `clearActiveSession() +
+  activeLaunch = null`. This unmounts `ProductionTerminal` and
+  re-renders `TerminalView`'s `{:else}` (empty-state) branch —
+  before the operator can interact with the now-disabled
+  workspace-pane Reconnect button. The fix's intended UX is
+  therefore essentially never visible in production.
+- The empty-state branch carries a separate "Reconnect last session"
+  affordance gated by `let saved = $state<ActiveSessionRecord |
+  null>(loadActiveSession())`. That `$state` initializer runs once
+  at mount and is never re-read while the component stays mounted.
+  `TerminalView` is NOT unmounted by AppShell on a launch
+  transition; both `{#if launch}` and `{:else}` branches live inside
+  the same component. So `saved` stays cached pointing at the
+  just-closed session id — and the operator clicks "Reconnect last
+  session", which routes back to the workspace, opens a doomed
+  WebSocket attach, and surfaces the generic "connection error"
+  copy. That is the original 2026-05-09 staging-smoke complaint;
+  it persists on staging through the empty-state path even with
+  `0804083` shipped. Verified that `clearActiveSession()` did
+  durably remove the entry from the WebView's
+  `localstorage/https_relayterm-staging.js-node.cc_0.localstorage`
+  SQLite (only `relayterm.backend-config.v1` remained), so the
+  staleness is purely an in-memory `$state` cache that never
+  re-syncs.
+
+Follow-up source fix (this branch):
+
+- `apps/web/src/lib/app/AppShell.svelte`: wrap `<TerminalView>` in
+  `{#key activeLaunch?.sessionId ?? "empty"}` so every launch
+  transition (non-null → null on wire-close, null → some-id on
+  launch, id → different-id on reconnect-from-Sessions) unmounts
+  and remounts `TerminalView`. `saved` is then always reflective of
+  current localStorage at the moment the empty state renders.
+- `apps/web/src/lib/app/views/TerminalView.svelte`: corrected the
+  inline comment that previously asserted "the AppShell unmounts
+  and remounts this view across launch transitions" (which was
+  aspirational, not actual). The comment now points at the new
+  AppShell wrapper and the new regression pin.
+- `apps/web/tests/appShellIsolation.test.ts`: added a static-text
+  regression scan that asserts `AppShell.svelte` wraps
+  `<TerminalView>` in `{#key activeLaunch?.sessionId ?? "empty"}`.
+  Red-green verified: the assertion fails with the wrapper removed
+  and passes with the wrapper restored. No Svelte component test
+  harness is wired into the workspace today; the static scan is the
+  smallest maintainable pin given that constraint.
+
+Verified end-to-end on staging:
+
+- HTTPS reachability gate (§7.3) re-checked from the workstation
+  before any UI action: `/` → 200, `/healthz` → 200,
+  `/api/v1/auth/me` → 401. Staging Compose stack carried over from
+  the prior 2026-05-09 entries; only `relayterm-backend` and
+  `relayterm-web` were `up -d --force-recreate`-d to pick up the
+  refreshed `:main` images. Postgres was not touched.
+- Desktop bundled-shell handoff to staging worked unchanged (saved
+  bootstrap config in `localstorage/https_relayterm-staging.js-node.cc_0.localstorage`
+  short-circuited the picker per the prior 2026-05-09 same-origin
+  short-circuit lesson).
+- Original-fix smoke against the refreshed `:main` (commit
+  `0804083` in the served bundle, verified by `grep -a -c "closed
+  and cannot be reconnected"` on the served `assets/index-*.js` —
+  count `1`): launch + echo + End. Empty-state still surfaced a
+  clickable "Reconnect last session" pointing at the closed session;
+  click produced "connection error". Bug reproduced on the original
+  fix, scoped to the empty-state path as analysed above.
+- Follow-up-fix smoke against the locally-built bundle hot-replaced
+  into the running `relayterm-staging-relayterm-web-1` nginx (per
+  the 2026-05-09 WebKit-cache lesson the bundle filename
+  necessarily changes when the source changes, so the
+  `index-*.js` URL changes and nginx's content-hash-immutable cache
+  strategy invalidates cleanly; WebKit cache + CacheStorage were
+  also wiped before relaunching the desktop binary to be safe).
+  Bundle hash `index-BADxlpqn.js`; `grep -a -oE "empty\""` against
+  the served bundle returned a hit confirming the `{#key}` wrapper
+  compiled in. Re-smoke flow: relaunch desktop fresh-context → log
+  in (already had a session cookie) → empty-state validation
+  effect ran on the lingering pre-fix saved pointer, validated
+  against the backend, returned `stale (closed)`, ran
+  `onForgetLastSession` and the localStorage pointer was cleared →
+  fresh launch via `ux-smoke-profile-v2` → echo round-trip
+  (one cold-start nudge per the documented race) → `End session`
+  → empty state rendered cleanly with NO saved-session affordance
+  and the only action surface being "Launch a terminal from a
+  server profile". `localstorage/https_relayterm-staging.js-node.cc_0.localstorage`
+  inspected post-end; only `relayterm.backend-config.v1` remained.
+  Operator-visible "End → Reconnect → connection error" UX bug
+  is no longer reachable through the empty-state path. The
+  workspace-pane closed-session guard from `0804083` remains in
+  place as defence in depth (its narrow-scope unit-test invariants
+  still pass).
+
+Workstation checks before stop-before-commit:
+
+- `pnpm -r check` (svelte-check + tsc): clean.
+- `pnpm -r test`: 948 tests pass (incl. the new regression pin in
+  `tests/appShellIsolation.test.ts`).
+- `pnpm -r build`: clean; web bundle `index-BADxlpqn.js` produced.
+- `pnpm run check:docs-contracts`: clean.
+- `git diff --check`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`: clean.
+- `cargo test --workspace`: clean.
+
+Drift worth folding back later (intentional non-goals for this run):
+
+- **Promote `:main` post-merge.** Staging is currently serving the
+  follow-up-fix bundle via `docker cp` hot-replace into the running
+  web container. That is a smoke convenience only; the durable
+  shape is `cargo / pnpm green → merge to main → CI publishes a
+  fresh `:main` → re-pull on the VPS slot`. A follow-up entry will
+  pin the post-merge re-pull was clean.
+- **No host-key-revoke route.** Re-using the prior smoke profile
+  was blocked by RelayTerm's "refuse to silently overwrite a pinned
+  host key" policy and there is no `DELETE /known-host-entries/:id`
+  surface to clear stale trust. The supported flow is "create a new
+  host + profile", which is what this run did. Operator UX is
+  acceptable for now (single-user staging) but the cost will grow
+  with multi-user / production reuse — call out in a future SPEC
+  slice if the operator UX becomes a friction point.
+- **No Svelte component test harness.** The regression-pin is a
+  static-text scan rather than a behavioural test of TerminalView's
+  remount-on-launch-transition. Wiring `@testing-library/svelte` (or
+  the workspace-preferred equivalent) is a useful future investment;
+  the static scan is the smallest maintainable pin until then.
+
 ### 2026-05-10 · Desktop Tauri staging custom detached-live-PTY TTL smoke
 
 Picks up from the 2026-05-09 desktop reconnect smoke entry below

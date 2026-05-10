@@ -282,14 +282,37 @@
         {:else if selected === "dashboard"}
           <DashboardView onNavigate={(id) => navigate(id)} />
         {:else if selected === "terminal"}
-          <TerminalView
-            launch={activeLaunch}
-            onExit={handleTerminalExit}
-            onSessionClosed={handleSessionClosed}
-            onLastSeenSeqUpdate={handleLastSeenSeqUpdate}
-            onReconnectLastSession={handleReconnectLastSession}
-            onForgetLastSession={handleForgetLastSession}
-          />
+          <!--
+            {#key} on activeLaunch.sessionId so a launch transition
+            (non-null → null on wire-close, null → new id on launch,
+            id → different id on reconnect-from-Sessions) unmounts and
+            remounts TerminalView. Without this, TerminalView's
+            `let saved = $state(loadActiveSession())` is captured at
+            first mount and stays stale even after handleSessionClosed
+            calls clearActiveSession() — so the empty-state
+            "Reconnect last session" button surfaces a pointer at the
+            just-closed session and a click produces a doomed
+            connection error. Pinned by tests/appShellIsolation.test.ts
+            so a regression that drops this wrapper trips the suite.
+
+            Note: when activeLaunch transitions null → null (a
+            redundant onSessionClosed firing on an already-empty
+            shell), the key value stays "empty" → "empty" and
+            TerminalView is NOT remounted. That is safe by design —
+            clearActiveSession() already ran on the first close, so
+            saved is already null inside the still-mounted
+            TerminalView.
+          -->
+          {#key activeLaunch?.sessionId ?? "empty"}
+            <TerminalView
+              launch={activeLaunch}
+              onExit={handleTerminalExit}
+              onSessionClosed={handleSessionClosed}
+              onLastSeenSeqUpdate={handleLastSeenSeqUpdate}
+              onReconnectLastSession={handleReconnectLastSession}
+              onForgetLastSession={handleForgetLastSession}
+            />
+          {/key}
         {:else if selected === "sessions"}
           <SessionsView
             onReconnect={handleLaunch}

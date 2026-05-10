@@ -63,4 +63,45 @@ describe("production app shell isolation", () => {
     }
     expect(offenders).toEqual([]);
   });
+
+  it("wraps <TerminalView> in a key block on activeLaunch.sessionId", () => {
+    // TerminalView's `let saved = $state(loadActiveSession())` is captured
+    // at first mount and never re-read while the component stays alive.
+    // After AppShell's `handleSessionClosed` runs `clearActiveSession()`
+    // and sets `activeLaunch = null`, TerminalView's `{:else}` empty
+    // state still renders the stale saved pointer if the component was
+    // not unmounted/remounted across the launch transition. The wrapper
+    //
+    //   {#key activeLaunch?.sessionId ?? "empty"}
+    //     <TerminalView ... />
+    //   {/key}
+    //
+    // forces a fresh mount on every launch transition (non-null → null
+    // on wire-close, null → some-id on launch, id → different-id on
+    // reconnect-from-Sessions), so `saved` always reflects current
+    // localStorage. A regression that drops this wrapper would re-open
+    // the "End session → Reconnect → connection error" UX bug surfaced
+    // in the 2026-05-09 staging smoke; pin the wrapper here so the
+    // regression trips this test instead.
+    const appShellPath = new URL(
+      "../src/lib/app/AppShell.svelte",
+      import.meta.url,
+    ).pathname;
+    const text = readFileSync(appShellPath, "utf8");
+    // Two assertions so the test is tolerant of comment / whitespace
+    // reformatting between the `{#key}` line and the `<TerminalView>`
+    // tag (e.g. an inline comment being moved into the body of the
+    // key block) without losing its grip on the structural property
+    // being pinned.
+    const keyOpen =
+      /\{#key\s+activeLaunch\?\.sessionId\s*\?\?\s*"empty"\s*\}/;
+    expect(keyOpen.test(text)).toBe(true);
+    // The key block immediately containing <TerminalView ... />: scan
+    // up to ~500 chars after the matched opener (covers a reasonable
+    // amount of inline comment / whitespace) for the tag.
+    const keyBody = new RegExp(
+      String.raw`\{#key\s+activeLaunch\?\.sessionId\s*\?\?\s*"empty"\s*\}[\s\S]{0,500}<TerminalView\b`,
+    );
+    expect(keyBody.test(text)).toBe(true);
+  });
 });

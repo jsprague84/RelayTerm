@@ -70,9 +70,14 @@
 
   /**
    * The saved-record snapshot the empty state offers as a reconnect
-   * affordance. Read once at mount-time — re-navigating between views
-   * remounts the AppShell view branch, which remounts this component,
-   * which re-reads. We don't poll storage.
+   * affordance. Read once at mount-time. We don't poll storage —
+   * AppShell wraps this component in `{#key activeLaunch?.sessionId
+   * ?? "empty"}` so every launch transition (post wire-close, post
+   * launch, post reconnect-from-Sessions) unmounts and remounts this
+   * component, which re-reads. Without that AppShell wrapper, this
+   * cache would stay stale after `handleSessionClosed` runs
+   * `clearActiveSession()` — see the comment in `AppShell.svelte` and
+   * the regression pin in `tests/appShellIsolation.test.ts`.
    */
   let saved = $state<ActiveSessionRecord | null>(loadActiveSession());
 
@@ -117,12 +122,13 @@
    *     not cost the operator their saved record.
    *
    * Re-run discipline: the effect tracks `saved` because the async branch
-   * reads `saved.session_id` synchronously. In practice `saved` only ever
-   * transitions `non-null → null` (forget click, stale outcome), never
-   * `non-null → different non-null` — this view does not own the saved
-   * record's identity, the AppShell does, and the AppShell unmounts and
-   * remounts this view across launch transitions. If a future revision
-   * starts mutating `saved` in place to a different session id, the
+   * reads `saved.session_id` synchronously. Within a single mount, `saved`
+   * only ever transitions `non-null → null` (forget click, stale outcome),
+   * never `non-null → different non-null` — AppShell owns the saved
+   * record's identity and remounts this component on every launch
+   * transition via the `{#key activeLaunch?.sessionId ?? "empty"}`
+   * wrapper around `<TerminalView>`. If a future revision starts mutating
+   * `saved` in place to a different session id within one mount, the
    * effect would re-fire and a second validation would race the first;
    * the cancellation flag below would let the second one win cleanly.
    */
