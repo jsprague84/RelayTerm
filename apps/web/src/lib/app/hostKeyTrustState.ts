@@ -19,9 +19,11 @@
  *    the single source of truth for that comparison.
  */
 
-import type {
-  HostKeyPreflightResponse,
-  HostKeyStatus,
+import {
+  isHostKeyReplacementReasonCode,
+  type HostKeyPreflightResponse,
+  type HostKeyReplacementReasonCode,
+  type HostKeyStatus,
 } from "../api/serverProfiles.js";
 
 /** Short, deliberately-conservative status label for the UI badge. */
@@ -147,3 +149,147 @@ export const TRUST_DISCLAIMER =
  */
 export const PREFLIGHT_DISCLAIMER =
   "Preflight verifies the server's host key during SSH key exchange. It does not authenticate, does not open a terminal, and does not install your public key.";
+
+// ---------------------------------------------------------------------------
+// Host-key REPLACE pure helpers
+// ---------------------------------------------------------------------------
+//
+// Phase 3 of the host-key replace flow (see
+// `docs/spec/host-key-replace.md` § R6). UI-state helpers — no Svelte
+// state, no I/O, no side effects. The HostKeyPanel component will
+// compose these in Phase 4; Phase 3 lands them so they can be unit-
+// tested in isolation.
+//
+// Architectural rule (load-bearing): the replace affordance is offered
+// ONLY when the most-recent preflight returned `host_key_status ===
+// "changed"` AND the fingerprint shape is valid. It is invisible
+// (NOT just disabled) for `unknown` and `trusted` outcomes. The replace
+// route IS the only operator-sanctioned recovery path from a `changed`
+// outcome — there is no "force trust", no "overwrite", no global
+// bypass.
+
+/**
+ * Wire-stable reason code on the request body. Re-exported so the
+ * HostKeyPanel does not need to reach into `lib/api/` for the type.
+ */
+export type { HostKeyReplacementReasonCode };
+
+/**
+ * Type-guard for {@link HostKeyReplacementReasonCode}. Re-exported so
+ * a UI component can refuse to submit a request whose `reason_code`
+ * fell out of the closed accept-list (e.g. through a forced enum cast)
+ * BEFORE any wire round-trip.
+ */
+export const reasonCodeIsValid = isHostKeyReplacementReasonCode;
+
+/**
+ * Operator-facing label + wire enum value for each reason code.
+ *
+ * Source of truth for the reason picker. The wire enum value stays in
+ * sync with the backend's `KnownHostRevocationReason::from_str_tag`
+ * accept-list and the DB CHECK in
+ * `20260510000022_known_host_entries_revoke_metadata.sql`. The label
+ * column is operator copy and may evolve without breaking the wire.
+ */
+export interface HostKeyReplacementReasonOption {
+  /** Wire-stable enum tag — submitted to the backend verbatim. */
+  code: HostKeyReplacementReasonCode;
+  /** Operator-facing label rendered in the reason picker. */
+  label: string;
+}
+
+/**
+ * Ordered list of reason-code options for the modal's reason picker.
+ *
+ * Order is operator copy: most common cause first, "operator other"
+ * last so it isn't picked by accident. The function returns a fresh
+ * array on every call so callers cannot accidentally mutate a shared
+ * module-level singleton — Svelte renders the picker once per modal
+ * open and a fresh array carries no state-leak risk.
+ */
+export function replacementReasonOptions(): HostKeyReplacementReasonOption[] {
+  return [
+    { code: "server_reinstalled", label: "Server reinstalled or rebuilt" },
+    {
+      code: "host_key_rotated",
+      label: "Host key rotated by the server operator",
+    },
+    {
+      code: "lab_target_recreated",
+      label: "Lab or staging target recreated",
+    },
+    { code: "operator_other", label: "Other (acknowledged)" },
+  ];
+}
+
+/**
+ * Whether the operator's typed-confirmation matches the destructive
+ * action gate. Byte-exact, case-sensitive — matches the same posture
+ * as {@link fingerprintConfirmationMatches}: a `"replace"` /
+ * `" REPLACE "` / `"REPLACE\n"` MUST be refused so a destructive write
+ * cannot be dispatched by accidental whitespace.
+ */
+export function replaceConfirmationMatches(input: string): boolean {
+  return input === "REPLACE";
+}
+
+/**
+ * Whether the replace action may be offered from a preflight result,
+ * and — if not — why. Pure function of the parsed preflight: no I/O,
+ * no Svelte state, no side effects. The Phase 4 component will
+ * translate each variant into the appropriate
+ * disabled/visible/copy state.
+ *
+ * On the `ok` path, the helper exposes both fingerprints (old = the
+ * active pin the operator is consenting to revoke; new = the freshly-
+ * captured fingerprint the operator just confirmed in preflight).
+ * The HostKeyPanel forwards them into the modal AND into the request
+ * body — keeping the helper as the single derivation point closes a
+ * shape-mismatch race where the modal could show the old fingerprint
+ * but submit a different `expected_old_fingerprint`.
+ *
+ * `activePinFingerprint` is supplied by the caller from the inventory
+ * panel's known-host-entries fetch. The helper does not run any
+ * fingerprint-shape check on `activePinFingerprint` — the panel is
+ * responsible for sourcing it from a trusted server response, where
+ * the shape was already validated.
+ */
+export type ReplaceGate =
+  | {
+      kind: "ok";
+      old_fingerprint: string;
+      new_fingerprint: string;
+    }
+  | { kind: "not_changed_status" }
+  | { kind: "missing_active_pin" }
+  | { kind: "invalid_old_fingerprint_shape" }
+  | { kind: "invalid_new_fingerprint_shape" };
+
+export function replaceGateForPreflight(
+  preflight: HostKeyPreflightResponse,
+  activePinFingerprint: string | null,
+): ReplaceGate {
+  // Only a `changed` preflight outcome enables the affordance. `unknown`
+  // and `trusted` MUST be invisible (not just disabled) — the spec
+  // forbids offering replace as a path of least resistance.
+  if (preflight.host_key_status !== "changed") {
+    return { kind: "not_changed_status" };
+  }
+  if (activePinFingerprint === null || activePinFingerprint.length === 0) {
+    return { kind: "missing_active_pin" };
+  }
+  if (!isFingerprintShapeValid(activePinFingerprint)) {
+    return { kind: "invalid_old_fingerprint_shape" };
+  }
+  if (
+    preflight.host_key_fingerprint.length === 0 ||
+    !isFingerprintShapeValid(preflight.host_key_fingerprint)
+  ) {
+    return { kind: "invalid_new_fingerprint_shape" };
+  }
+  return {
+    kind: "ok",
+    old_fingerprint: activePinFingerprint,
+    new_fingerprint: preflight.host_key_fingerprint,
+  };
+}

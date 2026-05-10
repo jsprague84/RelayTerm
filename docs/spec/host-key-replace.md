@@ -1,7 +1,7 @@
 # Host-key replace (revoke-and-replace) — design
 
-> Status: **Phase 1 + Phase 2 implemented;** frontend helpers, UI, and
-> staging smoke deferred to phases 3–5.
+> Status: **Phase 1 + Phase 2 + Phase 3 implemented;** UI and staging
+> smoke deferred to phases 4–5.
 >
 > Phase 1 landed as `feat/known-host-revoke-metadata`:
 > - Migration `20260510000022_known_host_entries_revoke_metadata.sql`
@@ -116,6 +116,77 @@
 >   `terminal_session_create_blocks_revoked_pin` tests are restored.
 >   This was masked because the affected tests are gated on the
 >   `postgres-tests` feature.
+>
+> Phase 3 landed as `feat/replace-host-key-api-helpers`:
+> - **API helper.** `replaceHostKey(profileId, request, options?)` on
+>   `apps/web/src/lib/api/serverProfiles.ts` issues
+>   `POST /api/v1/server-profiles/:id/replace-host-key` with the profile
+>   id URL-encoded into the path. Local validators run BEFORE any wire
+>   round-trip — both fingerprints go through `isValidFingerprintShape`
+>   and `reason_code` goes through `isHostKeyReplacementReasonCode`,
+>   collapsing each refusal to a typed `validation` error
+>   (`invalid_old_fingerprint_shape`, `invalid_new_fingerprint_shape`,
+>   `invalid_reason_code`). The helper does not throw, does not log,
+>   and does not echo wire / transport detail through any user-facing
+>   string.
+> - **Types.** `HostKeyReplacementReasonCode` (closed set of four wire
+>   tags), `ReplaceHostKeyRequest`, `ReplaceHostKeyResponse`,
+>   `ReplaceHostKeyError` (validation / http / transport /
+>   malformed_response), `ReplaceHostKeyConflictReason` (closed set of
+>   six 409 discriminators including the `profile_disabled` case).
+> - **Response parser.** `parseReplaceHostKeyResponse(raw)` builds the
+>   DTO field-by-field; a stray `private_key` /
+>   `encrypted_private_key` / `password` / `cookie` / `session_token` /
+>   `token_hash` smuggled onto the wire body cannot reach the returned
+>   object. Pinned by sentinel tests in
+>   `apps/web/tests/replaceHostKeyApi.test.ts`.
+> - **Conflict-reason classifier.** `classifyReplaceConflictMessage`
+>   (private to the API helper) maps the wire `message` of a 409
+>   envelope (`"host_key {reason}"` / `"server_profile disabled"`)
+>   against a closed accept-list and surfaces a typed `reason` field
+>   on the `http` error variant. Unknown tags collapse to `null` so
+>   the formatter never echoes an unrecognised wire string.
+> - **Error formatter.** `describeReplaceHostKeyError(err)` is a function
+>   of `kind` + `status` + `code` + the derived `reason` discriminator
+>   ONLY — never echoes the wire `message` of an HTTP error or the
+>   thrown `Error.message` of a transport failure. Each of the six
+>   recognised 409 reasons renders distinct, deliberate operator copy
+>   ("re-run preflight", "host key did not actually change",
+>   "previously revoked", etc.).
+> - **Pure UI helpers** in `apps/web/src/lib/app/hostKeyTrustState.ts`:
+>   - `reasonCodeIsValid(value)` (re-exports the API-layer guard).
+>   - `replacementReasonOptions()` returns a fresh array of
+>     `{ code, label }` for the modal's reason picker.
+>   - `replaceConfirmationMatches(input)` is byte-exact and case-
+>     sensitive (`"REPLACE"` only — refuses `"replace"`, `" REPLACE "`,
+>     `"REPLACE\n"`).
+>   - `replaceGateForPreflight(preflight, activePinFingerprint)` returns
+>     a `ReplaceGate` whose `ok` variant carries both `old_fingerprint`
+>     and `new_fingerprint` so the modal and the request body share one
+>     derivation point. Refusal variants:
+>     `not_changed_status` / `missing_active_pin` /
+>     `invalid_old_fingerprint_shape` / `invalid_new_fingerprint_shape`.
+> - **Test coverage.** 40 vitest cases in
+>   `apps/web/tests/replaceHostKeyApi.test.ts` covering: every reason
+>   tag (`reasonCodeIsValid` + `replacementReasonOptions`); every
+>   `replaceConfirmationMatches` boundary (case, whitespace, partial,
+>   empty); every `replaceGateForPreflight` branch (changed/unknown/
+>   trusted, missing active pin, malformed old/new fingerprint, ok with
+>   both fingerprints); response parser shape + sentinel redaction;
+>   API helper request encoding (URL-encoding, headers, body shape);
+>   pre-wire validator refusals (no fetch dispatched on bad shape /
+>   bad reason); 409 wire-message classification across all six
+>   recognised reasons; unknown-reason fallback to `reason=null`;
+>   400 / 401 / 403 / 404 / 502 / 503 envelopes; transport
+>   `console.*` silence; malformed_response collapse; formatter
+>   distinct-copy invariant; sentinel scan against `private_key`,
+>   `encrypted_private_key`, `password`, `cookie`, `session_token`,
+>   `token_hash`. Existing host-key trust/preflight tests
+>   (`apps/web/tests/hostKeyApi.test.ts`) still pass.
+> - **No UI wiring lands here.** No `HostKeyPanel.svelte` button, no
+>   modal, no fetch from any view — Phase 4 picks those up. The Phase
+>   3 helpers are pure / vitest-only by design (rollout table § "5
+>   small, separately-mergeable PRs").
 >
 > This doc proposes an explicit, auditable operator flow to revoke an
 > active pinned host key and trust a new one in its place — without
@@ -405,11 +476,11 @@ on the SPA produces deliberate operator copy keyed off `kind / status
 | `401` | `unauthorized` | session cookie missing/invalid |
 | `403` | `csrf_origin_mismatch` | shared `CsrfGuard` extractor fires before any DB / body work, per [`AGENTS.md`](../../AGENTS.md) row 7 |
 | `404` | `not_found { entity: "server_profile" }` | missing or foreign-owned profile (byte-identical to the genuine 404) |
-| `409` | `conflict { entity: "host_key", reason: "no_active_pin" }` | no active trusted pin exists for this host |
-| `409` | `conflict { entity: "host_key", reason: "active_pin_mismatch" }` | active pin's fingerprint ≠ `expected_old_fingerprint` |
+| `409` | `conflict { entity: "host_key", reason: "active_pin_mismatch" }` | active pin's fingerprint ≠ `expected_old_fingerprint` **OR** no active trusted pin exists for this host (Phase 2 implementation collapses both subcases under one wire tag — see `replace_host_key_rejects_when_no_active_pin_exists`; Phase 3 frontend classifier accepts only `active_pin_mismatch`) |
 | `409` | `conflict { entity: "host_key", reason: "captured_mismatch" }` | freshly-captured probe fingerprint ≠ `expected_new_fingerprint` |
 | `409` | `conflict { entity: "host_key", reason: "captured_unchanged" }` | freshly-captured fingerprint matches the active pin (host hasn't actually changed; replace is a no-op) |
 | `409` | `conflict { entity: "host_key", reason: "captured_revoked" }` | a revoked row exists for `(host_id, captured_fingerprint)` — refuse re-trust through the replace path |
+| `409` | `conflict { entity: "host_key", reason: "new_fingerprint_already_active" }` | forward-compat: another operator raced through a duplicate trust before this replace landed. Currently impossible because the `captured_unchanged` / `captured_mismatch` / `captured_revoked` checks fire first; the repository's `FOR UPDATE` constraint surfaces it for future code paths that bypass those checks. |
 | `409` | `conflict { entity: "server_profile", reason: "disabled" }` | profile is disabled (mirrors the launch / preflight / trust / auth-check guards) |
 | `502` | `bad_gateway` | probe failure (unreachable, timeout, transport error, unsupported host-key algorithm). Wire body is the static `"bad gateway"` string so peer banners / topology never leak. |
 | `503` | `service_unavailable` | vault disabled |
@@ -804,7 +875,7 @@ tests on slices that touch DB or audit.
 |---|---|---|---|
 | 1 ✅ | `feat/known-host-revoke-metadata` | **Landed.** Migration `20260510000022_known_host_entries_revoke_metadata.sql` + the three new columns + the two CHECK constraints + Rust row mapping + `KnownHostRevocationReason` enum + `replace_active_pin` repository primitive + repository tests. **No route, no UI.** | Repository tests in `crates/relayterm-db/tests/repositories.rs`. The project uses runtime sqlx queries, so no `.sqlx/` prepare cache. |
 | 2 ✅ | `feat/replace-host-key-route` | **Landed.** The `POST /api/v1/server-profiles/:id/replace-host-key` route + `ReplaceHostKeyRequest` / `ReplaceHostKeyResponse` DTOs + paired-audit emission inside `replace_active_pin` (option (a)) + integration tests. **No UI yet.** | Route integration tests in `crates/relayterm-api/tests/api.rs` (`replace_host_key_*`); redaction-sentinel scan via `AUDIT_FORBIDDEN_SUBSTRINGS`; repository-level audit + atomic-rollback tests in `crates/relayterm-db/tests/repositories.rs`. |
-| 3 | `feat/replace-host-key-api-helpers` | `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid`. Pure helpers, vitest only. **No component edits yet.** | vitest. |
+| 3 ✅ | `feat/replace-host-key-api-helpers` | **Landed.** `replaceHostKey(...)` helper + `parseReplaceHostKeyResponse` + `describeReplaceHostKeyError` + `replaceGateForPreflight` + `replaceConfirmationMatches` + `reasonCodeIsValid` + `replacementReasonOptions`. Pure helpers, vitest only. **No component edits yet.** | vitest (`apps/web/tests/replaceHostKeyApi.test.ts`, 40 cases). |
 | 4 | `feat/replace-host-key-ui` | `HostKeyPanel.svelte` modal + button gate; threading through to the API helper. | Component tests once a harness exists; static-text scan as a fallback. |
 | 5 | `chore/replace-host-key-staging-smoke` | One throwaway-target smoke run; update the deferred note in `vps-staging-smoke.md`; final docs sweep on `auth.md`, `inventory.md`, `SPEC.md`. | Manual smoke; doc-contracts guard. |
 

@@ -1139,3 +1139,408 @@ export function describeAuthCheckError(err: AuthCheckError): string {
       return "Auth-check failed: malformed response";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Host-key replace helpers
+// ---------------------------------------------------------------------------
+//
+// Wire shapes mirror `ReplaceHostKeyRequest` / `ReplaceHostKeyResponse` in
+// `crates/relayterm-api/src/dto/preflight.rs`. The route is the operator-
+// sanctioned recovery path from the `changed` outcome that the regular
+// `trust-host-key` route refuses — it preserves the TOFU posture (no auto-
+// overwrite) by requiring BOTH the active pin's fingerprint AND the freshly-
+// captured fingerprint AND a canonical reason code. See
+// `docs/spec/host-key-replace.md`.
+//
+// Redaction posture: the response carries only public-side identifiers and
+// public fingerprints — no `public_key` byte blob, no vault payloads, no
+// peer banner. The parser builds the DTO field-by-field; a stray
+// `private_key` / `encrypted_private_key` smuggled onto the wire body
+// cannot reach the returned object. The error formatter is a function of
+// `kind` + `status` + `code` + the derived `reason` discriminator only —
+// it never echoes the wire `message` of an HTTP error or the thrown
+// `Error.message` of a transport failure.
+
+/**
+ * Wire-stable reason-code tag the request body carries. Mirrors the
+ * `KnownHostRevocationReason` enum on the backend
+ * (`crates/relayterm-core/src/known_host.rs`) and the DB CHECK in
+ * migration `20260510000022_known_host_entries_revoke_metadata.sql`.
+ *
+ * Free-text reason notes are deliberately NOT part of the schema —
+ * operator-supplied prose is the canonical shape that smuggles secrets
+ * (stack traces, hostname-with-credentials, etc.) into audit. The enum
+ * is the only persisted reason channel.
+ */
+export type HostKeyReplacementReasonCode =
+  | "server_reinstalled"
+  | "host_key_rotated"
+  | "lab_target_recreated"
+  | "operator_other";
+
+const HOST_KEY_REPLACEMENT_REASON_CODES: ReadonlySet<HostKeyReplacementReasonCode> =
+  new Set([
+    "server_reinstalled",
+    "host_key_rotated",
+    "lab_target_recreated",
+    "operator_other",
+  ]);
+
+/**
+ * Request body for `POST /api/v1/server-profiles/:id/replace-host-key`.
+ *
+ * The caller MUST echo BOTH fingerprints — the active pin they consent
+ * to revoke AND the captured fingerprint they confirmed in the preceding
+ * `changed` preflight — and pick one of the four canonical reason codes.
+ */
+export interface ReplaceHostKeyRequest {
+  expected_old_fingerprint: string;
+  expected_new_fingerprint: string;
+  reason_code: HostKeyReplacementReasonCode;
+}
+
+/**
+ * Parsed shape of `POST /api/v1/server-profiles/:id/replace-host-key`.
+ *
+ * Carries only public-side identifiers and public fingerprints. No
+ * private-key field is declared here — the parser builds the DTO
+ * field-by-field, so any stray `private_key` / `encrypted_private_key`
+ * smuggled onto the wire body cannot reach the returned object. The
+ * reason code is intentionally NOT echoed on the wire (it lives in the
+ * audit row), so the response shape does not carry it.
+ */
+export interface ReplaceHostKeyResponse {
+  profile_id: string;
+  host_id: string;
+  revoked_known_host_entry_id: string;
+  revoked_fingerprint: string;
+  trusted_known_host_entry_id: string;
+  trusted_fingerprint: string;
+  host_key_type: SshKeyType;
+  /** RFC 3339 timestamp. */
+  trusted_at: string;
+}
+
+export function parseReplaceHostKeyResponse(
+  raw: unknown,
+): ReplaceHostKeyResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (
+    typeof r.profile_id !== "string" ||
+    typeof r.host_id !== "string" ||
+    typeof r.revoked_known_host_entry_id !== "string" ||
+    typeof r.revoked_fingerprint !== "string" ||
+    typeof r.trusted_known_host_entry_id !== "string" ||
+    typeof r.trusted_fingerprint !== "string" ||
+    typeof r.host_key_type !== "string" ||
+    typeof r.trusted_at !== "string"
+  ) {
+    return null;
+  }
+  // Build the value field-by-field. Any stray sibling field (including
+  // `private_key` / `encrypted_private_key`) cannot reach the returned
+  // object because no path here copies it.
+  return {
+    profile_id: r.profile_id,
+    host_id: r.host_id,
+    revoked_known_host_entry_id: r.revoked_known_host_entry_id,
+    revoked_fingerprint: r.revoked_fingerprint,
+    trusted_known_host_entry_id: r.trusted_known_host_entry_id,
+    trusted_fingerprint: r.trusted_fingerprint,
+    host_key_type: r.host_key_type as SshKeyType,
+    trusted_at: r.trusted_at,
+  };
+}
+
+/**
+ * Closed accept-list of `reason` discriminators the formatter recognises.
+ *
+ * The wire shape for a 409 envelope is `{ code: "conflict", message:
+ * "<entity> <reason>" }` — `entity` is `host_key` or `server_profile`
+ * and `reason` is one of these tags or `"disabled"`. The helper parses
+ * the message against this fixed set so the formatter can produce
+ * deliberate per-reason copy WITHOUT echoing the message itself: a
+ * future widening of the wire `message` cannot leak through, because
+ * unknown tags collapse to `null` and the formatter falls back to the
+ * generic "HTTP 409 conflict" string.
+ */
+export type ReplaceHostKeyConflictReason =
+  | "active_pin_mismatch"
+  | "captured_unchanged"
+  | "captured_mismatch"
+  | "captured_revoked"
+  | "new_fingerprint_already_active"
+  | "profile_disabled";
+
+const REPLACE_HOST_KEY_CONFLICT_REASONS: ReadonlySet<ReplaceHostKeyConflictReason> =
+  new Set([
+    "active_pin_mismatch",
+    "captured_unchanged",
+    "captured_mismatch",
+    "captured_revoked",
+    "new_fingerprint_already_active",
+    "profile_disabled",
+  ]);
+
+/**
+ * Map a 409 wire envelope to a typed conflict reason.
+ *
+ * The wire `code` is always the static `"conflict"`; the discriminator
+ * rides in the message string (`"host_key active_pin_mismatch"`,
+ * `"server_profile disabled"`, etc.). Unknown tags collapse to `null`
+ * so the formatter never echoes an unrecognised wire string — the
+ * generic 409 fallback runs instead.
+ *
+ * NOT exported. The caller is the API helper, which derives the
+ * `reason` field on the typed error envelope.
+ */
+function classifyReplaceConflictMessage(
+  message: string,
+): ReplaceHostKeyConflictReason | null {
+  // The on-wire form is two whitespace-separated tags. We match against
+  // a fixed accept-list so a future widening of the wire `message`
+  // (e.g. operator detail interpolated by a misconfigured handler)
+  // cannot leak through.
+  const tokens = message.split(/\s+/u);
+  if (tokens.length === 0) return null;
+  // Cheap two-token matcher — covers both `host_key <reason>` and
+  // `server_profile disabled`.
+  const [entity, reason] = [tokens[0], tokens[1] ?? ""];
+  if (entity === "server_profile" && reason === "disabled") {
+    return "profile_disabled";
+  }
+  if (entity === "host_key" && REPLACE_HOST_KEY_CONFLICT_REASONS.has(
+    reason as ReplaceHostKeyConflictReason,
+  )) {
+    return reason as ReplaceHostKeyConflictReason;
+  }
+  return null;
+}
+
+/**
+ * Typed error envelope returned by {@link replaceHostKey}.
+ *
+ * Mirrors the rest of the host-key surface: `validation` covers
+ * client-side refusals before any wire round-trip; `http` carries the
+ * status / code / message / derived reason; `transport` and
+ * `malformed_response` cover the no-status code paths. The `reason`
+ * field on the `http` variant is set ONLY when a 409 envelope's wire
+ * message matches the closed accept-list — it never echoes operator
+ * detail.
+ */
+export type ReplaceHostKeyError =
+  | {
+      kind: "validation";
+      reason:
+        | "invalid_old_fingerprint_shape"
+        | "invalid_new_fingerprint_shape"
+        | "invalid_reason_code";
+    }
+  | {
+      kind: "http";
+      status: number;
+      code: string;
+      message: string;
+      /** Derived 409 discriminator; `null` for non-409 statuses or for
+       * an unrecognised wire reason. The formatter switches on this
+       * field WITHOUT echoing the wire `message` itself. */
+      reason: ReplaceHostKeyConflictReason | null;
+    }
+  | { kind: "transport"; message: string }
+  | { kind: "malformed_response" };
+
+export type ReplaceHostKeyResult =
+  | { ok: true; replacement: ReplaceHostKeyResponse }
+  | { ok: false; error: ReplaceHostKeyError };
+
+export interface ReplaceHostKeyOptions extends LoadOptions {
+  /** Replaceable for tests. Defaults to
+   * `/api/v1/server-profiles/:id/replace-host-key`. */
+  endpoint?: string;
+}
+
+/**
+ * Type-guard for {@link HostKeyReplacementReasonCode}.
+ *
+ * Backend remains authoritative — the validator on the wire
+ * (`ReplaceHostKeyRequest::validated`) is the canonical accept-list,
+ * the DB CHECK is the second-line backstop. This guard is the third
+ * line: the SPA refuses to ship a request whose `reason_code` is not
+ * in the closed set, BEFORE any wire round-trip.
+ */
+export function isHostKeyReplacementReasonCode(
+  value: unknown,
+): value is HostKeyReplacementReasonCode {
+  return (
+    typeof value === "string" &&
+    HOST_KEY_REPLACEMENT_REASON_CODES.has(value as HostKeyReplacementReasonCode)
+  );
+}
+
+/**
+ * POST a host-key replace request and parse the typed response.
+ *
+ * Refuses to ship the request if either fingerprint shape is invalid
+ * or the reason code is not in the closed accept-list — the local
+ * validators run before any wire round-trip so a typo never reaches
+ * the backend's CSRF guard. The backend remains authoritative; this
+ * helper is a thin transport.
+ *
+ * The function does NOT throw, does NOT log raw response bodies, and
+ * does NOT echo wire / transport detail through any user-facing
+ * string. The 409 envelope's `message` is read once to derive the
+ * typed `reason` discriminator and is never re-emitted.
+ */
+export async function replaceHostKey(
+  profileId: string,
+  request: ReplaceHostKeyRequest,
+  options: ReplaceHostKeyOptions = {},
+): Promise<ReplaceHostKeyResult> {
+  if (!isValidFingerprintShape(request.expected_old_fingerprint)) {
+    return {
+      ok: false,
+      error: { kind: "validation", reason: "invalid_old_fingerprint_shape" },
+    };
+  }
+  if (!isValidFingerprintShape(request.expected_new_fingerprint)) {
+    return {
+      ok: false,
+      error: { kind: "validation", reason: "invalid_new_fingerprint_shape" },
+    };
+  }
+  if (!isHostKeyReplacementReasonCode(request.reason_code)) {
+    return {
+      ok: false,
+      error: { kind: "validation", reason: "invalid_reason_code" },
+    };
+  }
+  const endpoint =
+    options.endpoint ??
+    `/api/v1/server-profiles/${encodeURIComponent(profileId)}/replace-host-key`;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+  // Build the wire body field-by-field so an extra property on the
+  // caller's object cannot smuggle into the request.
+  const wireBody = {
+    expected_old_fingerprint: request.expected_old_fingerprint,
+    expected_new_fingerprint: request.expected_new_fingerprint,
+    reason_code: request.reason_code,
+  };
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(wireBody),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    const reason =
+      response.status === 409 ? classifyReplaceConflictMessage(message) : null;
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message, reason },
+    };
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const parsed = parseReplaceHostKeyResponse(body);
+  if (parsed === null) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, replacement: parsed };
+}
+
+/**
+ * Format a {@link ReplaceHostKeyError} as a one-line UI summary.
+ *
+ * Stays a function of `kind` + `status` + `code` + the derived 409
+ * `reason` discriminator only — never echoes the wire `message` of an
+ * HTTP error or the thrown `Error.message` of a transport failure.
+ *
+ * Per-status copy mirrors `docs/spec/host-key-replace.md` § R4. The
+ * conflict branches name what is true on each path so the operator
+ * gets a precise next step (re-run preflight vs. host hasn't changed
+ * vs. profile is disabled etc.); the generic 409 fallback covers any
+ * future reason the SPA hasn't been taught yet.
+ */
+export function describeReplaceHostKeyError(
+  err: ReplaceHostKeyError,
+): string {
+  switch (err.kind) {
+    case "validation":
+      switch (err.reason) {
+        case "invalid_old_fingerprint_shape":
+          return "Cannot replace host key: old fingerprint shape is invalid";
+        case "invalid_new_fingerprint_shape":
+          return "Cannot replace host key: new fingerprint shape is invalid";
+        case "invalid_reason_code":
+          return "Cannot replace host key: reason code is not recognised";
+      }
+      return "Cannot replace host key";
+    case "http":
+      if (err.status === 400 && err.code === "invalid_input") {
+        return "Replace refused: backend rejected the request shape";
+      }
+      if (err.status === 401) {
+        return "Replace refused: not authenticated";
+      }
+      if (err.status === 403 && err.code === "csrf_origin_mismatch") {
+        return "Replace refused: request blocked by browser security policy";
+      }
+      if (err.status === 404 && err.code === "not_found") {
+        return "Replace refused: server profile not found";
+      }
+      if (err.status === 409) {
+        switch (err.reason) {
+          case "active_pin_mismatch":
+            return "Replace refused: the active pinned host key no longer matches the fingerprint shown — re-run preflight before trying again";
+          case "captured_unchanged":
+            return "Replace refused: the host key did not actually change — re-run preflight to confirm the current state";
+          case "captured_mismatch":
+            return "Replace refused: the captured host key differs from what you confirmed — re-run preflight before trying again";
+          case "captured_revoked":
+            return "Replace refused: the captured host key has been revoked previously and cannot be re-trusted through this flow";
+          case "new_fingerprint_already_active":
+            return "Replace refused: another operator already trusted this host key — re-run preflight to confirm the current state";
+          case "profile_disabled":
+            return "Replace refused: server profile is disabled — re-enable the profile before replacing the host key";
+          case null:
+            return `Replace refused: HTTP ${err.status} ${err.code}`;
+        }
+      }
+      if (err.status === 502 && err.code === "bad_gateway") {
+        return "Replace refused: could not re-probe the server (network, timeout, or unsupported host-key algorithm)";
+      }
+      if (err.status === 503 && err.code === "service_unavailable") {
+        return "Replace refused: backend vault is not configured";
+      }
+      return `Replace refused: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Replace refused: transport error";
+    case "malformed_response":
+      return "Replace refused: malformed response";
+  }
+}
