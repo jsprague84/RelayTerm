@@ -37,6 +37,11 @@
   import {
     createTerminalSession,
   } from "../../api/terminalSessions.js";
+  import {
+    DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+    formatDetachedTtl,
+    loadSessionPolicy,
+  } from "../../api/sessionPolicy.js";
   import { describeLaunchError } from "../terminal/terminalLaunch.js";
   import type { ActiveLaunch } from "../terminal/activeLaunch.js";
   import HostKeyPanel from "./HostKeyPanel.svelte";
@@ -129,6 +134,14 @@
 
   let view = $state<LoadState>({ kind: "idle" });
   let panel = $state<Panel>("none");
+  /**
+   * Effective detached-live-PTY TTL window in seconds. Seeded from the
+   * SPEC-pinned default so the future-work footer renders honest copy
+   * on first paint; overwritten asynchronously when
+   * `loadSessionPolicy()` resolves. The loader is failure-safe so this
+   * state NEVER blocks the view.
+   */
+  let detachedTtlSeconds = $state(DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS);
 
   /**
    * Currently-selected detail target. Selection is mutually exclusive
@@ -194,6 +207,16 @@
   // button below.
   $effect(() => {
     void load();
+  });
+
+  // Resolve the deployment's configured detached-PTY TTL once so the
+  // future-work footer stops overclaiming the legacy 30 s literal. The
+  // loader never throws and falls back to the SPEC-pinned default on
+  // failure, so this $effect CANNOT block or break the view.
+  $effect(() => {
+    void loadSessionPolicy().then((policy) => {
+      detachedTtlSeconds = policy.detached_live_pty_ttl_seconds;
+    });
   });
 
   function formatPort(port: number): string {
@@ -1801,11 +1824,13 @@
 
   <p
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
+    data-testid="servers-future-work-blurb"
+    data-detached-ttl-seconds={detachedTtlSeconds}
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
     Edit / delete forms land in a later slice. Launch starts a live SSH
     PTY using the xterm baseline renderer; detached sessions survive
-    only briefly (~30s) and replay is in-memory only — not durable
-    across a backend restart.
+    for {formatDetachedTtl(detachedTtlSeconds)} and replay is in-memory
+    only — not durable across a backend restart.
   </p>
 </section>

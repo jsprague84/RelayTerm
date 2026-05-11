@@ -3,7 +3,6 @@ import {
   buildAttachWsUrl,
   classifyReconnectAttempt,
   computeWorkspaceEnablement,
-  DETACHED_TTL_MS,
   derivePhase,
   describeLaunchError,
   describeWorkspaceError,
@@ -17,6 +16,7 @@ import {
   TERMINAL_UX_COPY,
   type WorkspacePhase,
 } from "../src/lib/app/terminal/terminalLaunch.js";
+import { DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS } from "../src/lib/api/sessionPolicy.js";
 
 /**
  * Sentinel that should NEVER appear in any user-visible launch summary.
@@ -26,16 +26,16 @@ import {
  */
 const SENTINEL = "RELAY_SENTINEL_LAUNCH_OPERATOR_DETAIL_5511";
 
-describe("DETACHED_TTL_MS", () => {
-  it("matches the backend's pinned DETACHED_LIVE_PTY_TTL", () => {
-    // The constant is duplicated in
-    // `apps/web/src/lib/app/terminal/terminalLaunch.ts` (and again in
-    // `apps/web/src/lib/dev/liveTerminalState.ts` for the dev lab).
-    // The backend pins `relayterm_terminal::DETACHED_LIVE_PTY_TTL` at
-    // 30s. Drift is a bug — both copies must move in lockstep with
-    // the Rust constant. This test fails loudly if either side bumps
-    // the value without the other.
-    expect(DETACHED_TTL_MS).toBe(30_000);
+describe("DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS", () => {
+  it("matches the backend's pinned DETACHED_LIVE_PTY_TTL fallback", () => {
+    // Production UI now reads the effective detach-TTL window from
+    // `GET /api/v1/config/session-policy`; this constant is the
+    // safe fallback the SPA uses while the policy fetch is pending
+    // OR has failed. It MUST track the backend's
+    // `relayterm_terminal::DETACHED_LIVE_PTY_TTL` baseline (30 s) so
+    // a not-yet-deployed policy endpoint still renders honest copy.
+    // Drift is a bug — bump both sides in lockstep.
+    expect(DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS).toBe(30);
   });
 });
 

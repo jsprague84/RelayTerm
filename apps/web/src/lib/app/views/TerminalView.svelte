@@ -31,6 +31,11 @@
     validateSavedSession,
     type SavedSessionValidation,
   } from "../../api/terminalSessions.js";
+  import {
+    DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+    formatDetachedTtl,
+    loadSessionPolicy,
+  } from "../../api/sessionPolicy.js";
 
   interface Props {
     launch: ActiveLaunch | null;
@@ -80,6 +85,21 @@
    * the regression pin in `tests/appShellIsolation.test.ts`.
    */
   let saved = $state<ActiveSessionRecord | null>(loadActiveSession());
+
+  /**
+   * Effective detached-live-PTY TTL window in seconds. Seeded from the
+   * SPEC-pinned default so the empty-state copy renders honest text on
+   * first paint; overwritten once `loadSessionPolicy()` resolves. The
+   * loader is failure-safe (default fallback on transport / HTTP /
+   * parse failure), so this state NEVER blocks the empty state.
+   */
+  let detachedTtlSeconds = $state(DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS);
+
+  $effect(() => {
+    void loadSessionPolicy().then((policy) => {
+      detachedTtlSeconds = policy.detached_live_pty_ttl_seconds;
+    });
+  });
 
   /**
    * Outcome of the optional saved-session validation pass against the
@@ -220,9 +240,14 @@
       </li>
       <li class="flex items-start gap-2">
         <span class="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-600"></span>
-        <span>
-          Detached sessions survive only briefly (~30s); replay is
-          in-memory and does not survive a backend restart.
+        <span
+          data-testid="terminal-empty-detached-blurb"
+          data-detached-ttl-seconds={detachedTtlSeconds}
+        >
+          Detached sessions survive for {formatDetachedTtl(
+            detachedTtlSeconds,
+          )} after the last client drop; replay is in-memory and does
+          not survive a backend restart.
         </span>
       </li>
     </ul>

@@ -12,7 +12,11 @@
  *    cannot be re-attached; the orchestrator dropped the runtime.
  *  - {@link canReconnect} is `true` for `active` and `detached` rows but
  *    the UI MUST present the detached path with a TTL disclaimer — the
- *    PTY only survives ~30s after the last attachment dropped.
+ *    PTY only survives for the deployment's configured detach window
+ *    after the last attachment dropped. The window is operator-tunable
+ *    via `terminal_sessions.detached_live_pty_ttl_seconds`; the SPA
+ *    fetches it from `GET /api/v1/config/session-policy` and passes
+ *    the value to {@link describeSessionStatus}.
  *  - {@link canReconnect} for `starting` is `false`: the create call has
  *    not yet returned, the runtime is not bound, and a wire attach would
  *    race the create.
@@ -26,6 +30,10 @@
  */
 
 import type { TerminalSessionStatus } from "../../api/terminalSessions.js";
+import {
+  DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+  describeDetachedTtl,
+} from "../../api/sessionPolicy.js";
 
 export type SessionStatusTone =
   | "neutral"
@@ -48,13 +56,14 @@ const STATUS_TONES: Record<TerminalSessionStatus, SessionStatusTone> = {
   closed: "neutral",
 };
 
-const STATUS_DESCRIPTIONS: Record<TerminalSessionStatus, string> = {
+const STATUS_DESCRIPTIONS_STATIC: Record<
+  Exclude<TerminalSessionStatus, "detached">,
+  string
+> = {
   starting:
     "Session is starting; the SSH PTY is not yet bound. Reconnect becomes available once the orchestrator promotes it to active.",
   active:
     "Session is live on the backend. Open it to attach, or close it to end the PTY immediately.",
-  detached:
-    "No client is attached. The remote PTY only survives briefly (~30s) after the last detach — reconnect within that window or the session is reaped. Replay is in-memory and not durable across a backend restart.",
   closed:
     "Session ended. The runtime is gone and cannot be reconnected. Launch a new session from the originating server profile.",
 };
@@ -71,9 +80,22 @@ export function statusTone(status: TerminalSessionStatus): SessionStatusTone {
  * Human-readable description of a status. Honest about TTL, in-memory
  * replay, and post-restart recovery (none of which exist yet on the
  * backend).
+ *
+ * The detached copy is parametised on the deployment's configured
+ * detach-TTL window so production UI never overclaims the legacy 30 s
+ * literal. Callers fetch the value from `loadSessionPolicy()` and
+ * pass it through; omitting it falls back to the SPEC-pinned default
+ * ({@link DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS}) so a not-yet-fetched
+ * or failed policy load still renders honest copy.
  */
-export function describeSessionStatus(status: TerminalSessionStatus): string {
-  return STATUS_DESCRIPTIONS[status];
+export function describeSessionStatus(
+  status: TerminalSessionStatus,
+  detachedTtlSeconds: number = DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+): string {
+  if (status === "detached") {
+    return `No client is attached. ${describeDetachedTtl(detachedTtlSeconds)}`;
+  }
+  return STATUS_DESCRIPTIONS_STATIC[status];
 }
 
 /**

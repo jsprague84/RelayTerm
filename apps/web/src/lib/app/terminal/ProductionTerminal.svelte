@@ -46,7 +46,6 @@
     buildAttachWsUrl,
     classifyReconnectAttempt,
     computeWorkspaceEnablement,
-    DETACHED_TTL_MS,
     derivePhase,
     describeWorkspaceError,
     phaseLabel,
@@ -57,6 +56,11 @@
     TERMINAL_UX_COPY,
     type WorkspacePhase,
   } from "./terminalLaunch.js";
+  import {
+    DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+    describeDetachedTtl,
+    loadSessionPolicy,
+  } from "../../api/sessionPolicy.js";
   import {
     loadTerminalSettings,
     settingsToRendererOptions,
@@ -119,6 +123,15 @@
 
   let clientState = $state<TerminalSessionState | null>(null);
   let replayActive = $state(false);
+  /**
+   * Effective detached-live-PTY TTL window in seconds. Seeded from the
+   * SPEC-pinned default ({@link DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS})
+   * so the TTL hint renders honest copy on first paint; overwritten
+   * once `loadSessionPolicy()` resolves. The loader falls back to the
+   * same default on transport / HTTP / parse failure, so this state
+   * NEVER blocks the workspace.
+   */
+  let detachedTtlSeconds = $state(DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS);
   /**
    * `lastSeenSeq` is seeded inside `onMount` from `initialLastSeenSeq`
    * rather than via the `$state(...)` initializer. The initializer
@@ -497,6 +510,15 @@
       lastSeenSeq = seed;
     }
     void attach({ resume: lastSeenSeq > 0 });
+
+    // Fire-and-forget policy lookup so the TTL hint copy stops
+    // overclaiming when a deployment runs a non-default window. The
+    // loader is failure-safe (default fallback) and module-cached
+    // (one wire round-trip across all consumers), so this is cheap
+    // and the workspace cannot stall on it.
+    void loadSessionPolicy().then((policy) => {
+      detachedTtlSeconds = policy.detached_live_pty_ttl_seconds;
+    });
   });
 
   onDestroy(() => {
@@ -642,11 +664,9 @@
     <p
       class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
       data-testid="production-terminal-ttl-hint"
+      data-detached-ttl-seconds={detachedTtlSeconds}
     >
-      Detached. The remote PTY remains alive only briefly (~{Math.round(
-        DETACHED_TTL_MS / 1000,
-      )}s) — reconnect within that window or the session is reaped. Replay is
-      in-memory and not durable across a backend restart.
+      {describeDetachedTtl(detachedTtlSeconds)}
     </p>
   {/if}
 

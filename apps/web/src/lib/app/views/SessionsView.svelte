@@ -7,8 +7,11 @@
    *  - Closed rows cannot be reconnected. The reconnect button is
    *    disabled and the copy never implies otherwise.
    *  - Detached rows include a TTL disclaimer: the remote PTY only
-   *    survives ~30s past the last detach, replay is in-memory, and a
-   *    backend restart drops everything.
+   *    survives the deployment's configured detach-TTL window (read
+   *    via `loadSessionPolicy()` from
+   *    `GET /api/v1/config/session-policy`; default 30 s, operator-
+   *    tunable to 24 h) past the last detach, replay is in-memory, and
+   *    a backend restart drops everything.
    *  - The view never shows raw terminal output, replay buffer contents,
    *    or any field that could carry input bytes. Only safe public
    *    metadata (id, profile_id, status, dims, timestamps).
@@ -29,6 +32,12 @@
     listServerProfiles,
     type ServerProfile,
   } from "../../api/serverProfiles.js";
+  import {
+    DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+    describeDetachedTtl,
+    formatDetachedTtl,
+    loadSessionPolicy,
+  } from "../../api/sessionPolicy.js";
   import {
     canClose,
     canReconnect,
@@ -109,6 +118,16 @@
   let view = $state<LoadState>({ kind: "idle" });
   let closing = $state<Record<string, CloseState>>({});
   /**
+   * Effective detached-live-PTY TTL window in seconds. Seeded from the
+   * SPEC-pinned default so the view renders honest copy on first paint
+   * before the policy fetch resolves; overwritten once
+   * `loadSessionPolicy()` lands (falls back to the same default on
+   * fetch failure, so this never blocks the view). Multiple consumers
+   * share the module-level cache inside `sessionPolicy.ts` — three
+   * views mounting at once issue one wire round-trip total.
+   */
+  let detachedTtlSeconds = $state(DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS);
+  /**
    * Per-row state for the Open/Reconnect action. Independent of `closing`
    * so a row may be in mid-verify while another is mid-close. The
    * `verifying` state is short-lived (one HTTP round-trip via
@@ -142,6 +161,18 @@
 
   $effect(() => {
     void load();
+  });
+
+  // Resolve the deployment's configured detached-PTY TTL once and pin
+  // the resulting seconds onto state so the header + per-row hint stay
+  // honest about what window the orchestrator actually enforces.
+  // `loadSessionPolicy` never throws; on transport / HTTP / parse
+  // failure it falls back to the SPEC-pinned default, so this $effect
+  // CANNOT block or break the view.
+  $effect(() => {
+    void loadSessionPolicy().then((policy) => {
+      detachedTtlSeconds = policy.detached_live_pty_ttl_seconds;
+    });
   });
 
   function profileLabel(profile_id: string, profiles: readonly ServerProfile[]): string {
@@ -291,11 +322,17 @@
     <h2 class="text-lg font-semibold tracking-tight text-zinc-100">
       Terminal sessions
     </h2>
-    <p class="text-sm text-zinc-400">
+    <p
+      class="text-sm text-zinc-400"
+      data-testid="sessions-header-blurb"
+      data-detached-ttl-seconds={detachedTtlSeconds}
+    >
       Live and detached terminal sessions owned by your account. The
       backend owns each session's lifecycle, sequence numbers, and a
-      bounded ~30-second detached reconnect window. Replay is in-memory
-      only — a backend restart drops every session.
+      bounded detached reconnect window ({formatDetachedTtl(
+        detachedTtlSeconds,
+      )}). Replay is in-memory only — a backend restart drops every
+      session.
     </p>
   </header>
 
@@ -430,18 +467,16 @@
           </dl>
 
           <p class="text-xs text-zinc-400" data-testid="sessions-row-description">
-            {describeSessionStatus(session.status)}
+            {describeSessionStatus(session.status, detachedTtlSeconds)}
           </p>
 
           {#if showsTtlHint(session.status)}
             <p
               class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
               data-testid="sessions-row-ttl-hint"
+              data-detached-ttl-seconds={detachedTtlSeconds}
             >
-              Detached. The remote PTY remains alive only briefly (~30s) —
-              reconnect within that window or the session is reaped.
-              Replay is in-memory and not durable across a backend
-              restart.
+              {describeDetachedTtl(detachedTtlSeconds)}
             </p>
           {/if}
 

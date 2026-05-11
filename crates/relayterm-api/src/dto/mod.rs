@@ -15,6 +15,7 @@ pub(crate) mod auth_check;
 pub(crate) mod host;
 pub(crate) mod preflight;
 pub(crate) mod server_profile;
+pub(crate) mod session_policy;
 pub(crate) mod ssh_identity;
 pub(crate) mod terminal_recording;
 pub(crate) mod terminal_session;

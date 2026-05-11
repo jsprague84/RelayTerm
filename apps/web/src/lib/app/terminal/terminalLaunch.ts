@@ -31,15 +31,6 @@ import type {
 import type { CreateTerminalSessionError } from "../../api/terminalSessions.js";
 
 /**
- * Pinned detached-PTY TTL on the backend (30s). The same constant lives
- * in `lib/dev/liveTerminalState.ts`; both copies must move in lockstep
- * with `relayterm_terminal::DETACHED_LIVE_PTY_TTL`. It is duplicated
- * (rather than imported from the dev module) because the production
- * shell is forbidden from importing `lib/dev/`.
- */
-export const DETACHED_TTL_MS = 30_000;
-
-/**
  * Top-level workspace phase. Mirrors the dev lab's `LabPhase` but with
  * the experimental sub-states (`reconnecting`) collapsed: production
  * does not auto-poll the local detach clock or expose a renderer

@@ -11819,3 +11819,116 @@ async fn recording_read_routes_write_no_audit_rows(pool: PgPool) {
         "recording read endpoints must not write audit rows",
     );
 }
+
+// ----------------------------------------------------------------------
+// Session policy (/api/v1/config/session-policy)
+// ----------------------------------------------------------------------
+//
+// Public read-only surface that exposes the deployment's effective
+// detached-live-PTY TTL to the authenticated frontend so production UX
+// copy can stop hardcoding the legacy `~30s` literal. Three properties
+// the route pins:
+//
+//   1. Authenticated. Missing cookie → 401 before any state read.
+//   2. Returns the configured TTL — the value the orchestrator is
+//      actually running with (`TerminalSessionManager::detach_ttl`),
+//      not whatever the default is.
+//   3. Wire shape is minimal. No secret-shaped / vault / cookie /
+//      CSRF / db / env-name fields leak through — the redaction
+//      backstop is the `AUDIT_FORBIDDEN_SUBSTRINGS` sweep.
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn session_policy_unauthorized_without_session_cookie(pool: PgPool) {
+    let (app, _user, _cookie) = setup(pool).await;
+    let resp = app
+        .oneshot(get_no_auth("/api/v1/config/session-policy"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn session_policy_returns_default_ttl(pool: PgPool) {
+    // Default `TerminalSessionManager::new` uses the SPEC-pinned
+    // `relayterm_terminal::DETACHED_LIVE_PTY_TTL` (30 s). The endpoint
+    // surfaces the orchestrator's live value so a future production
+    // override does not regress to the constant silently.
+    let (app, _user, cookie) = setup(pool).await;
+    let resp = app
+        .oneshot(get("/api/v1/config/session-policy", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body["detached_live_pty_ttl_seconds"], 30,
+        "endpoint must return the orchestrator's live detach TTL",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn session_policy_returns_configured_custom_ttl(pool: PgPool) {
+    // Drive the route from a router whose manager runs with a custom
+    // TTL (here 7 s — well outside the 30 s default and inside the
+    // `5..=86_400` validator bound). The route MUST read the live
+    // orchestrator's value, not a hardcoded constant. This is the
+    // load-bearing honesty contract for the Phase 1A UI copy.
+    let (app, _user, cookie) = setup_with_full_state_short_ttl(
+        pool,
+        default_probe(),
+        Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        default_pty_bridge(),
+        std::time::Duration::from_secs(7),
+    )
+    .await;
+    let resp = app
+        .oneshot(get("/api/v1/config/session-policy", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["detached_live_pty_ttl_seconds"], 7);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn session_policy_response_shape_is_minimal(pool: PgPool) {
+    // Exactly one wire field. A future widening (vault / cookie /
+    // CSRF / database url / env name / deployment paths) MUST fail
+    // this assertion until the redaction posture is consciously
+    // re-reviewed.
+    let (app, _user, cookie) = setup(pool).await;
+    let resp = app
+        .oneshot(get("/api/v1/config/session-policy", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    let obj = body.as_object().expect("response is a JSON object");
+    let keys: Vec<&String> = obj.keys().collect();
+    assert_eq!(
+        keys.len(),
+        1,
+        "session-policy response carries exactly one field; got {keys:?}",
+    );
+    assert!(
+        obj.contains_key("detached_live_pty_ttl_seconds"),
+        "the one field is the TTL knob",
+    );
+    // Sentinel sweep: nothing secret-shaped reaches the wire. Re-uses
+    // the existing audit-redaction substring set so a future widening
+    // that smuggles credentials / sessions / vault material through
+    // this route fails the same backstop the audit feed already pins.
+    let raw = body.to_string();
+    for forbidden in AUDIT_FORBIDDEN_SUBSTRINGS {
+        assert!(
+            !raw.contains(forbidden),
+            "session-policy response must not contain `{forbidden}`: {raw}",
+        );
+    }
+    // Belt-and-suspenders: the env name is intentionally NOT a public
+    // wire field even though it is operator-documented elsewhere.
+    assert!(
+        !raw.contains("RELAYTERM_"),
+        "session-policy response must not leak env names",
+    );
+}
