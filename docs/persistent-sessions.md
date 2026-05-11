@@ -403,6 +403,16 @@ its own design doc and code-review round when its time comes.
 **Goal.** Make the current in-memory TTL model honest, observable, and
 bounded by quotas.
 
+> **Phase 1A landed (2026-05-11):** `GET /api/v1/config/session-policy`
+> exposes the effective `detached_live_pty_ttl_seconds`; the SPA renders
+> honest parameterised copy via `describeDetachedTtl`. Phase 1B is the
+> quota model on top of the wire-observable TTL — full design in
+> [`docs/session-quotas.md`](session-quotas.md). The quota slices land as
+> 1B.1 (per-user live ceiling) → 1B.2 (deployment + starting-burst
+> ceilings + operator dashboard tile) → 1B.3 (optional production-default
+> tuning). Zero schema, zero migration, zero new audit kinds; design is
+> deliberately conservative so a later Phase 2 / 3 can build on it.
+
 **In scope.**
 
 - Inventory of every UX string that names the TTL window or
@@ -432,7 +442,7 @@ carries `code` + static `message` only — no user / session id leaked).
 
 **Deliverables.**
 
-1. Design doc: `docs/persistent-sessions-phase1-quotas.md`.
+1. Design doc: [`docs/session-quotas.md`](session-quotas.md).
 2. Config additions in `apps/backend/src/config.rs` (typed,
    `RELAYTERM_TERMINAL_SESSIONS__*` env mirrors; validation envelope
    matches the existing `terminal_recording.cleanup` pattern).
