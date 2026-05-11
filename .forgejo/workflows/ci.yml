@@ -96,15 +96,26 @@ concurrency:
 jobs:
   rust-checks:
     name: rust checks (fmt + clippy + test)
-    runs-on: [lxc, docker]
+    runs-on: [lxc, rust-high]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
       CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 64
       RUSTFLAGS: -D warnings
     steps:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: cache cargo dependencies
+        uses: https://code.forgejo.org/actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: install linux desktop tauri build dependencies
         # Phase 0 of the Tauri rollout added `apps/desktop/src-tauri` and
@@ -177,7 +188,7 @@ jobs:
 
   web-checks:
     name: web checks (check + build + test)
-    runs-on: [lxc, docker]
+    runs-on: [lxc, high-cpu]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
@@ -185,6 +196,13 @@ jobs:
     steps:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: cache pnpm store
+        uses: https://code.forgejo.org/actions/cache@v3
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
 
       - name: docs contract check
         # Guards the AGENTS.md / SPEC.md / docs/spec / docs/agent context
@@ -236,13 +254,6 @@ jobs:
   docker-build:
     name: docker build (backend + migrate + web)
     runs-on: [lxc, docker]
-    # `catthehacker/ubuntu:act-latest` ships docker CLI + buildx out of
-    # the box; the runner's `container.options` config provides
-    # `DOCKER_HOST` + TLS certs (DinD sidecar) so `docker build` works
-    # without per-job socket plumbing. If the daemon endpoint is
-    # missing, `docker info` fails fast with "Cannot connect to the
-    # Docker daemon" — that's the operator's signal to fix runner
-    # config, not the workflow.
     container:
       image: catthehacker/ubuntu:act-latest
     steps:

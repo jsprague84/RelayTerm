@@ -89,7 +89,7 @@ concurrency:
 jobs:
   android-build:
     name: tauri android build (debug apk)
-    runs-on: [lxc, docker]
+    runs-on: [lxc, android]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
@@ -249,6 +249,16 @@ jobs:
         # build slot — matches the fail-fast ordering in
         # `desktop-linux.yml` and `ci.yml` web-checks.
         run: bash scripts/check-doc-contracts.sh
+
+      - name: cache cargo dependencies
+        uses: https://code.forgejo.org/actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: install rust 1.95 (rustup minimal) + android targets
         # Same rustup invocation as `ci.yml` and `desktop-linux.yml`,

@@ -75,11 +75,12 @@ concurrency:
 jobs:
   desktop-linux-build:
     name: tauri desktop linux build (deb + rpm)
-    runs-on: [lxc, docker]
+    runs-on: [lxc, rust-high]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
       CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 64
       # Match the `ci.yml` rust-checks job — `-D warnings` keeps Tauri's
       # own Rust crate (`relayterm-desktop`) honest under the same gate
       # as the rest of the workspace. Build-only smoke; no `cargo test`
@@ -121,6 +122,16 @@ jobs:
         # so a docs regression shorts out before consuming a Tauri build
         # slot — matches the fail-fast ordering in `ci.yml` web-checks.
         run: bash scripts/check-doc-contracts.sh
+
+      - name: cache cargo dependencies
+        uses: https://code.forgejo.org/actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: install rust 1.95 (rustup minimal)
         # Same rustup invocation as `ci.yml` rust-checks. Pin floats with
