@@ -68,6 +68,13 @@
   let selected = $state<AppViewId>(initialView());
   let devToolsOpen = $state(false);
   let current = $derived(findNavItem(selected));
+  /**
+   * Mobile nav drawer open state. Ephemeral — never persisted. Only
+   * meaningful below the `sm:` breakpoint (640px) where `SidebarNav`
+   * becomes a slide-in drawer; at and above `sm:` the sidebar is part
+   * of the static layout and this state is ignored.
+   */
+  let mobileNavOpen = $state(false);
 
   $effect(() => {
     // Wire popstate + canonicalize the initial URL. The effect tracks
@@ -100,6 +107,10 @@
     // entry — landing on a different view drops it.
     activeReplaySessionId = null;
     activeReplayLabel = null;
+    // Programmatic navigation (e.g. dashboard "Go to servers" button)
+    // also dismisses the mobile drawer. SidebarNav already closes the
+    // drawer on item-tap; this covers the in-content paths.
+    mobileNavOpen = false;
     if (id === selected) return;
     selected = id;
     if (typeof window === "undefined") return;
@@ -256,6 +267,8 @@
     showDevTools={devMode && devTools !== undefined}
     devToolsOpen={devToolsOpen}
     onToggleDevTools={() => (devToolsOpen = !devToolsOpen)}
+    isOpen={mobileNavOpen}
+    onClose={() => (mobileNavOpen = false)}
   />
   <div class="flex min-w-0 flex-1 flex-col">
     <TopBar
@@ -264,6 +277,8 @@
       {user}
       onSignOut={signOut ? handleSignOut : undefined}
       signingOut={signingOut}
+      mobileNavOpen={mobileNavOpen}
+      onToggleMobileNav={() => (mobileNavOpen = !mobileNavOpen)}
     />
     <main
       class="flex-1 overflow-y-auto px-6 py-6"
