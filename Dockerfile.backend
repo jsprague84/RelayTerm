@@ -20,6 +20,27 @@
 # Neither stage bakes secrets into the image. Configuration is supplied
 # at run time via `RELAYTERM_*` env vars and/or a TOML file mounted via
 # `RELAYTERM_CONFIG`. See `docs/deployment/docker-compose.md`.
+#
+# Build-cache strategy (Group 4 of the CI optimisation review, 2026-05-11):
+#
+#   `cargo-chef` separates the dep-compile from the source-compile so a
+#   workspace source edit (with stable `Cargo.lock`) is incremental:
+#
+#     1. chef    — base image with `cargo-chef` installed.
+#     2. planner — runs `cargo chef prepare` to distill `Cargo.toml` +
+#                  `Cargo.lock` into a stable `recipe.json`.
+#     3. builder — runs `cargo chef cook` to compile ONLY the dependency
+#                  graph (cached as long as Cargo.lock + RUSTFLAGS are
+#                  unchanged), then `cargo build` for the workspace's
+#                  own sources on top of the cooked deps.
+#
+#   `RUN --mount=type=cache` mounts on `target/`, `~/.cargo/registry`,
+#   and `~/.cargo/git` reuse BuildKit's local layer cache across builds
+#   on the same DinD daemon. The mount `id=` values are explicit so the
+#   same cache is referenced from every stage that needs it (chef cook,
+#   workspace build, sqlx-cli install).
+#
+#   Reference: https://github.com/LukeMathWalker/cargo-chef
 
 # `rust-version` in `Cargo.toml` is the public MSRV claim (1.85).
 # `edition = "2024"` is the only post-1.85 language feature currently in
@@ -40,17 +61,21 @@ ARG DEBIAN_VERSION=bookworm-slim
 
 
 # ---------------------------------------------------------------------------
-# Builder stage — compiles the workspace in release mode and installs
-# `sqlx-cli` into a known path so the migrate stage can copy it.
+# Chef base — Rust + cargo-chef + apt build deps.
+#
+# `cargo install cargo-chef --locked` is bounded by the workspace's pinned
+# cargo registry cache, so the first build pays for it once; subsequent
+# builds hit the cache. We avoid `lukemathwalker/cargo-chef:latest-rust-1`
+# because that image's Rust version drifts independently of our pin — we
+# want one source of truth (`ARG RUST_VERSION`).
 # ---------------------------------------------------------------------------
-FROM rust:${RUST_VERSION}-bookworm AS builder
+FROM rust:${RUST_VERSION}-bookworm AS chef
 
 WORKDIR /workspace
 
-# Install build dependencies. `pkg-config` and `libssl-dev` are not
-# strictly required (`sqlx` uses `rustls` and the workspace forbids
-# `unsafe_code`), but `git` is needed by some build scripts and the
-# defaults are kept narrow.
+# `pkg-config` and `libssl-dev` are not strictly required (`sqlx` uses
+# `rustls` and the workspace forbids `unsafe_code`), but `git` is needed
+# by some build scripts and the defaults are kept narrow.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         pkg-config \
@@ -58,25 +83,59 @@ RUN apt-get update \
         git \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy the entire workspace. This is intentionally a single COPY rather
-# than a manifests-first cache trick: the workspace has many crates and
-# the manifest-only fake-build pattern is fragile across `path = "..."`
-# dependencies. Layer caching still works — rebuilding without source
-# edits hits the cargo cache. If build time becomes a problem, a future
-# slice can wire `cargo-chef` or sccache.
-COPY . .
+# Install cargo-chef. Cached via the registry mount so a rebuild with
+# Cargo.lock unchanged is a no-op.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo install cargo-chef --locked
 
-# Build the backend binary.
-RUN --mount=type=cache,target=/workspace/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+
+# ---------------------------------------------------------------------------
+# Planner — produce a `recipe.json` that describes the dependency graph
+# without baking any source-edit signal into its content. The recipe is
+# stable as long as Cargo.toml/Cargo.lock are unchanged, so the builder's
+# `cargo chef cook` step has a stable cache key.
+# ---------------------------------------------------------------------------
+FROM chef AS planner
+
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+
+# ---------------------------------------------------------------------------
+# Builder — compile workspace deps from the recipe (cached on Cargo.lock),
+# then compile the workspace's own sources on top.
+# ---------------------------------------------------------------------------
+FROM chef AS builder
+
+# Cook only the dependency graph. This step's cache key is the recipe
+# (= Cargo.lock + Cargo.toml), so it stays warm across source-only
+# changes. With the mount caches it also stays warm across runner
+# restarts (BuildKit's local cache survives DinD's persistent volume).
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN --mount=type=cache,target=/workspace/target,id=cargo-target-backend,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo chef cook --release --recipe-path recipe.json
+
+# Copy workspace sources and compile the binary. With deps already cooked
+# above, this step recompiles only the workspace's own crates.
+COPY . .
+RUN --mount=type=cache,target=/workspace/target,id=cargo-target-backend,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     cargo build --release --bin relayterm-backend \
  && cp target/release/relayterm-backend /usr/local/bin/relayterm-backend
 
 # Build sqlx-cli with only the features we need (postgres + rustls).
 # Pinned to the same minor line as the workspace `sqlx` dependency so
 # the migration semantics match the application's compile-time queries.
-RUN --mount=type=cache,target=/workspace/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+# `cargo install` writes to a separate `--root /sqlx-out` so it does NOT
+# pollute the workspace `target/` cache mount. Its compile output uses
+# its own `id=sqlx-cli-target` cache mount to avoid contention with
+# the workspace build cache.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     cargo install sqlx-cli \
         --version ^0.8 \
         --no-default-features \
