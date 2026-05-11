@@ -348,21 +348,6 @@ jobs:
           echo "discovered DinD bridge gateway: $gw"
           echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"
 
-      - name: set up docker buildx
-        # Pin the BuildKit container image. BuildKit's
-        # `buildx-stable-1` tag auto-requests `--gpus=all` when
-        # ANY container runtime named `nvidia` is registered upstream
-        # (epyc-ai's outer LXC Docker daemon has the `nvidia-container-runtime`
-        # entry in `/etc/docker/daemon.json`). The DinD container running
-        # the job has no GPU drivers, so the container start fails:
-        #   could not select device driver "" with capabilities: [[gpu]]
-        # v0.12.5 predates the auto-GPU detection and Just Works for our
-        # x86_64 image builds. Bump deliberately if/when DinD gains GPU.
-        uses: https://github.com/docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:v0.12.5
-
       - name: verify registry token is configured
         # Surface a precise, actionable failure when
         # `secrets.FORGEJO_REGISTRY_TOKEN` is missing or unavailable to
@@ -388,14 +373,24 @@ jobs:
           fi
 
       - name: log in to forgejo container registry
-        # `docker/login-action` writes the token to ~/.docker/config.json
-        # via `--password-stdin`; the token never appears on a command
-        # line and never lands in the workflow log.
-        uses: https://github.com/docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+        # Plain `docker login --password-stdin` — same redaction posture
+        # as `docker/login-action` (token written to ~/.docker/config.json,
+        # never on a command line, never echoed). We use raw docker CLI
+        # because buildx (which `docker/login-action` doesn't actually
+        # need, but `setup-buildx-action` does) creates a builder
+        # container with `--gpus=all` whenever the upstream LXC Docker
+        # daemon has the `nvidia` runtime registered — and DinD can't
+        # satisfy that, so container start fails. The `docker-build` job
+        # already proves that plain `docker build` works inside DinD via
+        # the runtime-discovered DOCKER_HOST.
+        env:
+          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          printf '%s' "${FORGEJO_REGISTRY_TOKEN}" \
+            | docker login "${REGISTRY}" \
+                --username "${{ github.actor }}" \
+                --password-stdin
 
       - name: compute image tags
         id: tags
@@ -422,34 +417,38 @@ jobs:
           printf 'sha_short=%s\n' "${sha_short}" >> "$GITHUB_OUTPUT"
           printf 'ref_tag=%s\n' "${REF_NAME}" >> "$GITHUB_OUTPUT"
 
+      # Plain `docker build` + `docker tag` + `docker push`. Avoids
+      # `docker/build-push-action`, which transitively needs buildx (and
+      # buildx creates a builder container with `--gpus=all` whenever
+      # the upstream LXC Docker daemon has `nvidia` in its runtimes).
+      # The `docker-build` job already proves plain `docker build`
+      # works against the runtime-discovered DOCKER_HOST.
       - name: build and push relayterm-backend
-        uses: https://github.com/docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.backend
-          target: runtime
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend:${{ steps.tags.outputs.ref_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend:sha-${{ steps.tags.outputs.sha_short }}
+        run: |
+          set -eu
+          image="${REGISTRY}/${IMAGE_NAMESPACE}/relayterm-backend"
+          docker build -f Dockerfile.backend --target runtime \
+            -t "${image}:${{ steps.tags.outputs.ref_tag }}" \
+            -t "${image}:sha-${{ steps.tags.outputs.sha_short }}" .
+          docker push "${image}:${{ steps.tags.outputs.ref_tag }}"
+          docker push "${image}:sha-${{ steps.tags.outputs.sha_short }}"
 
       - name: build and push relayterm-backend-migrate
-        uses: https://github.com/docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.backend
-          target: migrate
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend-migrate:${{ steps.tags.outputs.ref_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-backend-migrate:sha-${{ steps.tags.outputs.sha_short }}
+        run: |
+          set -eu
+          image="${REGISTRY}/${IMAGE_NAMESPACE}/relayterm-backend-migrate"
+          docker build -f Dockerfile.backend --target migrate \
+            -t "${image}:${{ steps.tags.outputs.ref_tag }}" \
+            -t "${image}:sha-${{ steps.tags.outputs.sha_short }}" .
+          docker push "${image}:${{ steps.tags.outputs.ref_tag }}"
+          docker push "${image}:sha-${{ steps.tags.outputs.sha_short }}"
 
       - name: build and push relayterm-web
-        uses: https://github.com/docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.web
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-web:${{ steps.tags.outputs.ref_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/relayterm-web:sha-${{ steps.tags.outputs.sha_short }}
+        run: |
+          set -eu
+          image="${REGISTRY}/${IMAGE_NAMESPACE}/relayterm-web"
+          docker build -f Dockerfile.web \
+            -t "${image}:${{ steps.tags.outputs.ref_tag }}" \
+            -t "${image}:sha-${{ steps.tags.outputs.sha_short }}" .
+          docker push "${image}:${{ steps.tags.outputs.ref_tag }}"
+          docker push "${image}:sha-${{ steps.tags.outputs.sha_short }}"
