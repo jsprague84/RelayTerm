@@ -349,7 +349,19 @@ jobs:
           echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"
 
       - name: set up docker buildx
+        # Pin the BuildKit container image. BuildKit's
+        # `buildx-stable-1` tag auto-requests `--gpus=all` when
+        # ANY container runtime named `nvidia` is registered upstream
+        # (epyc-ai's outer LXC Docker daemon has the `nvidia-container-runtime`
+        # entry in `/etc/docker/daemon.json`). The DinD container running
+        # the job has no GPU drivers, so the container start fails:
+        #   could not select device driver "" with capabilities: [[gpu]]
+        # v0.12.5 predates the auto-GPU detection and Just Works for our
+        # x86_64 image builds. Bump deliberately if/when DinD gains GPU.
         uses: https://github.com/docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.12.5
 
       - name: verify registry token is configured
         # Surface a precise, actionable failure when
