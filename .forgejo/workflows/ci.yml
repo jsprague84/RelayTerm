@@ -331,14 +331,20 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v4
 
       - name: discover DinD endpoint
-        # See the matching step on `docker-build`. `docker/setup-buildx-action`,
-        # `docker/login-action`, and `docker/build-push-action` all read
-        # DOCKER_HOST; setting it via $GITHUB_ENV here makes every later
-        # step in this job inherit a working endpoint.
+        # See the matching step on `docker-build` for full rationale.
+        # `docker/setup-buildx-action`, `docker/login-action`, and
+        # `docker/build-push-action` all read DOCKER_HOST; setting it
+        # via $GITHUB_ENV here makes every later step in this job
+        # inherit a working endpoint. Parsed from /proc/net/route
+        # because catthehacker/ubuntu:act-latest does not ship
+        # iproute2 / net-tools.
         run: |
           set -eu
-          gw=$(ip route show default | awk '/default/{print $3; exit}')
-          test -n "$gw"
+          gw_hex=$(awk '$2=="00000000" {print $3; exit}' /proc/net/route)
+          test -n "$gw_hex"
+          gw=$(printf '%d.%d.%d.%d' \
+            "0x${gw_hex:6:2}" "0x${gw_hex:4:2}" \
+            "0x${gw_hex:2:2}" "0x${gw_hex:0:2}")
           echo "discovered DinD bridge gateway: $gw"
           echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"
 
