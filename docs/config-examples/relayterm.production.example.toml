@@ -228,3 +228,32 @@ enabled = true
 #
 # [terminal_sessions]
 # detached_live_pty_ttl_seconds = 30
+
+# Per-user ceiling on concurrent live PTY runtimes (Phase 1B.1 quota —
+# see `docs/session-quotas.md`). Counted against the in-memory
+# orchestrator registry; both `active` and `detached` sessions count
+# equally. A `POST /api/v1/terminal-sessions` that would exceed this
+# ceiling is refused with `429 too_many_sessions`. The refusal writes
+# no DB row and no audit event — quota refusals are operational, not
+# security-relevant (mirrors the login-throttler posture). The
+# `current_count` / `cap` values stay server-side (operator `warn!`
+# only); the wire body is the static `too many terminal sessions`
+# string.
+#
+# Operational impact: each live PTY consumes one russh channel, one
+# target-host PTY (with the upstream sshd's `MaxSessions` budget),
+# one in-memory replay buffer, and one or more tasks. The quota is
+# per-instance — a deployment running N instances behind a load
+# balancer has an effective per-user ceiling of `N × this value`.
+# Single-instance deployments are exact (the v1 default).
+#
+# Default: 8. Bounded 1..=256. 0 and out-of-range values are a hard
+# boot failure. The default is conservative for solo homelab and
+# defensible for a small multi-user deployment; reconsider after
+# observing real usage. Phase 1B.2 will add deployment-wide and
+# starting-burst ceilings.
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER
+#
+# [terminal_sessions]
+# max_live_pty_sessions_per_user = 8

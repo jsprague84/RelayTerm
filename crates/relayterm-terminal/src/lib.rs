@@ -33,11 +33,12 @@ pub mod retention_worker;
 
 pub use manager::{
     AttachSessionOutcome, AttachSessionRequest, AttachmentRuntime, CloseTerminalSessionOutcome,
-    CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DETACHED_LIVE_PTY_TTL, DetachInfo,
-    DetachOutcome, DetachSessionOutcome, LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE,
-    LiveRuntimeView, ResizeSessionOutcome, RuntimeSessionStatus,
-    STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE, STUB_PTY_NOT_IMPLEMENTED_MESSAGE,
-    TerminalSessionManager, TerminalSessionManagerError, TerminalSessionRuntime,
+    CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DEFAULT_MAX_LIVE_PTY_PER_USER,
+    DETACHED_LIVE_PTY_TTL, DetachInfo, DetachOutcome, DetachSessionOutcome,
+    LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE, LiveRuntimeView, ResizeSessionOutcome,
+    RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
+    STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager, TerminalSessionManagerError,
+    TerminalSessionRuntime,
 };
 pub use recording::{RecordingRuntime, RecordingWriter, RecordingWriterConfig, replay_gap_reason};
 pub use replay::{OutputFrame, ReplayBuffer, ReplayBufferConfig, ReplayRange, ReplayWindowLost};

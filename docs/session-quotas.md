@@ -1,12 +1,25 @@
 # Session quota policy — design
 
-> **Status (2026-05-11):** design draft, NOT a slice.
+> **Status (2026-05-11):** design draft, partially landed.
 > Phase 1B of the durable persistent-sessions roadmap
 > ([`docs/persistent-sessions.md`](persistent-sessions.md) § 8 Phase 1).
 > This document defines the quota and limit model that bounds RelayTerm's
-> in-memory detached-live-PTY sessions before any implementation lands.
-> It does NOT change any code, schema, route, frontend behaviour, CI,
-> staging config, or audit-event surface.
+> in-memory detached-live-PTY sessions.
+>
+> **Implementation status:**
+>
+> - **Phase 1B.1 (landed 2026-05-11):** `max_live_pty_sessions_per_user`
+>   — per-user live PTY ceiling, default `8`, bound `1..=256`. Wire
+>   shape: 429 `too_many_sessions`. Exposed via
+>   `GET /api/v1/config/session-policy` as
+>   `max_live_pty_sessions_per_user`. SPA renders parameterised refusal
+>   copy via `describeMaxLivePtyPerUser`. No new audit kind, no DB
+>   row, no `Retry-After`. Enforcement order: after ownership +
+>   host-key gates, before vault decrypt / SSH side effects.
+> - **Phase 1B.2 (NOT landed):** deployment-wide quota
+>   (`max_live_pty_sessions_per_deployment`), starting-burst quota
+>   (`max_starting_sessions_per_user`), operator dashboard tile.
+> - **Phase 1B.3 (NOT landed):** production-default tuning.
 >
 > **Related normative documents:**
 >

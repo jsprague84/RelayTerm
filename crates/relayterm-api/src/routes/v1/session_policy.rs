@@ -58,7 +58,15 @@ async fn session_policy(
     State(state): State<AppState>,
 ) -> Json<SessionPolicyResponse> {
     let detached_live_pty_ttl_seconds = state.terminal_sessions.detach_ttl().as_secs();
+    // Phase 1B.1 per-user live-PTY ceiling (`docs/session-quotas.md`
+    // § 5.4). Read off the live orchestrator so a future per-instance
+    // override surfaces here without re-reading config. The
+    // deployment-wide ceiling is intentionally NOT exposed (operator-
+    // only, fingerprinting risk) — only the per-user value the SPA
+    // needs for parameterised refusal copy.
+    let max_live_pty_sessions_per_user = state.terminal_sessions.max_live_pty_per_user().get();
     Json(SessionPolicyResponse {
         detached_live_pty_ttl_seconds,
+        max_live_pty_sessions_per_user,
     })
 }

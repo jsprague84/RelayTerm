@@ -1758,3 +1758,135 @@ async fn drop_of_manager_aborts_ttl_close_task() {
     // Sleep past the TTL so the spawned task definitely wakes.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }
+
+// ----------------------------------------------------------------------
+// Per-user live-PTY ceiling (Phase 1B.1 quota — `docs/session-quotas.md`)
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn count_live_pty_for_user_is_zero_for_empty_registry() {
+    let (mgr, _) = build_manager();
+    assert_eq!(mgr.count_live_pty_for_user(UserId::new()), 0);
+}
+
+#[tokio::test]
+async fn count_live_pty_for_user_ignores_starting_placeholders() {
+    // `create_session` registers a `Starting` placeholder with `live =
+    // None`. The Phase 1B.1 counter MUST NOT count it — only entries
+    // with a bound PTY (i.e. those that survived `start_live_pty`)
+    // consume the live-PTY ceiling.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let _ = mgr.create_session(req(owner)).await.unwrap();
+    assert_eq!(mgr.count_live_pty_for_user(owner), 0);
+}
+
+#[tokio::test]
+async fn count_live_pty_for_user_counts_active_and_detached_equally() {
+    // Both `active` (attached) and `detached` (in the TTL window) hold
+    // the same live resource tuple (russh channel + PTY + buffer +
+    // tasks). The per-user quota collapses them — § 4.1 of
+    // `docs/session-quotas.md`.
+    let (mgr, _) = build_manager_with_short_ttl(std::time::Duration::from_secs(60));
+    let owner = UserId::new();
+
+    // Session A: active (attached).
+    let a = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start_a, _fa) = fake_start();
+    mgr.start_live_pty(owner, a.id, start_a).await.unwrap();
+    let _att_a = mgr
+        .attach_session(attach_req(owner, a.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    // Session B: detached (attached then detached, still inside TTL).
+    let b = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start_b, _fb) = fake_start();
+    mgr.start_live_pty(owner, b.id, start_b).await.unwrap();
+    let att_b = mgr
+        .attach_session(attach_req(owner, b.id))
+        .await
+        .unwrap()
+        .attachment;
+    mgr.detach_attachment(owner, b.id, att_b.id, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mgr.count_live_pty_for_user(owner),
+        2,
+        "active + detached both count against the per-user live-PTY ceiling",
+    );
+}
+
+#[tokio::test]
+async fn count_live_pty_for_user_is_owner_scoped() {
+    // The counter MUST NOT bleed across owners. A second user's live
+    // PTYs are invisible to the first user's quota — § 4.1.
+    let (mgr, _) = build_manager();
+    let alice = UserId::new();
+    let bob = UserId::new();
+
+    for _ in 0..3u8 {
+        let s = mgr.create_session(req(alice)).await.unwrap().session;
+        let (start, _f) = fake_start();
+        mgr.start_live_pty(alice, s.id, start).await.unwrap();
+    }
+    let s_bob = mgr.create_session(req(bob)).await.unwrap().session;
+    let (start_bob, _f) = fake_start();
+    mgr.start_live_pty(bob, s_bob.id, start_bob).await.unwrap();
+
+    assert_eq!(mgr.count_live_pty_for_user(alice), 3);
+    assert_eq!(mgr.count_live_pty_for_user(bob), 1);
+    assert_eq!(mgr.count_live_pty_for_user(UserId::new()), 0);
+}
+
+#[tokio::test]
+async fn count_live_pty_for_user_drops_on_close() {
+    // After explicit close the registry entry goes away, so the
+    // counter drops. This is the "slot frees naturally" property the
+    // quota relies on — once the user closes a session, the next
+    // create succeeds without any operator action.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let s = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _f) = fake_start();
+    mgr.start_live_pty(owner, s.id, start).await.unwrap();
+    assert_eq!(mgr.count_live_pty_for_user(owner), 1);
+
+    mgr.close_session(s.id, owner).await.unwrap();
+    assert_eq!(mgr.count_live_pty_for_user(owner), 0);
+}
+
+#[tokio::test]
+async fn max_live_pty_per_user_default_matches_pinned_constant() {
+    use relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_USER;
+    let (mgr, _) = build_manager();
+    assert_eq!(
+        mgr.max_live_pty_per_user().get(),
+        DEFAULT_MAX_LIVE_PTY_PER_USER,
+    );
+    assert_eq!(DEFAULT_MAX_LIVE_PTY_PER_USER, 8);
+}
+
+#[tokio::test]
+async fn max_live_pty_per_user_builder_overrides_default() {
+    use std::num::NonZeroU32;
+    let (mgr, repo) = build_manager();
+    // The manager from `build_manager` is `Arc<TerminalSessionManager>`,
+    // so we can't mutate the builder field on it directly. Build a
+    // fresh one through the same wiring so the builder path is
+    // exercised end-to-end.
+    let _ = repo; // silence unused
+    let cap = NonZeroU32::new(16).unwrap();
+    let alt = TerminalSessionManager::new(
+        Arc::new(InMemoryRepo::default()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(InMemoryRepo::default()) as Arc<dyn SessionEventRepository>,
+    )
+    .with_max_live_pty_per_user(cap);
+    assert_eq!(alt.max_live_pty_per_user(), cap);
+
+    // Default-constructed manager keeps the default cap.
+    assert_eq!(mgr.max_live_pty_per_user().get(), 8);
+}

@@ -493,6 +493,13 @@ pub(crate) struct TerminalSessionsConfig {
     /// a silent fall-through to the default — operator intent and
     /// runtime state stay aligned.
     pub(crate) detached_live_pty_ttl_seconds: u64,
+    /// Per-user ceiling on concurrent live PTY runtimes (Phase 1B.1 of
+    /// the session-quota policy in `docs/session-quotas.md`). Counted
+    /// against the in-memory `TerminalSessionManager` registry — both
+    /// `active` and `detached` rows are live PTYs and count equally.
+    /// Bounded `1..=256` by [`Config::validate_terminal_sessions`]; `0`
+    /// would refuse every create and is a hard boot failure.
+    pub(crate) max_live_pty_sessions_per_user: u32,
 }
 
 /// Numeric defaults / bounds for [`TerminalSessionsConfig`]. Pulled into
@@ -517,6 +524,19 @@ pub(crate) mod terminal_sessions_defaults {
     /// scope of this knob — durable persistent sessions are a
     /// separate, future architecture.
     pub(crate) const DETACHED_LIVE_PTY_TTL_SECONDS_MAX: u64 = 24 * 60 * 60;
+    /// Default per-user live PTY ceiling. Phase 1B.1 of
+    /// `docs/session-quotas.md` recommends `8` — conservative for solo
+    /// homelab use and defensible for a small multi-user deployment.
+    pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_USER: u32 = 8;
+    /// Lower bound for the per-user live PTY ceiling. `0` would refuse
+    /// every create and is a config mistake, so the validator rejects
+    /// it with a clearer error than "no session can ever start".
+    pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_USER_MIN: u32 = 1;
+    /// Upper bound for the per-user live PTY ceiling. `256` per user
+    /// on a single-tenant deployment is far past the practical
+    /// resource ceiling (channels + PTYs + buffers + tasks per user).
+    /// Anything above is almost certainly a unit / digit-shift mistake.
+    pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_USER_MAX: u32 = 256;
 }
 
 impl Config {
@@ -598,6 +618,8 @@ impl Config {
             terminal_sessions: TerminalSessionsConfig {
                 detached_live_pty_ttl_seconds:
                     terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
+                max_live_pty_sessions_per_user:
+                    terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
             },
         }
     }
@@ -783,6 +805,11 @@ impl Config {
             cfg.terminal_sessions.detached_live_pty_ttl_seconds = v
                 .parse()
                 .context("RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER") {
+            cfg.terminal_sessions.max_live_pty_sessions_per_user = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER")?;
         }
         Ok(())
     }
@@ -1175,6 +1202,25 @@ impl Config {
                 max = terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MAX,
             );
         }
+        let max_live = self.terminal_sessions.max_live_pty_sessions_per_user;
+        if max_live < terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MIN {
+            bail!(
+                "terminal_sessions.max_live_pty_sessions_per_user = {got} must be >= {min}; \
+                 a zero cap would refuse every terminal-session create",
+                got = max_live,
+                min = terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MIN,
+            );
+        }
+        if max_live > terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX {
+            bail!(
+                "terminal_sessions.max_live_pty_sessions_per_user = {got} exceeds the hard cap \
+                 of {max}; per-user concurrent live PTYs above this are almost certainly a \
+                 configuration mistake — each live PTY consumes a russh channel, a target-host \
+                 PTY, an in-memory replay buffer, and one or more tasks",
+                got = max_live,
+                max = terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX,
+            );
+        }
         Ok(())
     }
 
@@ -1185,6 +1231,14 @@ impl Config {
     /// conversion never overflows for any value the validator accepts.
     pub(crate) fn detached_live_pty_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.terminal_sessions.detached_live_pty_ttl_seconds)
+    }
+
+    /// Per-user live PTY ceiling (Phase 1B.1 quota). Production callers
+    /// pass this into [`relayterm_terminal::TerminalSessionManager::with_max_live_pty_per_user`].
+    /// Assumes [`Self::validate_terminal_sessions`] has already passed
+    /// — the value is post-validation, in-range, and a positive `u32`.
+    pub(crate) fn max_live_pty_sessions_per_user(&self) -> u32 {
+        self.terminal_sessions.max_live_pty_sessions_per_user
     }
 
     /// Resolve the configured master key, or return `None` when the vault
@@ -1379,6 +1433,7 @@ struct FileTerminalRecordingCompressionConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileTerminalSessionsConfig {
     detached_live_pty_ttl_seconds: Option<u64>,
+    max_live_pty_sessions_per_user: Option<u32>,
 }
 
 impl FileConfig {
@@ -1480,10 +1535,13 @@ impl FileConfig {
                 }
             }
         }
-        if let Some(s) = self.terminal_sessions
-            && let Some(ttl) = s.detached_live_pty_ttl_seconds
-        {
-            cfg.terminal_sessions.detached_live_pty_ttl_seconds = ttl;
+        if let Some(s) = self.terminal_sessions {
+            if let Some(ttl) = s.detached_live_pty_ttl_seconds {
+                cfg.terminal_sessions.detached_live_pty_ttl_seconds = ttl;
+            }
+            if let Some(cap) = s.max_live_pty_sessions_per_user {
+                cfg.terminal_sessions.max_live_pty_sessions_per_user = cap;
+            }
         }
     }
 }
@@ -1543,6 +1601,8 @@ mod tests {
             terminal_sessions: TerminalSessionsConfig {
                 detached_live_pty_ttl_seconds:
                     terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
+                max_live_pty_sessions_per_user:
+                    terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
             },
         }
     }
@@ -3054,5 +3114,110 @@ detached_live_pty_ttl_seconds = 600
         cfg.terminal_sessions.detached_live_pty_ttl_seconds =
             terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS_MAX;
         cfg.validate_terminal_sessions().expect("max boundary ok");
+    }
+
+    // --- Terminal sessions (per-user live PTY quota — Phase 1B.1) ----
+
+    #[test]
+    fn terminal_sessions_default_max_live_pty_per_user_is_eight() {
+        // Phase 1B.1 default. `docs/session-quotas.md` § 4.1 names `8`
+        // as the recommended default — pinned here so a future bump in
+        // either source surfaces here in CI rather than silently in
+        // production behaviour.
+        let cfg = Config::defaults();
+        assert_eq!(
+            cfg.terminal_sessions.max_live_pty_sessions_per_user,
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
+        );
+        assert_eq!(cfg.terminal_sessions.max_live_pty_sessions_per_user, 8);
+        cfg.validate_terminal_sessions()
+            .expect("default max-live cap must validate");
+        assert_eq!(cfg.max_live_pty_sessions_per_user(), 8);
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_user_env_override_parses() {
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER",
+                "16",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(cfg.terminal_sessions.max_live_pty_sessions_per_user, 16);
+        cfg.validate_terminal_sessions().unwrap();
+        assert_eq!(cfg.max_live_pty_sessions_per_user(), 16);
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_user_toml_round_trip() {
+        let raw = r#"
+[terminal_sessions]
+max_live_pty_sessions_per_user = 4
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert_eq!(cfg.terminal_sessions.max_live_pty_sessions_per_user, 4);
+        cfg.validate_terminal_sessions()
+            .expect("TOML round-trip must validate");
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_user_env_invalid_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER",
+                "not-a-number",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_zero_max_live_pty_per_user_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_user = 0;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_live_pty_sessions_per_user") && msg.contains(">="),
+            "zero cap must be rejected naming the field and the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_above_max_live_pty_per_user_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_user =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX + 1;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_live_pty_sessions_per_user") && msg.contains("hard cap"),
+            "above-max cap must be rejected naming the field and the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_user_min_and_max_boundaries_validate() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_user =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MIN;
+        cfg.validate_terminal_sessions()
+            .expect("min boundary ok (per-user live cap)");
+        cfg.terminal_sessions.max_live_pty_sessions_per_user =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX;
+        cfg.validate_terminal_sessions()
+            .expect("max boundary ok (per-user live cap)");
     }
 }

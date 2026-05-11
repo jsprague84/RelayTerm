@@ -128,6 +128,12 @@ services:
       # still-live PTY. Default 30s; bounded 5..=86400. NOT durable
       # session resume across backend restart.
       RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS: "${RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS:-30}"
+      # Per-user live-PTY ceiling (Phase 1B.1 quota — see
+      # `docs/session-quotas.md`). Refuses `POST
+      # /api/v1/terminal-sessions` with `429 too_many_sessions` when the
+      # caller already holds this many live PTYs. Default 8; bounded
+      # 1..=256.
+      RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER:-8}"
 
       # Tracing. The backend honors `RUST_LOG` via tracing_subscriber's
       # env filter. Default keeps app-level info on, dependencies at

@@ -1,14 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+  DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
   __resetSessionPolicyCache,
   describeDetachedTtl,
+  describeMaxLivePtyPerUser,
   fetchSessionPolicy,
   formatDetachedTtl,
   loadSessionPolicy,
   parseSessionPolicy,
   type SessionPolicy,
 } from "../src/lib/api/sessionPolicy.js";
+
+/** Well-formed wire body for Phase 1B.1+ session-policy responses. */
+const VALID_BODY = {
+  detached_live_pty_ttl_seconds: 30,
+  max_live_pty_sessions_per_user: 8,
+};
 
 /**
  * Secret-shaped sentinels that MUST NEVER reach the parsed DTO no
@@ -54,36 +62,56 @@ describe("DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS", () => {
 });
 
 describe("parseSessionPolicy", () => {
-  it("accepts a minimal well-shaped body", () => {
-    expect(parseSessionPolicy({ detached_live_pty_ttl_seconds: 30 })).toEqual({
+  it("accepts a well-shaped body with both fields", () => {
+    expect(parseSessionPolicy(VALID_BODY)).toEqual({
       detached_live_pty_ttl_seconds: 30,
+      max_live_pty_sessions_per_user: 8,
     });
-    expect(parseSessionPolicy({ detached_live_pty_ttl_seconds: 1800 })).toEqual(
-      { detached_live_pty_ttl_seconds: 1800 },
-    );
     expect(
-      parseSessionPolicy({ detached_live_pty_ttl_seconds: 86_400 }),
-    ).toEqual({ detached_live_pty_ttl_seconds: 86_400 });
+      parseSessionPolicy({
+        detached_live_pty_ttl_seconds: 1800,
+        max_live_pty_sessions_per_user: 16,
+      }),
+    ).toEqual({
+      detached_live_pty_ttl_seconds: 1800,
+      max_live_pty_sessions_per_user: 16,
+    });
+    expect(
+      parseSessionPolicy({
+        detached_live_pty_ttl_seconds: 86_400,
+        max_live_pty_sessions_per_user: 256,
+      }),
+    ).toEqual({
+      detached_live_pty_ttl_seconds: 86_400,
+      max_live_pty_sessions_per_user: 256,
+    });
   });
 
-  it("rejects out-of-range / non-integer / non-numeric values", () => {
+  it("rejects out-of-range / non-integer / non-numeric TTL values", () => {
     // The parser mirrors the backend validator's `5..=86_400` bound
     // exactly: a value outside that range cannot have been emitted by
     // a current backend, so we treat it as a malformed wire body and
     // fall back to the default rather than trust a hostile payload.
-    expect(parseSessionPolicy({ detached_live_pty_ttl_seconds: 0 })).toBeNull();
-    expect(parseSessionPolicy({ detached_live_pty_ttl_seconds: 4 })).toBeNull();
     expect(
-      parseSessionPolicy({ detached_live_pty_ttl_seconds: -1 }),
+      parseSessionPolicy({ ...VALID_BODY, detached_live_pty_ttl_seconds: 0 }),
     ).toBeNull();
     expect(
-      parseSessionPolicy({ detached_live_pty_ttl_seconds: 86_401 }),
+      parseSessionPolicy({ ...VALID_BODY, detached_live_pty_ttl_seconds: 4 }),
     ).toBeNull();
     expect(
-      parseSessionPolicy({ detached_live_pty_ttl_seconds: 30.5 }),
+      parseSessionPolicy({ ...VALID_BODY, detached_live_pty_ttl_seconds: -1 }),
     ).toBeNull();
     expect(
-      parseSessionPolicy({ detached_live_pty_ttl_seconds: "30" }),
+      parseSessionPolicy({
+        ...VALID_BODY,
+        detached_live_pty_ttl_seconds: 86_401,
+      }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, detached_live_pty_ttl_seconds: 30.5 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, detached_live_pty_ttl_seconds: "30" }),
     ).toBeNull();
     expect(parseSessionPolicy({})).toBeNull();
     expect(parseSessionPolicy(null)).toBeNull();
@@ -91,22 +119,105 @@ describe("parseSessionPolicy", () => {
     expect(parseSessionPolicy("30")).toBeNull();
   });
 
+  it("rejects out-of-range / non-integer max_live_pty_sessions_per_user values", () => {
+    // Mirrors backend validator's `1..=256` bound.
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_live_pty_sessions_per_user: 0 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_live_pty_sessions_per_user: -1 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_live_pty_sessions_per_user: 257 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_live_pty_sessions_per_user: 4.5 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_live_pty_sessions_per_user: "8" }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ detached_live_pty_ttl_seconds: 30 }),
+    ).toBeNull();
+  });
+
   it("ignores secret-shaped sibling fields — they NEVER reach the parsed DTO", () => {
     // The parser builds the DTO field-by-field; a hostile body with
     // every secret-shaped sibling under the sun must yield exactly
-    // the one valid field. This is the load-bearing redaction
+    // the two valid fields. This is the load-bearing redaction
     // backstop on the frontend side.
     const hostile: Record<string, unknown> = {
+      ...VALID_BODY,
       detached_live_pty_ttl_seconds: 600,
+      max_live_pty_sessions_per_user: 4,
       ...HOSTILE_SECRETS,
     };
     const parsed = parseSessionPolicy(hostile);
-    expect(parsed).toEqual({ detached_live_pty_ttl_seconds: 600 });
-    const keys = Object.keys(parsed as object);
-    expect(keys).toEqual(["detached_live_pty_ttl_seconds"]);
+    expect(parsed).toEqual({
+      detached_live_pty_ttl_seconds: 600,
+      max_live_pty_sessions_per_user: 4,
+    });
+    const keys = Object.keys(parsed as object).sort();
+    expect(keys).toEqual([
+      "detached_live_pty_ttl_seconds",
+      "max_live_pty_sessions_per_user",
+    ]);
     const raw = JSON.stringify(parsed);
     for (const secret of Object.values(HOSTILE_SECRETS)) {
       expect(raw).not.toContain(secret);
+    }
+  });
+});
+
+describe("DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER", () => {
+  it("mirrors the backend's Phase 1B.1 default of 8", () => {
+    // The SPA falls back to this constant while the policy fetch is
+    // in flight OR has failed. It MUST track the backend's
+    // `relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_USER` default so
+    // an at-cap launch refusal renders honest copy.
+    expect(DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER).toBe(8);
+  });
+});
+
+describe("describeMaxLivePtyPerUser", () => {
+  it("renders parameterised copy on a sane integer cap", () => {
+    expect(describeMaxLivePtyPerUser(1)).toBe(
+      "This deployment allows up to 1 live terminal session per user.",
+    );
+    expect(describeMaxLivePtyPerUser(8)).toBe(
+      "This deployment allows up to 8 live terminal sessions per user.",
+    );
+    expect(describeMaxLivePtyPerUser(16)).toBe(
+      "This deployment allows up to 16 live terminal sessions per user.",
+    );
+  });
+
+  it("falls back to the default for non-positive / non-integer inputs", () => {
+    expect(describeMaxLivePtyPerUser(0)).toContain("8 live terminal sessions");
+    expect(describeMaxLivePtyPerUser(-1)).toContain("8 live terminal sessions");
+    expect(describeMaxLivePtyPerUser(4.5)).toContain("8 live terminal sessions");
+    expect(describeMaxLivePtyPerUser(Number.NaN)).toContain(
+      "8 live terminal sessions",
+    );
+  });
+
+  it("never uses the anti-overclaim register", () => {
+    // `docs/session-quotas.md` § 7.5 / § 12. Full set of substrings
+    // the quota-refusal copy MUST avoid.
+    const forbidden = [
+      "your session quota",
+      "we're rate-limiting you",
+      "please slow down",
+      "queue",
+      "always available",
+      "persistent across restart",
+    ];
+    for (const cap of [1, 4, 8, 16, 64, 256]) {
+      const copy = describeMaxLivePtyPerUser(cap).toLowerCase();
+      for (const phrase of forbidden) {
+        expect(copy).not.toContain(phrase);
+      }
+      expect(copy).not.toMatch(/wait \d+ seconds/);
     }
   });
 });
@@ -181,14 +292,20 @@ describe("describeDetachedTtl", () => {
 describe("fetchSessionPolicy", () => {
   it("returns the parsed policy on a 200 with a valid body", async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse(200, { detached_live_pty_ttl_seconds: 600 }),
+      jsonResponse(200, {
+        detached_live_pty_ttl_seconds: 600,
+        max_live_pty_sessions_per_user: 4,
+      }),
     );
     const result = await fetchSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.policy).toEqual({ detached_live_pty_ttl_seconds: 600 });
+      expect(result.policy).toEqual({
+        detached_live_pty_ttl_seconds: 600,
+        max_live_pty_sessions_per_user: 4,
+      });
     }
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(fetchImpl).toHaveBeenCalledWith(
@@ -219,7 +336,10 @@ describe("fetchSessionPolicy", () => {
 
   it("collapses a malformed body to malformed_response", async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse(200, { detached_live_pty_ttl_seconds: "not-a-number" }),
+      jsonResponse(200, {
+        detached_live_pty_ttl_seconds: "not-a-number",
+        max_live_pty_sessions_per_user: 8,
+      }),
     );
     const result = await fetchSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -247,15 +367,21 @@ describe("fetchSessionPolicy", () => {
 describe("loadSessionPolicy", () => {
   it("returns the fetched policy on success", async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse(200, { detached_live_pty_ttl_seconds: 1800 }),
+      jsonResponse(200, {
+        detached_live_pty_ttl_seconds: 1800,
+        max_live_pty_sessions_per_user: 16,
+      }),
     );
     const policy: SessionPolicy = await loadSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    expect(policy).toEqual({ detached_live_pty_ttl_seconds: 1800 });
+    expect(policy).toEqual({
+      detached_live_pty_ttl_seconds: 1800,
+      max_live_pty_sessions_per_user: 16,
+    });
   });
 
-  it("falls back to the SPEC-pinned default on HTTP failure", async () => {
+  it("falls back to the SPEC-pinned defaults on HTTP failure", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(503, { error: { code: "service_unavailable", message: "" } }),
     );
@@ -265,9 +391,12 @@ describe("loadSessionPolicy", () => {
     expect(policy.detached_live_pty_ttl_seconds).toBe(
       DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
     );
+    expect(policy.max_live_pty_sessions_per_user).toBe(
+      DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
+    );
   });
 
-  it("falls back to the SPEC-pinned default on transport failure", async () => {
+  it("falls back to the SPEC-pinned defaults on transport failure", async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error("offline");
     });
@@ -277,11 +406,17 @@ describe("loadSessionPolicy", () => {
     expect(policy.detached_live_pty_ttl_seconds).toBe(
       DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
     );
+    expect(policy.max_live_pty_sessions_per_user).toBe(
+      DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
+    );
   });
 
   it("caches the successful result across calls (one wire round-trip)", async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse(200, { detached_live_pty_ttl_seconds: 1800 }),
+      jsonResponse(200, {
+        detached_live_pty_ttl_seconds: 1800,
+        max_live_pty_sessions_per_user: 16,
+      }),
     );
     const a = await loadSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -300,7 +435,10 @@ describe("loadSessionPolicy", () => {
         throw new Error("offline");
       })
       .mockImplementationOnce(async () =>
-        jsonResponse(200, { detached_live_pty_ttl_seconds: 42 }),
+        jsonResponse(200, {
+          detached_live_pty_ttl_seconds: 42,
+          max_live_pty_sessions_per_user: 3,
+        }),
       );
     const first = await loadSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -308,22 +446,27 @@ describe("loadSessionPolicy", () => {
     expect(first.detached_live_pty_ttl_seconds).toBe(
       DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
     );
+    expect(first.max_live_pty_sessions_per_user).toBe(
+      DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
+    );
     const second = await loadSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(second.detached_live_pty_ttl_seconds).toBe(42);
+    expect(second.max_live_pty_sessions_per_user).toBe(3);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it("drops hostile secret-shaped sibling fields end-to-end", async () => {
     // End-to-end redaction sentinel: a hostile body that smuggles
-    // every secret-shaped field MUST collapse to either the one valid
-    // numeric field (when shape parses) or the fallback (when it
+    // every secret-shaped field MUST collapse to either the two valid
+    // numeric fields (when shape parses) or the fallback (when it
     // doesn't). In either case, no hostile value reaches the
     // returned object.
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, {
         detached_live_pty_ttl_seconds: 90,
+        max_live_pty_sessions_per_user: 2,
         ...HOSTILE_SECRETS,
       }),
     );
@@ -331,7 +474,12 @@ describe("loadSessionPolicy", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(policy.detached_live_pty_ttl_seconds).toBe(90);
-    expect(Object.keys(policy)).toEqual(["detached_live_pty_ttl_seconds"]);
+    expect(policy.max_live_pty_sessions_per_user).toBe(2);
+    const keys = Object.keys(policy).sort();
+    expect(keys).toEqual([
+      "detached_live_pty_ttl_seconds",
+      "max_live_pty_sessions_per_user",
+    ]);
     const raw = JSON.stringify(policy);
     for (const secret of Object.values(HOSTILE_SECRETS)) {
       expect(raw).not.toContain(secret);

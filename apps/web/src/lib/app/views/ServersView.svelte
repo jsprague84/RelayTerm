@@ -39,6 +39,7 @@
   } from "../../api/terminalSessions.js";
   import {
     DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+    DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
     formatDetachedTtl,
     loadSessionPolicy,
   } from "../../api/sessionPolicy.js";
@@ -142,6 +143,14 @@
    * state NEVER blocks the view.
    */
   let detachedTtlSeconds = $state(DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS);
+  /**
+   * Per-user live-PTY ceiling read from `loadSessionPolicy()`. Seeded
+   * from the SPEC-pinned default so an at-cap launch refusal renders
+   * an honest parameterised message on first paint; overwritten when
+   * the loader resolves. Phase 1B.1 — see `docs/session-quotas.md`
+   * § 7.5.
+   */
+  let maxLivePtyPerUser = $state(DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER);
 
   /**
    * Currently-selected detail target. Selection is mutually exclusive
@@ -216,6 +225,7 @@
   $effect(() => {
     void loadSessionPolicy().then((policy) => {
       detachedTtlSeconds = policy.detached_live_pty_ttl_seconds;
+      maxLivePtyPerUser = policy.max_live_pty_sessions_per_user;
     });
   });
 
@@ -506,7 +516,10 @@
         ...launchStates,
         [profile.id]: {
           kind: "error",
-          summary: describeLaunchError(result.error),
+          summary: describeLaunchError(result.error, {
+            maxLivePtyPerUser,
+            detachedTtlSeconds,
+          }),
         },
       };
       return;

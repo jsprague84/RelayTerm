@@ -290,6 +290,96 @@ describe("describeLaunchError", () => {
       "Could not start terminal: malformed response",
     );
   });
+
+  it("maps 429 too_many_sessions to safe parameterised copy (Phase 1B.1)", () => {
+    // The refusal MUST yield the spec-pinned parameterised copy from
+    // `docs/session-quotas.md` § 7.5: opening sentence carries the
+    // cap, second sentence the action, third sentence the
+    // detached-TTL caveat. The wire `message` is intentionally NOT
+    // echoed — even if a future backend revision widened it, the
+    // launcher MUST stay independent.
+    const summary = describeLaunchError(
+      {
+        kind: "http",
+        status: 429,
+        code: "too_many_sessions",
+        message: `wire detail ${SENTINEL}`,
+      },
+      { maxLivePtyPerUser: 4, detachedTtlSeconds: 30 },
+    );
+    expect(summary).toContain("limit of 4 concurrent terminal sessions");
+    expect(summary).toContain("Close a session from the Sessions list");
+    expect(summary).toContain("Detached sessions count toward this limit");
+    expect(summary).toContain("about 30 seconds");
+    expect(summary).not.toContain(SENTINEL);
+    // Anti-overclaim register (`docs/session-quotas.md` § 7.5 + § 12).
+    const lower = summary.toLowerCase();
+    const forbidden = [
+      "your session quota",
+      "we're rate-limiting you",
+      "please slow down",
+      "queue",
+      "always available",
+      "persistent across restart",
+    ];
+    for (const phrase of forbidden) {
+      expect(lower).not.toContain(phrase);
+    }
+    expect(lower).not.toMatch(/wait \d+ seconds/);
+  });
+
+  it("uses singular phrasing when the cap is 1", () => {
+    const summary = describeLaunchError(
+      {
+        kind: "http",
+        status: 429,
+        code: "too_many_sessions",
+        message: "",
+      },
+      { maxLivePtyPerUser: 1, detachedTtlSeconds: 30 },
+    );
+    expect(summary).toContain("limit of 1 concurrent terminal session.");
+  });
+
+  it("falls back to the default cap AND default TTL when neither is supplied", () => {
+    // The launcher MAY be called before `loadSessionPolicy()`
+    // resolves. The fallback defaults keep the copy honest.
+    const summary = describeLaunchError({
+      kind: "http",
+      status: 429,
+      code: "too_many_sessions",
+      message: "",
+    });
+    expect(summary).toContain("limit of 8 concurrent terminal sessions");
+    expect(summary).toContain("about 30 seconds");
+  });
+
+  it("parameterises the TTL fragment on the configured window", () => {
+    const summary = describeLaunchError(
+      {
+        kind: "http",
+        status: 429,
+        code: "too_many_sessions",
+        message: "",
+      },
+      { maxLivePtyPerUser: 8, detachedTtlSeconds: 1800 },
+    );
+    expect(summary).toContain("about 30 minutes");
+    expect(summary).not.toContain("about 30 seconds");
+  });
+
+  it("falls through to the generic mapping for other 429 codes", () => {
+    // A 429 with a different code (e.g. the login throttler's
+    // `too_many_requests`) MUST NOT borrow the quota-refusal copy.
+    expect(
+      describeLaunchError({
+        kind: "http",
+        status: 429,
+        code: "too_many_requests",
+        message: SENTINEL,
+      }),
+    ).toBe("Could not start terminal: HTTP 429 too_many_requests");
+  });
 });
 
 describe("describeWorkspaceError", () => {

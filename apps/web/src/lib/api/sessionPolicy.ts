@@ -35,6 +35,16 @@ import { readErrorEnvelope } from "./apiErrors.js";
 export const DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS = 30;
 
 /**
+ * Fallback per-user live-PTY ceiling (Phase 1B.1 quota) used when the
+ * policy fetch has not yet resolved or failed. Matches the backend
+ * default (`relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_USER = 8`).
+ * Surfaced through {@link describeMaxLivePtyPerUser} so quota-refusal
+ * copy can render with a defensible parameterised number even when
+ * the SPA boots before the wire round-trip resolves.
+ */
+export const DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER = 8;
+
+/**
  * Wire-side range bounds for the parsed TTL. Mirrors the backend's
  * `5..=86_400` config-validator bound exactly — a value outside this
  * range cannot have been emitted by a current backend, so we treat it
@@ -45,12 +55,29 @@ const POLICY_MIN_TTL_SECONDS = 5;
 const POLICY_MAX_TTL_SECONDS = 24 * 60 * 60;
 
 /**
+ * Wire-side range bounds for the parsed per-user live-PTY ceiling.
+ * Mirrors the backend's `1..=256` config-validator bound (Phase 1B.1).
+ * Same rationale as the TTL bounds above: a value outside this range
+ * cannot have been emitted by a current backend, so we collapse it to
+ * `malformed_response` rather than trusting a hostile payload.
+ */
+const POLICY_MIN_MAX_LIVE_PTY_PER_USER = 1;
+const POLICY_MAX_MAX_LIVE_PTY_PER_USER = 256;
+
+/**
  * Parsed, typed session policy. Carries only the fields the SPA renders;
  * future fields require an explicit migration here AND on the backend.
  */
 export interface SessionPolicy {
   /** Effective detached-live-PTY TTL window in seconds. */
   detached_live_pty_ttl_seconds: number;
+  /**
+   * Effective per-user live-PTY ceiling (Phase 1B.1 quota). The SPA
+   * uses this to render parameterised copy on a `429 too_many_sessions`
+   * refusal ("you're at the limit of N sessions"). NOT a probe for the
+   * caller's current count — the count never crosses the wire.
+   */
+  max_live_pty_sessions_per_user: number;
 }
 
 /**
@@ -73,7 +100,18 @@ export function parseSessionPolicy(raw: unknown): SessionPolicy | null {
   const ttl = r.detached_live_pty_ttl_seconds;
   if (typeof ttl !== "number" || !Number.isInteger(ttl)) return null;
   if (ttl < POLICY_MIN_TTL_SECONDS || ttl > POLICY_MAX_TTL_SECONDS) return null;
-  return { detached_live_pty_ttl_seconds: ttl };
+  const cap = r.max_live_pty_sessions_per_user;
+  if (typeof cap !== "number" || !Number.isInteger(cap)) return null;
+  if (
+    cap < POLICY_MIN_MAX_LIVE_PTY_PER_USER ||
+    cap > POLICY_MAX_MAX_LIVE_PTY_PER_USER
+  ) {
+    return null;
+  }
+  return {
+    detached_live_pty_ttl_seconds: ttl,
+    max_live_pty_sessions_per_user: cap,
+  };
 }
 
 export type SessionPolicyError = WireError;
@@ -183,6 +221,7 @@ export async function loadSessionPolicy(
     // sees so the UI can render honest copy without blocking.
     return {
       detached_live_pty_ttl_seconds: DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+      max_live_pty_sessions_per_user: DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
     };
   })().finally(() => {
     // CRITICAL ordering: clear `inflight` BEFORE any subsequent caller
@@ -266,4 +305,23 @@ export function describeDetachedTtl(seconds: number): string {
   return `Detached sessions stay reconnectable for ${formatDetachedTtl(
     seconds,
   )} after the last client drop. Replay is in-memory and not durable across a backend restart.`;
+}
+
+/**
+ * Short, parameterised copy describing the per-user live-PTY ceiling
+ * (Phase 1B.1 quota). Used by terminal-launch error formatters to
+ * render honest text on a `429 too_many_sessions` refusal.
+ *
+ * Anti-overclaim register (`docs/session-quotas.md` § 7.5):
+ *   - Never says "your session quota" — the cap is per-deployment.
+ *   - Never says "rate-limiting" / "slow down" / "queue" / "wait N
+ *     seconds" — this is a concurrent ceiling, not a rate limit, and
+ *     the refusal carries no `Retry-After` contract.
+ *   - Never says "always available" — sessions are bounded.
+ */
+export function describeMaxLivePtyPerUser(cap: number): string {
+  const safe = Number.isInteger(cap) && cap > 0
+    ? cap
+    : DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER;
+  return `This deployment allows up to ${safe} live terminal session${safe === 1 ? "" : "s"} per user.`;
 }

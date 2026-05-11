@@ -19,9 +19,18 @@ use serde::Serialize;
 /// Wire body of `GET /api/v1/config/session-policy`.
 ///
 /// Carries only the effective detached-live-PTY TTL the orchestrator
-/// is running with right now (after env / TOML / default merge). The
-/// frontend uses it to format honest UX copy without hardcoding the
-/// legacy `~30s` literal.
+/// is running with right now (after env / TOML / default merge) PLUS
+/// (since Phase 1B.1) the per-user live-PTY ceiling so the SPA can
+/// render parameterised refusal copy. The frontend uses these to
+/// format honest UX copy without hardcoding the legacy `~30s` literal
+/// or the default `8` cap.
+///
+/// What this DTO MUST NOT carry (re-asserted alongside the per-route
+/// doc-comment): the deployment-wide quota (operator-only,
+/// fingerprinting risk), any session id / profile id / host id, any
+/// secret-shaped string, any `RELAYTERM_` env name. The sentinel sweep
+/// in `crates/relayterm-api/tests/api.rs::session_policy_*` is the
+/// redaction backstop.
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionPolicyResponse {
     /// Effective TTL (seconds) for the bounded detached-live-PTY
@@ -32,4 +41,13 @@ pub(crate) struct SessionPolicyResponse {
     /// lives in the UI copy that consumes this value, not on the
     /// wire.
     pub detached_live_pty_ttl_seconds: u64,
+    /// Per-user live PTY ceiling (Phase 1B.1 quota, see
+    /// `docs/session-quotas.md` § 4.1). Mirrors
+    /// `terminal_sessions.max_live_pty_sessions_per_user` (env
+    /// `RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER`);
+    /// bounded `1..=256` by the config validator. Used by the SPA to
+    /// parameterise the "you're at the limit of N sessions" copy on a
+    /// `429 too_many_sessions` refusal. NOT a probe for the caller's
+    /// current count — the count never crosses the wire.
+    pub max_live_pty_sessions_per_user: u32,
 }

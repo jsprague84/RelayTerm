@@ -31,6 +31,12 @@ pub enum ErrorCode {
     NotFound,
     Conflict,
     TooManyRequests,
+    /// Phase 1B.1 quota refusal — per-user live PTY ceiling reached.
+    /// Distinct from [`Self::TooManyRequests`] (the login throttler's
+    /// rate-limit code) so the SPA can map the two wires to different
+    /// copy without parsing the static `message` string. See
+    /// `docs/session-quotas.md` § 7.1.
+    TooManySessions,
     BadGateway,
     ServiceUnavailable,
     InternalError,
@@ -45,6 +51,7 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::TooManyRequests => "too_many_requests",
+            Self::TooManySessions => "too_many_sessions",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
             Self::InternalError => "internal_error",
@@ -109,6 +116,24 @@ pub enum ApiError {
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
+    /// 429 — request rejected because the caller has reached their
+    /// per-user live-PTY ceiling (Phase 1B.1 quota — see
+    /// `docs/session-quotas.md` § 7.1). Emitted by
+    /// `POST /api/v1/terminal-sessions` AFTER ownership + host-key
+    /// gating but BEFORE any vault decrypt or SSH side effect.
+    ///
+    /// Wire envelope is `429 { code: "too_many_sessions", message:
+    /// "too many terminal sessions" }` — distinct from
+    /// [`Self::TooManyRequests`] (login throttle) so the SPA can map
+    /// the two wires to different copy. NO `Retry-After` header
+    /// (the user must act, not wait on a wall clock). NO operator
+    /// detail on the wire — no count, no cap, no session ids, no
+    /// hostnames. The operator-side `warn!` line (built at the call
+    /// site BEFORE returning this variant) carries the safe public
+    /// metadata (`user_id`, `current_count`, `cap`).
+    #[error("too many terminal sessions")]
+    TooManySessions,
+
     /// 502 — an upstream system the request depends on (e.g. an SSH peer
     /// during preflight) failed in a way that's not the client's fault.
     /// The wrapped detail is operator-facing only; the wire body collapses
@@ -164,6 +189,11 @@ impl ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::TooManyRequests,
                 "too many requests".to_owned(),
+            ),
+            Self::TooManySessions => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManySessions,
+                "too many terminal sessions".to_owned(),
             ),
             Self::BadGateway(_) => (
                 StatusCode::BAD_GATEWAY,

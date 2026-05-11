@@ -344,6 +344,23 @@ describe("describeCreateError", () => {
     expect(summary).not.toContain(SENTINEL);
     expect(summary).not.toContain("https://");
   });
+
+  it("maps 429 too_many_sessions to a clear dev-lab summary (Phase 1B.1)", () => {
+    // The dev lab stays self-contained — it doesn't carry the
+    // parameterised production copy, but it MUST surface the
+    // per-user-cap refusal as something more useful than a raw
+    // "HTTP 429 too_many_sessions". `docs/session-quotas.md` § 7.6.
+    const summary = describeCreateError({
+      kind: "http",
+      status: 429,
+      code: "too_many_sessions",
+      message: SENTINEL,
+    });
+    expect(summary).toBe(
+      "create failed: per-user live session limit reached",
+    );
+    expect(summary).not.toContain(SENTINEL);
+  });
 });
 
 // ---------------------------------------------------------------------------

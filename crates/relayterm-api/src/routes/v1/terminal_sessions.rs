@@ -163,6 +163,36 @@ async fn create(
         });
     }
 
+    // Phase 1B.1 per-user live-PTY ceiling (`docs/session-quotas.md`
+    // § 4.1). Sits AFTER ownership + host-key gating so a refusal
+    // cannot be used to probe for foreign / disabled / untrusted
+    // profiles, and BEFORE vault decrypt + SSH side effects so a
+    // refused request does no outbound work, no decryption cycle, and
+    // no target-host probe. The orchestrator's in-memory registry is
+    // the authoritative tracker — counting from DB would race the
+    // registry and let a user create more PTYs than this process can
+    // actually hold (§ 4.1 rationale point 1).
+    let cap = state.terminal_sessions.max_live_pty_per_user().get() as usize;
+    let current = state.terminal_sessions.count_live_pty_for_user(user_id);
+    if current >= cap {
+        // Operator-side log line: public metadata only. Per
+        // `docs/session-quotas.md` § 8.3 — `user_id` is public-shape
+        // (already in many existing log lines via `AuthenticatedUser`
+        // extraction); `current_count` and `cap` describe deployment
+        // state, not user content. NEVER log session ids, profile
+        // ids, host ids, identity ids, peer banners, or wire bodies.
+        // No `audit_events` row — quota refusals are operational, not
+        // security-relevant (§ 8.2).
+        warn!(
+            user_id = %user_id,
+            scope = "per_user_live",
+            current_count = current,
+            cap = cap,
+            "terminal session quota refused"
+        );
+        return Err(ApiError::TooManySessions);
+    }
+
     // Decrypt the identity. Vault disabled → 503 (matches the rest of
     // the SSH-side routes). The decrypted PEM is held in a Zeroizing
     // buffer for the rest of this function.

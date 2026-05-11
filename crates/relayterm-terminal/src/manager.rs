@@ -1,6 +1,7 @@
 //! `TerminalSessionManager` and supporting types.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -100,6 +101,14 @@ const ATTACHMENT_FANOUT_CAPACITY: usize = 256;
 /// TTL is supplied (test convenience + the documented default the
 /// config layer mirrors).
 pub const DETACHED_LIVE_PTY_TTL: Duration = Duration::from_secs(30);
+
+/// Default per-user ceiling on concurrent live PTY runtimes. Phase 1B.1
+/// of `docs/session-quotas.md` § 4.1 names `8` — conservative for solo
+/// homelab use, defensible for a small multi-user deployment. The
+/// configuration layer (`apps/backend/src/config.rs`) mirrors this
+/// constant; the manager defaults to it when no operator override is
+/// supplied (test convenience + the documented default).
+pub const DEFAULT_MAX_LIVE_PTY_PER_USER: u32 = 8;
 
 /// In-memory status for a runtime registry entry.
 ///
@@ -441,6 +450,15 @@ pub struct TerminalSessionManager {
     /// [`Self::with_detach_ttl`] so they don't have to burn real
     /// wall-clock budget driving the timer.
     detach_ttl: Duration,
+    /// Per-user ceiling on concurrent live PTY runtime entries. Phase 1B.1
+    /// of `docs/session-quotas.md`; default
+    /// [`DEFAULT_MAX_LIVE_PTY_PER_USER`], operator-tunable via
+    /// `terminal_sessions.max_live_pty_sessions_per_user`. Always
+    /// positive — `NonZeroU32` keeps the type-level invariant. The
+    /// manager owns the value so a single accessor surfaces it to
+    /// both the create route (for enforcement) and the
+    /// `session-policy` route (for the SPA cap copy).
+    max_live_pty_per_user: NonZeroU32,
     /// Recording runtime (`Some` when `terminal_recording.enabled =
     /// true` and the writer is supported in the configured mode). When
     /// `None`, every live session gets a [`RecordingWriter::disabled`]
@@ -474,8 +492,24 @@ impl TerminalSessionManager {
             runtimes: RwLock::new(HashMap::new()),
             attachments: RwLock::new(HashMap::new()),
             detach_ttl,
+            max_live_pty_per_user: NonZeroU32::new(DEFAULT_MAX_LIVE_PTY_PER_USER)
+                .expect("DEFAULT_MAX_LIVE_PTY_PER_USER is non-zero"),
             recording: None,
         }
+    }
+
+    /// Override the per-user live-PTY ceiling (Phase 1B.1 quota).
+    ///
+    /// Builder-style: returns `self` so the caller can chain construction
+    /// at backend boot. The configuration layer
+    /// (`apps/backend/src/config.rs::Config::validate_terminal_sessions`)
+    /// has already bounded the value `1..=256` before this is called;
+    /// passing a value outside that range is a programmer bug, not an
+    /// operator-recoverable state.
+    #[must_use]
+    pub fn with_max_live_pty_per_user(mut self, cap: NonZeroU32) -> Self {
+        self.max_live_pty_per_user = cap;
+        self
     }
 
     /// Attach a [`RecordingRuntime`] for durable PTY-output recording.
@@ -1556,6 +1590,41 @@ impl TerminalSessionManager {
             .read()
             .expect("runtime registry lock poisoned")
             .len()
+    }
+
+    /// Per-user ceiling on concurrent live PTY runtime entries. The
+    /// configured operator value (defaults to
+    /// [`DEFAULT_MAX_LIVE_PTY_PER_USER`]). Phase 1B.1 of
+    /// `docs/session-quotas.md` § 4.1.
+    #[must_use]
+    pub fn max_live_pty_per_user(&self) -> NonZeroU32 {
+        self.max_live_pty_per_user
+    }
+
+    /// Count of an owner's runtime-registry entries whose live PTY is
+    /// currently bound (`entry.live.is_some()`). Equivalent to "rows in
+    /// the registry whose `snapshot.status == RuntimeSessionStatus::Live`"
+    /// because `start_live_pty` sets both atomically under the same
+    /// write-lock guard.
+    ///
+    /// Used by the create route (Phase 1B.1 quota enforcement) to
+    /// refuse a new session when this would exceed
+    /// [`Self::max_live_pty_per_user`]. The check sits AFTER ownership
+    /// and host-key gating, and BEFORE vault decrypt or SSH side
+    /// effects, so the refusal does no outbound work and cannot be
+    /// used to probe for foreign / disabled / untrusted profiles.
+    ///
+    /// O(N) over the registry under the existing `RwLock` read guard;
+    /// the registry is bounded by the deployment-wide configuration so
+    /// the scan is a small handful of comparisons.
+    #[must_use]
+    pub fn count_live_pty_for_user(&self, owner_id: UserId) -> usize {
+        self.runtimes
+            .read()
+            .expect("runtime registry lock poisoned")
+            .values()
+            .filter(|entry| entry.snapshot.owner_id == owner_id && entry.live.is_some())
+            .count()
     }
 }
 

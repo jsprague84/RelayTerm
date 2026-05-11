@@ -29,6 +29,11 @@ import type {
   TerminalSessionState,
 } from "@relayterm/terminal-core";
 import type { CreateTerminalSessionError } from "../../api/terminalSessions.js";
+import {
+  DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+  DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
+  formatDetachedTtl,
+} from "../../api/sessionPolicy.js";
 
 /**
  * Top-level workspace phase. Mirrors the dev lab's `LabPhase` but with
@@ -241,12 +246,31 @@ export function classifyReconnectAttempt(
  * wire body, which is fine — `reason` is a closed string-literal union
  * defined in the resource module and is operator-safe by construction.
  */
-export function describeLaunchError(err: CreateTerminalSessionError): string {
+export function describeLaunchError(
+  err: CreateTerminalSessionError,
+  options: { maxLivePtyPerUser?: number; detachedTtlSeconds?: number } = {},
+): string {
   switch (err.kind) {
     case "validation":
       return `Could not start terminal: ${err.reason}`;
-    case "http":
+    case "http": {
+      // Phase 1B.1: per-user live-PTY ceiling refusal (`429
+      // too_many_sessions`). Mapped to the spec-pinned parameterised
+      // copy in `docs/session-quotas.md` § 7.5. Both the cap and the
+      // TTL-window fragment come from `/api/v1/config/session-policy`
+      // (or the safe defaults) — never from the wire body of the
+      // refusal, which intentionally carries no count, no cap, and
+      // no TTL (§ 7.3). Branching on `code` only, never `message`.
+      if (err.status === 429 && err.code === "too_many_sessions") {
+        const cap = options.maxLivePtyPerUser
+          ?? DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER;
+        const ttlFragment = formatDetachedTtl(
+          options.detachedTtlSeconds ?? DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
+        );
+        return `You're at the limit of ${cap} concurrent terminal session${cap === 1 ? "" : "s"}. Close a session from the Sessions list before starting another. Detached sessions count toward this limit and free up automatically after their reconnect window (${ttlFragment} by default).`;
+      }
       return `Could not start terminal: HTTP ${err.status} ${err.code}`;
+    }
     case "transport":
       return "Could not start terminal: transport error";
     case "malformed_response":

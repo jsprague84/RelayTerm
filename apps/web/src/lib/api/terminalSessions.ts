@@ -153,6 +153,13 @@ export function describeCreateError(err: CreateTerminalSessionError): string {
     case "validation":
       return `invalid request: ${err.reason}`;
     case "http":
+      // Phase 1B.1: per-user live-PTY ceiling refusal. The dev lab
+      // surfaces the typed code+status without the parameterised
+      // production copy (the dev lab stays self-contained — see
+      // `docs/session-quotas.md` § 7.6).
+      if (err.status === 429 && err.code === "too_many_sessions") {
+        return "create failed: per-user live session limit reached";
+      }
       return `create failed: HTTP ${err.status} ${err.code}`;
     case "transport":
       return "create failed: transport error";
