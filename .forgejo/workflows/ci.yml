@@ -276,6 +276,18 @@ jobs:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
+      - name: diagnose docker reachability
+        run: |
+          set +e
+          echo "=== /etc/hosts ==="
+          cat /etc/hosts
+          echo "=== env (DOCKER + HOST) ==="
+          env | grep -E "DOCKER|HOST" || echo "(none)"
+          echo "=== getent hosts docker ==="
+          getent hosts docker || echo "(no DNS entry)"
+          echo "=== nc :2375 ==="
+          (echo > /dev/tcp/docker/2375) 2>&1 && echo "tcp connect OK" || echo "tcp connect failed"
+
       - name: docker info
         # Surfaces the daemon endpoint the job is talking to so a
         # misconfigured runner produces a recognisable failure instead

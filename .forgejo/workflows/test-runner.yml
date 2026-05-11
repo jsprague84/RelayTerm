@@ -132,6 +132,20 @@ jobs:
           echo "runner.labels: ${{ toJson(runner.labels) }}"
           nproc
 
+      - name: diagnose docker reachability
+        run: |
+          set +e
+          echo "=== /etc/hosts ==="
+          cat /etc/hosts
+          echo "=== env (DOCKER + HOST) ==="
+          env | grep -E "DOCKER|HOST" || echo "(none)"
+          echo "=== getent hosts docker ==="
+          getent hosts docker || echo "(no DNS entry)"
+          echo "=== ping docker ==="
+          ping -c1 -W2 docker 2>&1 || true
+          echo "=== nc :2375 ==="
+          (echo > /dev/tcp/docker/2375) 2>&1 && echo "tcp connect OK" || echo "tcp connect failed"
+
       - name: docker daemon (confirms host socket access)
         run: |
           echo "docker version info:"
