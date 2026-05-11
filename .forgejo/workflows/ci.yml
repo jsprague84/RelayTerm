@@ -96,7 +96,7 @@ concurrency:
 jobs:
   rust-checks:
     name: rust checks (fmt + clippy + test)
-    runs-on: docker
+    runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
@@ -177,7 +177,7 @@ jobs:
 
   web-checks:
     name: web checks (check + build + test)
-    runs-on: docker
+    runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
@@ -235,7 +235,7 @@ jobs:
 
   docker-build:
     name: docker build (backend + migrate + web)
-    runs-on: docker
+    runs-on: [lxc, docker]
     # `catthehacker/ubuntu:act-latest` ships docker CLI + buildx out of
     # the box; the runner's `container.options` config provides
     # `DOCKER_HOST` + TLS certs (DinD sidecar) so `docker build` works
@@ -278,7 +278,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-    runs-on: docker
+    runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
     env:

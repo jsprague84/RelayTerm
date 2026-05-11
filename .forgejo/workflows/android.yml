@@ -89,7 +89,7 @@ concurrency:
 jobs:
   android-build:
     name: tauri android build (debug apk)
-    runs-on: docker
+    runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
     env:

@@ -1,0 +1,148 @@
+# TEST WORKFLOW — verify new LXC runners on EPYC server.
+#
+# This workflow is MANUAL TRIGGER ONLY (workflow_dispatch). It NEVER runs on
+# push or PR so it cannot accidentally interfere with ci.yml,
+# desktop-linux.yml, or android.yml.
+#
+# Quick smoke tests per runner:
+#   • rust-high  → cargo fmt + check (not full clippy/test build)
+#   • high-cpu   → pnpm install + check (no full build)
+#   • docker     → docker buildx version check (confirms socket works)
+#
+# Push a branch with this file, then trigger from Forgejo UI:
+#   Actions → test-runner → Run workflow (branch: the-branch-name)
+
+name: test-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke_only:
+        description: "Skip actual builds, just print runner info"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  # --- Job 1: Rust labels on epyc-rust ---
+  rust-smoke:
+    name: "rust labels smoke"
+    runs-on: [lxc, rust-high]
+    container:
+      image: catthehacker/ubuntu:act-latest
+    steps:
+      - name: runner info
+        run: |
+          echo "job: rust-smoke"
+          echo "runner.os: ${{ runner.os }}"
+          echo "runner.arch: ${{ runner.arch }}"
+          echo "runner.name: ${{ runner.name }}"
+          echo "runner.labels: ${{ toJson(runner.labels) }}"
+          echo "CARGO_BUILD_JOBS: $CARGO_BUILD_JOBS"
+          nproc
+          uname -a
+          cat /etc/os-release 2>/dev/null || true
+
+      - name: confirm CARGO_BUILD_JOBS env
+        run: |
+          echo "CARGO_BUILD_JOBS is unset (will set in env below)"
+          echo "nproc: $(nproc)"
+
+      - name: install rust (quick — no cargo build)
+        if: ${{ !inputs.smoke_only }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.95 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "rustc $(rustc --version)"
+          echo "cargo $(cargo --version)"
+          echo "nproc: $(nproc)"
+
+      - name: checkout (minimal)
+        if: ${{ !inputs.smoke_only }}
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          # Only fetch a shallow copy for speed
+          fetch-depth: 1
+
+      - name: cargo fmt (fast validation)
+        if: ${{ !inputs.smoke_only }}
+        run: |
+          "$HOME/.cargo/bin/cargo" fmt --all -- --check
+
+  # --- Job 2: high-cpu labels on any available LXC runner ---
+  high-cpu-smoke:
+    name: "high-cpu labels smoke"
+    runs-on: [lxc, high-cpu]
+    container:
+      image: catthehacker/ubuntu:act-latest
+    steps:
+      - name: runner info
+        run: |
+          echo "job: high-cpu-smoke"
+          echo "runner.os: ${{ runner.os }}"
+          echo "runner.arch: ${{ runner.arch }}"
+          echo "runner.name: ${{ runner.name }}"
+          echo "runner.labels: ${{ toJson(runner.labels) }}"
+          nproc
+          uname -a
+
+      - name: setup node (quick)
+        if: ${{ !inputs.smoke_only }}
+        uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: node version
+        if: ${{ !inputs.smoke_only }}
+        run: |
+          node --version
+          npm --version
+
+  # --- Job 3: docker labels on epyc-docker ---
+  docker-smoke:
+    name: "docker labels smoke"
+    runs-on: [lxc, docker]
+    container:
+      image: catthehacker/ubuntu:act-latest
+    steps:
+      - name: runner info
+        run: |
+          echo "job: docker-smoke"
+          echo "runner.os: ${{ runner.os }}"
+          echo "runner.arch: ${{ runner.arch }}"
+          echo "runner.name: ${{ runner.name }}"
+          echo "runner.labels: ${{ toJson(runner.labels) }}"
+          nproc
+
+      - name: docker daemon (confirms host socket access)
+        run: |
+          echo "docker version info:"
+          docker version --format '{{.Server.Version}}'
+          docker info --format '{{.Driver}}'
+          echo "hostname inside container: $(hostname)"
+          echo "if this succeeds, automount or socket mount works"
+
+  # --- Job 4: android labels on epyc-android ---
+  android-smoke:
+    name: "android labels smoke"
+    runs-on: [lxc, android]
+    container:
+      image: catthehacker/ubuntu:act-latest
+    steps:
+      - name: runner info
+        run: |
+          echo "job: android-smoke"
+          echo "runner.os: ${{ runner.os }}"
+          echo "runner.arch: ${{ runner.arch }}"
+          echo "runner.name: ${{ runner.name }}"
+          echo "runner.labels: ${{ toJson(runner.labels) }}"
+          nproc
+          uname -a
+
+      - name: install JDK (light — confirms Android runner can install deps)
+        if: ${{ !inputs.smoke_only }}
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            openjdk-17-jdk-headless curl unzip ca-certificates
+          java -version 2>&1

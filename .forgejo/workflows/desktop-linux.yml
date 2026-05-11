@@ -75,7 +75,7 @@ concurrency:
 jobs:
   desktop-linux-build:
     name: tauri desktop linux build (deb + rpm)
-    runs-on: docker
+    runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
     env:
