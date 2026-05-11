@@ -87,11 +87,15 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Avoid running redundant CI on the same branch — when a new push lands
-# while a previous run is still in flight, cancel the older one.
+# Avoid redundant CI on the same branch — when a new push lands while
+# a previous run is still in flight, cancel the older one. EXCEPT on
+# `main`, where every push must produce a verdict so we never cascade-
+# cancel a run that would have published images. Conditional pattern
+# is documented at https://forgejo.org/docs/latest/user/actions/reference/
+# under "Conditional Concurrency Cancellation".
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   rust-checks:
@@ -106,16 +110,6 @@ jobs:
     steps:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
-
-      - name: cache cargo dependencies
-        uses: https://code.forgejo.org/actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
 
       - name: install linux desktop tauri build dependencies
         # Phase 0 of the Tauri rollout added `apps/desktop/src-tauri` and
@@ -173,6 +167,25 @@ jobs:
           "$HOME/.cargo/bin/rustc" --version
           "$HOME/.cargo/bin/cargo" --version
 
+      - name: cache cargo dependencies
+        # `Swatinem/rust-cache@v2` replaces the previous raw
+        # `actions/cache@v3` block. It hashes `Cargo.lock` + `rustc -V`
+        # + workspace member set; restores `~/.cargo/{registry,git}` +
+        # `target/`; and crucially PRUNES `target/` before save (strips
+        # `*.rmeta` / non-workspace dep artifacts / stale incremental
+        # dirs) so the cache stays small. Must run AFTER `rustup-init`
+        # so `cargo` is on PATH. `cache-bin: false` keeps the action
+        # from scrubbing `~/.cargo/bin` (its default behaviour is
+        # surprising on self-hosted runners). `save-if` restricts cache
+        # WRITES to main / tag refs — feature branches still RESTORE
+        # from main's cache but don't add their own ephemeral entries.
+        # https://github.com/Swatinem/rust-cache (v2.9.1, 2026-03-12)
+        uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
@@ -197,13 +210,6 @@ jobs:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
-      - name: cache pnpm store
-        uses: https://code.forgejo.org/actions/cache@v3
-        with:
-          path: ~/.pnpm-store
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-
-
       - name: docs contract check
         # Guards the AGENTS.md / SPEC.md / docs/spec / docs/agent context
         # split: anchors, high-risk cross-corpus terms, forbidden stale
@@ -213,23 +219,36 @@ jobs:
         # Also exposed as `pnpm run check:docs-contracts` for local use.
         run: bash scripts/check-doc-contracts.sh
 
+      - name: setup pnpm (with content-addressed store cache)
+        # `pnpm/action-setup@v6` with `cache: true` manages the store at
+        # `pnpm store path`, hashes the workspace's `pnpm-lock.yaml`, and
+        # auto-prunes the store in its post-step. Replaces both the
+        # previous `actions/cache@v3` block (which hard-coded the wrong
+        # store path on some runners — pnpm now defaults to
+        # `~/.local/share/pnpm/store/v3` on Linux) AND `setup-node`'s
+        # `cache: pnpm` parameter (extra dep, no auto-prune).
+        # `cache_dependency_path` defaults to `pnpm-lock.yaml`; we set
+        # it explicitly to glob every workspace lockfile (currently one
+        # at root, but defends against future workspace splits).
+        # https://github.com/pnpm/action-setup (v6.0.6, 2026-05-08)
+        uses: https://github.com/pnpm/action-setup@v6
+        with:
+          # Pin to the exact version in `package.json#packageManager`
+          # (currently `pnpm@10.33.0`) so CI cannot drift onto a newer
+          # pnpm minor that local dev hasn't seen. Bump in lockstep with
+          # the package.json field.
+          version: 10.33.0
+          cache: true
+          cache_dependency_path: '**/pnpm-lock.yaml'
+
       - name: setup node 22
         # Node 22 LTS — must match `Dockerfile.web` `ARG NODE_VERSION`.
-        # The catthehacker base image ships *a* Node, but pinning here
-        # makes the CI Node version explicit and decoupled from the
-        # base image's choice.
+        # `pnpm/action-setup@v6` above installs pnpm; we still need
+        # `setup-node` for Node itself (the catthehacker base image
+        # ships *a* Node but we pin to a known version).
         uses: https://code.forgejo.org/actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: enable corepack (pnpm via package.json#packageManager)
-        run: |
-          corepack enable
-          # `corepack prepare` is implicit on first pnpm invocation, but
-          # making it explicit fails fast on a missing/wrong pin.
-          corepack prepare --activate
-          node --version
-          pnpm --version
 
       - name: install
         run: pnpm install --frozen-lockfile

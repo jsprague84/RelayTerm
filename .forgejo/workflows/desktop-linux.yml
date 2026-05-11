@@ -63,14 +63,42 @@ on:
     # path as PRs and main pushes.
     tags:
       - 'v*'
+    # Path filters keep this workflow off doc-only / backend-only
+    # pushes. The desktop Tauri build only depends on the desktop
+    # shell, the embedded web SPA, the Rust workspace, and this
+    # workflow's own machinery. A docs change or a pure-backend route
+    # change should not trigger a 5-10 min Tauri build.
+    paths:
+      - 'apps/desktop/**'
+      - 'apps/web/**'
+      - 'crates/**'
+      - 'packages/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.forgejo/workflows/desktop-linux.yml'
+      - '.forgejo/actions/**'
   pull_request:
+    paths:
+      - 'apps/desktop/**'
+      - 'apps/web/**'
+      - 'crates/**'
+      - 'packages/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.forgejo/workflows/desktop-linux.yml'
+      - '.forgejo/actions/**'
   workflow_dispatch:
 
-# Cancel an in-flight build for the same ref when a newer push lands —
-# matches the `ci.yml` concurrency policy.
+# Conditional cancel: feature branches cancel-on-superseded (cheap);
+# `main` always finishes so we never lose a verdict during rapid
+# pushes. See ci.yml for the matching pattern.
 concurrency:
-  group: desktop-linux-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   desktop-linux-build:

@@ -75,16 +75,41 @@ on:
     # same packaging path as PRs and main pushes.
     tags:
       - 'v*'
+    # Path filters keep this workflow off doc-only / backend-only /
+    # desktop-only pushes. The Android Tauri build only depends on the
+    # mobile shell, the embedded web SPA, the Rust workspace, and this
+    # workflow's own machinery.
+    paths:
+      - 'apps/mobile/**'
+      - 'apps/web/**'
+      - 'crates/**'
+      - 'packages/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.forgejo/workflows/android.yml'
+      - '.forgejo/actions/**'
   pull_request:
+    paths:
+      - 'apps/mobile/**'
+      - 'apps/web/**'
+      - 'crates/**'
+      - 'packages/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.forgejo/workflows/android.yml'
+      - '.forgejo/actions/**'
   workflow_dispatch:
 
-# Cancel an in-flight build for the same ref when a newer push lands —
-# matches the `ci.yml` and `desktop-linux.yml` concurrency policies.
-# Group key is `android-` prefixed so this concurrency does NOT interact
-# with `ci-` (server/web) or `desktop-linux-` (Linux desktop) groups.
+# Conditional cancel: feature branches cancel-on-superseded (cheap);
+# `main` always finishes so we never lose a verdict during rapid pushes.
+# See ci.yml for the matching pattern.
 concurrency:
-  group: android-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   android-build:
