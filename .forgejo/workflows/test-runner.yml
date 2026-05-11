@@ -105,23 +105,6 @@ jobs:
     runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
-      # The runner-config.yml on epyc-ai tries to inject
-      # `--add-host=docker:host-gateway -e DOCKER_HOST=tcp://docker:2375`
-      # via `container.options`, BUT when a workflow declares its own
-      # `container:` block the runner-config options are silently ignored
-      # by act. We re-add the gateway mapping here so the `docker`
-      # hostname resolves to DinD's bridge gateway (172.17.0.1) where
-      # dockerd listens on :2375. The `env: DOCKER_HOST` below provides
-      # the matching endpoint URL.
-      #
-      # Without either piece the job's docker CLI fails with:
-      #   dial unix /var/run/docker.sock: connect: no such file or directory
-      # (DOCKER_HOST unset) or:
-      #   dial tcp: lookup docker: no such host
-      # (DOCKER_HOST set but no host entry).
-      options: --add-host=docker:host-gateway
-    env:
-      DOCKER_HOST: tcp://docker:2375
     steps:
       - name: runner info
         run: |
@@ -132,19 +115,23 @@ jobs:
           echo "runner.labels: ${{ toJson(runner.labels) }}"
           nproc
 
-      - name: diagnose docker reachability
+      - name: discover DinD endpoint
+        # Empirically verified: act/forgejo-runner silently drops both
+        # the runner-config's `container.options` AND the workflow's
+        # `container.options` field, so injecting
+        # `--add-host=docker:host-gateway` or `-e DOCKER_HOST=...` via
+        # those paths does NOT reach the spawned job container
+        # (`HostConfig.ExtraHosts == null`, no DOCKER_HOST in env).
+        # Workaround: discover the job container's default-route
+        # gateway at runtime — that gateway IS DinD's bridge interface,
+        # where dockerd listens on 0.0.0.0:2375 — and export
+        # DOCKER_HOST via $GITHUB_ENV so subsequent steps inherit it.
         run: |
-          set +e
-          echo "=== /etc/hosts ==="
-          cat /etc/hosts
-          echo "=== env (DOCKER + HOST) ==="
-          env | grep -E "DOCKER|HOST" || echo "(none)"
-          echo "=== getent hosts docker ==="
-          getent hosts docker || echo "(no DNS entry)"
-          echo "=== ping docker ==="
-          ping -c1 -W2 docker 2>&1 || true
-          echo "=== nc :2375 ==="
-          (echo > /dev/tcp/docker/2375) 2>&1 && echo "tcp connect OK" || echo "tcp connect failed"
+          set -eu
+          gw=$(ip route show default | awk '/default/{print $3; exit}')
+          test -n "$gw"
+          echo "discovered DinD bridge gateway: $gw"
+          echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"
 
       - name: docker daemon (confirms host socket access)
         run: |
