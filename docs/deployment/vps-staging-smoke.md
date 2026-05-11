@@ -1452,6 +1452,383 @@ run):
   procedure to grep the chunk that owns `lib/app/terminal/*`
   rather than the entry bundle.
 
+### 2026-05-10 · Long-TTL (1800 s) reconnect smoke via Playwright browser automation
+
+Extends the 2026-05-10 custom-TTL smoke below (which validated
+`RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS=300`
+end-to-end through the desktop Tauri shell) to a substantially
+longer reconnect window — `1800 s` (30 min) — and replaces the
+desktop Tauri client with Playwright-driven browser automation
+against the production browser path at
+`https://relayterm-staging.js-node.cc`. Goal: confirm the
+configurable knob keeps a still-live PTY reachable for a long
+multi-minute disconnect, that the in-memory replay buffer keeps
+delivering post-detach output past the prior 300 s validated
+window, and that the reaper still fires exactly at the configured
+TTL boundary (not the old hard-coded 30 s default, and not the
+prior smoke's 300 s).
+
+This is a **smoke + docs** slice: no source, deploy, schema, API,
+auth, CSRF, CORS, WebSocket-protocol, or Tauri-native code
+changed. The configurable-TTL knob and the Compose-template
+plumbing for it shipped in earlier commits (see the 2026-05-10
+custom-TTL entry below for that landing record) — this run only
+turned the knob up and observed the long-window behaviour.
+
+**Date convention.** The heading date `2026-05-10` matches this
+file's operator-local-date convention (the 2026-05-09 desktop
+Tauri reconnect entry below uses the same convention — its inline
+timestamps include UTC values past midnight UTC). The smoke
+proper ran from operator-local-evening 2026-05-10 across UTC
+midnight, so every inline `session_events` row, attachment row,
+and absolute UTC timestamp in this entry carries a `2026-05-11`
+date. There is no UTC-date error in the timestamps; only the
+heading uses the operator-local convention.
+
+**Pinned contract under test.** Same field as the 2026-05-10
+custom-TTL smoke below: `terminal_sessions.detached_live_pty_ttl_seconds`
+(env `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS`),
+bounded `5..=86400` (5 s..24 h), staging value for this run
+**1800 s**. The knob is a *short-term reconnect grace window* on
+a still-live PTY held by the running backend; it does NOT survive
+a backend restart, is NOT durable shell persistence
+(no `tmux`/`screen`-style resurrection), and explicitly was not
+asked to do either — see
+[`docs/spec/terminal.md`](../spec/terminal.md) § "Output sequence
++ in-memory replay buffer contract" and the SCOPE preamble in
+[`docs/config-examples/relayterm.production.example.toml`](../config-examples/relayterm.production.example.toml).
+
+**Origin:** `https://relayterm-staging.js-node.cc` (unchanged).
+**Image tag:** `:main` carried over from the 2026-05-10 custom-TTL
+smoke below at `sha256:22e092f824b4…` (same SHA on both
+`relayterm-backend` and `relayterm-web`; no `docker compose pull`,
+no migrations, no image upgrade). Backend was force-recreated once
+to pick up the env-var change; Postgres + `relayterm-web`
+containers were untouched.
+**Throwaway SSH target:** new `linuxserver/openssh-server:latest`
+container `relayterm-staging-smoke-ssh-longttl` joined to
+`relayterm-staging_relayterm-staging-internal` (key-auth-only,
+`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`, port `2222`, **no
+host port published**, user `smoke` with `/bin/bash`; ed25519 host
+fingerprint `SHA256:7FWo7ltkrf4bAiOGP4WR3p7B3gc85Skvd5LwkNrLZo0`
+captured at `host-key-preflight` and pinned at `trust-host-key`).
+The reused `smoke-id` ed25519 identity's public key was injected
+into `/config/.ssh/authorized_keys` (`smoke:users`, mode `600`,
+single line) by `docker cp` from a temp file on the VPS that was
+shredded immediately after copy; no private key material left the
+backend vault. **Throwaway; torn down at end of run.**
+
+**Inventory:** brand-new host `long-reconnect-smoke-host`
+(`1812f957-c8e1-4c86-96f6-2e5d75c1605d`,
+`relayterm-staging-smoke-ssh-longttl:2222 smoke`) and brand-new
+profile `long-reconnect-smoke-profile`
+(`11978f87-61d1-4ad9-b208-00ae7e4fea13`) bound to the existing
+reused `smoke-id` ed25519 identity
+(`44b5e2be-29c2-4eb0-b6ac-3b4e25ca789d`). All prior staging
+inventory rows from the 2026-05-09 and 2026-05-10 entries were
+left intact per the AGENTS.md "Inventory lifecycle and
+destructive-action policy". Single new `known_host_entry` row
+`82abb0ad-6d12-4ce4-8c96-7dadff327abc` from the preflight + trust
+cycle.
+
+**Driver surface — Playwright MCP, not desktop Tauri.** Diff vs.
+the 2026-05-10 custom-TTL smoke below: the operator surface here
+is a Chromium instance driven by Playwright MCP, against the
+HTTPS staging hostname directly (no Tauri bundled-handoff path,
+no native shell). The 2026-05-09 desktop Tauri smoke and the
+2026-05-10 custom-TTL desktop Tauri smoke already verified the
+bundled-shell handoff + cookie persistence layers; this slice's
+scope is the configured-TTL backend behaviour, so the simpler
+browser path was used. The terminal canvas is read via DOM
+inspection (`document.querySelectorAll('.xterm-rows > div')`
+under `browser_evaluate`) — the xterm.js DOM renderer (`renderer-type=dom`
+is the production default per
+[`packages/terminal-xterm/src/index.ts`](../../packages/terminal-xterm/src/index.ts))
+puts visible cells in plain `<div>` rows, so the agent can
+ground-truth the replay handshake against the rendered grid
+without driving WebGL.
+
+Setup-API path drove from the workstation against the same
+Compose stack on `cloud-edge` (login cookie persisted in the
+ephemeral Playwright MCP browser context for the duration of the
+run, plus a parallel curl-driven cookie at
+`cloud-edge:/tmp/relayterm-longttl.cookie` chmod 600 used only
+for the inventory bootstrap and torn down at cleanup; bootstrap
+credentials sourced from
+`/home/ubuntu/docker/relayterm-staging/.bootstrap-credentials`
+identically to the 2026-05-10 custom-TTL entry below, parsed
+key-by-key into shell vars and never echoed).
+
+Verified — **all timings are wall-clock UTC ground-truth from the
+Postgres `session_events` table on the staging stack itself**
+(not operator-reported):
+
+- HTTPS reachability gate (§7.3) re-checked from the workstation
+  pre-recreate and post-recreate: `/healthz` → 200,
+  `/api/v1/auth/me` → 401 JSON envelope (`{"error":{"code":"unauthorized","message":"unauthorized"}}`),
+  identical headers (HSTS / CSP / referrer-policy from
+  `secure-chain@file`). Pre-recreate startup log line was
+  `detached_live_pty_ttl_seconds=30` (the prior smoke had not
+  persisted the `1800` value into `.env` — staging starts each
+  recreate at the Compose template default unless `.env`
+  overrides it). After appending one line to
+  `/home/ubuntu/docker/relayterm-staging/.env` (timestamp-suffixed
+  backup at `.env.bak.20260511T005244Z`) and
+  `docker compose --env-file ... up -d --no-deps --force-recreate
+  relayterm-backend`, the container reached `(healthy)` in ~13 s
+  and the first-line startup log read
+  `detached_live_pty_ttl_seconds=1800`. `docker exec ... env`
+  inside the running container confirmed
+  `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS=1800`.
+- Inventory CRUD: `POST /api/v1/hosts` → 201 (host id above);
+  `POST /api/v1/server-profiles` → 201 (profile id above);
+  `POST .../host-key-preflight` → `host_key_status: "unknown"`
+  with `host_key_fingerprint:
+  "SHA256:7FWo7ltkrf4bAiOGP4WR3p7B3gc85Skvd5LwkNrLZo0"`
+  matching `docker exec ... ssh-keygen -lf
+  /config/ssh_host_keys/ssh_host_ed25519_key.pub`; subsequent
+  `POST .../trust-host-key` with the same `expected_fingerprint`
+  returned the fresh `known_host_entry_id` above;
+  `POST .../auth-check` → `status: "authentication_succeeded"`
+  ("ssh public-key authentication succeeded; no PTY was allocated
+  and no command was executed"). One incidental shape note: the
+  trust-host-key body is `expected_fingerprint` (must begin with
+  `SHA256:`), the preflight response field is `host_key_fingerprint`
+  — these are distinct names. A first-cycle attempt that mistook
+  the preflight response for a `observed_fingerprint` field
+  returned `invalid_input` ("expected_fingerprint must start with
+  'SHA256:'"); the retry with the correct copy succeeded.
+- **Pre-flight WS-idle observation (informational, not a TTL
+  finding).** The very first launch on the Playwright browser
+  (session `7e37f2f1-b740-4c0d-80c7-d17631e7873c`, click
+  `01:34:25.327Z`) was lost at exactly **60 s of WS idle** —
+  `session_events` showed `attached 01:34:26.017Z → detached
+  01:35:26.055Z` with the client never having sent a keystroke
+  (the agent was busy inspecting DOM globals via
+  `browser_evaluate`). The session became `detached`,
+  `last_seen_seq=0`, Reconnect disabled. **This is an idle-WS
+  gate at the proxy or backend, NOT the TTL knob under test, and
+  NOT a regression** — the 2026-05-09 and 2026-05-10 desktop
+  Tauri reconnect entries below do not surface it because the
+  operator was producing keystrokes/output continuously during
+  live windows. On the smoke proper (session
+  `e7ae8b6e-caa4-47bd-a264-07be42fc4e45`, below) the agent typed
+  the baseline command within the first 7 s after launch and the
+  60 s idle gate did not fire. Worth folding back later if a
+  future slice depends on hands-off browser-headless test
+  fixtures — see "Drift worth folding back later" below.
+- **Smoke session (the one that matters):**
+  `e7ae8b6e-caa4-47bd-a264-07be42fc4e45`. `terminal_sessions`
+  end-state row: `status=closed`, `cols=80`, `rows=24`,
+  `created_at=2026-05-11T01:36:30.394513Z`,
+  `last_seen_at=2026-05-11T02:47:34.322412Z`,
+  `closed_at=2026-05-11T02:47:34.314367Z`. Full `session_events`
+  trace (only `kind` + `recorded_at`, no `payload` dump — same
+  defensive default as the prior smokes):
+
+  ```
+  created    2026-05-11 01:36:30.395867+00
+  attached   2026-05-11 01:36:30.647381+00   ← initial attach
+  detached   2026-05-11 01:37:36.832974+00   ← T_detach_1
+  attached   2026-05-11 01:49:52.706617+00   ← reconnect 1 (12-min window)
+  reattached 2026-05-11 01:49:52.711682+00
+  detached   2026-05-11 01:50:39.239252+00   ← T_detach_2
+  attached   2026-05-11 02:16:58.799760+00   ← reconnect 2 (26-min window)
+  reattached 2026-05-11 02:16:58.802457+00
+  detached   2026-05-11 02:17:34.297582+00   ← T_detach_3 (final)
+  closed     2026-05-11 02:47:34.327946+00   ← reaper fired
+  ```
+
+  Three `terminal_session_attachments` rows mirror the three live
+  windows (initial + two reattach cycles); each
+  `(attached_at, detached_at)` is within microseconds of the
+  corresponding `session_events` pair.
+- **Case A — short detach + reconnect at 12 min** (well past the
+  prior 300 s smoke window). `detached 01:37:36.832 → attached
+  01:49:52.706 → reattached 01:49:52.711`. Detach gap =
+  **735.874 s** (12 min 16 s) — 2.45 × the prior smoke's 300 s
+  validation, 24.5 × the old 30 s default. `reattached` event
+  fired **5.07 ms** after `attached`, proving the
+  cancel-pending-close path on
+  `crates/relayterm-terminal/src/manager.rs:914-919, 956-970`
+  fires correctly at the new non-default TTL. **Replay during
+  the gap:** before detach, the live shell started a
+  six-tick background loop emitting `relayterm-detached-output-N`
+  lines at 120 s spacing; ticks 2 through 6 emitted between
+  `01:39:20Z` and `01:47:20Z` while the WebView was detached. On
+  reconnect, the rendered xterm DOM grid showed **all five
+  post-detach ticks (lines 2-6)** before any new input,
+  delivered via the `replay_started → buffered output →
+  replay_completed` handshake on `last_seen_seq=118`. Tick 1
+  (emitted pre-detach) was absent — expected: same
+  *resume-the-live-stream not restore-the-canvas* behaviour
+  documented in the 2026-05-09 entry below and pinned by
+  `apps/web/src/lib/dev/liveTerminalState.ts`; the renderer
+  `dispose()` on Detach destroys the local grid and replay
+  delivers only output past `last_seen_seq`, not local
+  scrollback. Post-reconnect baseline command
+  (`echo relayterm-probe-1-resumed && date -u`) round-tripped
+  and rendered `Mon May 11 01:50:27 UTC 2026`.
+- **Case B — long detach + reconnect at 26 min** (most of the
+  way through the configured 1800 s window). `detached
+  01:50:39.239 → attached 02:16:58.799 → reattached
+  02:16:58.802`. Detach gap = **1579.560 s** (26 min 19 s) —
+  margin to the 1800 s reaper boundary was only ~220 s.
+  `reattached` event fired **2.7 ms** after `attached`. A second
+  bounded loop started pre-detach emitted
+  `relayterm-probe2-tick-N` lines at 240 s spacing (so all six
+  ticks land within the detach window); after reconnect, the
+  rendered grid showed **probe2-tick-2 through probe2-tick-6**
+  (five post-detach lines) via replay. Tick 1 (emitted
+  pre-detach, at `01:50:27Z` per the remote bash clock) was
+  again absent for the same documented reason. Post-reconnect
+  baseline (`echo relayterm-probe-2-resumed && date -u`)
+  rendered `Mon May 11 02:17:21 UTC 2026`. **No duplicate /
+  garbled / out-of-order replay observed** — the five lines
+  arrived monotonic on `recorded_at`-ordered seq, with the
+  ASCII payloads byte-identical to the producer-side `date -u
+  +%H:%M:%S` timestamps embedded in each line.
+- **Case C — beyond-TTL reaper** (final detach, single
+  reconnect attempt ~31 min later). `detached 02:17:34.297` →
+  scheduled close fires → `closed 02:47:34.327`. Gap from
+  `detached` to `closed` event = **1800.030 s** — exactly the
+  configured `1800 s` TTL, ±**30 ms**. The reaper landed on the
+  configured boundary, not on the old 30 s default and not on
+  the prior smoke's 300 s. `terminal_sessions.closed_at`
+  (`02:47:34.314367Z`) is **13.58 ms** earlier than the
+  `closed` event's `recorded_at` (`02:47:34.327946Z`) — the
+  row-flip happens inside `close_session` before the event row
+  is written, matching the manager-crate ordering. **UI behaviour
+  at attempted reconnect of the reaped session** (click at
+  `02:49:06Z`, ~92 s past the reaper): the production terminal
+  route's status badge flipped from the stale
+  `detached (TTL window)` (frontend `liveTerminalState.ts`'s
+  duplicated `DETACHED_TTL_MS=30_000` doesn't poll for true
+  remaining TTL — see [`docs/spec/terminal.md`](../spec/terminal.md)
+  § "Detached-session TTL contract (load-bearing)" bullet "TTL
+  clarity") to **`Status
+  error`** with body text **"Connection error"**. Navigating
+  `Sidebar → Sessions` to the same `session_id` then surfaced
+  the spec-pinned closed-session UX from
+  [`apps/web/src/lib/app/terminal/sessionStatus.ts`](../../apps/web/src/lib/app/terminal/sessionStatus.ts):
+  row reads **"Session ended. The runtime is gone and cannot
+  be reconnected. Launch a new session from the originating
+  server profile."**, Reconnect button disabled with `title=
+  "Closed sessions cannot be reconnected"`, Close button
+  disabled with `title="Already closed"`. The closed-session
+  helper text is the same one pinned by
+  `apps/web/tests/sessionStatus.test.ts` and surfaced by the
+  2026-05-09 desktop Tauri smoke for the 30 s case.
+- Backend log sweep over **90 minutes** of `relayterm-backend`
+  output covering pre-recreate + recreate + Cases A through C
+  (`ssh ubuntu@cloud-edge ... docker logs --since 90m`):
+  **zero hits** across the full redaction sentinel set
+  (`session_token`, `token_hash`, `password=`, `"password"`,
+  `encrypted_private_key`, `private_key`, `BEGIN OPENSSH`,
+  `BEGIN PRIVATE`, `data_b64`, `REDACT-MARKER`,
+  `csrf_origin_mismatch`). **Zero ERROR and zero WARN lines** in
+  the same 90 min window — the binary `RTB1` data plane through
+  Traefik to the Playwright Chromium WebView was silent on
+  errors across three full attach/detach/replay cycles and the
+  reaper close. Web (`relayterm-web` nginx) container redaction
+  sweep over the same window: **zero hits**. Backend log lines
+  mentioning the smoke session id (`e7ae8b6e`): **zero** — the
+  backend does not log session ids in routine paths, only event
+  rows hit the database.
+
+Deferred (intentional non-goals for this run):
+
+- **Durable long-term session persistence** (`tmux`/`screen`-style
+  resurrection across backend restart). Unchanged from the prior
+  2026-05-10 custom-TTL smoke below — the configurable knob is a
+  *short-term reconnect grace window* on a still-live PTY held
+  by the running backend; a backend restart drops every detached
+  PTY AND its replay buffer per
+  [`docs/spec/terminal.md`](../spec/terminal.md) § "Output
+  sequence + in-memory replay buffer contract". This slice did
+  not exercise restart-survival and explicitly does NOT claim
+  durable persistence.
+- **Backend restart survival.** Not exercised. The backend was
+  force-recreated ONCE at the start of the slice to pick up the
+  new env var; that recreate happened BEFORE the smoke session
+  was created, not during it. No mid-smoke restart was performed
+  and no claim is made about restart resilience.
+- **Desktop Tauri / Android Tauri surfaces.** Per the slice
+  framing this run was browser-only; the 2026-05-09 and
+  2026-05-10 desktop Tauri smokes below already cover the
+  bundled-shell handoff + cookie persistence paths against the
+  same staging slot, and nothing in this slice changed any
+  Tauri-relevant surface.
+- **Mobile portrait sidebar UX / mobile autocapitalize on
+  identifier inputs** — both shipped on `main` (`f19a043`,
+  `153a15c`) prior to this slice and were not re-exercised here;
+  irrelevant to the configured-TTL contract.
+- **Recording surface.** `RELAYTERM_TERMINAL_RECORDING__ENABLED=false`
+  on this slot per `.env`; the View-recording button visible in
+  the closed-session UX would open the read-only recording
+  viewer for a recording-enabled deployment, but no chunks
+  exist on this slot.
+- **Alternate renderer adapters** — only
+  `@relayterm/terminal-xterm` baseline was exercised (DOM
+  renderer, which makes the agent's
+  `document.querySelectorAll('.xterm-rows > div')` read-back
+  trivial); the experimental ghostty-web / restty / wterm
+  adapters were not.
+- **Multi-tab / multi-client collaborative attach** — single
+  attachment per live window throughout. No second concurrent
+  client was tested.
+- **Production hostname / production credentials / real
+  production SSH identities** — staging is throwaway by
+  construction (§1). The throwaway SSH target had no host port
+  published; only the `smoke` user with the `smoke-id` public
+  key in `authorized_keys` could authenticate.
+- **CI / signing / auth / CORS / CSRF / WebSocket-protocol
+  behaviour changes** — none in scope, none made. The only
+  staging-side mutation was the one-line `.env` append and the
+  ensuing `relayterm-backend` `--force-recreate`.
+
+Drift worth folding back later (non-blocking):
+
+- **Browser-idle WS gate vs. fully-automated browser test
+  fixtures.** The pre-flight 60 s idle disconnect on the very
+  first launch (recorded above) shows the live attach is
+  sensitive to client-side keystroke/output activity. This is
+  benign for human operators and for any test that produces
+  PTY input within the first ~60 s, but a future
+  Playwright-driven CI fixture that wants to validate a
+  long-LIVE attach (no input, no output) would surface it again.
+  The most likely cause is either the Traefik proxy's default
+  WS read-idle timeout or backend's WS keepalive expectations
+  not seeing client pings. Worth folding back if and when
+  hands-off browser-headless reconnect tests land; not in scope
+  here.
+- **Frontend TTL countdown copy stays at "~30 s" regardless of
+  the configured backend value.** During the two reconnect
+  windows the production terminal route's "Detached" paragraph
+  read "The remote PTY remains alive only briefly (~30 s) —
+  reconnect within that window or the session is reaped" even
+  though the backend was configured for 1800 s. This is the
+  duplicated frontend constant in
+  `apps/web/src/lib/dev/liveTerminalState.ts`
+  (`DETACHED_TTL_MS = 30_000`) that is deliberately NOT polled
+  from the backend — see [`docs/spec/terminal.md`](../spec/terminal.md)
+  § "Detached-session TTL contract (load-bearing)" bullet "TTL
+  clarity" pinning the drift as intentional. A future slice could surface the
+  backend-configured value through the
+  `GET /api/v1/terminal-sessions/:id` envelope or the
+  `replay_start` frame so the countdown reflects the actual
+  remaining TTL; that is a separate slice and was not in scope
+  here. **No copy change was made in this slice.**
+- **One-line `.env` revert worth doing before walking away.** The
+  staging stack is intentionally left running per slice policy,
+  but with `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS=1800`
+  still in `.env` and on the running backend. Next time a
+  default-TTL behaviour smoke runs against staging, either delete
+  this line from `/home/ubuntu/docker/relayterm-staging/.env`
+  before the `--force-recreate` or pass an explicit
+  `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS=30`
+  override.
+
 ### 2026-05-10 · Desktop Tauri staging custom detached-live-PTY TTL smoke
 
 Picks up from the 2026-05-09 desktop reconnect smoke entry below
