@@ -108,15 +108,25 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ---------------------------------------------------------------------------
 FROM chef AS builder
 
-# Cook only the dependency graph. This step's cache key is the recipe
-# (= Cargo.lock + Cargo.toml), so it stays warm across source-only
-# changes. With the mount caches it also stays warm across runner
-# restarts (BuildKit's local cache survives DinD's persistent volume).
+# Cook ONLY the dependency graph reachable from `relayterm-backend`.
+# Without `--bin`, `cargo chef cook` compiles every dep in the
+# workspace recipe — including the Tauri-dependent crates
+# (`relayterm-desktop`, `relayterm-mobile`) which transitively pull
+# `libdbus-sys` (Tauri's Linux IPC) and the GTK/WebKit graph. The
+# runtime image ships only the backend, so cooking those is wasted
+# work AND requires extra apt deps (`libdbus-1-dev` etc.) we don't
+# otherwise need. Scoping to `--bin relayterm-backend` keeps the
+# build narrow and avoids the dep skew.
+#
+# This step's cache key is (recipe.json, --bin scope, RUSTFLAGS), so
+# it stays warm across source-only changes. With the mount caches it
+# also stays warm across runner restarts (BuildKit's local cache
+# survives DinD's persistent volume).
 COPY --from=planner /workspace/recipe.json recipe.json
 RUN --mount=type=cache,target=/workspace/target,id=cargo-target-backend,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --recipe-path recipe.json --bin relayterm-backend
 
 # Copy workspace sources and compile the binary. With deps already cooked
 # above, this step recompiles only the workspace's own crates.
