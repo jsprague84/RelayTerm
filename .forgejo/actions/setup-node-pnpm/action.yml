@@ -1,0 +1,55 @@
+name: Setup Node + pnpm (with content-addressed store cache)
+description: >-
+  Install Node 22 LTS via setup-node@v4 and pnpm via
+  `pnpm/action-setup@v6` with `cache: true`. The pnpm action manages
+  the content-addressed store at `pnpm store path`, hashes every
+  workspace `pnpm-lock.yaml`, and auto-prunes the store in its
+  post-step. Replaces the previous raw `actions/cache@v3
+  ~/.pnpm-store` + corepack dance.
+
+  Why two actions and not just setup-node's built-in `cache: pnpm`?
+  setup-node's pnpm cache is an extra dependency, doesn't auto-prune,
+  and is easy to misconfigure on a self-hosted runner. `pnpm/action-setup`
+  is the upstream-blessed path.
+
+  pnpm version is PINNED to match `package.json#packageManager`
+  exactly (currently `pnpm@10.33.0`). Bump this composite in lockstep
+  with the package.json field — otherwise CI runs on a different pnpm
+  than local dev and a future lockfile-format change could go unnoticed.
+
+inputs:
+  node-version:
+    description: 'Node.js version'
+    required: false
+    default: '22'
+  pnpm-version:
+    description: 'pnpm version (must match package.json#packageManager)'
+    required: false
+    default: '10.33.0'
+  install:
+    description: >-
+      Whether to run `pnpm install --frozen-lockfile` as the last
+      step. Default true. Set false for workflows that only need
+      pnpm available but install in a later, customized step.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: setup pnpm (with content-addressed store cache)
+      uses: https://github.com/pnpm/action-setup@v6
+      with:
+        version: ${{ inputs.pnpm-version }}
+        cache: true
+        cache_dependency_path: '**/pnpm-lock.yaml'
+
+    - name: setup node ${{ inputs.node-version }}
+      uses: https://code.forgejo.org/actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: pnpm install
+      if: ${{ inputs.install == 'true' }}
+      shell: bash
+      run: pnpm install --frozen-lockfile

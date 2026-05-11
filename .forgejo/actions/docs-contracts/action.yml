@@ -1,0 +1,17 @@
+name: Docs contract check
+description: >-
+  Guard the AGENTS.md / SPEC.md / docs/spec / docs/agent context
+  split: anchors, high-risk cross-corpus terms, forbidden stale
+  phrases, and renderer/auth/recording term discoverability.
+
+  Pure bash; no node / pnpm / network needed, so it runs BEFORE the
+  slow Rust + Node install steps in workflows that call it, to fail
+  fast on docs regressions. Also exposed as `pnpm run check:docs-contracts`
+  for local use.
+
+runs:
+  using: composite
+  steps:
+    - name: docs contract check
+      shell: bash
+      run: bash scripts/check-doc-contracts.sh

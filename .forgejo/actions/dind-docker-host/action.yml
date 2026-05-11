@@ -1,0 +1,42 @@
+name: Discover DinD Docker endpoint
+description: >-
+  Discover the job container's default-route gateway IP via
+  `/proc/net/route` and export `DOCKER_HOST=tcp://<gw>:2375` so
+  subsequent steps reach the DinD daemon running alongside the
+  forgejo-runner on epyc-ai.
+
+  Background. act/forgejo-runner silently drops the runner-config's
+  `container.options` AND the workflow's own `container.options`
+  when the workflow declares a `container:` block (empirically
+  confirmed: `HostConfig.ExtraHosts == null`). So the
+  `--add-host=docker:host-gateway` + `-e DOCKER_HOST=tcp://docker:2375`
+  injection that the runner-config tries to apply never reaches the
+  spawned job container, and `docker` CLI falls back to
+  `/var/run/docker.sock` (not mounted) and fails with:
+    dial unix /var/run/docker.sock: connect: no such file or directory
+  This workaround discovers the gateway at runtime — that gateway IS
+  DinD's bridge interface, where dockerd listens on 0.0.0.0:2375 —
+  and exports DOCKER_HOST via $GITHUB_ENV so subsequent steps
+  (`docker info`, `docker build`, buildx, login-action) inherit it.
+
+  `/proc/net/route` is used instead of `ip route` because the
+  catthehacker/ubuntu:act-latest base image does NOT ship iproute2
+  or net-tools. `/proc/net/route` always exists on Linux. The
+  gateway field is hex little-endian (e.g. `010012AC` = `172.18.0.1`);
+  the printf below converts byte by byte without needing python or
+  any other interpreter.
+
+runs:
+  using: composite
+  steps:
+    - name: discover DinD endpoint
+      shell: bash
+      run: |
+        set -eu
+        gw_hex=$(awk '$2=="00000000" {print $3; exit}' /proc/net/route)
+        test -n "$gw_hex"
+        gw=$(printf '%d.%d.%d.%d' \
+          "0x${gw_hex:6:2}" "0x${gw_hex:4:2}" \
+          "0x${gw_hex:2:2}" "0x${gw_hex:0:2}")
+        echo "discovered DinD bridge gateway: $gw"
+        echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"

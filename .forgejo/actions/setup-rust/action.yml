@@ -1,0 +1,65 @@
+name: Setup Rust (rustup-init, pinned)
+description: >-
+  Install a pinned Rust toolchain via rustup-init with `--profile
+  minimal`, optionally adding clippy/rustfmt and Android targets.
+  Always appends `$HOME/.cargo/bin` to `$GITHUB_PATH` so subsequent
+  steps resolve `cargo` / `rustc` without an absolute path.
+
+  This composite does NOT call `Swatinem/rust-cache` — workflows that
+  want caching should call that action separately AFTER this one so
+  they can pick a job-specific `shared-key` and `save-if`. Keeping
+  cache config per-workflow makes the cache hit-rate observable
+  alongside the workflow that owns it.
+
+inputs:
+  toolchain:
+    description: 'Rust toolchain version (e.g. "1.95" or "stable")'
+    required: false
+    default: '1.95'
+  components:
+    description: >-
+      Comma-separated rustup components (default: none). Pass
+      "clippy,rustfmt" for the ci.yml rust-checks job; leave empty
+      for build-only jobs (desktop-linux, android, docker-build).
+    required: false
+    default: ''
+  targets:
+    description: >-
+      Space-separated rustup target triples to add (default: none).
+      Used by android.yml to add the four `*-linux-android` targets.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: install rustup-init
+      shell: bash
+      run: |
+        set -eu
+        # Build the component flags only when components are specified
+        # so we don't pass an empty `--component=` (rustup-init rejects it).
+        components_args=""
+        if [ -n "${{ inputs.components }}" ]; then
+          IFS=',' read -ra parts <<< "${{ inputs.components }}"
+          for c in "${parts[@]}"; do
+            components_args="$components_args --component $c"
+          done
+        fi
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y \
+              --default-toolchain "${{ inputs.toolchain }}" \
+              --profile minimal \
+              $components_args
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        "$HOME/.cargo/bin/rustc" --version
+        "$HOME/.cargo/bin/cargo" --version
+
+    - name: rustup target add
+      if: ${{ inputs.targets != '' }}
+      shell: bash
+      run: |
+        set -eu
+        # shellcheck disable=SC2086
+        "$HOME/.cargo/bin/rustup" target add ${{ inputs.targets }}
+        "$HOME/.cargo/bin/rustup" target list --installed

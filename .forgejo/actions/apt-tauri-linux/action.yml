@@ -1,0 +1,43 @@
+name: Install Tauri Linux build dependencies (apt)
+description: >-
+  Install the canonical Debian/Ubuntu package set required for
+  building Tauri v2's GTK/WebKit-backed Rust crates and the
+  `relayterm-{desktop,mobile}` workspace members that transitively
+  depend on `gtk` / `gdk-sys` / `webkit2gtk-sys`.
+
+  Without these packages, `cargo clippy --workspace --all-targets`
+  fails with:
+    Package 'gdk-3.0', required by 'virtual:world', not found
+    The system library `gdk-3.0` required by crate `gdk-sys` was not
+    found.
+
+  `libgtk-3-dev` provides `gdk-3.0.pc`; `libwebkit2gtk-4.1-dev`
+  provides `webkit2gtk-4.1.pc`; `libayatana-appindicator3-dev`,
+  `libxdo-dev`, and `librsvg2-dev` cover the rest of Tauri v2's
+  Linux build prerequisites.
+
+  This list is the SINGLE source of truth — ci.yml rust-checks and
+  desktop-linux.yml both call this composite. Update here once;
+  both workflows pick it up. android.yml does NOT call this
+  composite (Android cross-compile does not need GTK/WebKit).
+
+runs:
+  using: composite
+  steps:
+    - name: apt install libwebkit2gtk-4.1-dev (and friends)
+      shell: bash
+      run: |
+        set -eu
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          libwebkit2gtk-4.1-dev \
+          build-essential \
+          curl \
+          wget \
+          file \
+          libxdo-dev \
+          libssl-dev \
+          libayatana-appindicator3-dev \
+          librsvg2-dev \
+          pkg-config \
+          libgtk-3-dev
