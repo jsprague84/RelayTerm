@@ -105,6 +105,17 @@ jobs:
     runs-on: [lxc, docker]
     container:
       image: catthehacker/ubuntu:act-latest
+    # The runner-config.yml on epyc-ai injects `--add-host=docker:host-gateway`
+    # via `container.options`, which routes the `docker` hostname inside the
+    # job container to DinD's bridge gateway (172.17.0.1) where the daemon
+    # listens on :2375. But when a workflow declares its own `container:`
+    # block, act's container creation path does NOT reliably propagate the
+    # runner-config `-e DOCKER_HOST=...` flag, so the env must be set on
+    # the workflow side. Without this, `docker` CLI falls back to
+    # `/var/run/docker.sock` (which is not mounted) and fails with:
+    #   dial unix /var/run/docker.sock: connect: no such file or directory
+    env:
+      DOCKER_HOST: tcp://docker:2375
     steps:
       - name: runner info
         run: |
