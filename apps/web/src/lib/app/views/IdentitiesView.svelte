@@ -320,7 +320,10 @@
             disabled={generate.kind === "submitting"}
             data-testid="identities-generate-name"
             autocomplete="off"
+            autocapitalize="none"
+            autocorrect="off"
             spellcheck="false"
+            inputmode="text"
             required
           />
         </label>

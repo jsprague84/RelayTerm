@@ -745,7 +745,10 @@
             disabled={hostState.kind === "submitting"}
             data-testid="servers-create-host-hostname"
             autocomplete="off"
+            autocapitalize="none"
+            autocorrect="off"
             spellcheck="false"
+            inputmode="text"
             required
           />
         </label>
@@ -780,7 +783,10 @@
             disabled={hostState.kind === "submitting"}
             data-testid="servers-create-host-username"
             autocomplete="off"
+            autocapitalize="none"
+            autocorrect="off"
             spellcheck="false"
+            inputmode="text"
             required
           />
         </label>
@@ -881,7 +887,10 @@
               disabled={profileState.kind === "submitting"}
               data-testid="servers-create-profile-name"
               autocomplete="off"
+              autocapitalize="none"
+              autocorrect="off"
               spellcheck="false"
+              inputmode="text"
               required
             />
           </label>
@@ -939,7 +948,10 @@
               disabled={profileState.kind === "submitting"}
               data-testid="servers-create-profile-username-override"
               autocomplete="off"
+              autocapitalize="none"
+              autocorrect="off"
               spellcheck="false"
+              inputmode="text"
             />
           </label>
 
