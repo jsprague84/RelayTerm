@@ -120,77 +120,34 @@ jobs:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
-      - name: install linux desktop tauri build dependencies
-        # Canonical Debian/Ubuntu package list from the Tauri v2
-        # prerequisites doc and `docs/deployment/tauri-local-build.md`
-        # § "Debian / Ubuntu (canonical upstream list)". `pkg-config`
-        # and `libgtk-3-dev` are added because `webkit2gtk-4.1`'s
-        # build-time pkg-config files reference them on Ubuntu 24.04;
-        # without them `cargo build` fails resolving the gtk linkage.
-        # AppImage tooling (`linuxdeploy`, `appimagetool`) is NOT
-        # installed — the build below explicitly bundles `deb,rpm` only.
-        run: |
-          set -eu
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            pkg-config \
-            libgtk-3-dev
+      - name: install Tauri Linux build dependencies (apt)
+        # AppImage tooling (`linuxdeploy`, `appimagetool`) is NOT in
+        # the composite — Phase 1 explicitly bundles `deb,rpm` only.
+        uses: ./.forgejo/actions/apt-tauri-linux
 
       - name: docs contract check
-        # Cheap, pure-bash, no network. Runs BEFORE Rust + Node install
-        # so a docs regression shorts out before consuming a Tauri build
-        # slot — matches the fail-fast ordering in `ci.yml` web-checks.
-        run: bash scripts/check-doc-contracts.sh
+        # Runs BEFORE Rust + Node install — fail fast on docs regressions.
+        uses: ./.forgejo/actions/docs-contracts
 
-      - name: cache cargo dependencies
-        uses: https://code.forgejo.org/actions/cache@v3
+      - name: install Rust 1.95 (build-only, no clippy/rustfmt)
+        # Build-only smoke; workspace-wide clippy/rustfmt run in
+        # ci.yml rust-checks. Pin matches `Dockerfile.backend`.
+        uses: ./.forgejo/actions/setup-rust
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          toolchain: '1.95'
 
-      - name: install rust 1.95 (rustup minimal)
-        # Same rustup invocation as `ci.yml` rust-checks. Pin floats with
-        # `Dockerfile.backend` `ARG RUST_VERSION=1.95` and the
-        # `relayterm-desktop` crate inherits the workspace `rust-version`
-        # of 1.85 (the actual MSRV), so the 1.95 pin is a CI-diagnostic
-        # alignment choice, not a feature requirement. `--profile minimal`
-        # without `rustfmt`/`clippy` is intentional — those checks run
-        # workspace-wide in `ci.yml` rust-checks; this job is build-only.
-        run: |
-          set -eu
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.95 --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustc" --version
-          "$HOME/.cargo/bin/cargo" --version
-
-      - name: setup node 22
-        uses: https://code.forgejo.org/actions/setup-node@v4
+      - name: cache cargo dependencies (build-only)
+        # Shared key `desktop-build` so this cache is independent of
+        # the workspace-wide `rust-checks` cache (different RUSTFLAGS,
+        # different feature set — sharing would mostly be cache miss).
+        uses: https://github.com/Swatinem/rust-cache@v2
         with:
-          node-version: '22'
+          shared-key: desktop-build
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
-      - name: enable corepack (pnpm via package.json#packageManager)
-        run: |
-          corepack enable
-          corepack prepare --activate
-          node --version
-          pnpm --version
-
-      - name: pnpm install
-        run: pnpm install --frozen-lockfile
+      - name: setup Node + pnpm (with store cache, install)
+        uses: ./.forgejo/actions/setup-node-pnpm
 
       - name: tauri build (deb + rpm only)
         # Phase 1 intentionally bundles `deb,rpm` only and skips the

@@ -269,55 +269,33 @@ jobs:
           echo "NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: docs contract check
-        # Cheap, pure-bash, no network. Runs BEFORE Rust + Node install
-        # so a docs regression shorts out before consuming an Android
-        # build slot — matches the fail-fast ordering in
-        # `desktop-linux.yml` and `ci.yml` web-checks.
-        run: bash scripts/check-doc-contracts.sh
+        # Runs BEFORE Rust + Node install — fail fast on docs regressions.
+        uses: ./.forgejo/actions/docs-contracts
 
-      - name: cache cargo dependencies
-        uses: https://code.forgejo.org/actions/cache@v3
+      - name: install Rust 1.95 (build-only) + Android cross-compile targets
+        # Same toolchain pin as ci.yml + desktop-linux.yml. The four
+        # `*-linux-android` targets are the upstream Tauri v2 Android
+        # prerequisites; the composite installs them via `rustup target
+        # add` when `targets:` is provided. Build-only smoke (no
+        # rustfmt/clippy — workspace-wide checks run in ci.yml).
+        uses: ./.forgejo/actions/setup-rust
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          toolchain: '1.95'
+          targets: 'aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android'
 
-      - name: install rust 1.95 (rustup minimal) + android targets
-        # Same rustup invocation as `ci.yml` and `desktop-linux.yml`,
-        # plus the four Android cross-compile targets per the upstream
-        # Tauri v2 Android prerequisites doc. `--profile minimal` skips
-        # rustfmt/clippy — those checks run workspace-wide in `ci.yml`;
-        # this job is build-only.
-        run: |
-          set -eu
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.95 --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" target add \
-            aarch64-linux-android \
-            armv7-linux-androideabi \
-            i686-linux-android \
-            x86_64-linux-android
-          "$HOME/.cargo/bin/rustc" --version
-          "$HOME/.cargo/bin/cargo" --version
-
-      - name: setup node 22
-        uses: https://code.forgejo.org/actions/setup-node@v4
+      - name: cache cargo dependencies (android cross-compile)
+        # Shared key `android-build` so this cache is independent of
+        # workspace-wide rust-checks (different RUSTFLAGS, plus the
+        # four Android targets pull a separate set of rmeta/object
+        # graphs). Sharing would mostly be cache miss.
+        uses: https://github.com/Swatinem/rust-cache@v2
         with:
-          node-version: '22'
+          shared-key: android-build
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
-      - name: enable corepack (pnpm via package.json#packageManager)
-        run: |
-          corepack enable
-          corepack prepare --activate
-          node --version
-          pnpm --version
-
-      - name: pnpm install
-        run: pnpm install --frozen-lockfile
+      - name: setup Node + pnpm (with store cache, install)
+        uses: ./.forgejo/actions/setup-node-pnpm
 
       - name: print toolchain versions
         # Diagnostic snapshot — surfaced in the workflow log so a future

@@ -111,61 +111,22 @@ jobs:
       - name: checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
-      - name: install linux desktop tauri build dependencies
-        # Phase 0 of the Tauri rollout added `apps/desktop/src-tauri` and
-        # `apps/mobile/src-tauri` to the root Cargo workspace, so
-        # `cargo clippy --workspace --all-targets --all-features` and
-        # `cargo test --workspace` below now compile the `relayterm-desktop`
-        # and `relayterm-mobile` crates — both transitively depend on
-        # `gtk` / `gdk-sys` / `webkit2gtk-sys`. Without the GTK/WebKit
-        # development headers, clippy fails with:
-        #   Package 'gdk-3.0', required by 'virtual:world', not found
-        #   The system library `gdk-3.0` required by crate `gdk-sys`
-        #   was not found.
-        # `libgtk-3-dev` provides `gdk-3.0.pc`; `libwebkit2gtk-4.1-dev`
-        # provides `webkit2gtk-4.1.pc`; `libayatana-appindicator3-dev`,
-        # `libxdo-dev`, and `librsvg2-dev` cover the rest of Tauri v2's
-        # Linux build prerequisites.
-        #
-        # **Keep this list in sync with `.forgejo/workflows/desktop-linux.yml`
-        # unless deliberately diverging.** Both jobs target the same Tauri
-        # v2 Linux build prerequisites; a divergence here is a bug unless
-        # explicitly justified in the same change.
-        run: |
-          set -eu
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            pkg-config \
-            libgtk-3-dev
+      - name: install Tauri Linux build dependencies (apt)
+        # Tauri v2 Linux build deps (GTK/WebKit/etc.). Single source
+        # of truth at `.forgejo/actions/apt-tauri-linux/`; desktop-
+        # linux.yml shares the same composite so the package list
+        # cannot drift between this workspace clippy/test gate and
+        # the desktop bundle build.
+        uses: ./.forgejo/actions/apt-tauri-linux
 
-      - name: install rust 1.95 (rustup minimal + rustfmt + clippy)
-        # `--default-toolchain 1.95` is the CI Rust pin and MUST match
-        # `Dockerfile.backend` `ARG RUST_VERSION=1.95`. Both
-        # `rustup --default-toolchain 1.95` and Docker Hub
-        # `rust:1.95-bookworm` resolve to the latest 1.95.x patch, so
-        # the two pins float in lockstep without a separate tracker.
-        # `--profile minimal` skips docs/HTML index/etc.; rustfmt +
-        # clippy are added explicitly because they're the only
-        # components CI uses. `$HOME/.cargo/bin` is appended to
-        # `$GITHUB_PATH` so subsequent `cargo` / `rustc` calls resolve
-        # without an absolute path.
-        run: |
-          set -eu
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.95 --profile minimal \
-                --component rustfmt --component clippy
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustc" --version
-          "$HOME/.cargo/bin/cargo" --version
+      - name: install Rust 1.95 (with clippy + rustfmt)
+        # Pin matches `Dockerfile.backend` `ARG RUST_VERSION=1.95`;
+        # both rustup and Docker Hub `rust:1.95-bookworm` resolve to
+        # the latest 1.95.x patch, so they float in lockstep.
+        uses: ./.forgejo/actions/setup-rust
+        with:
+          toolchain: '1.95'
+          components: 'clippy,rustfmt'
 
       - name: cache cargo dependencies
         # `Swatinem/rust-cache@v2` replaces the previous raw
@@ -211,47 +172,15 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v4
 
       - name: docs contract check
-        # Guards the AGENTS.md / SPEC.md / docs/spec / docs/agent context
-        # split: anchors, high-risk cross-corpus terms, forbidden stale
-        # phrases, and renderer/auth/recording term discoverability.
-        # Pure bash; no node/pnpm/network needed, so it runs BEFORE the
-        # slow node + install steps to fail fast on docs regressions.
-        # Also exposed as `pnpm run check:docs-contracts` for local use.
-        run: bash scripts/check-doc-contracts.sh
+        # Pure bash; no node/pnpm/network. Runs BEFORE the slow
+        # toolchain installs to fail fast on docs regressions.
+        uses: ./.forgejo/actions/docs-contracts
 
-      - name: setup pnpm (with content-addressed store cache)
-        # `pnpm/action-setup@v6` with `cache: true` manages the store at
-        # `pnpm store path`, hashes the workspace's `pnpm-lock.yaml`, and
-        # auto-prunes the store in its post-step. Replaces both the
-        # previous `actions/cache@v3` block (which hard-coded the wrong
-        # store path on some runners — pnpm now defaults to
-        # `~/.local/share/pnpm/store/v3` on Linux) AND `setup-node`'s
-        # `cache: pnpm` parameter (extra dep, no auto-prune).
-        # `cache_dependency_path` defaults to `pnpm-lock.yaml`; we set
-        # it explicitly to glob every workspace lockfile (currently one
-        # at root, but defends against future workspace splits).
-        # https://github.com/pnpm/action-setup (v6.0.6, 2026-05-08)
-        uses: https://github.com/pnpm/action-setup@v6
-        with:
-          # Pin to the exact version in `package.json#packageManager`
-          # (currently `pnpm@10.33.0`) so CI cannot drift onto a newer
-          # pnpm minor that local dev hasn't seen. Bump in lockstep with
-          # the package.json field.
-          version: 10.33.0
-          cache: true
-          cache_dependency_path: '**/pnpm-lock.yaml'
-
-      - name: setup node 22
-        # Node 22 LTS — must match `Dockerfile.web` `ARG NODE_VERSION`.
-        # `pnpm/action-setup@v6` above installs pnpm; we still need
-        # `setup-node` for Node itself (the catthehacker base image
-        # ships *a* Node but we pin to a known version).
-        uses: https://code.forgejo.org/actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: install
-        run: pnpm install --frozen-lockfile
+      - name: setup Node + pnpm (with store cache, install)
+        # pnpm/action-setup@v6 (cache: true, version pinned to
+        # package.json#packageManager) + setup-node@v4 (node 22) +
+        # `pnpm install --frozen-lockfile`. Single composite.
+        uses: ./.forgejo/actions/setup-node-pnpm
 
       - name: pnpm check
         run: pnpm -r check
@@ -280,32 +209,12 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v4
 
       - name: discover DinD endpoint
-        # Empirically verified: act/forgejo-runner silently drops both
-        # the runner-config's `container.options` AND the workflow's
-        # `container.options` field, so `--add-host=docker:host-gateway`
-        # and `-e DOCKER_HOST=...` injected via those paths never reach
-        # the spawned job container (`HostConfig.ExtraHosts == null`).
-        # Workaround: discover the job container's default-route gateway
-        # by parsing /proc/net/route — that gateway IS DinD's bridge
-        # interface, where dockerd listens on 0.0.0.0:2375 — and export
-        # DOCKER_HOST via $GITHUB_ENV so subsequent steps (`docker info`,
-        # `docker build`, buildx, login-action) inherit it.
-        #
-        # `/proc/net/route` is used instead of `ip route` because the
-        # catthehacker/ubuntu:act-latest base image does NOT ship
-        # iproute2 / net-tools. `/proc/net/route` always exists on
-        # Linux. The gateway field is hex little-endian (e.g.
-        # `010012AC` = `172.18.0.1`); the printf below converts byte by
-        # byte without needing python or any other interpreter.
-        run: |
-          set -eu
-          gw_hex=$(awk '$2=="00000000" {print $3; exit}' /proc/net/route)
-          test -n "$gw_hex"
-          gw=$(printf '%d.%d.%d.%d' \
-            "0x${gw_hex:6:2}" "0x${gw_hex:4:2}" \
-            "0x${gw_hex:2:2}" "0x${gw_hex:0:2}")
-          echo "discovered DinD bridge gateway: $gw"
-          echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"
+        # /proc/net/route gateway discovery + DOCKER_HOST export.
+        # See `.forgejo/actions/dind-docker-host/action.yml` for the
+        # full rationale on why this is needed (act/forgejo-runner
+        # drops `container.options` when the workflow declares its
+        # own `container:` block).
+        uses: ./.forgejo/actions/dind-docker-host
 
       - name: docker info
         # Surfaces the daemon endpoint the job is talking to so a
@@ -350,22 +259,10 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v4
 
       - name: discover DinD endpoint
-        # See the matching step on `docker-build` for full rationale.
-        # `docker/setup-buildx-action`, `docker/login-action`, and
-        # `docker/build-push-action` all read DOCKER_HOST; setting it
-        # via $GITHUB_ENV here makes every later step in this job
-        # inherit a working endpoint. Parsed from /proc/net/route
-        # because catthehacker/ubuntu:act-latest does not ship
-        # iproute2 / net-tools.
-        run: |
-          set -eu
-          gw_hex=$(awk '$2=="00000000" {print $3; exit}' /proc/net/route)
-          test -n "$gw_hex"
-          gw=$(printf '%d.%d.%d.%d' \
-            "0x${gw_hex:6:2}" "0x${gw_hex:4:2}" \
-            "0x${gw_hex:2:2}" "0x${gw_hex:0:2}")
-          echo "discovered DinD bridge gateway: $gw"
-          echo "DOCKER_HOST=tcp://$gw:2375" >> "$GITHUB_ENV"
+        # /proc/net/route gateway discovery + DOCKER_HOST export.
+        # setup-buildx-action, login-action, and build-push-action
+        # all read DOCKER_HOST; this composite makes them work.
+        uses: ./.forgejo/actions/dind-docker-host
 
       - name: verify registry token is configured
         # Surface a precise, actionable failure when
