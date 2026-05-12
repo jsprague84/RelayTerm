@@ -8,14 +8,21 @@
 >
 > **Implementation status:**
 >
-> - **Phase 1B.1 (landed 2026-05-11):** `max_live_pty_sessions_per_user`
->   — per-user live PTY ceiling, default `8`, bound `1..=256`. Wire
->   shape: 429 `too_many_sessions`. Exposed via
+> - **Phase 1B.1 (landed 2026-05-11; staging-verified 2026-05-11):**
+>   `max_live_pty_sessions_per_user` — per-user live PTY ceiling,
+>   default `8`, bound `1..=256`. Wire shape: 429
+>   `too_many_sessions`. Exposed via
 >   `GET /api/v1/config/session-policy` as
->   `max_live_pty_sessions_per_user`. SPA renders parameterised refusal
->   copy via `describeMaxLivePtyPerUser`. No new audit kind, no DB
->   row, no `Retry-After`. Enforcement order: after ownership +
->   host-key gates, before vault decrypt / SSH side effects.
+>   `max_live_pty_sessions_per_user`. SPA renders parameterised
+>   refusal copy via `describeMaxLivePtyPerUser`. No new audit kind,
+>   no DB row, no `Retry-After`. Enforcement order: after ownership
+>   + host-key gates, before vault decrypt / SSH side effects.
+>   End-to-end smoke against the HTTPS staging slot (cap temporarily
+>   lowered to `1`) confirmed the 429 envelope, no DB row, no audit
+>   row, safe operator warn line, and slot-freeing on close — see
+>   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+>   § 12 "Per-user live PTY quota (Phase 1B.1, cap=1) staging
+>   smoke".
 > - **Phase 1B.2 (NOT landed):** deployment-wide quota
 >   (`max_live_pty_sessions_per_deployment`), starting-burst quota
 >   (`max_starting_sessions_per_user`), operator dashboard tile.

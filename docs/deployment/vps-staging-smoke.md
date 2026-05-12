@@ -2987,6 +2987,283 @@ Drift worth folding back later (non-blocking):
   subaddressing (keep `-` separator only). Not in scope for this
   run.
 
+### 2026-05-11 · Per-user live PTY quota (Phase 1B.1, cap=1) staging smoke
+
+Verification of the per-user live PTY ceiling shipped in
+`feat(api): enforce per-user live session quota` (`eb75116`,
+2026-05-11). The slice landed both Phase 1A
+(`/api/v1/config/session-policy` returns the configured detached-TTL)
+and Phase 1B.1 (per-user live-PTY ceiling refusal with the typed
+429 envelope). Both halves were verified end-to-end against the
+HTTPS staging slot at
+[`https://relayterm-staging.js-node.cc`](https://relayterm-staging.js-node.cc)
+with the cap temporarily lowered to `1` so the refusal could be
+exercised quickly.
+
+**Stack state at smoke start.** Compose project
+`relayterm-staging` on `cloud-edge`. Pre-smoke, the deployed
+backend image was the pre-Phase-1A `sha256:22e092f8…` (built
+2026-05-10 18:36 UTC, ~21 h before the quota commit); the
+`:main` tag in the Forgejo registry now resolved to the post-
+quota `sha256:218f1b83…` after CI run `353` (ci.yml for
+`eb75116`, status=success, 296 s). The recreate path picked it
+up automatically.
+
+**Compose env wiring (durable).** The staging compose at
+`/home/ubuntu/docker-compose/relayterm-staging/docker-compose.yml`
+gained a single line, slotted right after the existing
+`DETACHED_LIVE_PTY_TTL_SECONDS` row inside the
+`relayterm-backend.environment` block:
+
+```yaml
+      RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER:-8}"
+```
+
+The default expansion resolves to `8` (matching
+`relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_USER` and
+`docs/session-quotas.md` § 4.1); the smoke override (`=1`) was
+injected via shell-env at the `docker compose up -d
+--force-recreate` invocation, NOT written to any `.env` file.
+This compose-file edit stays in place after the smoke as the
+durable operator-knob wiring; the cleanup recreate just drops
+the shell override and lets the default re-apply.
+
+**Recreate.** Both backend and web were recreated from the
+refreshed `:main` digests via `docker compose ... up -d
+--no-deps --force-recreate --pull always relayterm-backend
+relayterm-web`. Postgres was untouched (`Up 2 days (healthy)`
+across the run). New container SHAs: backend
+`sha256:218f1b83…` (created 17:32:14 UTC), web
+`sha256:42c62ba4…` (created 17:32:16 UTC). Both reached
+`healthy` within ~4 s of start.
+
+**Baseline checks (post-deploy, pre-smoke).**
+
+- `GET /healthz` → `200 {"status":"ok"}`.
+- `GET /api/v1/auth/me` (unauthenticated) → `401 unauthorized`.
+- `GET /api/v1/config/session-policy` (unauthenticated) →
+  `401 unauthorized` (route now exists; pre-deploy was `404`,
+  proving the Phase 1A endpoint reached staging only at this
+  recreate).
+- Backend startup line literally read
+  `relayterm-backend starting addr=0.0.0.0:8080
+   auth_mode="production" recording_enabled=false
+   detached_live_pty_ttl_seconds=30 max_live_pty_sessions_per_user=1`
+  — the Phase 1B.1 cap is now in the startup-log echo, mirroring
+  the Phase 1A TTL convention.
+- `GET /api/v1/config/session-policy` (authenticated) →
+  `200 {"detached_live_pty_ttl_seconds":30,
+   "max_live_pty_sessions_per_user":1}` — confirms both
+  Phase 1A and Phase 1B.1 wire surfaces.
+
+**Throwaway SSH target.** A `linuxserver/openssh-server:latest`
+container named `relayterm-staging-quota-smoke-ssh`, attached
+ONLY to the existing internal Compose network
+`relayterm-staging_relayterm-staging-internal` (172.21.0.0/16,
+IP 172.21.0.5), with **no host port published**. Configured
+with `USER_NAME=smoke`, `PASSWORD_ACCESS=false`,
+`SUDO_ACCESS=false` so only key-based auth on TCP 2222 inside
+the network. The `--hostname quota-smoke-host` value is
+discoverable from the backend container's DNS in addition to
+the container name (Docker's modern engine adds both as
+`DNSNames`; verified via `getent hosts` from inside the
+backend container), so the RelayTerm host row uses the
+prettier `quota-smoke-host` form.
+
+**Inventory created (RelayTerm-managed; no private-key
+import).**
+
+- SSH identity `quota-smoke-identity` (Ed25519, fingerprint
+  `SHA256:N6QZEtno5iZhzyMOMbBWvNZwrTRPsXt5BvariKryris`).
+  Generated server-side by the vault; the response surfaces
+  only the public-key fragment.
+- Host `quota-smoke-host` (hostname `quota-smoke-host`, port
+  `2222`, default username `smoke`).
+- Server profile `quota-smoke-profile` referencing the host +
+  identity.
+- Host-key preflight observed `host_key_status: unknown` with
+  the target's freshly-generated ed25519 host key
+  (`SHA256:mf01uZE+NKV37R5wb5opx7/Z7d9TJYUcbTUvsxFNcj0`);
+  trust-host-key pinned that fingerprint as the active
+  `known_host_entries` row.
+- `auth-check` returned `authentication_succeeded` —
+  confirms the RelayTerm-managed public key is installed on
+  the target (injected into the container's
+  `/config/.ssh/authorized_keys` via `docker exec`, never via
+  any wire / API field) AND that the keypair authenticates
+  via the SSH KEX + userauth handshake without allocating a
+  PTY or executing a command (per the existing
+  `auth-check` contract).
+
+**Quota smoke proper.** Driven via authenticated `curl` calls
+from the workstation (browser-write routes carry
+`Origin: https://relayterm-staging.js-node.cc` and the
+`relayterm_session` cookie; cookie file lived in
+`/tmp/qs/cookies.txt` `chmod 600` for the smoke window only —
+removed at cleanup, never written to any tracked file).
+
+- **Launch session A** —
+  `POST /api/v1/terminal-sessions
+  {server_profile_id, cols:80, rows:24}` → `201 Created`,
+  body `{id:"2f20cc17-d3bd-41bb-8e65-b6b700643a78",
+  status:"active", pty_live:true,
+  message:"ssh pty started; replay across reconnects is not
+  yet implemented", ...}`.
+- **Attempt session B (same profile, same user, cap full)** —
+  same POST → **`429 Too Many Requests`**, body literally
+  `{"error":{"code":"too_many_sessions",
+  "message":"too many terminal sessions"}}`. Wire-stable per
+  `docs/session-quotas.md` § 7.1 — `code` is the typed
+  `too_many_sessions` (distinct from the login throttler's
+  `too_many_requests`), `message` is the static safe form
+  with no count / cap / session id / hostname / profile id /
+  user id / `Retry-After` header.
+- **DB after refusal** —
+  `select count(*) from terminal_sessions
+   where server_profile_id = $profile and id != $session_A`
+  returned **`0`**: the refused request wrote no
+  `terminal_sessions` row. `audit_events` row count was
+  identical to pre-refusal (`38 → 38`), confirming the
+  refusal wrote **no audit row** per `docs/session-quotas.md`
+  § 8.2.
+- **Backend warn line for the refusal** (only line attributable
+  to the smoke, sigil-stripped for the doc): `WARN
+  relayterm_api::routes::v1::terminal_sessions: terminal
+  session quota refused user_id=f968b6f5-... scope=
+  "per_user_live" current_count=1 cap=1`. Public-shape only:
+  `user_id` (already in every authenticated log line),
+  `scope`, `current_count`, `cap`. No session id, no profile
+  id, no host id, no identity id, no hostname, no peer
+  banner, no wire body, no User-Agent. Matches the operator-
+  side logging policy in `docs/session-quotas.md` § 8.3.
+- **Close session A** —
+  `POST /api/v1/terminal-sessions/2f20cc17-.../close` →
+  `200 {status:"closed", closed_at, already_closed:false}`
+  (abbreviated; the actual `CloseTerminalSessionResponse`
+  flattens the full `TerminalSessionResponse`, so the wire
+  body also carries `id`, `server_profile_id`, `cols`,
+  `rows`, `created_at`, `last_seen_at`).
+- **Launch session C (cap freed)** — same POST as A → **`201
+  Created`**, body
+  `{id:"404ce7a5-25d9-4849-987f-71aa1bfa67c2",
+  status:"active", pty_live:true, ...}`. Confirms the cap
+  truly counts the in-memory runtime registry's live PTYs
+  (`count_live_pty_for_user`) and the slot is reclaimed
+  immediately when `close_session` removes the registry
+  entry.
+- **Close session C** —
+  `POST .../close` → `200 closed`.
+- **Final DB state**: two terminal-session rows on the
+  throwaway profile, both `status:"closed"` with proper
+  `closed_at` timestamps; `audit_events` count unchanged
+  across the entire quota-smoke window (`38` before, `38`
+  after).
+
+**Log / nginx redaction sweep.** Full backend container log
+across the recreate-to-end window (22 lines total since
+backend start, 2 lines inside the smoke proper) and full
+nginx container log (15 lines) were grepped for the sentinel
+set `session_token|token_hash|cookie|password|private_key|
+encrypted_private_key|BEGIN OPENSSH|data_b64|REDACT-MARKER`.
+Zero hits. The two WARN lines inside the smoke window:
+
+1. `csrf origin mismatch detail=missing Origin header` at
+   02:07:21 UTC — caused by an unquoted-bash-var word-split
+   on the operator's first `curl` invocation, which dropped
+   the `Origin` header before the request reached `axum`.
+   Caught by `CsrfGuard` BEFORE any DB / auth / body work;
+   detail string is the static `missing Origin header` (no
+   echo of any offered value). Operator-side dev mistake,
+   not a smoke finding.
+2. The `terminal session quota refused …` line above
+   (02:08:57 UTC).
+
+**Cap reverted at cleanup**: cleanup recreate replaced the
+shell `MAX_LIVE_PTY_SESSIONS_PER_USER=1` override with the
+compose default (`8`). Post-cleanup
+`/api/v1/config/session-policy` (authenticated) returned
+`{detached_live_pty_ttl_seconds:30,
+ max_live_pty_sessions_per_user:8}`. Backend startup line
+echoed `max_live_pty_sessions_per_user=8`. The compose-file
+edit (one line in `relayterm-backend.environment`) stays
+in place as the durable operator knob.
+
+**Throwaway SSH target cleanup**: `docker rm -f
+relayterm-staging-quota-smoke-ssh` removed the container at
+end of smoke. The image stays in the local cache; no host
+port was ever published, so no firewall surface to revert.
+
+**Temp credentials cleanup**: `/tmp/qs/{cookies.txt,
+pass.txt,phc.txt,login.out,trace.out}` (cookie file,
+throwaway plaintext password, computed PHC string, raw
+login response, curl trace) were chmod-600 throughout the
+smoke window so they were never world-readable, and the
+whole `/tmp/qs/` directory was removed at cleanup. The
+uncommitted one-shot Argon2id PHC helper
+(`crates/relayterm-auth/examples/qs_hash.rs`) was deleted
+and the matching `.git/info/exclude` line removed.
+
+**Inventory rows (host / profile / identity / known-host
+entry / 2 closed terminal-session rows) intentionally
+LEFT IN PLACE** per the staging-smoke convention — they
+are operator-visible carry-over for the next smoke, and
+no destructive-action route was exercised in this slice.
+
+**Verified.**
+
+- Phase 1A `/api/v1/config/session-policy` exists at the
+  recreated backend (was 404 pre-recreate, 401/200 after).
+- Phase 1B.1 `max_live_pty_sessions_per_user` is the second
+  authenticated-only wire field on that endpoint.
+- Phase 1B.1 enforcement at `POST /api/v1/terminal-sessions`
+  with cap=1: launch-1 succeeds, launch-2 refused with
+  `429 too_many_sessions`, refusal writes no DB row + no
+  audit row, refusal log line carries only public-shape
+  fields, slot frees on close, relaunch succeeds.
+- The shipped wire envelope is the typed
+  `{error:{code:"too_many_sessions",
+   message:"too many terminal sessions"}}`, distinct from
+  the login throttler's `too_many_requests` code.
+- No `Retry-After` header on the 429 (verified by curl
+  `--include`).
+- All log / nginx redaction sentinels clean.
+
+**Deferred (intentional non-goals for this run; do NOT
+treat any of these as smoke-verified):**
+
+- **Starting-burst quota (`max_starting_sessions_per_user`)**
+  — Phase 1B.2, not landed.
+- **Deployment-wide quota
+  (`max_live_pty_sessions_per_deployment`)** — Phase 1B.2,
+  not landed.
+- **Operator dashboard tile** showing the caller's own
+  live-session count vs cap — Phase 1B.2, not landed.
+- **Prometheus / metrics surface** for quota counters —
+  out of scope per `docs/session-quotas.md` § 8.4.
+- **Durable persistent sessions across backend restart**
+  — Phase 2 / 3 in
+  [`docs/persistent-sessions.md`](../persistent-sessions.md),
+  unchanged by this slice. The quota acts ONLY on the
+  in-memory runtime registry; a backend restart reaps
+  every live PTY regardless (per the existing terminal-
+  session startup reconciliation).
+- **VT snapshot resume** of an existing detached session
+  across a restart — out of scope.
+- **tmux / screen multiplexer pass-through** — out of
+  scope.
+- **RelayTerm-side persistent-session agent on the target
+  host** — out of scope.
+- **Production-default tuning** (whether `8` is the right
+  per-user cap for a homelab vs a small team) — Phase 1B.3
+  per `docs/session-quotas.md` § 10.3.
+- **WebSocket attach + actual terminal I/O on session A /
+  C** — the smoke proves PTY allocation via `pty_live:
+  true` and `auth-check authentication_succeeded`, but did
+  NOT drive a shell prompt over the WS data-plane in this
+  run. The Phase 1B.1 quota gates session creation
+  (`count_live_pty_for_user` in the runtime registry),
+  which is upstream of any WS attach.
+
 ---
 
 ## See also
