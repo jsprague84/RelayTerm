@@ -37,6 +37,12 @@ pub enum ErrorCode {
     /// copy without parsing the static `message` string. See
     /// `docs/session-quotas.md` § 7.1.
     TooManySessions,
+    /// Phase 1B.2a quota refusal — per-user starting-burst ceiling
+    /// reached (see `docs/session-quotas.md` § 4.3 / § 7.1). Distinct
+    /// from [`Self::TooManySessions`] so the SPA can map the
+    /// "in-flight burst" cause to different copy than the live-cap
+    /// cause without parsing the static `message` string.
+    TooManyStartingSessions,
     BadGateway,
     ServiceUnavailable,
     InternalError,
@@ -52,6 +58,7 @@ impl ErrorCode {
             Self::Conflict => "conflict",
             Self::TooManyRequests => "too_many_requests",
             Self::TooManySessions => "too_many_sessions",
+            Self::TooManyStartingSessions => "too_many_starting_sessions",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
             Self::InternalError => "internal_error",
@@ -134,6 +141,25 @@ pub enum ApiError {
     #[error("too many terminal sessions")]
     TooManySessions,
 
+    /// 429 — request rejected because the caller has reached their
+    /// per-user starting-burst ceiling (Phase 1B.2a quota — see
+    /// `docs/session-quotas.md` § 4.3 / § 7.1). Emitted by
+    /// `POST /api/v1/terminal-sessions` AFTER ownership + host-key
+    /// gating but BEFORE any vault decrypt or SSH side effect.
+    ///
+    /// Wire envelope is `429 { code: "too_many_starting_sessions",
+    /// message: "too many starting terminal sessions" }` — distinct
+    /// from [`Self::TooManySessions`] so the SPA can map the
+    /// in-flight-burst cause to different copy than the live-cap
+    /// cause. Same redaction posture as the live variant: NO
+    /// `Retry-After` header, NO operator detail on the wire (no
+    /// count, no cap, no session ids, no hostnames). The
+    /// operator-side `warn!` line built at the call site carries the
+    /// safe public metadata (`user_id`, `scope = "per_user_starting"`,
+    /// `current_count`, `cap`).
+    #[error("too many starting terminal sessions")]
+    TooManyStartingSessions,
+
     /// 502 — an upstream system the request depends on (e.g. an SSH peer
     /// during preflight) failed in a way that's not the client's fault.
     /// The wrapped detail is operator-facing only; the wire body collapses
@@ -194,6 +220,11 @@ impl ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::TooManySessions,
                 "too many terminal sessions".to_owned(),
+            ),
+            Self::TooManyStartingSessions => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManyStartingSessions,
+                "too many starting terminal sessions".to_owned(),
             ),
             Self::BadGateway(_) => (
                 StatusCode::BAD_GATEWAY,

@@ -23,9 +23,21 @@
 >   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
 >   § 12 "Per-user live PTY quota (Phase 1B.1, cap=1) staging
 >   smoke".
+> - **Phase 1B.2a (landed 2026-05-11):**
+>   `max_starting_sessions_per_user` — per-user starting-burst
+>   ceiling, default `4`, bound `1..=32`. Wire shape: 429
+>   `too_many_starting_sessions`. Exposed via
+>   `GET /api/v1/config/session-policy` as
+>   `max_starting_sessions_per_user`. SPA renders parameterised
+>   refusal copy via `describeMaxStartingPerUser`. Counts the
+>   disjoint set of `Starting` placeholders that have NOT yet bound
+>   a live PTY (so the live and starting quotas never double-count).
+>   Same redaction posture as 1B.1 — no new audit kind, no DB row,
+>   no `Retry-After`. Enforcement order: same as 1B.1, immediately
+>   after the live-cap check.
 > - **Phase 1B.2 (NOT landed):** deployment-wide quota
->   (`max_live_pty_sessions_per_deployment`), starting-burst quota
->   (`max_starting_sessions_per_user`), operator dashboard tile.
+>   (`max_live_pty_sessions_per_deployment`), operator dashboard
+>   tile.
 > - **Phase 1B.3 (NOT landed):** production-default tuning.
 >
 > **Related normative documents:**

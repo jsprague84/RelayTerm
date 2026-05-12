@@ -380,6 +380,60 @@ describe("describeLaunchError", () => {
       }),
     ).toBe("Could not start terminal: HTTP 429 too_many_requests");
   });
+
+  it("maps 429 too_many_starting_sessions to safe copy (Phase 1B.2a)", () => {
+    // The starting-burst refusal MUST yield the spec-pinned copy
+    // from `docs/session-quotas.md` § 7.5: opening sentence describes
+    // the in-flight nature, second sentence the action ("wait a
+    // moment", NOT "wait N seconds"). The wire `message` is
+    // intentionally NOT echoed. The wire body intentionally carries
+    // no count or cap (§ 7.3); the cap is exposed separately via
+    // `describeMaxStartingPerUser` for surfaces that want it.
+    const summary = describeLaunchError({
+      kind: "http",
+      status: 429,
+      code: "too_many_starting_sessions",
+      message: `wire detail ${SENTINEL}`,
+    });
+    expect(summary).toBe(
+      "You already have the maximum number of terminal sessions starting. Wait a moment for one to finish starting, then try again.",
+    );
+    expect(summary).not.toContain(SENTINEL);
+    // Trailing-punctuation guard: the copy must end at the second
+    // sentence's period, with no stray ". ." or trailing space.
+    expect(summary).toMatch(/try again\.$/);
+    expect(summary).not.toMatch(/\. \.$/);
+    // Anti-overclaim register (`docs/session-quotas.md` § 7.5 + § 12).
+    const lower = summary.toLowerCase();
+    const forbidden = [
+      "your session quota",
+      "we're rate-limiting you",
+      "please slow down",
+      "queue",
+      "always available",
+      "persistent across restart",
+    ];
+    for (const phrase of forbidden) {
+      expect(lower).not.toContain(phrase);
+    }
+    expect(lower).not.toMatch(/wait \d+ seconds/);
+  });
+
+  it("does not borrow live-cap copy for too_many_starting_sessions", () => {
+    // The two refusal copies MUST stay distinct so the caller can
+    // tell the in-flight burst case ("wait a moment for an in-flight
+    // start to complete") from the live cap case ("close a session
+    // before starting another"). A future refactor that collapsed
+    // them would mislead the user about which action helps.
+    const summary = describeLaunchError({
+      kind: "http",
+      status: 429,
+      code: "too_many_starting_sessions",
+      message: "",
+    });
+    expect(summary).not.toContain("Close a session from the Sessions list");
+    expect(summary).not.toContain("Detached sessions count toward this limit");
+  });
 });
 
 describe("describeWorkspaceError", () => {

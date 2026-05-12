@@ -134,6 +134,12 @@ services:
       # caller already holds this many live PTYs. Default 8; bounded
       # 1..=256.
       RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER:-8}"
+      # Per-user starting-burst ceiling (Phase 1B.2a quota — see
+      # `docs/session-quotas.md` § 4.3). Counts in-flight
+      # `Starting` placeholders only. Refuses with `429
+      # too_many_starting_sessions` when the caller has this many
+      # creates in flight. Default 4; bounded 1..=32.
+      RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER:-4}"
 
       # Tracing. The backend honors `RUST_LOG` via tracing_subscriber's
       # env filter. Default keeps app-level info on, dependencies at

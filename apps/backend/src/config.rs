@@ -500,6 +500,16 @@ pub(crate) struct TerminalSessionsConfig {
     /// Bounded `1..=256` by [`Config::validate_terminal_sessions`]; `0`
     /// would refuse every create and is a hard boot failure.
     pub(crate) max_live_pty_sessions_per_user: u32,
+    /// Per-user ceiling on concurrent in-flight starting sessions
+    /// (Phase 1B.2a of `docs/session-quotas.md` § 4.3). Counts the
+    /// disjoint set of registry entries with `live = None` AND
+    /// `snapshot.status == Starting`, so the live and starting quotas
+    /// never double-count. Defends against a runaway client that POSTs
+    /// many sessions in flight without waiting for the PTY-start
+    /// round-trip to complete. Bounded `1..=32` by
+    /// [`Config::validate_terminal_sessions`]; `0` would deadlock every
+    /// create and is a hard boot failure.
+    pub(crate) max_starting_sessions_per_user: u32,
 }
 
 /// Numeric defaults / bounds for [`TerminalSessionsConfig`]. Pulled into
@@ -537,6 +547,21 @@ pub(crate) mod terminal_sessions_defaults {
     /// resource ceiling (channels + PTYs + buffers + tasks per user).
     /// Anything above is almost certainly a unit / digit-shift mistake.
     pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_USER_MAX: u32 = 256;
+    /// Default per-user starting-burst ceiling. Phase 1B.2a of
+    /// `docs/session-quotas.md` § 4.3 names `4` — enough for honest
+    /// SPA burst behaviour (a navigation that opens a few sessions in
+    /// parallel) but rejects a tight POST loop.
+    pub(crate) const MAX_STARTING_SESSIONS_PER_USER: u32 = 4;
+    /// Lower bound for the per-user starting-burst ceiling. `0` would
+    /// deadlock every create and is a config mistake, so the validator
+    /// rejects it with a clearer error than "no session can ever
+    /// start".
+    pub(crate) const MAX_STARTING_SESSIONS_PER_USER_MIN: u32 = 1;
+    /// Upper bound for the per-user starting-burst ceiling. `32` is
+    /// well past any honest burst pattern; the live quota is the
+    /// load-bearing ceiling and the starting quota only defends against
+    /// runaway in-flight POST loops.
+    pub(crate) const MAX_STARTING_SESSIONS_PER_USER_MAX: u32 = 32;
 }
 
 impl Config {
@@ -620,6 +645,8 @@ impl Config {
                     terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
                 max_live_pty_sessions_per_user:
                     terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
+                max_starting_sessions_per_user:
+                    terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER,
             },
         }
     }
@@ -810,6 +837,11 @@ impl Config {
             cfg.terminal_sessions.max_live_pty_sessions_per_user = v
                 .parse()
                 .context("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER") {
+            cfg.terminal_sessions.max_starting_sessions_per_user = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER")?;
         }
         Ok(())
     }
@@ -1221,6 +1253,24 @@ impl Config {
                 max = terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX,
             );
         }
+        let max_starting = self.terminal_sessions.max_starting_sessions_per_user;
+        if max_starting < terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MIN {
+            bail!(
+                "terminal_sessions.max_starting_sessions_per_user = {got} must be >= {min}; a \
+                 zero cap would deadlock every terminal-session create",
+                got = max_starting,
+                min = terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MIN,
+            );
+        }
+        if max_starting > terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MAX {
+            bail!(
+                "terminal_sessions.max_starting_sessions_per_user = {got} exceeds the hard cap \
+                 of {max}; this is a defensive burst quota — values above {max} are well past \
+                 any honest in-flight pattern",
+                got = max_starting,
+                max = terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MAX,
+            );
+        }
         Ok(())
     }
 
@@ -1239,6 +1289,15 @@ impl Config {
     /// — the value is post-validation, in-range, and a positive `u32`.
     pub(crate) fn max_live_pty_sessions_per_user(&self) -> u32 {
         self.terminal_sessions.max_live_pty_sessions_per_user
+    }
+
+    /// Per-user starting-burst ceiling (Phase 1B.2a quota). Production
+    /// callers pass this into
+    /// [`relayterm_terminal::TerminalSessionManager::with_max_starting_per_user`].
+    /// Assumes [`Self::validate_terminal_sessions`] has already passed
+    /// — the value is post-validation, in-range, and a positive `u32`.
+    pub(crate) fn max_starting_sessions_per_user(&self) -> u32 {
+        self.terminal_sessions.max_starting_sessions_per_user
     }
 
     /// Resolve the configured master key, or return `None` when the vault
@@ -1434,6 +1493,7 @@ struct FileTerminalRecordingCompressionConfig {
 struct FileTerminalSessionsConfig {
     detached_live_pty_ttl_seconds: Option<u64>,
     max_live_pty_sessions_per_user: Option<u32>,
+    max_starting_sessions_per_user: Option<u32>,
 }
 
 impl FileConfig {
@@ -1542,6 +1602,9 @@ impl FileConfig {
             if let Some(cap) = s.max_live_pty_sessions_per_user {
                 cfg.terminal_sessions.max_live_pty_sessions_per_user = cap;
             }
+            if let Some(cap) = s.max_starting_sessions_per_user {
+                cfg.terminal_sessions.max_starting_sessions_per_user = cap;
+            }
         }
     }
 }
@@ -1603,6 +1666,8 @@ mod tests {
                     terminal_sessions_defaults::DETACHED_LIVE_PTY_TTL_SECONDS,
                 max_live_pty_sessions_per_user:
                     terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
+                max_starting_sessions_per_user:
+                    terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER,
             },
         }
     }
@@ -3219,5 +3284,109 @@ max_live_pty_sessions_per_user = 4
             terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX;
         cfg.validate_terminal_sessions()
             .expect("max boundary ok (per-user live cap)");
+    }
+
+    // --- Terminal sessions (per-user starting quota — Phase 1B.2a) --
+
+    #[test]
+    fn terminal_sessions_default_max_starting_per_user_is_four() {
+        // Phase 1B.2a default. `docs/session-quotas.md` § 4.3 names `4`
+        // — pinned here so a future bump in either source surfaces in
+        // CI rather than silently in production behaviour.
+        let cfg = Config::defaults();
+        assert_eq!(
+            cfg.terminal_sessions.max_starting_sessions_per_user,
+            terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER,
+        );
+        assert_eq!(cfg.terminal_sessions.max_starting_sessions_per_user, 4);
+        cfg.validate_terminal_sessions()
+            .expect("default starting cap must validate");
+        assert_eq!(cfg.max_starting_sessions_per_user(), 4);
+    }
+
+    #[test]
+    fn terminal_sessions_max_starting_per_user_env_override_parses() {
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER",
+                "8",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(cfg.terminal_sessions.max_starting_sessions_per_user, 8);
+        cfg.validate_terminal_sessions().unwrap();
+        assert_eq!(cfg.max_starting_sessions_per_user(), 8);
+    }
+
+    #[test]
+    fn terminal_sessions_max_starting_per_user_toml_round_trip() {
+        let raw = r#"
+[terminal_sessions]
+max_starting_sessions_per_user = 2
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert_eq!(cfg.terminal_sessions.max_starting_sessions_per_user, 2);
+        cfg.validate_terminal_sessions()
+            .expect("TOML round-trip must validate");
+    }
+
+    #[test]
+    fn terminal_sessions_max_starting_per_user_env_invalid_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER",
+                "not-a-number",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER"),
+            "error must name the failing input: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_zero_max_starting_per_user_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_starting_sessions_per_user = 0;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_starting_sessions_per_user") && msg.contains(">="),
+            "zero starting cap must be rejected naming the field and the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_above_max_starting_per_user_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_starting_sessions_per_user =
+            terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MAX + 1;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_starting_sessions_per_user") && msg.contains("hard cap"),
+            "above-max starting cap must be rejected naming the field and the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_max_starting_per_user_min_and_max_boundaries_validate() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_starting_sessions_per_user =
+            terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MIN;
+        cfg.validate_terminal_sessions()
+            .expect("min boundary ok (per-user starting cap)");
+        cfg.terminal_sessions.max_starting_sessions_per_user =
+            terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MAX;
+        cfg.validate_terminal_sessions()
+            .expect("max boundary ok (per-user starting cap)");
     }
 }

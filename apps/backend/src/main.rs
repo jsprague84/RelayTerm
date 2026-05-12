@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         detached_live_pty_ttl_seconds =
             cfg.terminal_sessions.detached_live_pty_ttl_seconds,
         max_live_pty_sessions_per_user = cfg.max_live_pty_sessions_per_user(),
+        max_starting_sessions_per_user = cfg.max_starting_sessions_per_user(),
         "relayterm-backend starting",
     );
 
@@ -259,13 +260,19 @@ async fn main() -> anyhow::Result<()> {
     // therefore returns `Some` for every value that survives validation.
     let max_live_pty_per_user = std::num::NonZeroU32::new(cfg.max_live_pty_sessions_per_user())
         .expect("validate_terminal_sessions rejects 0");
+    // Phase 1B.2a per-user starting-burst ceiling. Bound 1..=32 already
+    // checked by `validate_terminal_sessions` above; `NonZeroU32::new`
+    // therefore returns `Some` for every value that survives validation.
+    let max_starting_per_user = std::num::NonZeroU32::new(cfg.max_starting_sessions_per_user())
+        .expect("validate_terminal_sessions rejects 0");
     let terminal_sessions = {
         let mut mgr = TerminalSessionManager::with_detach_ttl(
             Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
             Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
             detach_ttl,
         )
-        .with_max_live_pty_per_user(max_live_pty_per_user);
+        .with_max_live_pty_per_user(max_live_pty_per_user)
+        .with_max_starting_per_user(max_starting_per_user);
         if let Some(runtime) = recording_runtime {
             mgr = mgr.with_recording(runtime);
             info!("terminal recording writer enabled (plaintext-at-rest)");

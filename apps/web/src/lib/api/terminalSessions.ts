@@ -160,6 +160,11 @@ export function describeCreateError(err: CreateTerminalSessionError): string {
       if (err.status === 429 && err.code === "too_many_sessions") {
         return "create failed: per-user live session limit reached";
       }
+      // Phase 1B.2a: per-user starting-burst refusal. Same dev-lab
+      // posture as above — typed code+status only, no production copy.
+      if (err.status === 429 && err.code === "too_many_starting_sessions") {
+        return "create failed: per-user starting session limit reached";
+      }
       return `create failed: HTTP ${err.status} ${err.code}`;
     case "transport":
       return "create failed: transport error";

@@ -172,3 +172,23 @@ enabled = false
 #
 # [terminal_sessions]
 # max_live_pty_sessions_per_user = 8
+
+# Per-user ceiling on concurrent in-flight starting sessions (Phase
+# 1B.2a quota — see `docs/session-quotas.md` § 4.3). Counts the
+# disjoint set of `Starting` placeholders that have NOT yet bound a
+# live PTY, so it never double-counts the live cap above. Defends
+# against a runaway client that POSTs many sessions in flight without
+# waiting for the PTY-start round-trip to complete. A `POST
+# /api/v1/terminal-sessions` that would exceed this ceiling is
+# refused with `429 too_many_starting_sessions`; same redaction
+# posture as the live quota.
+#
+# Default: 4 (enough for honest SPA burst behaviour, rejects a tight
+# POST loop). Bounded 1..=32. Most homelab deployments leave the
+# default — the live cap is the load-bearing ceiling for resource
+# consumption.
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER
+#
+# [terminal_sessions]
+# max_starting_sessions_per_user = 4

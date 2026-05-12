@@ -1890,3 +1890,109 @@ async fn max_live_pty_per_user_builder_overrides_default() {
     // Default-constructed manager keeps the default cap.
     assert_eq!(mgr.max_live_pty_per_user().get(), 8);
 }
+
+// ----------------------------------------------------------------------
+// Per-user starting-burst quota (Phase 1B.2a — `docs/session-quotas.md`
+// § 4.3). Counts the disjoint set of registry entries that hold a
+// `Starting` snapshot AND have NOT yet bound a live PTY. The two
+// quotas (live + starting) never double-count.
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn count_starting_for_user_is_zero_for_empty_registry() {
+    let (mgr, _) = build_manager();
+    assert_eq!(mgr.count_starting_for_user(UserId::new()), 0);
+}
+
+#[tokio::test]
+async fn count_starting_for_user_counts_metadata_only_placeholders() {
+    // `create_session` registers a `Starting` placeholder with `live =
+    // None`. The Phase 1B.2a starting-burst counter MUST count it —
+    // that's the in-flight burst this quota defends against.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let _ = mgr.create_session(req(owner)).await.unwrap();
+    let _ = mgr.create_session(req(owner)).await.unwrap();
+    assert_eq!(mgr.count_starting_for_user(owner), 2);
+}
+
+#[tokio::test]
+async fn count_starting_for_user_excludes_live_entries() {
+    // After `start_live_pty` promotes the placeholder to `Live`, the
+    // entry MUST drop out of the starting count — it now consumes the
+    // SEPARATE per-user live ceiling. The two quotas count disjoint
+    // sets so they never double-count (`docs/session-quotas.md` § 4.1
+    // / § 4.3).
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let s = mgr.create_session(req(owner)).await.unwrap().session;
+    assert_eq!(mgr.count_starting_for_user(owner), 1);
+    let (start, _f) = fake_start();
+    mgr.start_live_pty(owner, s.id, start).await.unwrap();
+    assert_eq!(
+        mgr.count_starting_for_user(owner),
+        0,
+        "promoted-to-live entry must not count against the starting-burst quota",
+    );
+    assert_eq!(
+        mgr.count_live_pty_for_user(owner),
+        1,
+        "promoted-to-live entry counts against the live quota instead",
+    );
+}
+
+#[tokio::test]
+async fn count_starting_for_user_is_owner_scoped() {
+    // The starting counter MUST NOT bleed across owners. Same shape as
+    // the live counter — § 4.3.
+    let (mgr, _) = build_manager();
+    let alice = UserId::new();
+    let bob = UserId::new();
+    for _ in 0..3u8 {
+        let _ = mgr.create_session(req(alice)).await.unwrap();
+    }
+    let _ = mgr.create_session(req(bob)).await.unwrap();
+    assert_eq!(mgr.count_starting_for_user(alice), 3);
+    assert_eq!(mgr.count_starting_for_user(bob), 1);
+    assert_eq!(mgr.count_starting_for_user(UserId::new()), 0);
+}
+
+#[tokio::test]
+async fn count_starting_for_user_drops_on_close() {
+    // After explicit close the registry entry goes away, freeing both
+    // the starting slot AND any live slot it would have taken — close
+    // is a single drop point for both counters.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let s = mgr.create_session(req(owner)).await.unwrap().session;
+    assert_eq!(mgr.count_starting_for_user(owner), 1);
+    mgr.close_session(s.id, owner).await.unwrap();
+    assert_eq!(mgr.count_starting_for_user(owner), 0);
+}
+
+#[tokio::test]
+async fn max_starting_per_user_default_matches_pinned_constant() {
+    use relayterm_terminal::DEFAULT_MAX_STARTING_PER_USER;
+    let (mgr, _) = build_manager();
+    assert_eq!(
+        mgr.max_starting_per_user().get(),
+        DEFAULT_MAX_STARTING_PER_USER,
+    );
+    assert_eq!(DEFAULT_MAX_STARTING_PER_USER, 4);
+}
+
+#[tokio::test]
+async fn max_starting_per_user_builder_overrides_default() {
+    use std::num::NonZeroU32;
+    let cap = NonZeroU32::new(16).unwrap();
+    let alt = TerminalSessionManager::new(
+        Arc::new(InMemoryRepo::default()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(InMemoryRepo::default()) as Arc<dyn SessionEventRepository>,
+    )
+    .with_max_starting_per_user(cap);
+    assert_eq!(alt.max_starting_per_user(), cap);
+
+    // Default-constructed manager keeps the default cap.
+    let (mgr, _) = build_manager();
+    assert_eq!(mgr.max_starting_per_user().get(), 4);
+}

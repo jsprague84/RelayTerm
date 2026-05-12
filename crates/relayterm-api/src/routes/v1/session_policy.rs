@@ -65,8 +65,15 @@ async fn session_policy(
     // only, fingerprinting risk) — only the per-user value the SPA
     // needs for parameterised refusal copy.
     let max_live_pty_sessions_per_user = state.terminal_sessions.max_live_pty_per_user().get();
+    // Phase 1B.2a per-user starting-burst ceiling
+    // (`docs/session-quotas.md` § 5.4). Same shape and rationale as
+    // the live cap above. The current count never crosses the wire —
+    // only the configured cap, so the SPA can parameterise the
+    // `429 too_many_starting_sessions` refusal copy.
+    let max_starting_sessions_per_user = state.terminal_sessions.max_starting_per_user().get();
     Json(SessionPolicyResponse {
         detached_live_pty_ttl_seconds,
         max_live_pty_sessions_per_user,
+        max_starting_sessions_per_user,
     })
 }

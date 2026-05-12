@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
   DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
+  DEFAULT_MAX_STARTING_SESSIONS_PER_USER,
   __resetSessionPolicyCache,
   describeDetachedTtl,
   describeMaxLivePtyPerUser,
+  describeMaxStartingPerUser,
   fetchSessionPolicy,
   formatDetachedTtl,
   loadSessionPolicy,
@@ -12,10 +14,11 @@ import {
   type SessionPolicy,
 } from "../src/lib/api/sessionPolicy.js";
 
-/** Well-formed wire body for Phase 1B.1+ session-policy responses. */
+/** Well-formed wire body for Phase 1B.2a+ session-policy responses. */
 const VALID_BODY = {
   detached_live_pty_ttl_seconds: 30,
   max_live_pty_sessions_per_user: 8,
+  max_starting_sessions_per_user: 4,
 };
 
 /**
@@ -62,28 +65,33 @@ describe("DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS", () => {
 });
 
 describe("parseSessionPolicy", () => {
-  it("accepts a well-shaped body with both fields", () => {
+  it("accepts a well-shaped body with all three fields", () => {
     expect(parseSessionPolicy(VALID_BODY)).toEqual({
       detached_live_pty_ttl_seconds: 30,
       max_live_pty_sessions_per_user: 8,
+      max_starting_sessions_per_user: 4,
     });
     expect(
       parseSessionPolicy({
         detached_live_pty_ttl_seconds: 1800,
         max_live_pty_sessions_per_user: 16,
+        max_starting_sessions_per_user: 8,
       }),
     ).toEqual({
       detached_live_pty_ttl_seconds: 1800,
       max_live_pty_sessions_per_user: 16,
+      max_starting_sessions_per_user: 8,
     });
     expect(
       parseSessionPolicy({
         detached_live_pty_ttl_seconds: 86_400,
         max_live_pty_sessions_per_user: 256,
+        max_starting_sessions_per_user: 32,
       }),
     ).toEqual({
       detached_live_pty_ttl_seconds: 86_400,
       max_live_pty_sessions_per_user: 256,
+      max_starting_sessions_per_user: 32,
     });
   });
 
@@ -141,26 +149,54 @@ describe("parseSessionPolicy", () => {
     ).toBeNull();
   });
 
+  it("rejects out-of-range / non-integer max_starting_sessions_per_user values", () => {
+    // Mirrors backend validator's `1..=32` bound.
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_starting_sessions_per_user: 0 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_starting_sessions_per_user: -1 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_starting_sessions_per_user: 33 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_starting_sessions_per_user: 4.5 }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({ ...VALID_BODY, max_starting_sessions_per_user: "4" }),
+    ).toBeNull();
+    expect(
+      parseSessionPolicy({
+        detached_live_pty_ttl_seconds: 30,
+        max_live_pty_sessions_per_user: 8,
+      }),
+    ).toBeNull();
+  });
+
   it("ignores secret-shaped sibling fields — they NEVER reach the parsed DTO", () => {
     // The parser builds the DTO field-by-field; a hostile body with
     // every secret-shaped sibling under the sun must yield exactly
-    // the two valid fields. This is the load-bearing redaction
+    // the three valid fields. This is the load-bearing redaction
     // backstop on the frontend side.
     const hostile: Record<string, unknown> = {
       ...VALID_BODY,
       detached_live_pty_ttl_seconds: 600,
       max_live_pty_sessions_per_user: 4,
+      max_starting_sessions_per_user: 2,
       ...HOSTILE_SECRETS,
     };
     const parsed = parseSessionPolicy(hostile);
     expect(parsed).toEqual({
       detached_live_pty_ttl_seconds: 600,
       max_live_pty_sessions_per_user: 4,
+      max_starting_sessions_per_user: 2,
     });
     const keys = Object.keys(parsed as object).sort();
     expect(keys).toEqual([
       "detached_live_pty_ttl_seconds",
       "max_live_pty_sessions_per_user",
+      "max_starting_sessions_per_user",
     ]);
     const raw = JSON.stringify(parsed);
     for (const secret of Object.values(HOSTILE_SECRETS)) {
@@ -176,6 +212,64 @@ describe("DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER", () => {
     // `relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_USER` default so
     // an at-cap launch refusal renders honest copy.
     expect(DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER).toBe(8);
+  });
+});
+
+describe("DEFAULT_MAX_STARTING_SESSIONS_PER_USER", () => {
+  it("mirrors the backend's Phase 1B.2a default of 4", () => {
+    // The SPA falls back to this constant while the policy fetch is
+    // in flight OR has failed. It MUST track the backend's
+    // `relayterm_terminal::DEFAULT_MAX_STARTING_PER_USER` default so
+    // an at-cap launch refusal renders honest copy.
+    expect(DEFAULT_MAX_STARTING_SESSIONS_PER_USER).toBe(4);
+  });
+});
+
+describe("describeMaxStartingPerUser", () => {
+  it("renders parameterised copy on a sane integer cap", () => {
+    expect(describeMaxStartingPerUser(1)).toBe(
+      "This deployment allows up to 1 terminal session starting at once per user.",
+    );
+    expect(describeMaxStartingPerUser(4)).toBe(
+      "This deployment allows up to 4 terminal sessions starting at once per user.",
+    );
+    expect(describeMaxStartingPerUser(8)).toBe(
+      "This deployment allows up to 8 terminal sessions starting at once per user.",
+    );
+  });
+
+  it("falls back to the default for non-positive / non-integer inputs", () => {
+    expect(describeMaxStartingPerUser(0)).toContain(
+      "4 terminal sessions starting",
+    );
+    expect(describeMaxStartingPerUser(-1)).toContain(
+      "4 terminal sessions starting",
+    );
+    expect(describeMaxStartingPerUser(4.5)).toContain(
+      "4 terminal sessions starting",
+    );
+    expect(describeMaxStartingPerUser(Number.NaN)).toContain(
+      "4 terminal sessions starting",
+    );
+  });
+
+  it("never uses the anti-overclaim register", () => {
+    // `docs/session-quotas.md` § 7.5 / § 12.
+    const forbidden = [
+      "your session quota",
+      "we're rate-limiting you",
+      "please slow down",
+      "queue",
+      "always available",
+      "persistent across restart",
+    ];
+    for (const cap of [1, 4, 8, 16, 32]) {
+      const copy = describeMaxStartingPerUser(cap).toLowerCase();
+      for (const phrase of forbidden) {
+        expect(copy).not.toContain(phrase);
+      }
+      expect(copy).not.toMatch(/wait \d+ seconds/);
+    }
   });
 });
 
@@ -295,6 +389,7 @@ describe("fetchSessionPolicy", () => {
       jsonResponse(200, {
         detached_live_pty_ttl_seconds: 600,
         max_live_pty_sessions_per_user: 4,
+        max_starting_sessions_per_user: 2,
       }),
     );
     const result = await fetchSessionPolicy({
@@ -305,6 +400,7 @@ describe("fetchSessionPolicy", () => {
       expect(result.policy).toEqual({
         detached_live_pty_ttl_seconds: 600,
         max_live_pty_sessions_per_user: 4,
+        max_starting_sessions_per_user: 2,
       });
     }
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -339,6 +435,7 @@ describe("fetchSessionPolicy", () => {
       jsonResponse(200, {
         detached_live_pty_ttl_seconds: "not-a-number",
         max_live_pty_sessions_per_user: 8,
+        max_starting_sessions_per_user: 4,
       }),
     );
     const result = await fetchSessionPolicy({
@@ -370,6 +467,7 @@ describe("loadSessionPolicy", () => {
       jsonResponse(200, {
         detached_live_pty_ttl_seconds: 1800,
         max_live_pty_sessions_per_user: 16,
+        max_starting_sessions_per_user: 8,
       }),
     );
     const policy: SessionPolicy = await loadSessionPolicy({
@@ -378,6 +476,7 @@ describe("loadSessionPolicy", () => {
     expect(policy).toEqual({
       detached_live_pty_ttl_seconds: 1800,
       max_live_pty_sessions_per_user: 16,
+      max_starting_sessions_per_user: 8,
     });
   });
 
@@ -394,6 +493,9 @@ describe("loadSessionPolicy", () => {
     expect(policy.max_live_pty_sessions_per_user).toBe(
       DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
     );
+    expect(policy.max_starting_sessions_per_user).toBe(
+      DEFAULT_MAX_STARTING_SESSIONS_PER_USER,
+    );
   });
 
   it("falls back to the SPEC-pinned defaults on transport failure", async () => {
@@ -409,6 +511,9 @@ describe("loadSessionPolicy", () => {
     expect(policy.max_live_pty_sessions_per_user).toBe(
       DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
     );
+    expect(policy.max_starting_sessions_per_user).toBe(
+      DEFAULT_MAX_STARTING_SESSIONS_PER_USER,
+    );
   });
 
   it("caches the successful result across calls (one wire round-trip)", async () => {
@@ -416,6 +521,7 @@ describe("loadSessionPolicy", () => {
       jsonResponse(200, {
         detached_live_pty_ttl_seconds: 1800,
         max_live_pty_sessions_per_user: 16,
+        max_starting_sessions_per_user: 8,
       }),
     );
     const a = await loadSessionPolicy({
@@ -438,6 +544,7 @@ describe("loadSessionPolicy", () => {
         jsonResponse(200, {
           detached_live_pty_ttl_seconds: 42,
           max_live_pty_sessions_per_user: 3,
+          max_starting_sessions_per_user: 2,
         }),
       );
     const first = await loadSessionPolicy({
@@ -449,24 +556,29 @@ describe("loadSessionPolicy", () => {
     expect(first.max_live_pty_sessions_per_user).toBe(
       DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
     );
+    expect(first.max_starting_sessions_per_user).toBe(
+      DEFAULT_MAX_STARTING_SESSIONS_PER_USER,
+    );
     const second = await loadSessionPolicy({
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(second.detached_live_pty_ttl_seconds).toBe(42);
     expect(second.max_live_pty_sessions_per_user).toBe(3);
+    expect(second.max_starting_sessions_per_user).toBe(2);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it("drops hostile secret-shaped sibling fields end-to-end", async () => {
     // End-to-end redaction sentinel: a hostile body that smuggles
-    // every secret-shaped field MUST collapse to either the two valid
-    // numeric fields (when shape parses) or the fallback (when it
-    // doesn't). In either case, no hostile value reaches the
+    // every secret-shaped field MUST collapse to either the three
+    // valid numeric fields (when shape parses) or the fallback (when
+    // it doesn't). In either case, no hostile value reaches the
     // returned object.
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, {
         detached_live_pty_ttl_seconds: 90,
         max_live_pty_sessions_per_user: 2,
+        max_starting_sessions_per_user: 1,
         ...HOSTILE_SECRETS,
       }),
     );
@@ -475,10 +587,12 @@ describe("loadSessionPolicy", () => {
     });
     expect(policy.detached_live_pty_ttl_seconds).toBe(90);
     expect(policy.max_live_pty_sessions_per_user).toBe(2);
+    expect(policy.max_starting_sessions_per_user).toBe(1);
     const keys = Object.keys(policy).sort();
     expect(keys).toEqual([
       "detached_live_pty_ttl_seconds",
       "max_live_pty_sessions_per_user",
+      "max_starting_sessions_per_user",
     ]);
     const raw = JSON.stringify(policy);
     for (const secret of Object.values(HOSTILE_SECRETS)) {

@@ -307,6 +307,25 @@ fn test_terminal_manager_with_max_live_per_user(
     )
 }
 
+/// Like [`test_terminal_manager`] but with a custom per-user starting-burst
+/// cap (Phase 1B.2a quota). Used by integration tests that need to
+/// drive the `429 too_many_starting_sessions` refusal path. The live
+/// cap stays at the default so the tests exercise the starting-quota
+/// branch in isolation.
+fn test_terminal_manager_with_max_starting_per_user(
+    db: &Db,
+    cap: std::num::NonZeroU32,
+) -> Arc<TerminalSessionManager> {
+    use relayterm_core::repository::{SessionEventRepository, TerminalSessionRepository};
+    Arc::new(
+        TerminalSessionManager::new(
+            Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+            Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+        )
+        .with_max_starting_per_user(cap),
+    )
+}
+
 /// Vault service backed by a deterministic test master key. Tests that
 /// don't exercise the vault still need *some* vault instance because the
 /// API state requires it for the `POST /ssh-identities` route.
@@ -4769,6 +4788,444 @@ async fn create_terminal_session_refusal_fires_after_ownership_gate(pool: PgPool
         resp.status(),
         StatusCode::NOT_FOUND,
         "ownership gate fires before quota — foreign profile collapses to 404 even at cap",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Per-user starting-burst quota refusal (Phase 1B.2a — `docs/session-quotas.md`
+// § 4.3 / § 7.1).
+//
+// Unlike the live-PTY quota (which fills naturally via successful HTTP
+// POSTs because the FakePtyBridge promotes immediately), the starting
+// quota counts the disjoint "Starting placeholder, no live PTY yet"
+// set. Under the FakePtyBridge that set is empty in steady state — a
+// successful create promotes within the same handler call. To exercise
+// the refusal path deterministically we share the manager Arc with the
+// router, then seed Starting placeholders by calling `create_session`
+// directly on the shared manager (bypassing the bridge). The HTTP
+// POST that follows then trips the quota under controlled state.
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_refuses_with_429_when_per_user_starting_cap_reached(pool: PgPool) {
+    use relayterm_terminal::CreateTerminalSessionRequest as ManagerCreateRequest;
+    let cap = std::num::NonZeroU32::new(2).unwrap();
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager_with_max_starting_per_user(&db, cap);
+    let auth = test_auth(&db);
+    let cookie = bootstrap_test_session(&auth, user_id).await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+
+    let profile = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "starting-cap",
+        "starting-cap.example.com",
+        "SHA256:starting-cap",
+    )
+    .await;
+
+    // Seed the starting-burst quota directly on the shared manager —
+    // each call inserts a `Starting` placeholder with `live = None`,
+    // which is what the new starting-burst counter sums.
+    for _ in 0..cap.get() {
+        terminal_sessions
+            .create_session(ManagerCreateRequest {
+                owner_id: user_id,
+                server_profile_id: profile,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+    }
+
+    // At cap. The next HTTP create MUST refuse with the new typed
+    // 429, MUST NOT echo the count/cap or any session id, MUST NOT
+    // write a new DB row beyond the placeholders, and MUST NOT write
+    // any audit row.
+    let pre_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "too_many_starting_sessions");
+    assert_eq!(
+        body["error"]["message"],
+        "too many starting terminal sessions"
+    );
+    let raw = body.to_string();
+    for forbidden in [
+        "current_count",
+        "cap",
+        "owner_id",
+        "user_id",
+        "profile_id",
+        "session_id",
+        "starting-cap.example.com",
+        &profile.to_string(),
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "starting-quota refusal body must not contain `{forbidden}`: {raw}",
+        );
+    }
+    let post_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pre_count.0, post_count.0,
+        "refused create must not write a terminal_sessions row (was {}, now {})",
+        pre_count.0, post_count.0,
+    );
+    let audit_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count.0, 0,
+        "refused create must not write an audit_events row (have {} rows)",
+        audit_count.0,
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_starting_quota_is_owner_scoped(pool: PgPool) {
+    // One user's starting placeholders MUST NOT count against another
+    // user's starting cap. Mirrors the live-quota owner-scope test.
+    use relayterm_terminal::CreateTerminalSessionRequest as ManagerCreateRequest;
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager_with_max_starting_per_user(&db, cap);
+    let auth = test_auth(&db);
+    let alice_cookie = bootstrap_test_session(&auth, user_id).await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+    let alice_id = user_id;
+
+    let bob_id = create_user(&pool, "bob").await;
+    let bob_auth = test_auth(&Db::from_pool(pool.clone()));
+    let bob_cookie = bootstrap_test_session(&bob_auth, bob_id).await;
+
+    let alice_profile = make_trusted_profile(
+        &pool,
+        alice_id,
+        &test_vault(),
+        "alice-start",
+        "alice-start.example.com",
+        "SHA256:alice-start",
+    )
+    .await;
+    let bob_profile = make_trusted_profile(
+        &pool,
+        bob_id,
+        &test_vault(),
+        "bob-start",
+        "bob-start.example.com",
+        "SHA256:bob-start",
+    )
+    .await;
+
+    // Fill Alice's starting cap (1).
+    terminal_sessions
+        .create_session(ManagerCreateRequest {
+            owner_id: alice_id,
+            server_profile_id: alice_profile,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    // Alice's HTTP create is refused.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": alice_profile }),
+            &alice_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "too_many_starting_sessions");
+
+    // Bob's first attempt MUST succeed despite Alice's burst quota
+    // being filled — the cap is per-user, not per-deployment.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": bob_profile }),
+            &bob_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "Bob's create must succeed — starting quota is per-user, not per-deployment",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_starting_refusal_fires_before_vault_decrypt(pool: PgPool) {
+    // The starting-quota refusal MUST sit BEFORE vault decrypt + SSH
+    // side effects (§ 6.2 ordering). Same shape as the live-quota
+    // ordering test: a vault-disabled router still surfaces
+    // `429 too_many_starting_sessions` (NOT `503 service_unavailable`)
+    // when the quota is full.
+    use relayterm_terminal::CreateTerminalSessionRequest as ManagerCreateRequest;
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager_with_max_starting_per_user(&db, cap);
+    let auth = test_auth(&db);
+    let cookie = bootstrap_test_session(&auth, user_id).await;
+    let state_no_vault = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app_no_vault = router(state_no_vault);
+
+    let profile = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "start-order",
+        "start-order.example.com",
+        "SHA256:start-order",
+    )
+    .await;
+
+    // Fill the cap by seeding a Starting placeholder directly.
+    terminal_sessions
+        .create_session(ManagerCreateRequest {
+            owner_id: user_id,
+            server_profile_id: profile,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    // Vault disabled → if the quota check sat AFTER vault decrypt the
+    // route would surface 503; the load-bearing assertion is that the
+    // 429 fires first.
+    let resp = app_no_vault
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "starting-quota refusal fires before vault decrypt — at-cap second create stays 429, never 503",
+    );
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "too_many_starting_sessions");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_starting_refusal_fires_after_ownership_gate(pool: PgPool) {
+    // Symmetric to the live-quota ordering test
+    // (`create_terminal_session_refusal_fires_after_ownership_gate`).
+    // The starting-quota refusal MUST sit AFTER ownership resolution
+    // (§ 6.2 ordering). A foreign / missing profile id MUST still
+    // surface `404 not_found` even if the caller is at their starting
+    // cap — otherwise the quota refusal becomes a side-channel for
+    // cross-user profile existence.
+    use relayterm_terminal::CreateTerminalSessionRequest as ManagerCreateRequest;
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager_with_max_starting_per_user(&db, cap);
+    let auth = test_auth(&db);
+    let cookie = bootstrap_test_session(&auth, user_id).await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+
+    // Caller's own profile — used to seed the starting cap.
+    let own_profile = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "after-owner-start",
+        "after-owner-start.example.com",
+        "SHA256:after-owner-start",
+    )
+    .await;
+    // Fill the starting cap by seeding a Starting placeholder
+    // directly on the shared manager.
+    terminal_sessions
+        .create_session(ManagerCreateRequest {
+            owner_id: user_id,
+            server_profile_id: own_profile,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    // Ask for a session against a profile id this user does NOT own.
+    // Ownership gate fires first → 404. The starting-quota refusal
+    // does NOT override it.
+    let foreign_owner = create_user(&pool, "foreign-start").await;
+    let foreign_profile = make_trusted_profile(
+        &pool,
+        foreign_owner,
+        &test_vault(),
+        "foreign-start-quota",
+        "foreign-start-quota.example.com",
+        "SHA256:foreign-start-quota",
+    )
+    .await;
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": foreign_profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "ownership gate fires before starting quota — foreign profile collapses to 404 even at cap",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_starting_quota_does_not_double_count_live(pool: PgPool) {
+    // The starting and live quotas count DISJOINT sets — promoting a
+    // Starting placeholder to Live (via the normal HTTP create flow,
+    // which the FakePtyBridge does atomically) must move the entry
+    // from the starting count to the live count, never both. After a
+    // successful HTTP create the starting count is `0` and the live
+    // count is `1`; a follow-up HTTP create against the cap-filled
+    // starting set is therefore not at the starting cap.
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager_with_max_starting_per_user(&db, cap);
+    let auth = test_auth(&db);
+    let cookie = bootstrap_test_session(&auth, user_id).await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+    let profile = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "no-double",
+        "no-double.example.com",
+        "SHA256:no-double",
+    )
+    .await;
+    // First create succeeds end-to-end — the placeholder promotes to
+    // Live within the same handler call.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        terminal_sessions.count_starting_for_user(user_id),
+        0,
+        "promoted-to-live entry must drop out of the starting count",
+    );
+    assert_eq!(
+        terminal_sessions.count_live_pty_for_user(user_id),
+        1,
+        "promoted-to-live entry counts against the live quota instead",
+    );
+    // A second HTTP create at starting-cap = 1 must succeed because
+    // the starting count is 0 (the previous entry promoted to Live).
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "second create succeeds — starting count is disjoint from live count",
     );
 }
 
@@ -12321,6 +12778,13 @@ async fn session_policy_returns_default_ttl(pool: PgPool) {
         body["max_live_pty_sessions_per_user"], 8,
         "endpoint must return the default per-user live-PTY ceiling",
     );
+    // Phase 1B.2a per-user starting-burst ceiling. The default
+    // manager applies `DEFAULT_MAX_STARTING_PER_USER` (= 4) — same
+    // pinning rationale as the live ceiling above.
+    assert_eq!(
+        body["max_starting_sessions_per_user"], 4,
+        "endpoint must return the default per-user starting-burst ceiling",
+    );
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
@@ -12349,14 +12813,18 @@ async fn session_policy_returns_configured_custom_ttl(pool: PgPool) {
     // cap. Phase 1B.1: a custom TTL must not silently regress the cap
     // surface — both fields must be present on every successful response.
     assert_eq!(body["max_live_pty_sessions_per_user"], 8);
+    // Phase 1B.2a starting-burst cap: same defense — surfaces on
+    // every successful response, even when the test rewires the TTL.
+    assert_eq!(body["max_starting_sessions_per_user"], 4);
 }
 
 #[sqlx::test(migrations = "../../apps/backend/migrations")]
 async fn session_policy_response_shape_is_minimal(pool: PgPool) {
-    // Exactly two wire fields (Phase 1B.1: TTL + per-user live cap). A
-    // future widening (vault / cookie / CSRF / database url / env
-    // name / deployment paths / deployment-wide quota) MUST fail this
-    // assertion until the redaction posture is consciously re-reviewed.
+    // Exactly three wire fields (Phase 1B.2a: TTL + per-user live cap +
+    // per-user starting-burst cap). A future widening (vault / cookie
+    // / CSRF / database url / env name / deployment paths /
+    // deployment-wide quota) MUST fail this assertion until the
+    // redaction posture is consciously re-reviewed.
     let (app, _user, cookie) = setup(pool).await;
     let resp = app
         .oneshot(get("/api/v1/config/session-policy", &cookie))
@@ -12372,8 +12840,10 @@ async fn session_policy_response_shape_is_minimal(pool: PgPool) {
         vec![
             "detached_live_pty_ttl_seconds",
             "max_live_pty_sessions_per_user",
+            "max_starting_sessions_per_user",
         ],
-        "session-policy response carries exactly the TTL knob + per-user live cap; got {keys:?}",
+        "session-policy response carries exactly the TTL knob + per-user live cap + per-user \
+         starting cap; got {keys:?}",
     );
     // Sentinel sweep: nothing secret-shaped reaches the wire. Re-uses
     // the existing audit-redaction substring set so a future widening
@@ -12392,17 +12862,11 @@ async fn session_policy_response_shape_is_minimal(pool: PgPool) {
         !raw.contains("RELAYTERM_"),
         "session-policy response must not leak env names",
     );
-    // Phase 1B.1 specific: the deployment-wide ceiling (a Phase 1B.2
-    // concept that is deliberately NOT exposed at all in Phase 1B.1
-    // and SHOULD never be exposed on this surface even when 1B.2
-    // lands — operator-only, fingerprinting risk) MUST NOT smuggle
-    // onto the wire.
+    // The deployment-wide ceiling (a Phase 1B.2 deployment concept
+    // that is deliberately NOT exposed on this surface — operator-
+    // only, fingerprinting risk) MUST NOT smuggle onto the wire.
     assert!(
         !raw.contains("max_live_pty_sessions_per_deployment"),
         "session-policy response must not expose the deployment-wide ceiling",
-    );
-    assert!(
-        !raw.contains("max_starting_sessions_per_user"),
-        "session-policy response must not expose the starting-burst cap (not in Phase 1B.1)",
     );
 }

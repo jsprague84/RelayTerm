@@ -110,6 +110,15 @@ pub const DETACHED_LIVE_PTY_TTL: Duration = Duration::from_secs(30);
 /// supplied (test convenience + the documented default).
 pub const DEFAULT_MAX_LIVE_PTY_PER_USER: u32 = 8;
 
+/// Default per-user ceiling on concurrent in-flight starting sessions
+/// (Phase 1B.2a of `docs/session-quotas.md` § 4.3). `4` is enough for
+/// honest UI burst behaviour (a SPA navigation that opens a few
+/// sessions in parallel) but rejects a tight POST loop. Counts the
+/// disjoint set of registry entries with `live = None` AND `snapshot.
+/// status == Starting`, so it never double-counts the per-user live
+/// quota.
+pub const DEFAULT_MAX_STARTING_PER_USER: u32 = 4;
+
 /// In-memory status for a runtime registry entry.
 ///
 /// Distinct from [`TerminalSessionStatus`] (the persisted enum) so the
@@ -459,6 +468,14 @@ pub struct TerminalSessionManager {
     /// both the create route (for enforcement) and the
     /// `session-policy` route (for the SPA cap copy).
     max_live_pty_per_user: NonZeroU32,
+    /// Per-user ceiling on concurrent in-flight starting sessions
+    /// (Phase 1B.2a of `docs/session-quotas.md` § 4.3). Counts the
+    /// disjoint set of registry entries with `live = None` AND
+    /// `snapshot.status == Starting`. Default
+    /// [`DEFAULT_MAX_STARTING_PER_USER`], operator-tunable via
+    /// `terminal_sessions.max_starting_sessions_per_user`. Always
+    /// positive — `NonZeroU32` keeps the type-level invariant.
+    max_starting_per_user: NonZeroU32,
     /// Recording runtime (`Some` when `terminal_recording.enabled =
     /// true` and the writer is supported in the configured mode). When
     /// `None`, every live session gets a [`RecordingWriter::disabled`]
@@ -494,6 +511,8 @@ impl TerminalSessionManager {
             detach_ttl,
             max_live_pty_per_user: NonZeroU32::new(DEFAULT_MAX_LIVE_PTY_PER_USER)
                 .expect("DEFAULT_MAX_LIVE_PTY_PER_USER is non-zero"),
+            max_starting_per_user: NonZeroU32::new(DEFAULT_MAX_STARTING_PER_USER)
+                .expect("DEFAULT_MAX_STARTING_PER_USER is non-zero"),
             recording: None,
         }
     }
@@ -509,6 +528,20 @@ impl TerminalSessionManager {
     #[must_use]
     pub fn with_max_live_pty_per_user(mut self, cap: NonZeroU32) -> Self {
         self.max_live_pty_per_user = cap;
+        self
+    }
+
+    /// Override the per-user starting-burst ceiling (Phase 1B.2a quota).
+    ///
+    /// Builder-style: returns `self` so the caller can chain construction
+    /// at backend boot. The configuration layer
+    /// (`apps/backend/src/config.rs::Config::validate_terminal_sessions`)
+    /// has already bounded the value `1..=32` before this is called;
+    /// passing a value outside that range is a programmer bug, not an
+    /// operator-recoverable state.
+    #[must_use]
+    pub fn with_max_starting_per_user(mut self, cap: NonZeroU32) -> Self {
+        self.max_starting_per_user = cap;
         self
     }
 
@@ -1624,6 +1657,46 @@ impl TerminalSessionManager {
             .expect("runtime registry lock poisoned")
             .values()
             .filter(|entry| entry.snapshot.owner_id == owner_id && entry.live.is_some())
+            .count()
+    }
+
+    /// Per-user ceiling on concurrent in-flight starting sessions (Phase
+    /// 1B.2a quota — `docs/session-quotas.md` § 4.3). The configured
+    /// operator value (defaults to [`DEFAULT_MAX_STARTING_PER_USER`]).
+    #[must_use]
+    pub fn max_starting_per_user(&self) -> NonZeroU32 {
+        self.max_starting_per_user
+    }
+
+    /// Count of an owner's runtime-registry entries that hold a
+    /// `Starting` snapshot AND have NOT yet bound a live PTY. Equivalent
+    /// to "rows in the registry whose `live = None` AND `snapshot.status
+    /// == RuntimeSessionStatus::Starting`" — the disjoint complement of
+    /// the live-PTY count, so the two quotas never double-count
+    /// (`docs/session-quotas.md` § 4.1 / § 4.3).
+    ///
+    /// Used by the create route (Phase 1B.2a quota enforcement) to
+    /// refuse a new session when this would exceed
+    /// [`Self::max_starting_per_user`]. Same ordering posture as the
+    /// per-user live counter: AFTER ownership and host-key gating, and
+    /// BEFORE vault decrypt or SSH side effects, so the refusal does
+    /// no outbound work and cannot be used to probe for foreign /
+    /// disabled / untrusted profiles.
+    ///
+    /// O(N) over the registry under the existing `RwLock` read guard;
+    /// the registry is bounded by the operator quota so the scan is a
+    /// small handful of comparisons.
+    #[must_use]
+    pub fn count_starting_for_user(&self, owner_id: UserId) -> usize {
+        self.runtimes
+            .read()
+            .expect("runtime registry lock poisoned")
+            .values()
+            .filter(|entry| {
+                entry.snapshot.owner_id == owner_id
+                    && entry.live.is_none()
+                    && entry.snapshot.status == RuntimeSessionStatus::Starting
+            })
             .count()
     }
 }

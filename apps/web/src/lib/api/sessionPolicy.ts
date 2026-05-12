@@ -45,6 +45,16 @@ export const DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS = 30;
 export const DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER = 8;
 
 /**
+ * Fallback per-user starting-burst ceiling (Phase 1B.2a quota) used
+ * when the policy fetch has not yet resolved or failed. Matches the
+ * backend default (`relayterm_terminal::DEFAULT_MAX_STARTING_PER_USER
+ * = 4`). Surfaced through {@link describeMaxStartingPerUser} so
+ * quota-refusal copy can render with a defensible parameterised
+ * number even when the SPA boots before the wire round-trip resolves.
+ */
+export const DEFAULT_MAX_STARTING_SESSIONS_PER_USER = 4;
+
+/**
  * Wire-side range bounds for the parsed TTL. Mirrors the backend's
  * `5..=86_400` config-validator bound exactly — a value outside this
  * range cannot have been emitted by a current backend, so we treat it
@@ -65,6 +75,16 @@ const POLICY_MIN_MAX_LIVE_PTY_PER_USER = 1;
 const POLICY_MAX_MAX_LIVE_PTY_PER_USER = 256;
 
 /**
+ * Wire-side range bounds for the parsed per-user starting-burst
+ * ceiling. Mirrors the backend's `1..=32` config-validator bound
+ * (Phase 1B.2a). Same rationale as above: out-of-range values cannot
+ * have been emitted by a current backend, so we collapse them to
+ * `malformed_response`.
+ */
+const POLICY_MIN_MAX_STARTING_PER_USER = 1;
+const POLICY_MAX_MAX_STARTING_PER_USER = 32;
+
+/**
  * Parsed, typed session policy. Carries only the fields the SPA renders;
  * future fields require an explicit migration here AND on the backend.
  */
@@ -78,6 +98,13 @@ export interface SessionPolicy {
    * caller's current count — the count never crosses the wire.
    */
   max_live_pty_sessions_per_user: number;
+  /**
+   * Effective per-user starting-burst ceiling (Phase 1B.2a quota). The
+   * SPA uses this to render parameterised copy on a
+   * `429 too_many_starting_sessions` refusal. NOT a probe for the
+   * caller's current count — the count never crosses the wire.
+   */
+  max_starting_sessions_per_user: number;
 }
 
 /**
@@ -108,9 +135,28 @@ export function parseSessionPolicy(raw: unknown): SessionPolicy | null {
   ) {
     return null;
   }
+  // Forward-compat note (Phase 1B.2a): a pre-1B.2a backend that has
+  // not yet shipped this field will fail this check, parseSessionPolicy
+  // returns null, and `loadSessionPolicy` falls back to
+  // `DEFAULT_MAX_STARTING_SESSIONS_PER_USER` (= 4 — the backend's own
+  // default). On a mixed rollout where the SPA is ahead of the
+  // backend, that fallback is the safe and correct UX. When/if the
+  // backend gets rolled back to a pre-1B.2a build, expect the SPA to
+  // silently degrade to defaults until the backend catches up.
+  const startingCap = r.max_starting_sessions_per_user;
+  if (typeof startingCap !== "number" || !Number.isInteger(startingCap)) {
+    return null;
+  }
+  if (
+    startingCap < POLICY_MIN_MAX_STARTING_PER_USER ||
+    startingCap > POLICY_MAX_MAX_STARTING_PER_USER
+  ) {
+    return null;
+  }
   return {
     detached_live_pty_ttl_seconds: ttl,
     max_live_pty_sessions_per_user: cap,
+    max_starting_sessions_per_user: startingCap,
   };
 }
 
@@ -222,6 +268,7 @@ export async function loadSessionPolicy(
     return {
       detached_live_pty_ttl_seconds: DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
       max_live_pty_sessions_per_user: DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
+      max_starting_sessions_per_user: DEFAULT_MAX_STARTING_SESSIONS_PER_USER,
     };
   })().finally(() => {
     // CRITICAL ordering: clear `inflight` BEFORE any subsequent caller
@@ -324,4 +371,23 @@ export function describeMaxLivePtyPerUser(cap: number): string {
     ? cap
     : DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER;
   return `This deployment allows up to ${safe} live terminal session${safe === 1 ? "" : "s"} per user.`;
+}
+
+/**
+ * Short, parameterised copy describing the per-user starting-burst
+ * ceiling (Phase 1B.2a quota). Used by terminal-launch error
+ * formatters to render honest text on a `429
+ * too_many_starting_sessions` refusal.
+ *
+ * Anti-overclaim register (`docs/session-quotas.md` § 7.5):
+ *   - Never says "your session quota" — the cap is per-deployment.
+ *   - Never says "rate-limiting" / "slow down" / "queue" / "wait N
+ *     seconds" — this is a concurrent in-flight ceiling, not a rate
+ *     limit, and the refusal carries no `Retry-After` contract.
+ */
+export function describeMaxStartingPerUser(cap: number): string {
+  const safe = Number.isInteger(cap) && cap > 0
+    ? cap
+    : DEFAULT_MAX_STARTING_SESSIONS_PER_USER;
+  return `This deployment allows up to ${safe} terminal session${safe === 1 ? "" : "s"} starting at once per user.`;
 }

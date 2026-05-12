@@ -193,6 +193,31 @@ async fn create(
         return Err(ApiError::TooManySessions);
     }
 
+    // Phase 1B.2a per-user starting-burst ceiling (`docs/session-quotas.md`
+    // § 4.3). Same ordering posture as the live ceiling above (AFTER
+    // ownership + host-key gating, BEFORE vault decrypt + SSH side
+    // effects). Counts the disjoint set of `Starting` placeholders
+    // that have NOT yet bound a live PTY — a tight POST loop that
+    // outraces PTY-start round-trips would otherwise stack
+    // `live + starting` slots before any in-flight create promotes.
+    let starting_cap = state.terminal_sessions.max_starting_per_user().get() as usize;
+    let starting_current = state.terminal_sessions.count_starting_for_user(user_id);
+    if starting_current >= starting_cap {
+        // Operator-side log line: same redaction posture as the live
+        // refusal above. `scope = "per_user_starting"` distinguishes
+        // the burst-cap refusal in operator logs without leaking
+        // session ids, profile ids, hostnames, peer banners, or wire
+        // bodies. No `audit_events` row.
+        warn!(
+            user_id = %user_id,
+            scope = "per_user_starting",
+            current_count = starting_current,
+            cap = starting_cap,
+            "terminal session quota refused"
+        );
+        return Err(ApiError::TooManyStartingSessions);
+    }
+
     // Decrypt the identity. Vault disabled → 503 (matches the rest of
     // the SSH-side routes). The decrypted PEM is held in a Zeroizing
     // buffer for the rest of this function.

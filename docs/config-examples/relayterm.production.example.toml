@@ -250,10 +250,38 @@ enabled = true
 # Default: 8. Bounded 1..=256. 0 and out-of-range values are a hard
 # boot failure. The default is conservative for solo homelab and
 # defensible for a small multi-user deployment; reconsider after
-# observing real usage. Phase 1B.2 will add deployment-wide and
-# starting-burst ceilings.
+# observing real usage. Phase 1B.2 will add the deployment-wide
+# ceiling; the per-user starting-burst ceiling has landed below
+# (Phase 1B.2a).
 #
 # Env: RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER
 #
 # [terminal_sessions]
 # max_live_pty_sessions_per_user = 8
+
+# Per-user ceiling on concurrent in-flight starting sessions (Phase
+# 1B.2a quota — see `docs/session-quotas.md` § 4.3). Counts the
+# disjoint set of `Starting` placeholders that have NOT yet bound a
+# live PTY, so it never double-counts the live cap above. Defends
+# against a runaway client that POSTs many sessions in flight without
+# waiting for the PTY-start round-trip to complete. A `POST
+# /api/v1/terminal-sessions` that would exceed this ceiling is
+# refused with `429 too_many_starting_sessions`. The refusal writes
+# no DB row and no audit event — same operational, not security-
+# relevant posture as the live quota above.
+#
+# Operational impact: the starting count is typically zero in steady
+# state because each successful create promotes its placeholder to
+# Live within the same handler call. The cap is defensive against
+# tight POST loops that race PTY-start round-trips.
+#
+# Default: 4. Bounded 1..=32. 0 and out-of-range values are a hard
+# boot failure. The default is enough for honest SPA burst behaviour
+# (a navigation that opens a few sessions in parallel) but rejects a
+# tight POST loop. The live cap is the load-bearing ceiling for
+# resource consumption; this knob is defence-in-depth.
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER
+#
+# [terminal_sessions]
+# max_starting_sessions_per_user = 4

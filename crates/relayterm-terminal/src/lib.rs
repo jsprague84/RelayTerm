@@ -34,9 +34,9 @@ pub mod retention_worker;
 pub use manager::{
     AttachSessionOutcome, AttachSessionRequest, AttachmentRuntime, CloseTerminalSessionOutcome,
     CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DEFAULT_MAX_LIVE_PTY_PER_USER,
-    DETACHED_LIVE_PTY_TTL, DetachInfo, DetachOutcome, DetachSessionOutcome,
-    LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE, LiveRuntimeView, ResizeSessionOutcome,
-    RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
+    DEFAULT_MAX_STARTING_PER_USER, DETACHED_LIVE_PTY_TTL, DetachInfo, DetachOutcome,
+    DetachSessionOutcome, LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE, LiveRuntimeView,
+    ResizeSessionOutcome, RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,
     STUB_PTY_NOT_IMPLEMENTED_MESSAGE, TerminalSessionManager, TerminalSessionManagerError,
     TerminalSessionRuntime,
 };

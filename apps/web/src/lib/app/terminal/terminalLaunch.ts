@@ -269,6 +269,17 @@ export function describeLaunchError(
         );
         return `You're at the limit of ${cap} concurrent terminal session${cap === 1 ? "" : "s"}. Close a session from the Sessions list before starting another. Detached sessions count toward this limit and free up automatically after their reconnect window (${ttlFragment} by default).`;
       }
+      // Phase 1B.2a: per-user starting-burst refusal (`429
+      // too_many_starting_sessions`). Distinct from the live-cap
+      // refusal so the user knows the right action — wait for an
+      // in-flight start to complete rather than close an existing
+      // session. The wire body intentionally carries no count or
+      // cap (§ 7.3); the cap is exposed separately via
+      // `describeMaxStartingPerUser` for surfaces that want to
+      // surface it.
+      if (err.status === 429 && err.code === "too_many_starting_sessions") {
+        return "You already have the maximum number of terminal sessions starting. Wait a moment for one to finish starting, then try again.";
+      }
       return `Could not start terminal: HTTP ${err.status} ${err.code}`;
     }
     case "transport":
