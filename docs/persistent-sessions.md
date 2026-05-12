@@ -408,10 +408,13 @@ bounded by quotas.
 > honest parameterised copy via `describeDetachedTtl`. Phase 1B is the
 > quota model on top of the wire-observable TTL — full design in
 > [`docs/session-quotas.md`](session-quotas.md). The quota slices land as
-> 1B.1 (per-user live ceiling) → 1B.2 (deployment + starting-burst
-> ceilings + operator dashboard tile) → 1B.3 (optional production-default
-> tuning). Zero schema, zero migration, zero new audit kinds; design is
-> deliberately conservative so a later Phase 2 / 3 can build on it.
+> 1B.1 (per-user live ceiling — landed 2026-05-11) → 1B.2a (per-user
+> starting-burst ceiling — landed 2026-05-11) → 1B.2b (deployment-wide
+> live ceiling — design refined, NOT landed) → 1B.2c (operator dashboard
+> tile — deferred until 1B.2b is observed in staging) → 1B.3 (optional
+> production-default tuning). Zero schema, zero migration, zero new audit
+> kinds; design is deliberately conservative so a later Phase 2 / 3 can
+> build on it.
 
 **In scope.**
 

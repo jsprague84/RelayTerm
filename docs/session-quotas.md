@@ -23,7 +23,7 @@
 >   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
 >   § 12 "Per-user live PTY quota (Phase 1B.1, cap=1) staging
 >   smoke".
-> - **Phase 1B.2a (landed 2026-05-11):**
+> - **Phase 1B.2a (landed 2026-05-11; staging-smoked 2026-05-12):**
 >   `max_starting_sessions_per_user` — per-user starting-burst
 >   ceiling, default `4`, bound `1..=32`. Wire shape: 429
 >   `too_many_starting_sessions`. Exposed via
@@ -34,10 +34,37 @@
 >   a live PTY (so the live and starting quotas never double-count).
 >   Same redaction posture as 1B.1 — no new audit kind, no DB row,
 >   no `Retry-After`. Enforcement order: same as 1B.1, immediately
->   after the live-cap check.
-> - **Phase 1B.2 (NOT landed):** deployment-wide quota
->   (`max_live_pty_sessions_per_deployment`), operator dashboard
->   tile.
+>   after the live-cap check. Controlled TCP-stall smoke verified
+>   the refusal envelope, no DB row, no audit row, safe operator
+>   warn line, and post-close slot recovery — see
+>   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+>   § "2026-05-12 · Per-user starting-session quota (Phase 1B.2a,
+>   cap=1) staging smoke".
+> - **Phase 1B.2b (DESIGN — this slice's target; NOT landed):**
+>   `max_live_pty_sessions_per_deployment` — deployment-wide live
+>   PTY ceiling, default `64`, bound `1..=4096`. Wire shape: 429
+>   `too_many_sessions_deployment`. **NOT** exposed via
+>   `GET /api/v1/config/session-policy` (operator-only;
+>   fingerprinting risk — see § 5.4). SPA renders static (NOT
+>   parameterised) refusal copy. Counts ALL owners' runtime-
+>   registry entries whose `live = Some` (i.e. across users); does
+>   NOT count `Starting` placeholders, closed sessions, or
+>   recording-only state. Same redaction posture as 1B.1 / 1B.2a —
+>   no new audit kind, no DB row, no `Retry-After`. Enforcement
+>   order: AFTER per-user live cap, BEFORE per-user starting cap
+>   (rationale in § 6.2). Single-instance exact / multi-instance
+>   explicitly per-instance best-effort (§ 9). The operator
+>   dashboard tile that earlier roadmaps named alongside 1B.2 is
+>   deferred to a separate later slice (§ 10.2c) and is NOT a
+>   blocker for 1B.2b.
+> - **Phase 1B.2c (operator dashboard tile; deferred):** a
+>   single authenticated GET endpoint returning the caller's own
+>   live + starting counts, plus a Settings → Sessions tile that
+>   renders them. No quota override surface; tile is read-only.
+>   Explicitly deferred to land after 1B.2b runs in staging so the
+>   tile is informed by observed enforcement behaviour rather than
+>   shipped speculatively. NOT required for 1B.2b correctness or
+>   safety.
 > - **Phase 1B.3 (NOT landed):** production-default tuning.
 >
 > **Related normative documents:**
@@ -155,7 +182,7 @@ later slice can pick them up without re-arguing the boundary.
   via the probe channel) deliberately does not audit either; this
   policy mirrors it (`docs/agent/redaction-rules.md` § 9).
 - **No admin / cross-user quota inspection.** The dashboard surface
-  (§ 10.2) shows the caller's OWN counts only. An admin / cross-user
+  (§ 10.2c, deferred) shows the caller's OWN counts only. An admin / cross-user
   quota view sits with the broader "admin surface" v1 deferral
   ([`SPEC.md`](../SPEC.md) "Out of scope (v1)").
 - **No per-user override surface.** Every quota is per-deployment. A
@@ -240,7 +267,7 @@ reasons:
 
 | Quota | Counted as | Default | Bound at API boundary |
 |---|---|---|---|
-| `max_live_pty_sessions_per_deployment` | Total runtime-registry entries with `live = Some` | `64` | `POST /api/v1/terminal-sessions` create path |
+| `max_live_pty_sessions_per_deployment` | Total runtime-registry entries with `live = Some` (across ALL owners) | `64` | `POST /api/v1/terminal-sessions` create path |
 
 A deployment-wide ceiling on simultaneous live PTYs. Defends against
 the "one user multiplies their per-user quota across N profiles"
@@ -252,6 +279,41 @@ deployment (the SPEC.md "Out of scope (v1)" v1 default). Operators
 running a multi-user homelab can raise it; the upper bound the
 validator accepts is `4096` so a configuration mistake does not
 produce a silent unbounded ceiling.
+
+**Counting semantics (Phase 1B.2b implementation contract).** The
+count is the cardinality of
+`runtimes.values().filter(|e| e.live.is_some()).count()` —
+equivalently, of entries whose `snapshot.status ==
+RuntimeSessionStatus::Live`, since `start_live_pty` sets both
+atomically under the same write-lock guard. No owner filter is
+applied. The check answers a single question: "is this backend
+process already at its live-PTY capacity?"
+
+The count explicitly does NOT include:
+
+- `Starting` placeholders that have not yet bound a PTY — those
+  belong to the per-user `max_starting_sessions_per_user` quota
+  (§ 4.3) and are disjoint from `live = Some`.
+- `Closed` sessions — runtime entries are removed by
+  `close_session` and the TTL reaper; once removed they do not
+  contribute. The DB-side `closed` row persists forever per
+  SPEC.md "Inventory lifecycle policy" rule 4, but the registry
+  entry is gone.
+- Recording chunk-writer tasks that outlive the live PTY — those
+  run inside the orchestrator but are bookkeeping for durable
+  display history, not a resource that counts as "an open
+  terminal session". They are bounded by per-session 64 MiB and
+  the retention sweep, not by this quota.
+- `terminal_session_attachments` rows — multi-attach fanout is
+  future surface; quota is on PTYs, not attachment rows (§ 3
+  non-goals).
+
+`active` vs `detached` is irrelevant to this counter: both states
+share the same `RuntimeSessionStatus::Live` shape and hold the
+same resource tuple (channel + PTY + buffer + tasks). A user
+detaching a session does NOT free a deployment-wide slot; the
+slot frees only when the TTL reaper runs, the user explicitly
+closes the session, or the remote shell exits.
 
 ### 4.3 Per-user starting-burst quota (defensive)
 
@@ -378,6 +440,35 @@ and stays server-side — exposing it would give every authenticated
 caller a deployment-fingerprint signal with zero benefit to honest
 UX copy.
 
+**Recommendation (Phase 1B.2b — explicit).** Do NOT add
+`max_live_pty_sessions_per_deployment` to `SessionPolicyResponse`.
+Rationale:
+
+1. **Fingerprinting.** The per-user caps are inherently
+   per-caller, so the wire value already carries no information
+   about other tenants. The deployment-wide cap, by contrast,
+   describes the deployment as a whole; exposing it to every
+   authenticated caller is a posture-signal leak with no
+   parallel today.
+2. **UX value is near zero.** The deployment-refusal copy
+   (§ 7.5) cannot say "you're at the limit of N" without
+   misleading the user — the limit is across all users, and the
+   caller may have few or no sessions of their own. Parameterising
+   the copy on the cap would invite "your session quota"-style
+   overclaim sentences (forbidden in § 12); leaving the copy
+   static avoids the trap.
+3. **Asymmetry is already established.** The per-user cap is
+   exposed; the deployment cap is not. That asymmetry is the
+   same posture as today's TTL field: it exposes deployment-wide
+   knobs the SPA needs to parameterise honest copy, and nothing
+   more.
+
+A future operator-only dashboard endpoint (§ 10.2c, deferred) is
+the right surface for the deployment-wide count and cap. That
+endpoint would be a separate authenticated route (NOT this one)
+so it can grow operator-only fields without re-shaping a
+caller-facing DTO.
+
 The frontend `parseSessionPolicy`
 ([`apps/web/src/lib/api/sessionPolicy.ts`](../apps/web/src/lib/api/sessionPolicy.ts))
 parses field-by-field and rejects out-of-range values; Phase 1B
@@ -409,32 +500,66 @@ check belongs in exactly one place.
 
 ### 6.2 Ordering inside `create()`
 
-The check sits between the existing host-key precondition and the
-vault decrypt, BEFORE any outbound network or cryptographic work:
+The quota checks sit between the existing host-key precondition
+and the vault decrypt, BEFORE any outbound network or
+cryptographic work. The order across the three quotas is
+load-bearing.
+
+Final order (Phase 1B.1 + 1B.2a landed; 1B.2b inserts between
+them as marked):
 
 ```
-0. CsrfGuard               ← first, before any state-touch (SPEC.md CSRF)
+0. CsrfGuard                                ← first, before any state-touch (SPEC.md CSRF)
 1. AuthenticatedUser
-2. Resolve (profile, host, identity) trio  ← owner-scope
-3. Reject `server_profile disabled`        ← existing
-4. Resolve host-key accept pins            ← existing
-5. Reject `host_key not trusted`           ← existing
-6. ── QUOTA CHECK ──                       ← NEW (Phase 1B)
-7. Vault.decrypt_private_key()             ← existing
-8. SshPtyConfig + bridge.start()           ← existing
-9. terminal_sessions.start_live_pty()      ← existing
+2. Resolve (profile, host, identity) trio   ← owner-scope
+3. Reject `server_profile disabled`         ← existing
+4. Resolve host-key accept pins             ← existing
+5. Reject `host_key not trusted`            ← existing
+6. ── QUOTA: per-user live cap ──           ← Phase 1B.1 (landed)
+7. ── QUOTA: deployment-wide live cap ──    ← Phase 1B.2b (NEW)
+8. ── QUOTA: per-user starting cap ──       ← Phase 1B.2a (landed)
+9. Vault.decrypt_private_key()              ← existing
+10. SshPtyConfig + bridge.start()           ← existing
+11. terminal_sessions.start_live_pty()      ← existing
 ```
 
-The check happens AFTER ownership + host-key gating so a quota
+Every quota check happens AFTER ownership + host-key gating so a
 refusal cannot be used to probe whether a foreign / disabled /
 untrusted profile exists. Foreign profiles still collapse to a 404,
 disabled / untrusted profiles still surface their typed 409, BEFORE
-the quota check runs. Quota refusals therefore only fire for
+any quota check runs. Quota refusals therefore only fire for
 combinations the caller would otherwise have been allowed to launch.
 
-The check happens BEFORE vault decrypt + SSH connect so a rejected
-request does no outbound work, no decryption cycle, and no
-target-host probe.
+Every quota check happens BEFORE vault decrypt + SSH connect so a
+rejected request does no outbound work, no decryption cycle, and
+no target-host probe.
+
+**Why deployment cap sits BETWEEN per-user live and per-user
+starting.** Three constraints make this the only correct order:
+
+1. **Per-user live BEFORE deployment live.** If a user is already
+   at their personal live cap, the refusal they get should
+   describe that — a `too_many_sessions_deployment` refusal would
+   misdirect the user to "wait for the operator" when the actual
+   action they need to take is "close one of YOUR sessions".
+   The user's personal ceiling is the more specific cause; specific
+   refusal beats general.
+2. **Deployment live BEFORE per-user starting.** A starting-burst
+   refusal tells the user "wait a moment for your in-flight
+   starts to complete, then try again". If the deployment is
+   already at its global live cap, that advice is misleading —
+   the in-flight starts could land and the user would still be
+   refused. Surfacing the deployment refusal first matches
+   reality: the limiting factor is global, not per-user-in-flight.
+3. **Deployment live BEFORE vault decrypt and SSH side effects.**
+   Same rationale as the other quotas: a rejected request does
+   no outbound work, no decryption cycle, no target-host probe.
+
+The Phase 1B.2a per-user starting check stays as the LAST quota
+gate so it can fire when the user has not yet hit their personal
+live ceiling, the deployment is not yet at capacity, but the
+caller is in the middle of bursting many starts faster than the
+SSH side can promote them.
 
 ### 6.3 Counter primitives on the manager
 
@@ -679,12 +804,17 @@ operator-side concern.
 
 **Deployment ceiling reached (`too_many_sessions_deployment`):**
 
-> "The server is at its terminal-session capacity. Try again in a
-> few moments, or contact the operator if this persists."
+> "This RelayTerm deployment is at its live terminal session
+> limit. Close an existing session or wait for a detached session
+> to expire before starting another."
 
-Honest about the multi-user shape without saying "another user has
-too many sessions". The advice ("try again in a few moments")
-covers the eventual close that frees a slot.
+Static copy (NOT parameterised on a cap value — see § 5.4 for
+why the deployment cap stays off the wire). Honest about the
+multi-tenant shape without saying "another user has too many
+sessions" (which would breach the SPEC's "owner-scope every
+read" posture by leaking cross-user signal through the copy).
+Does NOT imply durable persistence — "detached" is the existing
+TTL-window status the SPA already names elsewhere.
 
 **Anti-overclaim register** for quota copy. None of these substrings
 may appear in any of the three SPA copies (extend the existing
@@ -747,12 +877,19 @@ metadata only:
 ```rust
 warn!(
     user_id = %user.user_id(),
-    scope = %scope.as_str(),       // "per_user_live" | "per_user_starting" | "deployment"
+    scope = %scope.as_str(),       // "per_user_live" | "per_user_starting" | "deployment_live"
     current_count = current,        // u64
     cap = cap,                      // u64
     "terminal session quota refused"
 );
 ```
+
+The `"deployment_live"` label (NOT bare `"deployment"`) mirrors
+the landed `"per_user_live"` / `"per_user_starting"` shape so an
+operator grepping `scope=` sees a self-describing label. A future
+deployment-starting or deployment-detached quota (currently
+deferred — § 4.4) would land as `"deployment_starting"` etc.
+without needing to rename the existing label.
 
 Forbidden in the line: any session id, attachment id, profile id,
 host id, identity id, IP address, User-Agent, or wire message. The
@@ -776,11 +913,11 @@ coalescer; until then, the simpler one-warn-per-refusal shape stays.
 A future Prometheus-style metrics surface (a `relayterm_quota_*`
 counter family) is desirable but out of scope for Phase 1B — the
 metrics primitives don't exist in the codebase yet. The operator
-dashboard surface (§ 10.2; see the smoke recipe in § 11) reads the
-same counters the enforcement path uses through a new authenticated
-read endpoint;
-that read endpoint is the implementation seam where Prometheus
-metrics could later land without re-plumbing.
+dashboard surface (§ 10.2c, deferred; see the smoke matrix in § 11)
+would read the same counters the enforcement path uses through a
+new authenticated read endpoint; that read endpoint is the
+implementation seam where Prometheus metrics could later land
+without re-plumbing.
 
 ## 9. Multi-instance limitations
 
@@ -874,43 +1011,230 @@ explicit refusal step: launch the configured cap of sessions, POST
 one more, observe the 429 + no DB row + no audit row + no log line
 echo of any session id.
 
-### 10.2 Slice 1B.2 — deployment + starting-burst ceilings
+### 10.2a Slice 1B.2a — per-user starting-burst ceiling (LANDED)
 
-**Goal.** Round out the quota set: `max_live_pty_sessions_per_deployment`
-and `max_starting_sessions_per_user`. Land the operator dashboard
-tile.
+**Status.** Landed 2026-05-11 (`feat(api): enforce per-user
+starting session quota`, `fd6813d`); controlled TCP-stall smoke
+verified on staging 2026-05-12. Listed here only so the slice
+sequence reads cleanly.
+
+**Shipped surface.** `max_starting_sessions_per_user` config
+field + env mirror; `count_starting_for_user(...)` accessor;
+`ApiError::TooManyStartingSessions` variant with wire code
+`too_many_starting_sessions`; enforcement step in `create()`
+AFTER the per-user-live check; public DTO field on
+`SessionPolicyResponse`; SPA `describeMaxStartingPerUser`
+helper; plumbing across all three Compose templates + both
+worked-example TOMLs + `scripts/check-doc-contracts.sh` § 9.
+
+### 10.2b Slice 1B.2b — deployment-wide live ceiling (THIS SLICE'S TARGET)
+
+**Goal.** Cap the running backend's total live-PTY footprint
+across all owners. Sits alongside the two landed per-user
+quotas, NOT as a replacement.
+
+**Scope: single backend instance, honestly.** The check counts
+the registry on this process. A multi-backend deployment behind
+a load balancer gets per-instance enforcement; effective
+deployment-wide ceiling is `N × cap`. This is called out in
+operator docs (§ 9 + production runbook); it is NOT silently
+papered over. True cross-instance coordination is its own
+later slice (§ 9 closing paragraph; § 13 open question 10).
 
 **In scope.**
 
-- Config: two new fields, paired validator bounds, paired plumbing
-  across all six deploy/docs files + `check-doc-contracts.sh` §9.
-- Manager: `count_live_pty_total()`, `count_starting_for_user(...)`.
-- API: two new `QuotaScope` variants, two new wire codes
-  (`too_many_sessions_deployment`, `too_many_starting_sessions`).
-- API: enforcement in `create()` AFTER the per-user check (so
-  per-user violations don't get masked by deployment-wide ones).
-- Public DTO: `SessionPolicyResponse.max_starting_sessions_per_user`.
-  Deployment-wide value stays server-side.
-- Frontend: two new typed-error reasons + matching SPA copies.
-- Operator dashboard tile (Settings → Sessions): renders the
-  caller's live count, the per-user cap, and the TTL. Single
-  authenticated GET endpoint returns the integers; mirrors
-  `/api/v1/config/session-policy` shape but is scoped to the
-  caller's counts. Tile is read-only; no quota override surface.
-- Tests:
-  - integration: per-user 429 fires BEFORE deployment 429 when
-    both would apply; deployment 429 fires when only deployment
-    is over.
-  - frontend: tile renders honestly when policy fetch fails (uses
-    the same fallback contract as the existing TTL copy).
+- **Config.** One new field
+  `terminal_sessions.max_live_pty_sessions_per_deployment`,
+  env mirror
+  `RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT`,
+  default `64`, validator bound `1..=4096`. Validator
+  additionally MUST reject
+  `max_live_pty_sessions_per_deployment <
+  max_live_pty_sessions_per_user` and SHOULD reject
+  `max_live_pty_sessions_per_deployment <
+  max_starting_sessions_per_user` (§ 5.2; surfaces operator
+  contradictions at boot rather than at first refusal).
+- **Manager.** One new accessor on `TerminalSessionManager`:
+  `count_live_pty_total(&self) -> usize`. O(N) over the
+  existing `RwLock<HashMap>` registry under a read guard; no
+  new lock, no new index, no new query. Bounded by the
+  deployment cap itself so the scan is a small handful of
+  comparisons.
+- **API.** One new `ApiError` variant + one new `ErrorCode`
+  variant. Wire code `too_many_sessions_deployment`; wire
+  message `"too many terminal sessions for this deployment"`
+  (static — never parameterised, never echoes counts). One
+  enforcement step in `create()` between the existing
+  per-user-live check (Phase 1B.1) and the existing
+  per-user-starting check (Phase 1B.2a) per § 6.2.
+  Operator-side `warn!` line with `scope="deployment_live"`,
+  `current_count`, `cap` — no session ids, no profile ids, no
+  hostnames, no wire body echo.
+- **Public DTO.** **NO change.** `SessionPolicyResponse` does
+  NOT gain a deployment field — § 5.4 records the explicit
+  recommendation against exposure. The sentinel sweep in
+  `apps/web/tests/sessionPolicy.test.ts` continues to pin the
+  DTO shape; this slice MUST NOT widen it.
+- **Frontend.** One new typed-error discriminator
+  (`{ reason: "too_many_sessions_deployment" }`) on
+  `CreateTerminalSessionError`. One new branch in
+  `describeLaunchError` returning the static copy from § 7.5;
+  branching on the typed `code` ONLY, never on `message`. New
+  forbidden-substring entry on the quota-copy sentinel sweep:
+  the deployment copy MUST NOT mention "your session quota",
+  "other users", a numeric cap, or `Retry-After`-style wait
+  language.
+- **Plumbing (Phase 1B.2b matrix row).** Per the AGENTS.md
+  2026-05-09 lesson, every new operator env knob MUST be wired
+  into ALL six locations + the contracts-script matrix in one
+  commit:
+  - `deploy/relayterm.env.example`
+  - `deploy/docker-compose.example.yml`
+  - `deploy/docker-compose.images.example.yml`
+  - `deploy/docker-compose.traefik-staging.example.yml`
+  - `docs/config-examples/relayterm.dev.example.toml`
+  - `docs/config-examples/relayterm.production.example.toml`
+  - `scripts/check-doc-contracts.sh` § 9 env-var × file matrix
+- **Tests.**
+  - **Integration (rust).** (a) refusal under cap; (b) success
+    at cap-after-close; (c) refusal does NOT write any DB row
+    or session_event row; (d) refusal does NOT write any
+    audit_events row; (e) refusal does NOT echo any forbidden
+    substring (session id, profile id, host id, identity id,
+    `current_count`, `cap`, hostname); (f) operator warn line
+    carries `scope="deployment_live"` and no forbidden field;
+    (g) per-user-live refusal still fires when BOTH would
+    apply (verifies the ordering in § 6.2);
+    (h) per-user-starting refusal still fires when ONLY
+    starting is over;
+    (i) validator rejects `max_dep < max_live_per_user` at
+    boot.
+  - **Manager unit.** `count_live_pty_total` correctness
+    across attach / detach / reattach / close / TTL-reaper
+    transitions and across multiple owners.
+  - **Frontend unit.** Typed-error mapping returns the new
+    `too_many_sessions_deployment` discriminator on 429 +
+    matching code; the static SPA copy passes the
+    forbidden-substring sweep.
 
-**Out of scope (1B.2).** Per-user override surface, cross-instance
-coordination, rate quota, attachment-row quota.
+**Out of scope (1B.2b).**
 
-**Smoke.** Extend the same long-TTL recipe with the deployment
-refusal step (configure `max_deployment = 2`, launch as two distinct
-users, refuse on user C). Confirm the operator dashboard tile
-reflects each user's own count and never leaks foreign counts.
+- **No operator dashboard tile** — deferred to § 10.2c. The
+  tile's value comes from observing real enforcement, which is
+  what 1B.2b ships first.
+- **No exposure on `SessionPolicyResponse`** — § 5.4
+  recommendation is to keep the deployment cap server-side.
+- **No cross-instance coordination** — single-backend exact,
+  multi-backend best-effort per § 9.
+- **No per-user override surface** for the deployment cap (a
+  user cannot have a different deployment-wide ceiling — by
+  construction the cap is global).
+- **No metrics surface** — § 8.4 deferred.
+- **No durable persistence change** — quotas remain in-memory
+  + config; restart resets counters and reaps PTYs together
+  (§ 3 non-goals).
+
+**Smoke (Phase 1B.2b — proposed staging recipe).** Goal: prove
+the deployment cap fires without overlap from the per-user-live
+cap.
+
+The smoke MUST configure the per-user-live and per-user-starting
+caps HIGH enough that a single user can drive the deployment cap
+to refusal by themselves. The proposed configuration:
+
+```
+RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER=8
+RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER=4
+RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT=1
+```
+
+(The per-user caps are `8 / 4` — the production defaults — so
+the deployment cap is the binding constraint.)
+
+Recipe:
+
+1. Launch session A as smoke-user. Expect `201 Created` (live
+   PTY, status `active`).
+2. Immediately launch session B as the SAME smoke-user. Expect
+   `429 { code: "too_many_sessions_deployment", message: "too
+   many terminal sessions for this deployment" }`. Confirm:
+   - response has no `Retry-After` header;
+   - response carries no `current_count`, no `cap`, no
+     session id, no profile id, no hostname;
+   - DB has no new `terminal_sessions` row, no new
+     `session_events` row, no new `audit_events` row (verified
+     via SQL probe scoped to a `created_at >` filter);
+   - backend log line carries `scope="deployment_live"`,
+     `current_count=1`, `cap=1` and no forbidden field.
+3. Close session A via the SPA "End session" affordance.
+   Expect the registry slot to free (the close-session path
+   removes the registry entry; the same path the TTL reaper
+   uses).
+4. Launch session C as the smoke-user. Expect `201 Created`,
+   proving the slot recovers.
+5. Cleanup: revert
+   `RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT`
+   to its default (`64`) via `docker compose up -d
+   --force-recreate` (mirrors the 1B.1 / 1B.2a cleanup
+   pattern); close any remaining smoke sessions; reconcile
+   the throwaway `quota-smoke-host` row state.
+
+**Why this isolates the deployment quota.** Per-user-live=8 and
+per-user-starting=4 are both well above the deployment=1
+threshold, so session B's refusal can ONLY have come from the
+deployment check. Reversing the per-user cap (e.g. setting
+per-user-live=1) would create ambiguity — that's a per-user
+1B.1 smoke and was already verified on 2026-05-11.
+
+**Alternative single-user smoke considered.** Setting
+`per-user-live=1, deployment=1` and launching twice as the same
+user would refuse on step 2, but the refusal would be
+`too_many_sessions` (per-user, by the ordering in § 6.2), not
+`too_many_sessions_deployment` — useless for isolating the new
+quota. The proposed recipe above is the minimal config that
+isolates 1B.2b without needing two real users.
+
+**Multi-user variant (optional).** If staging has two distinct
+test users, the recipe extends naturally: launch session A as
+user X, then session B as user Y, expect `429
+too_many_sessions_deployment` on B with the same
+no-DB-row / no-audit-row guarantees. This variant proves the
+counter is cross-user, not silently per-user. Optional because
+the single-user recipe is sufficient to prove the enforcement
+path.
+
+### 10.2c Slice 1B.2c — operator dashboard tile (DEFERRED, NOT a 1B.2b blocker)
+
+**Goal.** Settings → Sessions tile showing the caller's own
+live count, the caller's per-user cap, and the configured TTL.
+NO deployment-wide count or cap (those stay operator-only per
+§ 5.4). Read-only; no quota override surface.
+
+**Why deferred.**
+
+1. **Not required for safety.** 1B.2b ships an enforcement
+   path, refusal envelope, operator log line, and runbook
+   wording — those are the load-bearing surfaces. A tile that
+   echoes the per-user count to the caller is convenience, not
+   correctness.
+2. **Real shape is informed by observation.** What the tile
+   should surface (just the count? a list of session ids? a
+   warning band at 80% utilisation?) depends on what users
+   actually do with it. Letting 1B.2b run in staging first
+   means the tile lands with evidence.
+3. **Smaller blast radius.** Bundling the tile with the
+   deployment quota would mean a single slice touches the
+   backend create path, a new GET route, the SPA's Settings
+   view, AND the redaction harness for a new authenticated
+   read. Splitting halves the review surface per slice.
+
+**Shape sketch (NOT a commitment).** A single authenticated
+GET (`/api/v1/me/session-stats` or similar — naming at slice
+time) returning `{ live_count, starting_count }` for the
+caller's own user. Owner-scoped by construction (no foreign
+ids ever cross the wire). Tile renders the count + cap;
+fallback contract mirrors `loadSessionPolicy` (failures
+degrade to "—" without blocking the view).
 
 ### 10.3 Slice 1B.3 — production-default tuning (optional follow-up)
 
@@ -929,8 +1253,10 @@ cleanup, matrix-style log of every observed `session_events` and
 
 | Slice | Smoke entries |
 |---|---|
-| 1B.1 | (a) per-user refusal at cap; (b) close-then-success at cap-after-close; (c) refusal AFTER startup reconciliation (the registry is empty so the first cap+1 creates land); (d) refusal redaction sentinel sweep (the response body has no session id, no profile id, no `current_count`, no `cap`). |
-| 1B.2 | (e) deployment refusal with two users; (f) starting-burst refusal via a tight POST loop; (g) dashboard tile renders user-own counts only. |
+| 1B.1 (landed) | (a) per-user refusal at cap; (b) close-then-success at cap-after-close; (c) refusal AFTER startup reconciliation (the registry is empty so the first cap+1 creates land); (d) refusal redaction sentinel sweep (the response body has no session id, no profile id, no `current_count`, no `cap`). |
+| 1B.2a (landed) | (e) per-user starting-burst refusal via a controlled TCP-stall against `quota-smoke-host` (no real KEX completes inside the inner timeout); (f) refusal redaction sentinel sweep mirrors 1B.1. |
+| 1B.2b (this slice — proposed) | (g) deployment refusal with per-user caps set HIGH (`max_live_per_user=8, max_starting_per_user=4`) and the deployment cap set LOW (`=1`) so a single smoke-user can drive the deployment check to refusal (recipe in § 10.2b); (h) post-close slot recovery (launch → refuse → close → relaunch); (i) refusal redaction sentinel sweep (same forbidden-substring list as 1B.1 + 1B.2a; `current_count` and `cap` MUST NOT appear in wire body); (j) operator warn line carries `scope="deployment_live"`. Optional (k) multi-user variant: two distinct test users, session-A as X, session-B as Y, expect cross-user refusal. |
+| 1B.2c (deferred) | Dashboard tile renders user-own counts only and never leaks foreign counts. NOT a Phase 1B.2b smoke. |
 
 Each entry uses the existing `RELAYTERM_AUTH__ALLOWED_ORIGINS` +
 loopback caveat (per the 2026-05-09 lesson in AGENTS.md) and the
@@ -1002,11 +1328,14 @@ matching slice can start.
    deployment. Open question. Resolve only if real usage shows it.
 
 5. **Should the operator dashboard tile show the deployment-wide
-   count?** The recommendation (§ 7.4 + § 10.2) is NO for v1 — the
-   tile shows the caller's own counts only. A future admin view
-   would surface the deployment-wide value. The single-tenant v1
-   shape makes the per-user view equivalent to the deployment view
-   for the homelab operator. Reconsider if multi-user lands.
+   count?** **Resolved (Phase 1B.2b design):** NO. The tile (when
+   it lands as the deferred slice § 10.2c) shows the caller's own
+   counts only. A future admin view would surface the
+   deployment-wide value via a separate operator-only route; that
+   surface is NOT this tile. The single-tenant v1 shape makes the
+   per-user view equivalent to the deployment view for the
+   homelab operator anyway. Reconsider only if multi-user
+   self-hosted lands as a first-class shape.
 
 6. **Should the quota set include a `max_attachments_per_session`?**
    Today the WS handler is effectively single-attachment-per-session;
@@ -1027,6 +1356,30 @@ matching slice can start.
    `RwLock` read — incremental tracking adds complexity for no
    measurable benefit. Reconsider only if the deployment-wide
    ceiling rises above ~1024.
+
+9. **Should the validator rule for `max_dep < max_starting_per_user`
+   be MUST or SHOULD?** Phase 1B.2b ships it as SHOULD (operator
+   ergonomics — surfacing contradictions at boot rather than at
+   first refusal). The hard constraint (`max_dep <
+   max_live_per_user`) stays MUST because that combination is an
+   actual contradiction (the per-user cap could never be reached
+   even on an empty deployment). The starting variant could in
+   principle let a burst consume all deployment slots, but the
+   deployment quota still refuses correctly. Revisit at slice
+   design review if the asymmetry creates surprise.
+
+10. **When does cross-instance coordination become required?**
+    Phase 1B.2b is explicitly single-backend-exact /
+    multi-backend-per-instance-best-effort (§ 9). The trigger for
+    true cross-instance coordination (Postgres advisory lock per
+    `(deployment, "quota")`, OR a redis-backed counter, OR a
+    leader-elected counter service) is an operator scenario where
+    `N × per_instance_cap` is materially different from the
+    intended deployment-wide ceiling AND the operator wants
+    enforcement (not just observability). The single-tenant v1
+    default ([`SPEC.md`](../SPEC.md) "Out of scope (v1)") is
+    single-instance, so this trigger does not apply to any v1
+    deployment. Track at the design level; do not pre-build.
 
 ---
 
