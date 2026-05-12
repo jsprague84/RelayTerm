@@ -4913,7 +4913,9 @@ async fn create_terminal_session_refuses_with_429_when_deployment_cap_reached(po
     // user must act, not wait on a wall clock). Mirrors the per-user
     // variants and the existing `LoginThrottler` posture.
     assert!(
-        resp.headers().get(axum::http::header::RETRY_AFTER).is_none(),
+        resp.headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none(),
         "deployment-cap 429 must not carry a Retry-After header",
     );
     let body = read_body(resp).await;
