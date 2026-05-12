@@ -43,6 +43,16 @@ pub enum ErrorCode {
     /// "in-flight burst" cause to different copy than the live-cap
     /// cause without parsing the static `message` string.
     TooManyStartingSessions,
+    /// Phase 1B.2b quota refusal — deployment-wide live PTY ceiling
+    /// reached (see `docs/session-quotas.md` § 4.2 / § 7.1). Distinct
+    /// from [`Self::TooManySessions`] and
+    /// [`Self::TooManyStartingSessions`] so the SPA can render
+    /// honest copy that names the deployment-wide cause without
+    /// implying the caller's own session count is at fault. The
+    /// deployment cap is NOT exposed via session-policy — operator-
+    /// only, fingerprinting risk (§ 5.4); the SPA renders STATIC
+    /// (non-parameterised) copy on this refusal.
+    TooManySessionsDeployment,
     BadGateway,
     ServiceUnavailable,
     InternalError,
@@ -59,6 +69,7 @@ impl ErrorCode {
             Self::TooManyRequests => "too_many_requests",
             Self::TooManySessions => "too_many_sessions",
             Self::TooManyStartingSessions => "too_many_starting_sessions",
+            Self::TooManySessionsDeployment => "too_many_sessions_deployment",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
             Self::InternalError => "internal_error",
@@ -160,6 +171,29 @@ pub enum ApiError {
     #[error("too many starting terminal sessions")]
     TooManyStartingSessions,
 
+    /// 429 — request rejected because this backend instance has
+    /// reached its deployment-wide live PTY ceiling (Phase 1B.2b
+    /// quota — see `docs/session-quotas.md` § 4.2 / § 7.1). Emitted
+    /// by `POST /api/v1/terminal-sessions` AFTER the per-user live
+    /// cap check and BEFORE the per-user starting cap check (§ 6.2
+    /// ordering), and BEFORE any vault decrypt or SSH side effect.
+    ///
+    /// Wire envelope is `429 { code: "too_many_sessions_deployment",
+    /// message: "too many terminal sessions for this deployment" }`
+    /// — distinct from [`Self::TooManySessions`] and
+    /// [`Self::TooManyStartingSessions`] so the SPA can render copy
+    /// that names the global cause without misleading the caller
+    /// into thinking THEIR session count is at fault. Same redaction
+    /// posture as the per-user variants: NO `Retry-After`, NO
+    /// operator detail on the wire (no count, no cap, no session
+    /// ids, no hostnames). The operator-side `warn!` line at the
+    /// call site carries the safe public metadata
+    /// (`user_id`, `scope = "deployment_live"`, `current_count`,
+    /// `cap`). NEVER exposed via session-policy (§ 5.4 — operator-
+    /// only, fingerprinting risk).
+    #[error("too many terminal sessions for this deployment")]
+    TooManySessionsDeployment,
+
     /// 502 — an upstream system the request depends on (e.g. an SSH peer
     /// during preflight) failed in a way that's not the client's fault.
     /// The wrapped detail is operator-facing only; the wire body collapses
@@ -225,6 +259,11 @@ impl ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::TooManyStartingSessions,
                 "too many starting terminal sessions".to_owned(),
+            ),
+            Self::TooManySessionsDeployment => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManySessionsDeployment,
+                "too many terminal sessions for this deployment".to_owned(),
             ),
             Self::BadGateway(_) => (
                 StatusCode::BAD_GATEWAY,

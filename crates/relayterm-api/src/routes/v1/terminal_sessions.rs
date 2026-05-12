@@ -193,6 +193,39 @@ async fn create(
         return Err(ApiError::TooManySessions);
     }
 
+    // Phase 1B.2b deployment-wide live-PTY ceiling
+    // (`docs/session-quotas.md` § 4.2). Sits BETWEEN per-user live
+    // (above) and per-user starting (below) per § 6.2 ordering: the
+    // user's PERSONAL cap is the more specific cause when it fires
+    // ("close one of YOUR sessions") so it goes first; the global
+    // cap fires next so the SPA can render honest copy that names
+    // the multi-tenant cause without misleading the user about the
+    // right action; and the starting-burst cap stays last so it can
+    // fire when the user has neither hit their personal live cap
+    // nor exhausted the deployment but is bursting starts faster
+    // than the SSH side can promote them. Single-instance exact;
+    // per-instance best-effort for multi-instance topologies (§ 9).
+    let deployment_cap = state.terminal_sessions.max_live_pty_per_deployment().get() as usize;
+    let deployment_current = state.terminal_sessions.count_live_pty_total();
+    if deployment_current >= deployment_cap {
+        // Operator-side log line: same redaction posture as the
+        // per-user variants (§ 8.3). `scope = "deployment_live"`
+        // distinguishes the global cap refusal in operator logs
+        // without leaking session ids, profile ids, hostnames, peer
+        // banners, or wire bodies. `current_count` and `cap`
+        // describe deployment state, not user content. No
+        // `audit_events` row — quota refusals are operational, not
+        // security-relevant (§ 8.2).
+        warn!(
+            user_id = %user_id,
+            scope = "deployment_live",
+            current_count = deployment_current,
+            cap = deployment_cap,
+            "terminal session quota refused"
+        );
+        return Err(ApiError::TooManySessionsDeployment);
+    }
+
     // Phase 1B.2a per-user starting-burst ceiling (`docs/session-quotas.md`
     // § 4.3). Same ordering posture as the live ceiling above (AFTER
     // ownership + host-key gating, BEFORE vault decrypt + SSH side

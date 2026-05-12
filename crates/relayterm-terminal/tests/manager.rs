@@ -1996,3 +1996,135 @@ async fn max_starting_per_user_builder_overrides_default() {
     let (mgr, _) = build_manager();
     assert_eq!(mgr.max_starting_per_user().get(), 4);
 }
+
+// ----------------------------------------------------------------------
+// Deployment-wide live quota (Phase 1B.2b — `docs/session-quotas.md`
+// § 4.2). Counts ALL owners' runtime-registry entries whose `live =
+// Some` against this backend instance. Single-instance exact;
+// per-instance best-effort for multi-instance topologies (§ 9).
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn count_live_pty_total_is_zero_for_empty_registry() {
+    let (mgr, _) = build_manager();
+    assert_eq!(mgr.count_live_pty_total(), 0);
+}
+
+#[tokio::test]
+async fn count_live_pty_total_ignores_starting_placeholders() {
+    // `create_session` registers a `Starting` placeholder with `live =
+    // None`. The Phase 1B.2b deployment counter MUST exclude it — that
+    // disjoint set belongs to the starting-burst quota (§ 4.3) and
+    // collapsing the two would double-count.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let _ = mgr.create_session(req(owner)).await.unwrap();
+    let _ = mgr.create_session(req(owner)).await.unwrap();
+    assert_eq!(mgr.count_live_pty_total(), 0);
+}
+
+#[tokio::test]
+async fn count_live_pty_total_counts_active_and_detached_across_owners() {
+    // The deployment counter sums live PTYs across ALL owners and
+    // collapses `active` and `detached` (both are
+    // `RuntimeSessionStatus::Live`). § 4.2 of `docs/session-quotas.md`.
+    let (mgr, _) = build_manager_with_short_ttl(std::time::Duration::from_secs(60));
+    let alice = UserId::new();
+    let bob = UserId::new();
+
+    // Alice: one active (attached).
+    let a = mgr.create_session(req(alice)).await.unwrap().session;
+    let (start_a, _fa) = fake_start();
+    mgr.start_live_pty(alice, a.id, start_a).await.unwrap();
+    let _att_a = mgr
+        .attach_session(attach_req(alice, a.id))
+        .await
+        .unwrap()
+        .attachment;
+
+    // Bob: one detached (attached then detached, inside TTL).
+    let b = mgr.create_session(req(bob)).await.unwrap().session;
+    let (start_b, _fb) = fake_start();
+    mgr.start_live_pty(bob, b.id, start_b).await.unwrap();
+    let att_b = mgr
+        .attach_session(attach_req(bob, b.id))
+        .await
+        .unwrap()
+        .attachment;
+    mgr.detach_attachment(bob, b.id, att_b.id, None)
+        .await
+        .unwrap();
+
+    // Alice ALSO has a starting placeholder that MUST NOT be counted.
+    let _ = mgr.create_session(req(alice)).await.unwrap();
+
+    assert_eq!(
+        mgr.count_live_pty_total(),
+        2,
+        "deployment count sums active + detached across owners, ignoring starting",
+    );
+}
+
+#[tokio::test]
+async fn count_live_pty_total_drops_on_close() {
+    // Closing a session removes its registry entry, freeing both the
+    // owner's per-user slot AND the deployment slot the next create
+    // can fill.
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let s = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _f) = fake_start();
+    mgr.start_live_pty(owner, s.id, start).await.unwrap();
+    assert_eq!(mgr.count_live_pty_total(), 1);
+
+    mgr.close_session(s.id, owner).await.unwrap();
+    assert_eq!(mgr.count_live_pty_total(), 0);
+}
+
+#[tokio::test]
+async fn count_live_pty_total_unaffected_by_extra_attachments() {
+    // A single session with multiple attachment rows still consumes
+    // exactly one deployment slot — the quota is per live PTY, not per
+    // attachment row (§ 3 non-goals).
+    let (mgr, _) = build_manager();
+    let owner = UserId::new();
+    let s = mgr.create_session(req(owner)).await.unwrap().session;
+    let (start, _f) = fake_start();
+    mgr.start_live_pty(owner, s.id, start).await.unwrap();
+
+    let _ = mgr.attach_session(attach_req(owner, s.id)).await.unwrap();
+    let _ = mgr.attach_session(attach_req(owner, s.id)).await.unwrap();
+
+    assert_eq!(
+        mgr.count_live_pty_total(),
+        1,
+        "extra attachments must not inflate the deployment live-PTY count",
+    );
+}
+
+#[tokio::test]
+async fn max_live_pty_per_deployment_default_matches_pinned_constant() {
+    use relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_DEPLOYMENT;
+    let (mgr, _) = build_manager();
+    assert_eq!(
+        mgr.max_live_pty_per_deployment().get(),
+        DEFAULT_MAX_LIVE_PTY_PER_DEPLOYMENT,
+    );
+    assert_eq!(DEFAULT_MAX_LIVE_PTY_PER_DEPLOYMENT, 64);
+}
+
+#[tokio::test]
+async fn max_live_pty_per_deployment_builder_overrides_default() {
+    use std::num::NonZeroU32;
+    let cap = NonZeroU32::new(2048).unwrap();
+    let alt = TerminalSessionManager::new(
+        Arc::new(InMemoryRepo::default()) as Arc<dyn TerminalSessionRepository>,
+        Arc::new(InMemoryRepo::default()) as Arc<dyn SessionEventRepository>,
+    )
+    .with_max_live_pty_per_deployment(cap);
+    assert_eq!(alt.max_live_pty_per_deployment(), cap);
+
+    // Default-constructed manager keeps the default cap.
+    let (mgr, _) = build_manager();
+    assert_eq!(mgr.max_live_pty_per_deployment().get(), 64);
+}

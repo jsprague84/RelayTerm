@@ -510,6 +510,19 @@ pub(crate) struct TerminalSessionsConfig {
     /// [`Config::validate_terminal_sessions`]; `0` would deadlock every
     /// create and is a hard boot failure.
     pub(crate) max_starting_sessions_per_user: u32,
+    /// Deployment-wide ceiling on concurrent live PTY runtime entries
+    /// across ALL owners (Phase 1B.2b of `docs/session-quotas.md`
+    /// § 4.2). Counted against THIS backend instance's in-memory
+    /// `TerminalSessionManager` registry — exact for single-instance
+    /// deployments, per-instance best-effort for any multi-instance
+    /// topology (§ 9 "Multi-instance limitations"). Bounded
+    /// `1..=4096` by [`Config::validate_terminal_sessions`]; the
+    /// validator additionally rejects values below the per-user live
+    /// or starting caps (a per-user ceiling above the deployment
+    /// ceiling would be a contradiction — § 5.2). Deliberately NOT
+    /// exposed via `GET /api/v1/config/session-policy` (§ 5.4 —
+    /// operator-only, fingerprinting risk).
+    pub(crate) max_live_pty_sessions_per_deployment: u32,
 }
 
 /// Numeric defaults / bounds for [`TerminalSessionsConfig`]. Pulled into
@@ -562,6 +575,19 @@ pub(crate) mod terminal_sessions_defaults {
     /// load-bearing ceiling and the starting quota only defends against
     /// runaway in-flight POST loops.
     pub(crate) const MAX_STARTING_SESSIONS_PER_USER_MAX: u32 = 32;
+    /// Default deployment-wide live PTY ceiling (Phase 1B.2b of
+    /// `docs/session-quotas.md` § 4.2). `64` is conservative for a
+    /// single-tenant self-hosted v1 deployment; operators running a
+    /// multi-user homelab can raise it.
+    pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT: u32 = 64;
+    /// Lower bound for the deployment-wide live PTY ceiling. `0`
+    /// disables the backend (every create refuses) and is a config
+    /// mistake, so the validator rejects it with a clearer error.
+    pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MIN: u32 = 1;
+    /// Upper bound for the deployment-wide live PTY ceiling. `4096` is
+    /// past the kernel-side FD ceiling on most single-host deployments,
+    /// so anything above is almost certainly a configuration mistake.
+    pub(crate) const MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MAX: u32 = 4096;
 }
 
 impl Config {
@@ -647,6 +673,8 @@ impl Config {
                     terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
                 max_starting_sessions_per_user:
                     terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER,
+                max_live_pty_sessions_per_deployment:
+                    terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT,
             },
         }
     }
@@ -842,6 +870,12 @@ impl Config {
             cfg.terminal_sessions.max_starting_sessions_per_user = v
                 .parse()
                 .context("RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER")?;
+        }
+        if let Some(v) = getenv("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT")
+        {
+            cfg.terminal_sessions.max_live_pty_sessions_per_deployment = v
+                .parse()
+                .context("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT")?;
         }
         Ok(())
     }
@@ -1271,6 +1305,51 @@ impl Config {
                 max = terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MAX,
             );
         }
+        let max_deployment = self.terminal_sessions.max_live_pty_sessions_per_deployment;
+        if max_deployment < terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MIN {
+            bail!(
+                "terminal_sessions.max_live_pty_sessions_per_deployment = {got} must be >= {min}; \
+                 a zero deployment ceiling would refuse every terminal-session create",
+                got = max_deployment,
+                min = terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MIN,
+            );
+        }
+        if max_deployment > terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MAX {
+            bail!(
+                "terminal_sessions.max_live_pty_sessions_per_deployment = {got} exceeds the hard \
+                 cap of {max}; deployment ceilings above {max} are past the kernel-side FD \
+                 ceiling on most single-host deployments and are almost certainly a configuration \
+                 mistake",
+                got = max_deployment,
+                max = terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MAX,
+            );
+        }
+        // Cross-field bounds (`docs/session-quotas.md` § 5.2). The
+        // deployment-wide ceiling MUST sit at or above every per-user
+        // ceiling — a per-user cap above the global cap is a
+        // contradiction the enforcement layer cannot resolve sensibly.
+        // Each error names both fields explicitly so the operator can
+        // fix the right one.
+        if max_deployment < max_live {
+            bail!(
+                "terminal_sessions.max_live_pty_sessions_per_deployment = {dep} must be >= \
+                 terminal_sessions.max_live_pty_sessions_per_user = {user}; a per-user live \
+                 ceiling above the deployment ceiling is a contradiction (every user would be \
+                 capped by the deployment value before reaching their personal cap)",
+                dep = max_deployment,
+                user = max_live,
+            );
+        }
+        if max_deployment < max_starting {
+            bail!(
+                "terminal_sessions.max_live_pty_sessions_per_deployment = {dep} must be >= \
+                 terminal_sessions.max_starting_sessions_per_user = {user}; a starting-burst cap \
+                 above the deployment ceiling would let one user's burst exhaust the deployment \
+                 slot before any session promotes to live",
+                dep = max_deployment,
+                user = max_starting,
+            );
+        }
         Ok(())
     }
 
@@ -1298,6 +1377,15 @@ impl Config {
     /// — the value is post-validation, in-range, and a positive `u32`.
     pub(crate) fn max_starting_sessions_per_user(&self) -> u32 {
         self.terminal_sessions.max_starting_sessions_per_user
+    }
+
+    /// Deployment-wide live PTY ceiling (Phase 1B.2b quota). Production
+    /// callers pass this into
+    /// [`relayterm_terminal::TerminalSessionManager::with_max_live_pty_per_deployment`].
+    /// Assumes [`Self::validate_terminal_sessions`] has already passed
+    /// — the value is post-validation, in-range, and a positive `u32`.
+    pub(crate) fn max_live_pty_sessions_per_deployment(&self) -> u32 {
+        self.terminal_sessions.max_live_pty_sessions_per_deployment
     }
 
     /// Resolve the configured master key, or return `None` when the vault
@@ -1494,6 +1582,7 @@ struct FileTerminalSessionsConfig {
     detached_live_pty_ttl_seconds: Option<u64>,
     max_live_pty_sessions_per_user: Option<u32>,
     max_starting_sessions_per_user: Option<u32>,
+    max_live_pty_sessions_per_deployment: Option<u32>,
 }
 
 impl FileConfig {
@@ -1605,6 +1694,9 @@ impl FileConfig {
             if let Some(cap) = s.max_starting_sessions_per_user {
                 cfg.terminal_sessions.max_starting_sessions_per_user = cap;
             }
+            if let Some(cap) = s.max_live_pty_sessions_per_deployment {
+                cfg.terminal_sessions.max_live_pty_sessions_per_deployment = cap;
+            }
         }
     }
 }
@@ -1668,6 +1760,8 @@ mod tests {
                     terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER,
                 max_starting_sessions_per_user:
                     terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER,
+                max_live_pty_sessions_per_deployment:
+                    terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT,
             },
         }
     }
@@ -3280,6 +3374,12 @@ max_live_pty_sessions_per_user = 4
             terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MIN;
         cfg.validate_terminal_sessions()
             .expect("min boundary ok (per-user live cap)");
+        // Bump the deployment cap to its own MAX so the cross-field
+        // check (`max_live_pty_sessions_per_deployment >=
+        // max_live_pty_sessions_per_user`) is satisfied at the
+        // per-user upper boundary.
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MAX;
         cfg.terminal_sessions.max_live_pty_sessions_per_user =
             terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MAX;
         cfg.validate_terminal_sessions()
@@ -3384,9 +3484,178 @@ max_starting_sessions_per_user = 2
             terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MIN;
         cfg.validate_terminal_sessions()
             .expect("min boundary ok (per-user starting cap)");
+        // The default deployment cap (64) is already > MAX_STARTING_SESSIONS_PER_USER_MAX (32),
+        // so no cross-field adjustment is needed at the upper boundary here.
         cfg.terminal_sessions.max_starting_sessions_per_user =
             terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MAX;
         cfg.validate_terminal_sessions()
             .expect("max boundary ok (per-user starting cap)");
+    }
+
+    // --- Terminal sessions (deployment live quota — Phase 1B.2b) -----
+
+    #[test]
+    fn terminal_sessions_default_max_live_pty_per_deployment_is_sixty_four() {
+        // Phase 1B.2b default. `docs/session-quotas.md` § 4.2 names
+        // `64` — pinned here so a future bump in either source
+        // surfaces in CI rather than silently in production behaviour.
+        let cfg = Config::defaults();
+        assert_eq!(
+            cfg.terminal_sessions.max_live_pty_sessions_per_deployment,
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT,
+        );
+        assert_eq!(
+            cfg.terminal_sessions.max_live_pty_sessions_per_deployment,
+            64
+        );
+        cfg.validate_terminal_sessions()
+            .expect("default deployment cap must validate");
+        assert_eq!(cfg.max_live_pty_sessions_per_deployment(), 64);
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_deployment_env_override_parses() {
+        let mut cfg = empty_cfg();
+        Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT",
+                "128",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.terminal_sessions.max_live_pty_sessions_per_deployment,
+            128,
+        );
+        cfg.validate_terminal_sessions().unwrap();
+        assert_eq!(cfg.max_live_pty_sessions_per_deployment(), 128);
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_deployment_toml_round_trip() {
+        let raw = r#"
+[terminal_sessions]
+max_live_pty_sessions_per_deployment = 32
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        let mut cfg = Config::defaults();
+        parsed.merge_into(&mut cfg);
+        assert_eq!(
+            cfg.terminal_sessions.max_live_pty_sessions_per_deployment,
+            32,
+        );
+        cfg.validate_terminal_sessions()
+            .expect("TOML round-trip must validate");
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_deployment_env_invalid_value_fails_safely() {
+        let mut cfg = empty_cfg();
+        let err = Config::apply_env_with(
+            &mut cfg,
+            env_from(&[(
+                "RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT",
+                "not-a-number",
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT"),
+            "error must name the failing input: {msg}",
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_zero_max_live_pty_per_deployment_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment = 0;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_live_pty_sessions_per_deployment") && msg.contains(">="),
+            "zero deployment cap must be rejected naming the field and the bound: {msg}",
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_above_max_live_pty_per_deployment_rejected() {
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MAX + 1;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_live_pty_sessions_per_deployment") && msg.contains("hard cap"),
+            "above-max deployment cap must be rejected naming the field and the bound: {msg}",
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_max_live_pty_per_deployment_min_and_max_boundaries_validate() {
+        let mut cfg = empty_cfg();
+        // Lower the per-user caps so the min-boundary deployment cap is
+        // still >= every per-user cap (cross-field rule).
+        cfg.terminal_sessions.max_live_pty_sessions_per_user =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_USER_MIN;
+        cfg.terminal_sessions.max_starting_sessions_per_user =
+            terminal_sessions_defaults::MAX_STARTING_SESSIONS_PER_USER_MIN;
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MIN;
+        cfg.validate_terminal_sessions()
+            .expect("min boundary ok (deployment cap)");
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment =
+            terminal_sessions_defaults::MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT_MAX;
+        cfg.validate_terminal_sessions()
+            .expect("max boundary ok (deployment cap)");
+    }
+
+    #[test]
+    fn terminal_sessions_deployment_below_per_user_live_rejected() {
+        // Cross-field rule (`docs/session-quotas.md` § 5.2): the
+        // deployment-wide cap MUST sit at or above the per-user live
+        // cap. The error names both fields.
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_user = 16;
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment = 8;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_live_pty_sessions_per_deployment")
+                && msg.contains("max_live_pty_sessions_per_user"),
+            "deployment-below-per-user-live must name both fields: {msg}",
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_deployment_below_starting_rejected() {
+        // Cross-field rule (`docs/session-quotas.md` § 5.2): the
+        // deployment-wide cap MUST sit at or above the starting cap.
+        let mut cfg = empty_cfg();
+        // Keep per-user live below the deployment cap so the starting
+        // mismatch is what trips the validator.
+        cfg.terminal_sessions.max_live_pty_sessions_per_user = 1;
+        cfg.terminal_sessions.max_starting_sessions_per_user = 16;
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment = 8;
+        let err = cfg.validate_terminal_sessions().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_live_pty_sessions_per_deployment")
+                && msg.contains("max_starting_sessions_per_user"),
+            "deployment-below-starting must name both fields: {msg}",
+        );
+    }
+
+    #[test]
+    fn terminal_sessions_deployment_equal_to_per_user_live_validates() {
+        // Equal-bound at the cross-field check is acceptable (>=, not
+        // >). Single-user deployments can configure dep == per-user.
+        let mut cfg = empty_cfg();
+        cfg.terminal_sessions.max_live_pty_sessions_per_user = 4;
+        cfg.terminal_sessions.max_starting_sessions_per_user = 4;
+        cfg.terminal_sessions.max_live_pty_sessions_per_deployment = 4;
+        cfg.validate_terminal_sessions()
+            .expect("dep == per-user is allowed at the boundary");
     }
 }

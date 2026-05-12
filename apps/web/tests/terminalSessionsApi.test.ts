@@ -361,6 +361,25 @@ describe("describeCreateError", () => {
     );
     expect(summary).not.toContain(SENTINEL);
   });
+
+  it("maps 429 too_many_sessions_deployment to a clear dev-lab summary (Phase 1B.2b)", () => {
+    // Same dev-lab posture as the per-user refusal — the dev lab
+    // does NOT render the production copy, but it MUST surface the
+    // deployment-cap refusal as something more useful than a raw
+    // "HTTP 429 too_many_sessions_deployment". Distinct from the
+    // per-user dev-lab line so a maintainer reading the dev-lab
+    // status can tell the two causes apart.
+    const summary = describeCreateError({
+      kind: "http",
+      status: 429,
+      code: "too_many_sessions_deployment",
+      message: SENTINEL,
+    });
+    expect(summary).toBe(
+      "create failed: deployment live session limit reached",
+    );
+    expect(summary).not.toContain(SENTINEL);
+  });
 });
 
 // ---------------------------------------------------------------------------

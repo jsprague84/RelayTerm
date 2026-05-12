@@ -285,3 +285,33 @@ enabled = true
 #
 # [terminal_sessions]
 # max_starting_sessions_per_user = 4
+
+# Deployment-wide ceiling on concurrent live PTY runtimes across ALL
+# owners (Phase 1B.2b quota — `docs/session-quotas.md` § 4.2).
+#
+# Counted against THIS backend instance's in-memory registry. This
+# value is exact for single-instance deployments (the v1 default);
+# multi-instance topologies enforce per-instance best-effort — the
+# effective deployment-wide ceiling is `N × per-instance` (§ 9 of
+# `docs/session-quotas.md`). A `POST /api/v1/terminal-sessions` that
+# would exceed this ceiling is refused with `429
+# too_many_sessions_deployment`; the refusal writes no DB row and
+# no audit event.
+#
+# Deliberately NOT exposed via `GET /api/v1/config/session-policy`
+# (§ 5.4 — operator-only, fingerprinting risk). The SPA renders a
+# STATIC refusal copy ("This RelayTerm deployment is at its live
+# terminal session limit. Close an existing session or wait for a
+# detached session to expire before starting another.") rather than
+# parameterising on the cap.
+#
+# Default: 64 (conservative for single-tenant self-hosted; raise for
+# multi-user homelab). Bounded 1..=4096. 0 and out-of-range values are
+# a hard boot failure. The validator additionally rejects values below
+# `max_live_pty_sessions_per_user` or `max_starting_sessions_per_user`
+# — a per-user ceiling above the deployment ceiling is a contradiction.
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT
+#
+# [terminal_sessions]
+# max_live_pty_sessions_per_deployment = 64

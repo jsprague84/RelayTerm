@@ -140,6 +140,14 @@ services:
       # too_many_starting_sessions` when the caller has this many
       # creates in flight. Default 4; bounded 1..=32.
       RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER:-4}"
+      # Deployment-wide live-PTY ceiling (Phase 1B.2b quota — see
+      # `docs/session-quotas.md` § 4.2). Counted across ALL owners
+      # against this backend instance's in-memory registry; refuses
+      # with `429 too_many_sessions_deployment`. Per-instance
+      # best-effort for multi-instance topologies (§ 9). NOT exposed
+      # via session-policy (operator-only, fingerprinting risk).
+      # Default 64; bounded 1..=4096; MUST be >= every per-user cap.
+      RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT:-64}"
 
       # Tracing. The backend honors `RUST_LOG` via tracing_subscriber's
       # env filter. Default keeps app-level info on, dependencies at

@@ -165,6 +165,12 @@ export function describeCreateError(err: CreateTerminalSessionError): string {
       if (err.status === 429 && err.code === "too_many_starting_sessions") {
         return "create failed: per-user starting session limit reached";
       }
+      // Phase 1B.2b: deployment-wide live-PTY refusal. Same dev-lab
+      // posture — typed code+status only, no production copy
+      // (`docs/session-quotas.md` § 7.6).
+      if (err.status === 429 && err.code === "too_many_sessions_deployment") {
+        return "create failed: deployment live session limit reached";
+      }
       return `create failed: HTTP ${err.status} ${err.code}`;
     case "transport":
       return "create failed: transport error";

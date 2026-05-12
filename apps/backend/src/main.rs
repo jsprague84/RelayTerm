@@ -265,6 +265,14 @@ async fn main() -> anyhow::Result<()> {
     // therefore returns `Some` for every value that survives validation.
     let max_starting_per_user = std::num::NonZeroU32::new(cfg.max_starting_sessions_per_user())
         .expect("validate_terminal_sessions rejects 0");
+    // Phase 1B.2b deployment-wide live-PTY ceiling. Bound 1..=4096
+    // already checked by `validate_terminal_sessions` above (which
+    // also rejects values below either per-user cap); `NonZeroU32::new`
+    // therefore returns `Some` for every value that survives
+    // validation.
+    let max_live_pty_per_deployment =
+        std::num::NonZeroU32::new(cfg.max_live_pty_sessions_per_deployment())
+            .expect("validate_terminal_sessions rejects 0");
     let terminal_sessions = {
         let mut mgr = TerminalSessionManager::with_detach_ttl(
             Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
@@ -272,7 +280,8 @@ async fn main() -> anyhow::Result<()> {
             detach_ttl,
         )
         .with_max_live_pty_per_user(max_live_pty_per_user)
-        .with_max_starting_per_user(max_starting_per_user);
+        .with_max_starting_per_user(max_starting_per_user)
+        .with_max_live_pty_per_deployment(max_live_pty_per_deployment);
         if let Some(runtime) = recording_runtime {
             mgr = mgr.with_recording(runtime);
             info!("terminal recording writer enabled (plaintext-at-rest)");

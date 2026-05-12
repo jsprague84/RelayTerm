@@ -326,6 +326,53 @@ fn test_terminal_manager_with_max_starting_per_user(
     )
 }
 
+/// Like [`test_terminal_manager`] but with a custom deployment-wide
+/// live-PTY cap (Phase 1B.2b quota). The per-user live cap is set
+/// high enough that the deployment cap is the limiting factor in the
+/// tests that drive `429 too_many_sessions_deployment`.
+fn test_terminal_manager_with_max_live_per_deployment(
+    db: &Db,
+    cap: std::num::NonZeroU32,
+) -> Arc<TerminalSessionManager> {
+    use relayterm_core::repository::{SessionEventRepository, TerminalSessionRepository};
+    Arc::new(
+        TerminalSessionManager::new(
+            Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+            Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+        )
+        .with_max_live_pty_per_deployment(cap),
+    )
+}
+
+/// Mirrors [`setup_with_max_live_per_user`] but overrides the
+/// deployment-wide live-PTY cap (Phase 1B.2b quota). Tests that drive
+/// the cross-owner refusal path use this so the deployment cap is the
+/// limiting factor while every per-user cap stays at its generous
+/// default.
+async fn setup_with_max_live_per_deployment(
+    pool: PgPool,
+    cap: std::num::NonZeroU32,
+) -> (Router, UserId, String) {
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool);
+    let terminal_sessions = test_terminal_manager_with_max_live_per_deployment(&db, cap);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
+    let state = AppState {
+        db,
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
+    };
+    (router(state), user_id, cookie)
+}
+
 /// Vault service backed by a deterministic test master key. Tests that
 /// don't exercise the vault still need *some* vault instance because the
 /// API state requires it for the `POST /ssh-identities` route.
@@ -4788,6 +4835,424 @@ async fn create_terminal_session_refusal_fires_after_ownership_gate(pool: PgPool
         resp.status(),
         StatusCode::NOT_FOUND,
         "ownership gate fires before quota — foreign profile collapses to 404 even at cap",
+    );
+}
+
+// ----------------------------------------------------------------------
+// Deployment-wide live-PTY quota refusal (Phase 1B.2b —
+// `docs/session-quotas.md` § 4.2 / § 7.1). The cap is counted across
+// ALL owners against THIS backend instance's in-memory registry.
+// Single-instance exact; per-instance best-effort for multi-instance
+// topologies (§ 9). The cap is NOT exposed via session-policy
+// (operator-only, fingerprinting risk — § 5.4).
+// ----------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_refuses_with_429_when_deployment_cap_reached(pool: PgPool) {
+    // Drive the create route up to the configured deployment-wide cap
+    // (across two owners), then attempt one more. The refusal MUST be
+    // 429 with the new `too_many_sessions_deployment` wire code, MUST
+    // NOT create a DB row, MUST NOT echo the count/cap or any session
+    // id/profile id/hostname in the body, and MUST NOT write an
+    // audit_events row.
+    let cap = std::num::NonZeroU32::new(2).unwrap();
+    let (app, alice_id, alice_cookie) = setup_with_max_live_per_deployment(pool.clone(), cap).await;
+    let bob_id = create_user(&pool, "bob").await;
+    let bob_auth = test_auth(&Db::from_pool(pool.clone()));
+    let bob_cookie = bootstrap_test_session(&bob_auth, bob_id).await;
+
+    let alice_profile = make_trusted_profile(
+        &pool,
+        alice_id,
+        &test_vault(),
+        "dep-alice",
+        "dep-alice.example.com",
+        "SHA256:dep-alice",
+    )
+    .await;
+    let bob_profile = make_trusted_profile(
+        &pool,
+        bob_id,
+        &test_vault(),
+        "dep-bob",
+        "dep-bob.example.com",
+        "SHA256:dep-bob",
+    )
+    .await;
+
+    // Alice + Bob each create one — cap = 2 is reached across owners.
+    for (pid, cookie) in [
+        (alice_profile, alice_cookie.as_str()),
+        (bob_profile, bob_cookie.as_str()),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(json_post(
+                "/api/v1/terminal-sessions",
+                json!({ "server_profile_id": pid }),
+                cookie,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Alice's third attempt — at deployment cap (Bob already holds the
+    // second slot). MUST refuse with the deployment-scoped code.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": alice_profile }),
+            &alice_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // No `Retry-After` header (`docs/session-quotas.md` § 7.2 — the
+    // user must act, not wait on a wall clock). Mirrors the per-user
+    // variants and the existing `LoginThrottler` posture.
+    assert!(
+        resp.headers().get(axum::http::header::RETRY_AFTER).is_none(),
+        "deployment-cap 429 must not carry a Retry-After header",
+    );
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "too_many_sessions_deployment");
+    assert_eq!(
+        body["error"]["message"],
+        "too many terminal sessions for this deployment",
+    );
+    // No count, no cap, no session id, no profile id, no hostname, no
+    // operator detail. The wire MUST NOT carry the numeric values for
+    // the current count / cap either.
+    let raw = body.to_string();
+    for forbidden in [
+        "current_count",
+        "cap",
+        "owner_id",
+        "user_id",
+        "profile_id",
+        "session_id",
+        "dep-alice.example.com",
+        "dep-bob.example.com",
+        &alice_profile.to_string(),
+        &bob_profile.to_string(),
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "deployment-quota refusal must not contain `{forbidden}`: {raw}",
+        );
+    }
+
+    // No new DB row was written by the refusal.
+    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM terminal_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        total.0, 2,
+        "refused create must not write a terminal_sessions row (have {} rows)",
+        total.0,
+    );
+
+    // No audit_events row was written either — quota refusals are
+    // operational, not security-relevant (§ 8.2).
+    let audit_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count.0, 0,
+        "deployment-refused create must not write an audit_events row (have {} rows)",
+        audit_count.0,
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_deployment_cap_is_cross_owner(pool: PgPool) {
+    // The deployment cap MUST close out OTHER users once it is full —
+    // unlike the per-user cap, which is owner-scoped. Alice fills the
+    // single deployment slot; Bob's first attempt MUST be refused with
+    // the deployment-scoped code (not the per-user code, which would
+    // mislead Bob into thinking his own session count is the
+    // problem).
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let (app, alice_id, alice_cookie) = setup_with_max_live_per_deployment(pool.clone(), cap).await;
+    let bob_id = create_user(&pool, "bob").await;
+    let bob_auth = test_auth(&Db::from_pool(pool.clone()));
+    let bob_cookie = bootstrap_test_session(&bob_auth, bob_id).await;
+
+    let alice_profile = make_trusted_profile(
+        &pool,
+        alice_id,
+        &test_vault(),
+        "dep-cross-alice",
+        "dep-cross-alice.example.com",
+        "SHA256:dep-cross-alice",
+    )
+    .await;
+    let bob_profile = make_trusted_profile(
+        &pool,
+        bob_id,
+        &test_vault(),
+        "dep-cross-bob",
+        "dep-cross-bob.example.com",
+        "SHA256:dep-cross-bob",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": alice_profile }),
+            &alice_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Bob's create — deployment cap reached by another user. MUST be
+    // the deployment-scoped 429.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": bob_profile }),
+            &bob_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body["error"]["code"], "too_many_sessions_deployment",
+        "cross-owner refusal must surface the deployment scope, not the per-user scope",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_per_user_live_cap_beats_deployment_cap(pool: PgPool) {
+    // Ordering rule (`docs/session-quotas.md` § 6.2): the per-user
+    // live cap MUST fire BEFORE the deployment cap when BOTH would
+    // refuse. Rationale: the user's PERSONAL cap is the more specific
+    // cause when it fires ("close one of YOUR sessions"); the
+    // deployment refusal would misdirect them to "wait for the
+    // operator". Build a router where per-user = 1 AND deployment =
+    // 1; fill the slot; observe that the second create surfaces
+    // `too_many_sessions`, not `too_many_sessions_deployment`.
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    use relayterm_core::repository::{SessionEventRepository, TerminalSessionRepository};
+    let terminal_sessions = Arc::new(
+        TerminalSessionManager::new(
+            Arc::new(db.terminal_sessions()) as Arc<dyn TerminalSessionRepository>,
+            Arc::new(db.session_events()) as Arc<dyn SessionEventRepository>,
+        )
+        .with_max_live_pty_per_user(std::num::NonZeroU32::new(1).unwrap())
+        .with_max_live_pty_per_deployment(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let auth = test_auth(&db);
+    let cookie = bootstrap_test_session(&auth, user_id).await;
+    let state = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+
+    let profile = make_trusted_profile(
+        &pool,
+        user_id,
+        &test_vault(),
+        "order-user-vs-dep",
+        "order-user-vs-dep.example.com",
+        "SHA256:order-user-vs-dep",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": profile }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = read_body(resp).await;
+    assert_eq!(
+        body["error"]["code"], "too_many_sessions",
+        "per-user live cap fires before deployment cap when both would refuse",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_deployment_cap_refusal_fires_before_vault_decrypt(pool: PgPool) {
+    // The deployment refusal MUST sit BEFORE vault decrypt + SSH side
+    // effects (§ 6.2). Observable proof: share the manager Arc across
+    // two routers — one vault-enabled (fills the slot), one
+    // vault-disabled. If the deployment check sat AFTER vault decrypt,
+    // the second create would surface `503 service_unavailable`; if it
+    // sits BEFORE (as required), it stays 429
+    // too_many_sessions_deployment.
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let alice_id = create_user(&pool, "alice").await;
+    let bob_id = create_user(&pool, "bob").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager_with_max_live_per_deployment(&db, cap);
+    let auth = test_auth(&db);
+    let alice_cookie = bootstrap_test_session(&auth, alice_id).await;
+    let bob_cookie = bootstrap_test_session(&auth, bob_id).await;
+
+    let state_with_vault = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: Some(test_vault()),
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app_with_vault = router(state_with_vault);
+
+    let alice_profile = make_trusted_profile(
+        &pool,
+        alice_id,
+        &test_vault(),
+        "dep-order-alice",
+        "dep-order-alice.example.com",
+        "SHA256:dep-order-alice",
+    )
+    .await;
+    let bob_profile = make_trusted_profile(
+        &pool,
+        bob_id,
+        &test_vault(),
+        "dep-order-bob",
+        "dep-order-bob.example.com",
+        "SHA256:dep-order-bob",
+    )
+    .await;
+
+    let resp = app_with_vault
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": alice_profile }),
+            &alice_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Build a second router with `vault: None`, sharing the same
+    // terminal_sessions Arc → the deployment slot stays filled.
+    let state_no_vault = AppState {
+        db: Db::from_pool(pool.clone()),
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions: terminal_sessions.clone(),
+        auth: auth.clone(),
+        auth_routes: test_auth_routes(),
+        login_throttler: test_login_throttler(),
+    };
+    let app_no_vault = router(state_no_vault);
+    let resp = app_no_vault
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": bob_profile }),
+            &bob_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "deployment refusal fires before vault decrypt — at-cap create stays 429, never 503",
+    );
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "too_many_sessions_deployment");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_terminal_session_deployment_cap_foreign_profile_404_beats_quota(pool: PgPool) {
+    // Ownership gate MUST sit before the deployment quota (§ 6.2). A
+    // foreign profile id at the cap still collapses to 404, never
+    // 429 — otherwise the quota refusal would become a side-channel
+    // for cross-user profile existence.
+    let cap = std::num::NonZeroU32::new(1).unwrap();
+    let (app, alice_id, alice_cookie) = setup_with_max_live_per_deployment(pool.clone(), cap).await;
+    let alice_profile = make_trusted_profile(
+        &pool,
+        alice_id,
+        &test_vault(),
+        "dep-foreign-alice",
+        "dep-foreign-alice.example.com",
+        "SHA256:dep-foreign-alice",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": alice_profile }),
+            &alice_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let bob_id = create_user(&pool, "bob").await;
+    let bob_profile = make_trusted_profile(
+        &pool,
+        bob_id,
+        &test_vault(),
+        "dep-foreign-bob",
+        "dep-foreign-bob.example.com",
+        "SHA256:dep-foreign-bob",
+    )
+    .await;
+
+    // Alice asks for Bob's profile — 404 fires first, even at
+    // deployment cap.
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/terminal-sessions",
+            json!({ "server_profile_id": bob_profile }),
+            &alice_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "ownership gate fires before deployment quota — foreign profile collapses to 404",
     );
 }
 

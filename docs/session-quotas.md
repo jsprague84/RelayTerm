@@ -40,7 +40,7 @@
 >   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
 >   § "2026-05-12 · Per-user starting-session quota (Phase 1B.2a,
 >   cap=1) staging smoke".
-> - **Phase 1B.2b (DESIGN — this slice's target; NOT landed):**
+> - **Phase 1B.2b (landed 2026-05-12; staging smoke pending):**
 >   `max_live_pty_sessions_per_deployment` — deployment-wide live
 >   PTY ceiling, default `64`, bound `1..=4096`. Wire shape: 429
 >   `too_many_sessions_deployment`. **NOT** exposed via
@@ -54,9 +54,10 @@
 >   order: AFTER per-user live cap, BEFORE per-user starting cap
 >   (rationale in § 6.2). Single-instance exact / multi-instance
 >   explicitly per-instance best-effort (§ 9). The operator
->   dashboard tile that earlier roadmaps named alongside 1B.2 is
->   deferred to a separate later slice (§ 10.2c) and is NOT a
->   blocker for 1B.2b.
+>   dashboard tile (§ 10.2c) and Prometheus-style metrics surface
+>   (§ 8.4) remain deferred and are NOT blockers for 1B.2b. The
+>   validator also rejects deployment-cap values below either
+>   per-user cap (§ 5.2 cross-field bound).
 > - **Phase 1B.2c (operator dashboard tile; deferred):** a
 >   single authenticated GET endpoint returning the caller's own
 >   live + starting counts, plus a Settings → Sessions tile that

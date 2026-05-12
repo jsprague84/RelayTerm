@@ -192,3 +192,22 @@ enabled = false
 #
 # [terminal_sessions]
 # max_starting_sessions_per_user = 4
+
+# Deployment-wide ceiling on concurrent live PTY runtimes across ALL
+# owners (Phase 1B.2b quota — `docs/session-quotas.md` § 4.2). Counted
+# against THIS backend instance's in-memory registry — single-instance
+# deployments are exact, multi-instance topologies enforce per-instance
+# best-effort (§ 9). A `POST /api/v1/terminal-sessions` that would
+# exceed this ceiling is refused with `429 too_many_sessions_deployment`;
+# the refusal writes no DB row and no audit event. Deliberately NOT
+# exposed via `GET /api/v1/config/session-policy` (operator-only,
+# fingerprinting risk — § 5.4).
+#
+# Default: 64 (conservative for single-tenant self-hosted). Bounded
+# 1..=4096. MUST be >= every per-user cap above (the validator rejects
+# a per-user ceiling above the deployment ceiling).
+#
+# Env: RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT
+#
+# [terminal_sessions]
+# max_live_pty_sessions_per_deployment = 64

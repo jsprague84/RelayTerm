@@ -434,6 +434,88 @@ describe("describeLaunchError", () => {
     expect(summary).not.toContain("Close a session from the Sessions list");
     expect(summary).not.toContain("Detached sessions count toward this limit");
   });
+
+  it("maps 429 too_many_sessions_deployment to safe static copy (Phase 1B.2b)", () => {
+    // The deployment-wide refusal MUST yield the spec-pinned STATIC
+    // copy from `docs/session-quotas.md` § 7.5 — NOT parameterised on
+    // a numeric cap (the deployment cap is NOT exposed via
+    // session-policy, § 5.4 — operator-only, fingerprinting risk).
+    // The wire `message` is intentionally NOT echoed.
+    const summary = describeLaunchError({
+      kind: "http",
+      status: 429,
+      code: "too_many_sessions_deployment",
+      message: `wire detail ${SENTINEL}`,
+    });
+    expect(summary).toBe(
+      "This RelayTerm deployment is at its live terminal session limit. Close an existing session or wait for a detached session to expire before starting another.",
+    );
+    expect(summary).not.toContain(SENTINEL);
+    // Trailing-punctuation guard: the copy must end at the second
+    // sentence's period, with no stray ". ." or trailing space.
+    expect(summary).toMatch(/another\.$/);
+    expect(summary).not.toMatch(/\. \.$/);
+    // Anti-overclaim register (`docs/session-quotas.md` § 7.5).
+    // Deployment-scope-specific additions: must NOT mention "other
+    // users" (owner-scope leak), must NOT name a numeric cap (the
+    // value is not exposed on the wire), must NOT include
+    // wall-clock wait language.
+    const lower = summary.toLowerCase();
+    const forbidden = [
+      "your session quota",
+      "we're rate-limiting you",
+      "please slow down",
+      "queue",
+      "always available",
+      "persistent across restart",
+      "other users",
+      "another user",
+      "retry-after",
+    ];
+    for (const phrase of forbidden) {
+      expect(lower).not.toContain(phrase);
+    }
+    expect(lower).not.toMatch(/wait \d+ seconds/);
+    // The copy must not surface a numeric cap value (operator-only).
+    expect(summary).not.toMatch(/\b\d+\b/);
+  });
+
+  it("ignores cap/ttl options for too_many_sessions_deployment (static copy)", () => {
+    // Even when the caller passes maxLivePtyPerUser / detachedTtlSeconds
+    // (e.g. because the SPA already loaded session-policy for the
+    // per-user surface), the deployment-cap copy MUST remain static.
+    // The deployment cap is NOT exposed via session-policy and any
+    // parameterisation here would invite "your session quota"-style
+    // overclaim.
+    const summary = describeLaunchError(
+      {
+        kind: "http",
+        status: 429,
+        code: "too_many_sessions_deployment",
+        message: "",
+      },
+      { maxLivePtyPerUser: 12, detachedTtlSeconds: 1800 },
+    );
+    expect(summary).not.toMatch(/\b12\b/);
+    expect(summary).not.toContain("about 30 minutes");
+    expect(summary).not.toContain("about 30 seconds");
+  });
+
+  it("does not borrow per-user copy for too_many_sessions_deployment", () => {
+    // The deployment copy MUST stay distinct from both per-user
+    // copies. Collapsing them would mislead the user about the right
+    // action (per-user → close one of YOUR sessions; deployment →
+    // wait for a detached session to expire OR close one).
+    const summary = describeLaunchError({
+      kind: "http",
+      status: 429,
+      code: "too_many_sessions_deployment",
+      message: "",
+    });
+    expect(summary).not.toContain("limit of");
+    expect(summary).not.toContain("Sessions list");
+    expect(summary).not.toContain("Wait a moment for one to finish starting");
+  });
 });
 
 describe("describeWorkspaceError", () => {

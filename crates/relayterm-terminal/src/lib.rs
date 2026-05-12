@@ -33,7 +33,8 @@ pub mod retention_worker;
 
 pub use manager::{
     AttachSessionOutcome, AttachSessionRequest, AttachmentRuntime, CloseTerminalSessionOutcome,
-    CreateTerminalSessionOutcome, CreateTerminalSessionRequest, DEFAULT_MAX_LIVE_PTY_PER_USER,
+    CreateTerminalSessionOutcome, CreateTerminalSessionRequest,
+    DEFAULT_MAX_LIVE_PTY_PER_DEPLOYMENT, DEFAULT_MAX_LIVE_PTY_PER_USER,
     DEFAULT_MAX_STARTING_PER_USER, DETACHED_LIVE_PTY_TTL, DetachInfo, DetachOutcome,
     DetachSessionOutcome, LIVE_PTY_ATTACH_MESSAGE, LIVE_PTY_CREATE_MESSAGE, LiveRuntimeView,
     ResizeSessionOutcome, RuntimeSessionStatus, STUB_PTY_NOT_IMPLEMENTED_ATTACH_MESSAGE,

@@ -280,6 +280,19 @@ export function describeLaunchError(
       if (err.status === 429 && err.code === "too_many_starting_sessions") {
         return "You already have the maximum number of terminal sessions starting. Wait a moment for one to finish starting, then try again.";
       }
+      // Phase 1B.2b: deployment-wide live-PTY refusal (`429
+      // too_many_sessions_deployment`). The deployment cap is NOT
+      // exposed via `/api/v1/config/session-policy` (operator-only,
+      // fingerprinting risk — § 5.4), so this copy is STATIC, NOT
+      // parameterised on a numeric cap. Honest about the multi-tenant
+      // shape ("This RelayTerm deployment") without breaching the
+      // owner-scope posture by naming other users; no `Retry-After`
+      // wait-language; no "your session quota" overclaim. Branching
+      // on `code` only, never `message` (`docs/session-quotas.md`
+      // § 7.5).
+      if (err.status === 429 && err.code === "too_many_sessions_deployment") {
+        return "This RelayTerm deployment is at its live terminal session limit. Close an existing session or wait for a detached session to expire before starting another.";
+      }
       return `Could not start terminal: HTTP ${err.status} ${err.code}`;
     }
     case "transport":
