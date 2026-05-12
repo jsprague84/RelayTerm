@@ -3632,6 +3632,256 @@ treat any of these as smoke-verified):**
 
 ---
 
+### 2026-05-12 · Deployment-wide live PTY quota (Phase 1B.2b) staging finding: validator boot rejection verified; runtime smoke deferred
+
+Slice `docs/deployment-wide-quota-smoke-and-closeout` attempted
+to staging-verify the deployment-wide live PTY ceiling
+shipped in `feat(api): enforce deployment live session quota`
+(`316bc32`, 2026-05-12) plus the rustfmt-only follow-up
+(`0ea0939`). The deployment cap sits BETWEEN the Phase 1B.1
+per-user-live cap and the Phase 1B.2a per-user-starting cap in
+the create-route ordering and is intended to bound the running
+backend's total live-PTY footprint across all owners. Verified
+against the HTTPS staging slot at
+[`https://relayterm-staging.js-node.cc`](https://relayterm-staging.js-node.cc).
+
+**Key finding — single-user runtime smoke is structurally
+infeasible under the v1 validator.** The slice prompt and the
+prior text of `docs/session-quotas.md` § 10.2b both proposed a
+single-user recipe with caps
+`(per-user-live=8, per-user-starting=4, deployment=1)`. That
+configuration cannot boot: the § 5.2 validator (correctly)
+rejects `max_live_pty_sessions_per_deployment <
+max_live_pty_sessions_per_user`, observed live on staging at
+the recreate attempt below. Walking the route ordering proves
+the structural reason: for `deployment-live` to fire before
+`per-user-live` for the same user requires `count_user_live <
+user_cap` AND `count_total >= deployment_cap`; for one user
+the two counters are equal, so the relation reduces to
+`deployment_cap < user_cap`, which is exactly what the
+validator forbids. The deployment cap is therefore a
+structurally multi-user cap on a single backend instance,
+and the staging slot has exactly one user
+(`staging+throwaway-20260509173230@example.com`). Creating a
+second staging user requires either operator-side
+`auth.first_user_bootstrap_token` on a fresh DB (closed —
+user row already present) or direct-SQL `INSERT` into `users`
++ `user_passwords` (out of scope this slice — would be auth
+surgery). Runtime staging verification is therefore deferred
+until a supported second-user provisioning path lands; the
+Rust integration suite at
+`crates/relayterm-api/tests/api.rs` continues to cover the
+cross-owner deployment refusal envelope.
+
+**Stack state at smoke start.** Compose project
+`relayterm-staging` on `cloud-edge`. Pre-attempt, the deployed
+backend image was the Phase 1B.2a `sha256:80d5e000…` (built
+from `fd6813d`, the Phase 1B.2a commit, 2026-05-12 03:40 UTC)
+and the web image was `sha256:96d4c5a8…` (built 2026-05-12
+03:41 UTC). The Forgejo registry `:main` tag at the start of
+the slice now resolved to the post-deployment-quota
+`sha256:5d359a2d…` (backend, built 2026-05-12 05:21 UTC,
+~7 minutes before the slice began) and `sha256:73486f6c…`
+(web). The fresh backend digest was confirmed to carry
+`316bc32` indirectly — it boots `validate_terminal_sessions`
+correctly when the new field is contradicted (the validator
+error message at `apps/backend/src/config.rs:1335` was
+emitted by the recreate attempt below).
+
+**Compose env wiring (durable, landed this slice).** The
+staging compose at `/home/ubuntu/docker-compose/relayterm-staging/docker-compose.yml`
+gained a single line, slotted right after the existing
+`MAX_STARTING_SESSIONS_PER_USER` row inside the
+`relayterm-backend.environment` block:
+
+```yaml
+      RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT:-64}"
+```
+
+Exact-match the repo template at
+`deploy/docker-compose.traefik-staging.example.yml:117`. The
+default expansion resolves to `64` (matching
+`relayterm_terminal::DEFAULT_MAX_LIVE_PTY_PER_DEPLOYMENT` and
+`docs/session-quotas.md` § 4.2); the smoke override attempt
+(`=1`) was injected via shell-env at the `docker compose up
+-d --force-recreate` invocation, NOT written to any `.env`
+file. This compose-file edit stays in place after the slice
+as the durable operator-knob wiring; post-revert, the `:-64`
+default re-applies via the no-override recreate.
+
+**Boot validator rejection (the load-bearing staging
+finding).** The recreate attempt
+`RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT=1
+docker compose up -d --no-deps --force-recreate
+relayterm-backend relayterm-web` against the running per-user
+defaults (`MAX_LIVE_PTY_SESSIONS_PER_USER=8`,
+`MAX_STARTING_SESSIONS_PER_USER=4`) failed the dependency
+healthcheck inside the compose orchestration. `docker logs
+relayterm-staging-relayterm-backend-1` showed a tight crash
+loop with the exact error:
+
+```
+Error: validate terminal session config
+
+Caused by:
+    terminal_sessions.max_live_pty_sessions_per_deployment = 1 must be >= terminal_sessions.max_live_pty_sessions_per_user = 8; a per-user live ceiling above the deployment ceiling is a contradiction (every user would be capped by the deployment value before reaching their personal cap)
+```
+
+— byte-for-byte the message emitted by the validator at
+`apps/backend/src/config.rs:1335`. This is the live
+staging verification of test item **(i)** from
+`docs/session-quotas.md` § 11: "validator rejects
+`max_dep < max_live_per_user` at boot." The error string
+mentions only `1`, `8`, and the static contradiction
+explanation — no secrets, no peer / vault internals, no
+caller info, no session id, no hostname.
+
+**Revert to default cap=64 (post-validator finding).**
+`docker compose up -d --no-deps --force-recreate
+relayterm-backend relayterm-web` (no shell override) ran
+cleanly: both containers reached `healthy` within ~3 s of
+start; the durable compose `:-64` default applied. Postgres
+was untouched (`Up 2 days (healthy)` across the slice). The
+backend startup line literally reads:
+
+```
+relayterm-backend starting addr=0.0.0.0:8080 auth_mode="production" recording_enabled=false detached_live_pty_ttl_seconds=30 max_live_pty_sessions_per_user=8 max_starting_sessions_per_user=4
+```
+
+— note the deployment cap is intentionally NOT in the
+startup-log echo at `apps/backend/src/main.rs:56-65`,
+consistent with § 5.4 of `docs/session-quotas.md` ("operator-
+only, fingerprinting risk; never exposed on session-policy or
+the startup log"). The cap is verifiable instead via `docker
+inspect relayterm-staging-relayterm-backend-1 --format
+'{{range .Config.Env}}{{println .}}{{end}}'`, which (post-
+revert) shows all four `RELAYTERM_TERMINAL_SESSIONS__*` vars
+with their defaults including
+`MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT=64`.
+
+**Baseline checks (post-revert).**
+
+- `GET /healthz` → `200`.
+- `GET /api/v1/auth/me` (unauthenticated) → `401`.
+- `docker inspect …` env on the running backend confirms
+  `RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT=64`.
+- Backend image digest: `sha256:5d359a2d…`
+  (`git.js-node.cc/jsprague/relayterm-backend:main`,
+  post-deployment-quota — upgraded from the pre-slice
+  `sha256:80d5e000…`).
+- Web image digest: `sha256:73486f6c…`
+  (`git.js-node.cc/jsprague/relayterm-web:main`,
+  post-deployment-quota — upgraded from the pre-slice
+  `sha256:96d4c5a8…`).
+
+The authenticated `GET /api/v1/config/session-policy` was
+NOT exercised this slice (would have required login as the
+existing staging user, which the slice prompt did not
+require for a validator-only finding); the wire shape is
+pinned by the frontend sentinel test
+`apps/web/tests/sessionPolicy.test.ts` and the backend
+integration test `session_policy_response_does_not_expose_deployment_cap`
+(or equivalent — the policy DTO did NOT change for 1B.2b
+per § 5.4 of `docs/session-quotas.md`).
+
+**Runtime smoke NOT run.** Per the structural-infeasibility
+finding above, no `too_many_sessions_deployment` wire
+envelope was observed against the staging stack this slice.
+No throwaway SSH stall target was created (the prior smoke's
+`quota-smoke-host` inventory row remains in DB; the
+container behind it was removed at the 1B.2a cleanup). No
+authenticated cookie was minted; no `/tmp/sq/*` scratch
+directory was created; no SPA / Playwright session was
+opened.
+
+**Log / nginx redaction sweep.** Backend container log
+covering the recreate-and-revert window (the failed
+validator-rejection cycle plus the clean restart, ~30
+lines) and nginx log (no traffic) were grepped for the
+sentinel set
+`session_token|token_hash|cookie|password|private_key|encrypted_private_key|BEGIN OPENSSH|data_b64|REDACT-MARKER`.
+**Zero hits** in either log. The validator error message
+itself names only the two integer caps (`1` and `8`) and
+the static contradiction explanation — no secret-shaped
+substring.
+
+**Inventory state — unchanged.** No `terminal_sessions`,
+`session_events`, or `audit_events` rows were written this
+slice (no successful create, no refusal observed beyond
+the boot-validator rejection which is not a route-write).
+The prior smoke's `quota-smoke-host` / `quota-smoke-profile`
+/ `quota-smoke-identity` / known-host-entry rows remain
+intentionally in place per the staging-smoke convention.
+
+**Net change to staging at slice end.**
+
+- Backend image upgraded from `sha256:80d5e000…` (Phase
+  1B.2a) to `sha256:5d359a2d…` (post-deployment-quota,
+  `316bc32` + `0ea0939`).
+- Web image upgraded from `sha256:96d4c5a8…` to
+  `sha256:73486f6c…`.
+- One new durable line in
+  `docker-compose.yml` for the deployment-cap env
+  pass-through (default `64`).
+- All four `RELAYTERM_TERMINAL_SESSIONS__*` env vars now
+  present on the running backend with their defaults.
+- No `.env` change.
+- No DB change (no migrations applied this slice; the
+  deployment-quota commit is in-memory + config only).
+- No throwaway containers.
+- No scratch / cookie / cred files.
+
+**Verified.**
+
+- Phase 1B.2b code (`316bc32` + `0ea0939`) is present in
+  the freshly-deployed `:main` digests AND boots cleanly
+  with default cap=64.
+- Phase 1B.2b boot validator rejects
+  `max_live_pty_sessions_per_deployment <
+  max_live_pty_sessions_per_user` with the static
+  contradiction message — staging-verifies test item
+  **(i)** from § 11 of `docs/session-quotas.md`.
+- The fresh image starts under default config without
+  regression in any of the three already-staging-verified
+  quota fields (TTL, per-user-live, per-user-starting all
+  echo correctly on the startup line).
+- Durable compose pass-through line for
+  `MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT` landed on staging,
+  mirroring the repo template style.
+- Log / nginx redaction sentinel sweep clean (no hits in
+  either log).
+
+**Deferred (intentional non-goals for this run; do NOT
+treat any of these as staging-verified):**
+
+- **Runtime `too_many_sessions_deployment` wire envelope
+  on staging** — requires a supported second staging user
+  (see § 10.2b "Follow-up requirement" in
+  `docs/session-quotas.md`). Covered by the Rust
+  integration suite at `crates/relayterm-api/tests/api.rs`
+  for now.
+- **Operator dashboard tile** showing the caller's own
+  live-session count vs cap — Phase 1B.2c, not landed.
+- **Prometheus / metrics surface** for quota counters —
+  out of scope per `docs/session-quotas.md` § 8.4.
+- **Cross-instance coordination** of the deployment cap
+  (single-backend exact; multi-backend per-instance
+  best-effort) — out of scope per § 9 of
+  `docs/session-quotas.md`.
+- **Durable persistence** of quota counters across backend
+  restart — out of scope (§ 3 non-goals).
+- **VT snapshot resume**, **tmux / screen multiplexer
+  pass-through**, **RelayTerm-side persistent-session
+  agent** — out of scope.
+- **Authenticated `/api/v1/config/session-policy` probe**
+  this run — DTO shape unchanged for 1B.2b per § 5.4 of
+  `docs/session-quotas.md`; pinned by the sentinel test
+  `apps/web/tests/sessionPolicy.test.ts`.
+- **Production-default tuning** — out of scope per
+  `docs/session-quotas.md` § 10.3.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

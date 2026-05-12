@@ -650,7 +650,7 @@ Content-Type: application/json
 {
   "error": {
     "code": "too_many_sessions_deployment",
-    "message": "deployment session capacity reached"
+    "message": "too many terminal sessions for this deployment"
   }
 }
 ```
@@ -664,7 +664,7 @@ Content-Type: application/json
 {
   "error": {
     "code": "too_many_starting_sessions",
-    "message": "too many sessions starting"
+    "message": "too many starting terminal sessions"
   }
 }
 ```
@@ -1028,7 +1028,31 @@ AFTER the per-user-live check; public DTO field on
 helper; plumbing across all three Compose templates + both
 worked-example TOMLs + `scripts/check-doc-contracts.sh` § 9.
 
-### 10.2b Slice 1B.2b — deployment-wide live ceiling (THIS SLICE'S TARGET)
+### 10.2b Slice 1B.2b — deployment-wide live ceiling (LANDED; validator staging-verified, runtime staging deferred)
+
+**Implementation status (2026-05-12).** Code landed on `main` in
+`feat(api): enforce deployment live session quota` (`316bc32`,
+2026-05-12) plus the rustfmt-only follow-up `0ea0939`. Enforcement
+sits at `crates/relayterm-api/src/routes/v1/terminal_sessions.rs`
+between the per-user-live check and the per-user-starting check
+per § 6.2; wire envelope and operator log shape match § 4.2 / § 7.1.
+Single-backend exact / multi-backend per-instance best-effort per
+§ 9 (unchanged).
+
+Staging verification on 2026-05-12 covered ONLY the boot
+validator path — test item **(i)** from § 11:
+`max_live_pty_sessions_per_deployment < max_live_pty_sessions_per_user`
+was rejected at boot with the exact error message at
+`apps/backend/src/config.rs:1335`. The runtime refusal envelope
+(test items **(g)**, **(h)**, **(i: redaction)**, **(j)**) is
+covered by the Rust integration suite in
+`crates/relayterm-api/tests/api.rs` but is NOT yet
+staging-verified — see "Smoke" below for why single-user
+isolation is structurally infeasible under the v1 validator.
+Runtime staging verification is deferred until a supported
+second staging smoke user (or a supported test-user
+provisioning path that does not require direct-SQL user
+creation) exists.
 
 **Goal.** Cap the running backend's total live-PTY footprint
 across all owners. Sits alongside the two landed per-user
@@ -1135,30 +1159,54 @@ later slice (§ 9 closing paragraph; § 13 open question 10).
   + config; restart resets counters and reaps PTYs together
   (§ 3 non-goals).
 
-**Smoke (Phase 1B.2b — proposed staging recipe).** Goal: prove
-the deployment cap fires without overlap from the per-user-live
-cap.
+**Smoke (Phase 1B.2b).** Goal: prove the deployment cap fires
+without overlap from the per-user-live cap.
 
-The smoke MUST configure the per-user-live and per-user-starting
-caps HIGH enough that a single user can drive the deployment cap
-to refusal by themselves. The proposed configuration:
+**Single-user smoke is infeasible under the v1 validator
+(2026-05-12 staging finding).** An earlier draft of this
+section proposed a single-user recipe with caps
+`(per-user-live=8, per-user-starting=4, deployment=1)`. That
+configuration cannot boot: the § 5.2 validator (correctly)
+rejects `max_live_pty_sessions_per_deployment <
+max_live_pty_sessions_per_user`, observed live on staging on
+2026-05-12 with the exact error at
+`apps/backend/src/config.rs:1335`. Walking the create-route
+ordering proves the structural reason: for `deployment-live`
+to fire before `per-user-live` for the same user requires
+`count_user_live < user_cap` AND `count_total >=
+deployment_cap`; for one user the two counters are equal, so
+the relation reduces to `deployment_cap < user_cap`, which is
+exactly what the validator forbids. The deployment cap is
+therefore a structurally multi-user cap on a single backend
+instance.
+
+**Multi-user smoke is REQUIRED for runtime staging
+verification.** With two distinct staging users X and Y and
+caps configured so `deployment_cap < user_cap_X + user_cap_Y`
+but `deployment_cap >= max(user_cap_X, user_cap_Y)` (so the
+validator passes AND a single user cannot trigger deployment
+refusal alone):
 
 ```
-RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER=8
-RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER=4
+RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER=1
+RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER=1
 RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT=1
 ```
 
-(The per-user caps are `8 / 4` — the production defaults — so
-the deployment cap is the binding constraint.)
+(All three at `1` is the validator-minimum that still demonstrates
+the deployment path. The validator accepts equal caps; the
+per-user caps cannot be larger than the deployment cap.)
 
 Recipe:
 
-1. Launch session A as smoke-user. Expect `201 Created` (live
-   PTY, status `active`).
-2. Immediately launch session B as the SAME smoke-user. Expect
-   `429 { code: "too_many_sessions_deployment", message: "too
-   many terminal sessions for this deployment" }`. Confirm:
+1. Launch session A as user X. Expect `201 Created` (live PTY,
+   status `active`). Now `count_user_X = 1`, `count_total = 1`.
+2. Immediately launch session B as user Y (a DIFFERENT staging
+   user). User Y has `count_user_Y = 0` so the per-user-live
+   check passes; the deployment check sees `count_total = 1
+   >= deployment_cap = 1` and refuses. Expect `429 { code:
+   "too_many_sessions_deployment", message: "too many terminal
+   sessions for this deployment" }`. Confirm:
    - response has no `Retry-After` header;
    - response carries no `current_count`, no `cap`, no
      session id, no profile id, no hostname;
@@ -1166,43 +1214,62 @@ Recipe:
      `session_events` row, no new `audit_events` row (verified
      via SQL probe scoped to a `created_at >` filter);
    - backend log line carries `scope="deployment_live"`,
-     `current_count=1`, `cap=1` and no forbidden field.
-3. Close session A via the SPA "End session" affordance.
-   Expect the registry slot to free (the close-session path
-   removes the registry entry; the same path the TTL reaper
-   uses).
-4. Launch session C as the smoke-user. Expect `201 Created`,
-   proving the slot recovers.
+     `current_count=1`, `cap=1`, `user_id=<Y's id>` and no
+     forbidden field.
+3. Close session A (as user X) via the SPA "End session"
+   affordance. Expect the registry slot to free.
+4. Launch session C as user Y. Expect `201 Created`, proving
+   the slot recovers AND user Y was correctly never blocked
+   on their personal cap (`count_user_Y` went `0 → 1` over
+   the failed attempt — refusals do not increment).
 5. Cleanup: revert
    `RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT`
-   to its default (`64`) via `docker compose up -d
+   to its default (`64`) AND the per-user caps to the
+   production defaults (`8`, `4`) via `docker compose up -d
    --force-recreate` (mirrors the 1B.1 / 1B.2a cleanup
    pattern); close any remaining smoke sessions; reconcile
    the throwaway `quota-smoke-host` row state.
 
-**Why this isolates the deployment quota.** Per-user-live=8 and
-per-user-starting=4 are both well above the deployment=1
-threshold, so session B's refusal can ONLY have come from the
-deployment check. Reversing the per-user cap (e.g. setting
-per-user-live=1) would create ambiguity — that's a per-user
-1B.1 smoke and was already verified on 2026-05-11.
+**Why a single-user `(1,1,1)` smoke does NOT verify this
+quota.** With caps all at `1` and a single user, launching B
+as the same user trips the per-user-live check FIRST (§ 6.2
+ordering: per-user-live runs before deployment-live). The
+wire envelope is `too_many_sessions`, NOT
+`too_many_sessions_deployment`. Such a smoke would only
+prove the binary contains the deployment-quota code (it
+boots with the cap), not that the deployment refusal path
+is reachable on the wire.
 
-**Alternative single-user smoke considered.** Setting
-`per-user-live=1, deployment=1` and launching twice as the same
-user would refuse on step 2, but the refusal would be
-`too_many_sessions` (per-user, by the ordering in § 6.2), not
-`too_many_sessions_deployment` — useless for isolating the new
-quota. The proposed recipe above is the minimal config that
-isolates 1B.2b without needing two real users.
+**Follow-up requirement: supported second staging user.**
+The current staging slot has exactly one user
+(`staging+throwaway-20260509173230@example.com`). The
+v1 auth surface offers no supported path to add a second
+user without either (a) operator-side `auth.first_user_bootstrap_token`
+on a fresh DB or (b) direct-SQL `INSERT` into `users` +
+`user_passwords` (out of scope per AGENTS.md "Things to
+avoid" / SPEC.md § "Production authentication" — bootstrap
+is intentionally one-shot). Runtime staging verification of
+the deployment quota is deferred until a supported
+second-user path lands. Candidate paths (each is its own
+slice, none scheduled):
 
-**Multi-user variant (optional).** If staging has two distinct
-test users, the recipe extends naturally: launch session A as
-user X, then session B as user Y, expect `429
-too_many_sessions_deployment` on B with the same
-no-DB-row / no-audit-row guarantees. This variant proves the
-counter is cross-user, not silently per-user. Optional because
-the single-user recipe is sufficient to prove the enforcement
-path.
+- A staging-only `auth.staging_secondary_user_token` knob
+  symmetric to `first_user_bootstrap_token` but scoped to
+  `auth.mode = production` deploys with the
+  `staging` profile / hostname pattern.
+- A `tools/staging-user-add` operator script that performs
+  the same Argon2id + `user_passwords` insert the bootstrap
+  route does, with the operator supplying the password
+  via stdin (audit-equivalent to the bootstrap token path).
+- A second-user surface inside the auth admin slice
+  whenever the multi-user authorization story lands
+  (currently out of scope per SPEC.md "Out of scope (v1)").
+
+Until one of those exists, the integration suite is the
+authoritative check on the wire envelope; the staging
+smoke verifies only what staging CAN observe today (the
+validator boot rejection, plus the durable compose
+pass-through line landing on the staging slot).
 
 ### 10.2c Slice 1B.2c — operator dashboard tile (DEFERRED, NOT a 1B.2b blocker)
 
@@ -1256,7 +1323,7 @@ cleanup, matrix-style log of every observed `session_events` and
 |---|---|
 | 1B.1 (landed) | (a) per-user refusal at cap; (b) close-then-success at cap-after-close; (c) refusal AFTER startup reconciliation (the registry is empty so the first cap+1 creates land); (d) refusal redaction sentinel sweep (the response body has no session id, no profile id, no `current_count`, no `cap`). |
 | 1B.2a (landed) | (e) per-user starting-burst refusal via a controlled TCP-stall against `quota-smoke-host` (no real KEX completes inside the inner timeout); (f) refusal redaction sentinel sweep mirrors 1B.1. |
-| 1B.2b (this slice — proposed) | (g) deployment refusal with per-user caps set HIGH (`max_live_per_user=8, max_starting_per_user=4`) and the deployment cap set LOW (`=1`) so a single smoke-user can drive the deployment check to refusal (recipe in § 10.2b); (h) post-close slot recovery (launch → refuse → close → relaunch); (i) refusal redaction sentinel sweep (same forbidden-substring list as 1B.1 + 1B.2a; `current_count` and `cap` MUST NOT appear in wire body); (j) operator warn line carries `scope="deployment_live"`. Optional (k) multi-user variant: two distinct test users, session-A as X, session-B as Y, expect cross-user refusal. |
+| 1B.2b (landed; validator staging-verified, runtime staging deferred) | **(i)** validator rejects `max_dep < max_live_per_user` at boot — staging-verified on 2026-05-12 with the exact error at `apps/backend/src/config.rs:1335`; runtime items **(g)** deployment refusal, **(h)** post-close slot recovery, **(i: redaction)** refusal redaction sentinel sweep, **(j)** operator warn line `scope="deployment_live"` are covered by the Rust integration suite ONLY — staging runtime verification requires a supported second staging user (deferred; see § 10.2b "Follow-up requirement"). The original single-user staging recipe was found infeasible under the v1 validator on 2026-05-12; the multi-user recipe in § 10.2b is the only single-instance isolation path. |
 | 1B.2c (deferred) | Dashboard tile renders user-own counts only and never leaks foreign counts. NOT a Phase 1B.2b smoke. |
 
 Each entry uses the existing `RELAYTERM_AUTH__ALLOWED_ORIGINS` +
