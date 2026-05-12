@@ -3264,6 +3264,372 @@ treat any of these as smoke-verified):**
   (`count_live_pty_for_user` in the runtime registry),
   which is upstream of any WS attach.
 
+### 2026-05-12 · Per-user starting-session quota (Phase 1B.2a, cap=1) staging smoke
+
+Verification of the per-user starting-session ceiling shipped
+in `feat(api): enforce per-user starting session quota`
+(`fd6813d`, 2026-05-11). The starting-cap sits AFTER the
+Phase 1B.1 live-cap in the create-route ordering and refuses
+a tight POST loop that would otherwise stack `live + starting`
+slots before any in-flight create promotes. Verified against
+the HTTPS staging slot at
+[`https://relayterm-staging.js-node.cc`](https://relayterm-staging.js-node.cc)
+with the starting cap temporarily lowered to `1` so the
+refusal could be exercised quickly.
+
+**Smoke method (controlled TCP-stall / API smoke, NOT a
+real-SSH or terminal-I/O smoke).** Starting-state sessions
+are harder to exercise than live-cap refusals because a
+healthy SSH target promotes a session from `Starting` to
+`Live` in well under a second — the per-step inner timeout
+in `crates/relayterm-ssh/src/russh_pty.rs:48`
+(`DEFAULT_INNER_TIMEOUT = 10 s`) and the outer
+`DEFAULT_PTY_START_TIMEOUT = 20 s` in `crates/relayterm-
+ssh/src/pty.rs:46` only matter for stalled / non-responsive
+targets. To hold session A in `Starting` long enough to
+launch session B and observe the refusal, the smoke pointed
+the existing trusted host record `quota-smoke-host` at a
+throwaway alpine+socat container that ACCEPTS TCP on 2222
+but never sends an SSH banner. The bridge's KEX hangs at
+banner-read until the inner timeout fires (~10 s), giving
+ample window for the second POST. This is a controlled
+quota-path smoke driven via the authenticated HTTP API; it
+does NOT exercise real KEX, real auth, real PTY allocation,
+real WebSocket attach, or real terminal I/O — those surfaces
+are covered by other runs in this runbook.
+
+**Stack state at smoke start.** Compose project
+`relayterm-staging` on `cloud-edge`. Pre-smoke, the deployed
+backend image was the pre-Phase-1B.2a `sha256:218f1b83…`
+(built from `eb75116`, the Phase 1B.1 commit, 2026-05-11
+17:32 UTC); the `:main` tag in the Forgejo registry now
+resolved to the post-quota `sha256:80d5e000…` (backend,
+2026-05-12 03:40 UTC) and `sha256:96d4c5a8…` (web,
+2026-05-12 03:41 UTC). A throwaway `docker run` against the
+new backend image emitted the startup line
+`relayterm-backend starting … detached_live_pty_ttl_seconds=
+30 max_live_pty_sessions_per_user=8 max_starting_sessions_
+per_user=4` — the new `max_starting_sessions_per_user` field
+appears in the echo exactly as `apps/backend/src/main.rs:62`
+writes it on `fd6813d`, confirming the new digest carries
+the starting-quota commit.
+
+**Compose env wiring (durable).** The staging compose at
+`/home/ubuntu/docker-compose/relayterm-staging/docker-
+compose.yml` gained a single line, slotted right after the
+existing `MAX_LIVE_PTY_SESSIONS_PER_USER` row inside the
+`relayterm-backend.environment` block:
+
+```yaml
+      RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER:-4}"
+```
+
+Exact-match the repo template at
+`deploy/docker-compose.traefik-staging.example.yml:116`. The
+default expansion resolves to `4` (matching
+`relayterm_terminal::DEFAULT_MAX_STARTING_PER_USER` and
+`docs/session-quotas.md` § 4.3); the smoke override (`=1`)
+was injected via shell-env at the `docker compose up -d
+--force-recreate` invocation, NOT written to any `.env`
+file. This compose-file edit stays in place after the smoke
+as the durable operator-knob wiring; the cleanup recreate
+just drops the shell override and lets the `:-4` default
+re-apply.
+
+**`.env` reconstruction.** The previous live-PTY smoke
+removed the staging `.env` at its cleanup (the prior runs
+fed every secret inline via the shell), so the cap=1
+recreate first had to materialise an `.env` again. The
+reconstruction read the running container envs verbatim via
+`docker inspect … --format '{{range .Config.Env}}…{{end}}'`
+(`POSTGRES_*`, `RELAYTERM_AUTH__*`, `RELAYTERM_VAULT__*`,
+`RELAYTERM_DATABASE__URL`, `RELAYTERM_IMAGE_TAG`, `RUST_LOG`)
+and piped them straight into `/home/ubuntu/docker-compose/
+relayterm-staging/.env` under `umask 077` so the secret
+values never crossed an operator-visible buffer. The file
+is `-rw------- ubuntu:ubuntu`. The cleanup-as-described
+option intentionally KEEPS this file in place so the next
+staging smoke can `docker compose ...` without recreating
+the reconstruction dance; a future smoke that prefers a
+clean-slate `.env` can `shred -u .env` first.
+
+**Recreate.** Both backend and web were recreated from the
+refreshed `:main` digests via `RELAYTERM_TERMINAL_SESSIONS__
+MAX_STARTING_SESSIONS_PER_USER=1 docker compose up -d
+--no-deps --pull always --force-recreate relayterm-backend
+relayterm-web`. Postgres was untouched (`Up 2 days
+(healthy)` across the run). Both reached `healthy` within
+~3 s of start.
+
+**Baseline checks (post-deploy, pre-smoke).**
+
+- `GET /healthz` → `200`.
+- `GET /api/v1/auth/me` (unauthenticated) → `401`.
+- `GET /api/v1/config/session-policy` (unauthenticated) →
+  `401`.
+- Backend startup line literally read
+  `relayterm-backend starting addr=0.0.0.0:8080
+   auth_mode="production" recording_enabled=false
+   detached_live_pty_ttl_seconds=30
+   max_live_pty_sessions_per_user=8
+   max_starting_sessions_per_user=1` — the Phase 1B.2a cap
+  is the third quota-related field in the startup-log echo,
+  mirroring the Phase 1A TTL and Phase 1B.1 live-cap
+  conventions.
+- `GET /api/v1/config/session-policy` (authenticated) →
+  `200 {"detached_live_pty_ttl_seconds":30,
+   "max_live_pty_sessions_per_user":8,
+   "max_starting_sessions_per_user":1}` — confirms the
+  three-field wire shape introduced by `fd6813d`. The
+  `max_live_pty_sessions_per_user` field continues to read
+  the Phase 1B.1 default of `8` (no override in this run).
+
+**Throwaway stall target (TCP-only, NOT a real SSH
+server).** `relayterm-staging-starting-quota-smoke-ssh`
+running `alpine:3` with `apk add --no-cache socat` then
+`exec socat -d TCP-LISTEN:2222,fork,reuseaddr
+SYSTEM:"sleep 60"`. Attached ONLY to the existing internal
+Compose network `relayterm-staging_relayterm-staging-
+internal` (172.21.0.0/16, IP 172.21.0.5), with **no host
+port published**. Started with `--network-alias
+quota-smoke-host --hostname quota-smoke-host` so the backend
+container's DNS resolves the existing host record's
+hostname to the new stall container without any new
+inventory writes. `getent hosts quota-smoke-host` from
+inside the backend container returned `172.21.0.5
+quota-smoke-host`. The container accepts TCP (`echo</dev/
+tcp/quota-smoke-host/2222` succeeded from a sibling
+container) but never sends the SSH server identification
+banner — bytes sent by the russh client are routed to
+`sleep 60` and silently dropped. The bridge's KEX hangs at
+banner-read until the inner-step timeout fires.
+
+**Host-key gate.** The host record `quota-smoke-host`
+(id `026bcb2a-…`) carries one `known_host_entries` row from
+the prior live-PTY smoke: `key_type=ed25519`,
+`fingerprint_sha256=SHA256:mf01uZE+NKV37R5wb5opx7/
+Z7d9TJYUcbTUvsxFNcj0`, `trusted_at` set, `revoked_at` null.
+The create-route's `accept_pins` check at
+`crates/relayterm-api/src/routes/v1/terminal_sessions.rs:
+153-164` only requires that at least one trusted, non-
+revoked pin exists for the host — it does NOT call a fresh
+preflight against the live target. The actual host-key
+VERIFICATION happens later inside russh KEX inside
+`pty_bridge.start(target)`. Since the stall container never
+sends a banner, KEX never reaches the host-key step, so
+the host-key check never fires — but the gate at the
+create-route boundary already passed on the in-DB pin. No
+trust-host-key call or fresh preflight was needed for this
+run.
+
+**Inventory reused (no new rows written; same host /
+profile / identity from the prior smoke).**
+
+- Host `quota-smoke-host` (id `026bcb2a-…`, port `2222`).
+- Server profile `quota-smoke-profile`
+  (id `c7606505-…`).
+- SSH identity `quota-smoke-identity`
+  (id `baa56cd3-…`, `ed25519`).
+- Known-host entry as above.
+- Staging user `staging+throwaway-20260509173230@example.
+  com` (id `f968b6f5-…`), reused from the prior smoke;
+  operator supplied the saved password externally for this
+  run.
+
+**Quota smoke proper.** Driven via authenticated `curl`
+calls from the workstation (browser-write routes carry
+`Origin: https://relayterm-staging.js-node.cc` and the
+`relayterm_session` cookie; cookie file lived in
+`/tmp/sq/cookies.txt` `chmod 600` for the smoke window only
+— shredded at cleanup, never written to any tracked file).
+Login body composed via `jq -n --rawfile pw …` reading the
+password from a chmod-600 file so the plaintext never
+crossed argv, env, or shell history.
+
+- **Launch session A in background** —
+  `POST /api/v1/terminal-sessions
+  {server_profile_id:"c7606505-…", cols:80, rows:24}`
+  blocking on the stall.
+- **`sleep 3`** to give the create-route time to pass
+  ownership / disabled / host-key / live-cap / starting-cap
+  gates and call `create_session` (which registers the
+  in-memory entry with `RuntimeSessionStatus::Starting`)
+  before B fires. The starting-cap gate sits at
+  `crates/relayterm-api/src/routes/v1/terminal_sessions.
+  rs:196-219`, between the live-cap gate and the vault
+  decrypt + bridge-start side effects.
+- **Attempt session B (same profile, same user, starting
+  slot full)** — same POST → **`429 Too Many Requests`**
+  in `0.18 ms`, body literally
+  `{"error":{"code":"too_many_starting_sessions",
+  "message":"too many starting terminal sessions"}}`.
+  Wire-stable per `crates/relayterm-api/src/error.rs:61`
+  — `code` is the typed `too_many_starting_sessions`
+  (distinct from the live-cap's `too_many_sessions` and
+  from the login throttler's `too_many_requests`),
+  `message` is the static safe form with no count / cap /
+  session id / hostname / profile id / user id /
+  `Retry-After` header (verified by curl `--include` —
+  only `content-type: application/json`).
+- **Session A resolves** — after `~10.0 s` total wall the
+  background curl returned `502 Bad Gateway`, body
+  `{"error":{"code":"bad_gateway","message":"bad gateway"}}`
+  (the wire-stable safe envelope; the operator-side
+  WARN line carries the detail `ssh transport failure
+  during pty start`, which is the `map_pty_start_error`
+  classification for `SshPtyError::Transport(_)` at
+  `crates/relayterm-api/src/routes/v1/terminal_sessions.
+  rs:304-308`).
+- **DB after refusal** —
+  `select count(*) from terminal_sessions
+   where owner_id = 'f968b6f5-…'` went `31 → 32`. The single
+  new row is session A (id `e58b4d55-…`,
+  `status:"closed"`, created `04:13:47.924`, closed
+  `04:13:57.930` — `record_pty_start_failed` closed it the
+  moment the bridge errored). The 429-refused session B
+  wrote **no `terminal_sessions` row**. `audit_events` row
+  count was identical before and after the entire smoke
+  window (**`40 → 40`**), confirming the refusal wrote
+  **no audit row** per `docs/session-quotas.md` § 8.2.
+- **Backend warn line for the refusal** (sigil-stripped for
+  the doc): `WARN relayterm_api::routes::v1::terminal_
+  sessions: terminal session quota refused user_id=
+  f968b6f5-9cfc-46ae-b735-bc0f95465b5b scope=
+  "per_user_starting" current_count=1 cap=1`. Public-shape
+  only: `user_id`, `scope`, `current_count`, `cap`. No
+  session id, no profile id, no host id, no identity id,
+  no hostname, no peer banner, no wire body, no
+  User-Agent. The `scope="per_user_starting"` label
+  distinguishes the starting-burst refusal in operator
+  logs from the Phase 1B.1 `scope="per_user_live"` label;
+  both share the same redaction posture. Matches the
+  operator-side logging policy in `docs/session-quotas.md`
+  § 8.3.
+
+**Log / nginx redaction sweep.** Full backend container log
+across the recreate-to-end window (11 lines) and full nginx
+container log (27 lines) were grepped for the sentinel set
+`session_token|token_hash|cookie|password|private_key|
+encrypted_private_key|BEGIN OPENSSH|data_b64|REDACT-MARKER`.
+The two backend hits both match the static phrase
+`detail=missing session cookie` inside `WARN
+relayterm_api::error: unauthorized request …` lines from
+the unauthenticated baseline checks — descriptive text
+that mentions the word `cookie`, NOT any session-token
+value. No `session_token` / `token_hash` value, no
+`password` value, no `private_key` material, no
+`BEGIN OPENSSH`, no `data_b64`, no `REDACT-MARKER`. Nginx
+log: zero hits.
+
+**Cap reverted at cleanup**: cleanup recreate replaced the
+shell `MAX_STARTING_SESSIONS_PER_USER=1` override with the
+compose default (`4`). Post-cleanup
+`/api/v1/config/session-policy` (authenticated) returned
+`{"detached_live_pty_ttl_seconds":30,
+ "max_live_pty_sessions_per_user":8,
+ "max_starting_sessions_per_user":4}`. Backend startup line
+echoed `max_starting_sessions_per_user=4`. The compose-file
+edit (one line in `relayterm-backend.environment`) stays in
+place as the durable operator knob.
+
+**Throwaway stall-target cleanup**: `docker rm -f
+relayterm-staging-starting-quota-smoke-ssh` removed the
+container at end of smoke. The `alpine:3` image stays in
+the local cache; no host port was ever published, so no
+firewall surface to revert.
+
+**Temp credentials cleanup**: `/tmp/sq/{cookies.txt,
+pass.txt,create.json,login.out,A_*,B_*}` (cookie file,
+throwaway plaintext password, create-request body, raw
+login response, per-request curl headers + bodies) were
+chmod-600 throughout the smoke window so they were never
+world-readable, and the whole `/tmp/sq/` directory was
+`shred -u`'d at cleanup. No source-tree files were touched
+this run — no new uncommitted helpers, no `.git/info/
+exclude` entries (the operator supplied the password
+externally, sidestepping the previous-smoke Argon2id PHC
+helper pattern entirely).
+
+**Inventory rows (host / profile / identity / known-host
+entry / 3 closed terminal-session rows including the
+smoke-A failed-start row) intentionally LEFT IN PLACE** per
+the staging-smoke convention — they are operator-visible
+carry-over for the next smoke, and no destructive-action
+route was exercised in this slice.
+
+**Verified.**
+
+- Phase 1B.2a `max_starting_sessions_per_user` is the third
+  authenticated-only wire field on
+  `/api/v1/config/session-policy` (alongside the existing
+  Phase 1A `detached_live_pty_ttl_seconds` and Phase 1B.1
+  `max_live_pty_sessions_per_user`).
+- Phase 1B.2a enforcement at `POST /api/v1/terminal-
+  sessions` with cap=1: launch A blocks at the stall
+  (session in `Starting` for ~10 s), launch B refused
+  with `429 too_many_starting_sessions` in 0.18 ms,
+  refusal writes no DB row + no audit row, refusal log
+  line carries only public-shape fields, session A
+  resolves as `502 bad_gateway` after the bridge inner
+  timeout and is closed via `record_pty_start_failed`.
+- The shipped wire envelope is the typed
+  `{error:{code:"too_many_starting_sessions",
+   message:"too many starting terminal sessions"}}`,
+  distinct from the live-cap's `too_many_sessions` code
+  and the login throttler's `too_many_requests` code.
+- No `Retry-After` header on the 429 (verified by curl
+  `--include`).
+- The starting-cap gate sits AFTER ownership / disabled-
+  profile / host-key / live-cap gates and BEFORE vault
+  decrypt and any SSH side effects (verified by code
+  reading at
+  `crates/relayterm-api/src/routes/v1/terminal_sessions.
+  rs:113-219` plus the no-DB-row / no-audit-row /
+  no-decrypt observation: a 0.18 ms refusal cannot have
+  reached vault decrypt or any outbound TCP work).
+- All log / nginx redaction sentinels clean (only static
+  `detail=missing session cookie` warnings, no values).
+- Staging cap revert verified end-to-end (env, startup
+  log echo, authenticated session-policy).
+
+**Deferred (intentional non-goals for this run; do NOT
+treat any of these as smoke-verified):**
+
+- **Real KEX / auth / PTY allocation on the throwaway
+  target** — the stall container does not speak SSH; the
+  Phase 1B.1 live-cap smoke already covered the
+  real-OpenSSH-server path on the same hostname.
+- **WebSocket attach + actual terminal I/O on session
+  A or any successor** — out of scope; the starting-cap
+  gates session creation, which is upstream of any WS
+  attach.
+- **Deployment-wide quota
+  (`max_live_pty_sessions_per_deployment`)** — Phase
+  1B.3, not landed.
+- **Operator dashboard tile** showing the caller's own
+  live-session and starting-session counts vs cap —
+  Phase 1B.3, not landed.
+- **Prometheus / metrics surface** for quota counters —
+  out of scope per `docs/session-quotas.md` § 8.4.
+- **Durable persistent sessions across backend restart**
+  — Phase 2 / 3 in
+  [`docs/persistent-sessions.md`](../persistent-sessions.md),
+  unchanged by this slice. The starting-cap acts ONLY on
+  the in-memory runtime registry's
+  `RuntimeSessionStatus::Starting` entries; a backend
+  restart clears the registry, so any in-flight Starting
+  count resets to 0 along with the live count.
+- **VT snapshot resume** of an existing detached session
+  across a restart — out of scope.
+- **tmux / screen multiplexer pass-through** — out of
+  scope.
+- **RelayTerm-side persistent-session agent on the target
+  host** — out of scope.
+- **Production-default tuning** (whether `4` is the right
+  per-user starting cap for a homelab vs a small team)
+  — `docs/session-quotas.md` § 10.3 calls this Phase
+  1B.4-style tuning; not in scope for this run.
+
 ---
 
 ## See also
