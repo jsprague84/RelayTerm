@@ -90,6 +90,24 @@ pub struct CreateHost {
     pub default_username: SshUsername,
 }
 
+/// Partial update for a [`Host`] row owned by `owner_id`.
+///
+/// Every field is `Option` — `None` means "do not change this column."
+/// The repository applies fields via `COALESCE($n, column)`, so a `Some`
+/// always overwrites and a `None` always preserves. `updated_at` is
+/// bumped to `NOW()` whenever the route reaches the UPDATE.
+///
+/// All four updatable columns are validated newtypes — domain rules
+/// (length / charset / port range) hold at the type level, so the
+/// repository does not re-check them.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateHost {
+    pub display_name: Option<HostDisplayName>,
+    pub hostname: Option<Hostname>,
+    pub port: Option<SshPort>,
+    pub default_username: Option<SshUsername>,
+}
+
 /// `Debug` is implemented manually so [`Self::encrypted_private_key`]
 /// never leaks into tracing logs or error messages.
 #[derive(Clone)]
@@ -129,6 +147,50 @@ pub struct CreateServerProfile {
     pub ssh_identity_id: SshIdentityId,
     pub username_override: Option<SshUsername>,
     pub tags: Vec<Tag>,
+}
+
+/// Partial update for a [`ServerProfile`] row owned by `owner_id`.
+///
+/// `name`, `host_id`, `ssh_identity_id`, and `tags` follow the same
+/// `Some` = overwrite / `None` = preserve convention as [`UpdateHost`].
+///
+/// `username_override` uses [`SetOptional`] because the field is itself
+/// optional on the domain row: a caller needs to be able to distinguish
+/// "leave it alone" from "explicitly clear it back to the host default."
+/// `SetOptional::Unchanged` preserves the current column; `Set(None)`
+/// clears it; `Set(Some(u))` overwrites with a new username.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateServerProfile {
+    pub name: Option<ProfileName>,
+    pub host_id: Option<HostId>,
+    pub ssh_identity_id: Option<SshIdentityId>,
+    pub username_override: SetOptional<SshUsername>,
+    pub tags: Option<Vec<Tag>>,
+}
+
+/// Tri-state for partial updates of nullable columns.
+///
+/// `Unchanged` leaves the column at its current value. `Set(value)`
+/// overwrites it — `Set(None)` clears the column to `NULL`, `Set(Some(v))`
+/// writes `v`. The repository chooses the SQL shape; callers stay
+/// declarative.
+#[derive(Debug, Clone, Default)]
+pub enum SetOptional<T> {
+    #[default]
+    Unchanged,
+    Set(Option<T>),
+}
+
+impl<T> SetOptional<T> {
+    /// Maps the inner `Some` value of a `Set` while preserving the
+    /// surrounding tri-state. `Unchanged` and `Set(None)` pass through.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> SetOptional<U> {
+        match self {
+            Self::Unchanged => SetOptional::Unchanged,
+            Self::Set(None) => SetOptional::Set(None),
+            Self::Set(Some(v)) => SetOptional::Set(Some(f(v))),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +433,60 @@ pub trait HostRepository: Send + Sync {
     async fn create(&self, input: CreateHost) -> Result<Host, RepositoryError>;
     async fn get(&self, id: HostId) -> Result<Option<Host>, RepositoryError>;
     async fn list_for_user(&self, owner_id: UserId) -> Result<Vec<Host>, RepositoryError>;
+
+    /// Apply a partial update to a host owned by `owner_id`.
+    ///
+    /// Owner scoping is enforced in the SQL `WHERE` clause — an unowned
+    /// row, an absent id, AND an empty update all return
+    /// [`RepositoryError::NotFound`] (the empty-update case is filtered
+    /// at the route layer, so reaching this with no `Some` fields is a
+    /// caller bug; the route is expected to short-circuit and return
+    /// the current row unchanged).
+    ///
+    /// On success the post-update row is returned. `updated_at` is
+    /// bumped to `NOW()`. The repository does NOT consult or modify
+    /// `disabled_at` here — host rows have no disabled state today; if
+    /// that ever changes, this trait method gains a separate setter.
+    async fn update(
+        &self,
+        id: HostId,
+        owner_id: UserId,
+        input: UpdateHost,
+    ) -> Result<Host, RepositoryError>;
+
+    /// Hard-delete a host owned by `owner_id`.
+    ///
+    /// The caller (the route layer) is responsible for the dependency
+    /// pre-check — [`Self::any_dependents_for_user`] is the canonical
+    /// query for "is this row safe to delete?". The Postgres FK
+    /// `server_profiles.host_id REFERENCES hosts(id) ON DELETE RESTRICT`
+    /// is the race-safe backstop; a concurrent profile-create that
+    /// slips between the pre-check and the delete will surface as
+    /// [`RepositoryError::Conflict`] via the FK-violation branch of
+    /// `map_sqlx_error`.
+    ///
+    /// `known_host_entries.host_id REFERENCES hosts(id) ON DELETE
+    /// CASCADE` — the route layer refuses delete when known-host rows
+    /// exist (AGENTS.md "Do not hard-delete known_host_entries"); this
+    /// method does NOT enforce that policy.
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an unknown / foreign id.
+    async fn delete(&self, id: HostId, owner_id: UserId) -> Result<(), RepositoryError>;
+
+    /// `true` iff at least one row in the caller's inventory references
+    /// this host (today: a `server_profiles` row owned by `owner_id`
+    /// with `host_id = id`) OR at least one `known_host_entries` row
+    /// exists for the host (regardless of owner — the host itself is
+    /// owner-scoped, and known-host entries inherit that scope through
+    /// the FK).
+    ///
+    /// Used by the delete route to refuse with a typed 409 conflict
+    /// before issuing the DELETE.
+    async fn any_dependents_for_user(
+        &self,
+        id: HostId,
+        owner_id: UserId,
+    ) -> Result<bool, RepositoryError>;
 }
 
 #[async_trait]
@@ -378,6 +494,47 @@ pub trait SshIdentityRepository: Send + Sync {
     async fn create(&self, input: CreateSshIdentity) -> Result<SshIdentity, RepositoryError>;
     async fn get(&self, id: SshIdentityId) -> Result<Option<SshIdentity>, RepositoryError>;
     async fn list_for_user(&self, owner_id: UserId) -> Result<Vec<SshIdentity>, RepositoryError>;
+
+    /// Rename an SSH identity owned by `owner_id`.
+    ///
+    /// Owner scoping is enforced in SQL. The rename is the ONLY edit
+    /// surface in this slice — `key_type`, `public_key`, and
+    /// `encrypted_private_key` are immutable after creation. Private-key
+    /// material is never touched.
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an unknown / foreign id.
+    async fn rename(
+        &self,
+        id: SshIdentityId,
+        owner_id: UserId,
+        name: String,
+    ) -> Result<SshIdentity, RepositoryError>;
+
+    /// Hard-delete an SSH identity owned by `owner_id`.
+    ///
+    /// The caller MUST pre-check via
+    /// [`Self::any_dependents_for_user`] and refuse with a 409 if any
+    /// `server_profiles` row still references the identity. The FK
+    /// `server_profiles.ssh_identity_id REFERENCES ssh_identities(id)
+    /// ON DELETE RESTRICT` is the race-safe backstop.
+    ///
+    /// Deleting the identity row removes the `encrypted_private_key`
+    /// column value WITH the row — this is the ONE allowed path to
+    /// removal of vault-encrypted private-key bytes from durable
+    /// storage. The pre-check ensures no profile still expects to
+    /// authenticate with this key.
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an unknown / foreign id.
+    async fn delete(&self, id: SshIdentityId, owner_id: UserId) -> Result<(), RepositoryError>;
+
+    /// `true` iff at least one `server_profiles` row owned by
+    /// `owner_id` references this identity. Used by the delete route to
+    /// refuse with a typed 409 conflict before issuing the DELETE.
+    async fn any_dependents_for_user(
+        &self,
+        id: SshIdentityId,
+        owner_id: UserId,
+    ) -> Result<bool, RepositoryError>;
 }
 
 #[async_trait]
@@ -407,6 +564,50 @@ pub trait ServerProfileRepository: Send + Sync {
         owner_id: UserId,
         disabled_at: Option<DateTime<Utc>>,
     ) -> Result<ServerProfile, RepositoryError>;
+
+    /// Apply a partial update to a server profile owned by `owner_id`.
+    ///
+    /// `name` / `host_id` / `ssh_identity_id` / `tags` follow the
+    /// `Some` = overwrite / `None` = preserve convention.
+    /// `username_override` uses [`SetOptional`] so a caller can
+    /// explicitly clear the override back to the host default.
+    ///
+    /// Owner scoping is enforced in SQL. The route layer is responsible
+    /// for verifying that any new `host_id` / `ssh_identity_id` is also
+    /// owned by the caller — the FK alone does NOT check ownership.
+    /// `updated_at` is bumped to `NOW()` on the UPDATE.
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an unknown / foreign id
+    /// (matching the read-side `get` filter so cross-user existence is
+    /// never leaked) and [`RepositoryError::Conflict`] for unique-name
+    /// or FK violations.
+    async fn update(
+        &self,
+        id: ServerProfileId,
+        owner_id: UserId,
+        input: UpdateServerProfile,
+    ) -> Result<ServerProfile, RepositoryError>;
+
+    /// Hard-delete a server profile owned by `owner_id`.
+    ///
+    /// The caller MUST pre-check via [`Self::any_dependents_for_user`]
+    /// and refuse with a 409 if any `terminal_sessions` row references
+    /// the profile (live OR closed — `terminal_sessions` rows are
+    /// NEVER deleted per AGENTS.md, and the schema FK is `ON DELETE
+    /// RESTRICT`). The FK is the race-safe backstop.
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an unknown / foreign id.
+    async fn delete(&self, id: ServerProfileId, owner_id: UserId) -> Result<(), RepositoryError>;
+
+    /// `true` iff at least one `terminal_sessions` row references this
+    /// profile. The query is scoped to the profile id; ownership is
+    /// already proven at the route layer by the prior owner-scoped
+    /// `get` on the profile.
+    async fn any_dependents_for_user(
+        &self,
+        id: ServerProfileId,
+        owner_id: UserId,
+    ) -> Result<bool, RepositoryError>;
 }
 
 #[async_trait]

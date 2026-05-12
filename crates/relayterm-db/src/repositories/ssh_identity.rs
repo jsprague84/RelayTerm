@@ -90,4 +90,80 @@ impl SshIdentityRepository for PgSshIdentityRepository {
             .map(SshIdentityRow::try_into_domain)
             .collect()
     }
+
+    async fn rename(
+        &self,
+        id: SshIdentityId,
+        owner_id: UserId,
+        name: String,
+    ) -> Result<SshIdentity, RepositoryError> {
+        // The rename is the only edit surface. The vault-encrypted blob
+        // and public-key bytes are NOT in the UPDATE column list — they
+        // are immutable post-creation in this slice.
+        let row: Option<SshIdentityRow> = sqlx::query_as(
+            r#"
+            UPDATE ssh_identities
+            SET name = $3
+            WHERE id = $1 AND owner_id = $2
+            RETURNING id, owner_id, name, key_type, public_key,
+                      encrypted_private_key, fingerprint_sha256,
+                      created_at, last_used_at
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(owner_id.into_uuid())
+        .bind(&name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        row.map(SshIdentityRow::try_into_domain)
+            .transpose()?
+            .ok_or(RepositoryError::NotFound { entity: ENTITY })
+    }
+
+    async fn delete(&self, id: SshIdentityId, owner_id: UserId) -> Result<(), RepositoryError> {
+        // Deleting the row removes the `encrypted_private_key` column
+        // value along with it. The route's owner-scoped pre-check is
+        // the policy backstop; the FK `server_profiles.ssh_identity_id
+        // REFERENCES ssh_identities(id) ON DELETE RESTRICT` is the
+        // race-safe data-layer backstop.
+        let result = sqlx::query(
+            r#"
+            DELETE FROM ssh_identities
+            WHERE id = $1 AND owner_id = $2
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(owner_id.into_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound { entity: ENTITY });
+        }
+        Ok(())
+    }
+
+    async fn any_dependents_for_user(
+        &self,
+        id: SshIdentityId,
+        owner_id: UserId,
+    ) -> Result<bool, RepositoryError> {
+        let exists: (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM server_profiles
+                WHERE ssh_identity_id = $1 AND owner_id = $2
+            )
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(owner_id.into_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(ENTITY, e))?;
+        Ok(exists.0)
+    }
 }

@@ -52,33 +52,60 @@ impl CreateSshIdentityRequest {
     /// without echoing the offending value beyond what the validator
     /// already names.
     pub(crate) fn validate(self) -> Result<ValidatedCreateSshIdentity, ApiError> {
-        let trimmed = self.name.trim();
-        if trimmed.is_empty() {
-            return Err(ApiError::Validation("name must not be empty".to_owned()));
-        }
-        if trimmed != self.name {
-            return Err(ApiError::Validation(
-                "name must not start or end with whitespace".to_owned(),
-            ));
-        }
-        if trimmed.chars().count() > MAX_NAME_LEN {
-            return Err(ApiError::Validation(format!(
-                "name must be at most {MAX_NAME_LEN} characters",
-            )));
-        }
-        if trimmed.chars().any(char::is_control) {
-            return Err(ApiError::Validation(
-                "name must not contain control characters".to_owned(),
-            ));
-        }
+        let trimmed = validate_identity_name(&self.name)?;
         let key_type = match self.key_type.as_deref() {
             None => SshKeyType::Ed25519,
             Some(tag) => parse_supported_key_type(tag)?,
         };
         Ok(ValidatedCreateSshIdentity {
-            name: trimmed.to_owned(),
+            name: trimmed,
             key_type,
         })
+    }
+}
+
+/// Shared name validator for create + rename. Centralised so a rename
+/// produces byte-identical errors to a create (the wire `message` text
+/// is the same, the codes are the same, the per-rule order is the same).
+pub(crate) fn validate_identity_name(name: &str) -> Result<String, ApiError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::Validation("name must not be empty".to_owned()));
+    }
+    if trimmed != name {
+        return Err(ApiError::Validation(
+            "name must not start or end with whitespace".to_owned(),
+        ));
+    }
+    if trimmed.chars().count() > MAX_NAME_LEN {
+        return Err(ApiError::Validation(format!(
+            "name must be at most {MAX_NAME_LEN} characters",
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(ApiError::Validation(
+            "name must not contain control characters".to_owned(),
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Request body for `PATCH /api/v1/ssh-identities/:id`.
+///
+/// Rename is the only edit surface in this slice. `key_type`,
+/// `public_key`, and `encrypted_private_key` are immutable after
+/// creation — adding a `key_type` field here would imply we can re-key
+/// in place, which would silently break every saved server profile
+/// that references this identity. Re-keying is a separate, deliberate
+/// "delete + recreate + re-bind profiles" flow that doesn't exist yet.
+#[derive(Debug, Deserialize)]
+pub(crate) struct UpdateSshIdentityRequest {
+    pub name: String,
+}
+
+impl UpdateSshIdentityRequest {
+    pub(crate) fn validated_name(&self) -> Result<String, ApiError> {
+        validate_identity_name(&self.name)
     }
 }
 

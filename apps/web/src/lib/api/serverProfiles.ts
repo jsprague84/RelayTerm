@@ -471,6 +471,305 @@ export function resolveProfileLinks(
 }
 
 // ---------------------------------------------------------------------------
+// PATCH / DELETE helpers
+// ---------------------------------------------------------------------------
+//
+// Wire shapes mirror `crates/relayterm-api/src/dto/server_profile.rs`
+// (`UpdateServerProfileRequest`) and the 204-No-Content response from
+// `DELETE /api/v1/server-profiles/:id`. The helpers do NOT throw, do NOT log
+// raw response bodies, and do NOT echo wire / transport detail through any
+// user-facing string.
+//
+// `username_override` carries three caller intents:
+//  - field omitted → leave the column alone.
+//  - field === `null` → clear the override; fall back to the host default.
+//  - field === string → set the override.
+//
+// On the wire the absent / null distinction is preserved via JSON's own
+// `undefined`-vs-`null` semantics; the TS DTO models the tri-state using
+// `string | null | undefined` so callers don't need a sentinel.
+
+export interface UpdateServerProfileRequest {
+  name?: string;
+  host_id?: string;
+  ssh_identity_id?: string;
+  /** See module-level doc for the absent / null / string tri-state. */
+  username_override?: string | null;
+  tags?: string[];
+}
+
+export type UpdateServerProfileInvalidReason =
+  | "empty_update"
+  | CreateServerProfileInvalidReason;
+
+export type UpdateServerProfileValidation =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; reason: UpdateServerProfileInvalidReason };
+
+/**
+ * Validate a partial update on the client, mirroring the per-field
+ * validators used at create time. Re-uses
+ * {@link validateCreateServerProfileRequest} field-by-field so the
+ * client error set stays in sync — drift is a one-line update.
+ *
+ * Builds a wire body that ONLY includes the fields the caller touched.
+ * `username_override === null` is preserved as a deliberate clear.
+ */
+export function validateUpdateServerProfileRequest(
+  raw: UpdateServerProfileRequest,
+): UpdateServerProfileValidation {
+  const body: Record<string, unknown> = {};
+  let touched = false;
+
+  if (raw.name !== undefined) {
+    touched = true;
+    // Delegate to the create validator with placeholder ids — those
+    // pass the create validator's missing-*-id checks, so any error
+    // here MUST be name-related. The catch-all `!v.ok` arm fails
+    // closed for any future name rule whose prefix changes.
+    const v = validateCreateServerProfileRequest({
+      name: raw.name,
+      host_id: "placeholder",
+      ssh_identity_id: "placeholder",
+    });
+    if (!v.ok) {
+      return { ok: false, reason: v.reason };
+    }
+    body.name = raw.name;
+  }
+  if (raw.host_id !== undefined) {
+    touched = true;
+    if (raw.host_id.length === 0) {
+      return { ok: false, reason: "missing_host_id" };
+    }
+    body.host_id = raw.host_id;
+  }
+  if (raw.ssh_identity_id !== undefined) {
+    touched = true;
+    if (raw.ssh_identity_id.length === 0) {
+      return { ok: false, reason: "missing_ssh_identity_id" };
+    }
+    body.ssh_identity_id = raw.ssh_identity_id;
+  }
+  if (raw.username_override !== undefined) {
+    touched = true;
+    if (raw.username_override === null) {
+      body.username_override = null;
+    } else {
+      const v = validateCreateServerProfileRequest({
+        name: "placeholder",
+        host_id: "placeholder",
+        ssh_identity_id: "placeholder",
+        username_override: raw.username_override,
+      });
+      if (!v.ok) {
+        return { ok: false, reason: v.reason };
+      }
+      body.username_override = raw.username_override;
+    }
+  }
+  if (raw.tags !== undefined) {
+    touched = true;
+    const v = validateCreateServerProfileRequest({
+      name: "placeholder",
+      host_id: "placeholder",
+      ssh_identity_id: "placeholder",
+      tags: raw.tags,
+    });
+    if (!v.ok) {
+      return { ok: false, reason: v.reason };
+    }
+    body.tags = raw.tags;
+  }
+  if (!touched) {
+    return { ok: false, reason: "empty_update" };
+  }
+  return { ok: true, body };
+}
+
+export type UpdateServerProfileError =
+  | { kind: "validation"; reason: UpdateServerProfileInvalidReason }
+  | { kind: "http"; status: number; code: string; message: string }
+  | { kind: "transport"; message: string }
+  | { kind: "malformed_response" };
+
+export type UpdateServerProfileResult =
+  | { ok: true; profile: ServerProfile }
+  | { ok: false; error: UpdateServerProfileError };
+
+export interface UpdateServerProfileOptions extends LoadOptions {
+  endpoint?: string;
+}
+
+export async function updateServerProfile(
+  id: string,
+  raw: UpdateServerProfileRequest,
+  options: UpdateServerProfileOptions = {},
+): Promise<UpdateServerProfileResult> {
+  const validation = validateUpdateServerProfileRequest(raw);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      error: { kind: "validation", reason: validation.reason },
+    };
+  }
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+  const endpoint =
+    options.endpoint ?? `/api/v1/server-profiles/${encodeURIComponent(id)}`;
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "PATCH",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(validation.body),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const parsed = parseServerProfile(body);
+  if (!parsed) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, profile: parsed };
+}
+
+export function describeUpdateServerProfileError(
+  err: UpdateServerProfileError,
+): string {
+  switch (err.kind) {
+    case "validation":
+      if (err.reason === "empty_update") {
+        return "Cannot save server profile: change at least one field";
+      }
+      return `Cannot save server profile: ${describeProfileValidationReason(err.reason)}`;
+    case "http":
+      if (err.status === 404 && err.code === "not_found") {
+        return "Failed to save server profile: linked host, SSH identity, or profile not found";
+      }
+      if (err.status === 409 && err.code === "conflict") {
+        return "Failed to save server profile: another profile already uses this name";
+      }
+      if (err.status === 401) {
+        return "Failed to save server profile: not authenticated";
+      }
+      if (err.status === 403 && err.code === "csrf_origin_mismatch") {
+        return "Failed to save server profile: request blocked by browser security policy";
+      }
+      return `Failed to save server profile: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Failed to save server profile: transport error";
+    case "malformed_response":
+      return "Failed to save server profile: malformed response";
+  }
+}
+
+export type DeleteServerProfileError =
+  | {
+      kind: "http";
+      status: number;
+      code: string;
+      message: string;
+      reason: "referenced" | null;
+    }
+  | { kind: "transport"; message: string };
+
+export type DeleteServerProfileResult =
+  | { ok: true }
+  | { ok: false; error: DeleteServerProfileError };
+
+export interface DeleteServerProfileOptions extends LoadOptions {
+  endpoint?: string;
+}
+
+export async function deleteServerProfile(
+  id: string,
+  options: DeleteServerProfileOptions = {},
+): Promise<DeleteServerProfileResult> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+  const endpoint =
+    options.endpoint ?? `/api/v1/server-profiles/${encodeURIComponent(id)}`;
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, { method: "DELETE" });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+  if (response.status === 204) return { ok: true };
+  const { code, message } = await readErrorEnvelope(response);
+  const reason: "referenced" | null =
+    response.status === 409 && message === "server_profile referenced"
+      ? "referenced"
+      : null;
+  return {
+    ok: false,
+    error: { kind: "http", status: response.status, code, message, reason },
+  };
+}
+
+export function describeDeleteServerProfileError(
+  err: DeleteServerProfileError,
+): string {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 409 && err.reason === "referenced") {
+        return "Cannot delete server profile: it has terminal session history — disable it instead to keep the history while blocking new launches";
+      }
+      if (err.status === 404 && err.code === "not_found") {
+        return "Cannot delete server profile: profile not found";
+      }
+      if (err.status === 401) {
+        return "Cannot delete server profile: not authenticated";
+      }
+      if (err.status === 403 && err.code === "csrf_origin_mismatch") {
+        return "Cannot delete server profile: request blocked by browser security policy";
+      }
+      return `Cannot delete server profile: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Cannot delete server profile: transport error";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle helpers — disable / enable
 // ---------------------------------------------------------------------------
 //

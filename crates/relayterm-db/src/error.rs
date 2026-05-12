@@ -24,6 +24,21 @@ pub fn map_sqlx_error(entity: &'static str, err: sqlx::Error) -> RepositoryError
                     .unwrap_or_else(|| "unique".to_owned()),
             }
         }
+        // Foreign-key violation maps to `Conflict` so routes that delete
+        // an inventory row can return a clean 409 when a dependent row
+        // (e.g. a `server_profiles` row referencing a `hosts` row via
+        // `ON DELETE RESTRICT`) blocks the delete. Route layers do their
+        // own owner-scoped pre-check before issuing the delete; this
+        // mapping is the race-safe backstop.
+        sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
+            RepositoryError::Conflict {
+                entity,
+                constraint: db_err
+                    .constraint()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| "foreign_key".to_owned()),
+            }
+        }
         sqlx::Error::Database(db_err) => {
             // Foreign-key, check-constraint, etc. Surface a short message
             // tagged with the constraint name when present so operators can

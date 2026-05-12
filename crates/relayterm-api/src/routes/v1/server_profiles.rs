@@ -24,7 +24,9 @@ use crate::dto::preflight::{
     HostKeyPreflightResponse, HostKeyStatusWire, ReplaceHostKeyRequest, ReplaceHostKeyResponse,
     TrustHostKeyRequest, TrustHostKeyResponse,
 };
-use crate::dto::server_profile::{CreateServerProfileRequest, ServerProfileResponse};
+use crate::dto::server_profile::{
+    CreateServerProfileRequest, ServerProfileResponse, UpdateServerProfileRequest,
+};
 use crate::error::ApiError;
 
 const ENTITY: &str = "server_profile";
@@ -32,7 +34,7 @@ const ENTITY: &str = "server_profile";
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create).get(list))
-        .route("/{id}", get(get_by_id))
+        .route("/{id}", get(get_by_id).patch(update).delete(delete_by_id))
         .route("/{id}/disable", post(disable))
         .route("/{id}/enable", post(enable))
         .route("/{id}/host-key-preflight", post(host_key_preflight))
@@ -127,6 +129,146 @@ async fn get_by_id(
         .filter(|p| p.owner_id == user.user_id())
         .ok_or(ApiError::NotFound { entity: ENTITY })?;
     Ok(Json(profile.into()))
+}
+
+/// `PATCH /api/v1/server-profiles/:id`.
+///
+/// Owner-scoped partial update of name / host / identity / username
+/// override / tags. Each newly-supplied `host_id` and `ssh_identity_id`
+/// is re-resolved under the caller's `owner_id` BEFORE the UPDATE
+/// fires — referencing another user's host or identity collapses to
+/// the same 404 as "host not found" / "ssh_identity not found", so
+/// cross-user existence is never leaked through a PATCH any more than
+/// through a create.
+///
+/// Emits `server_profile_updated` audit on success. Same fail-closed
+/// policy as create / disable / enable: a failed audit insert surfaces
+/// as 500 with the row mutation already committed.
+async fn update(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(id): Path<ServerProfileId>,
+    Json(req): Json<UpdateServerProfileRequest>,
+) -> Result<Json<ServerProfileResponse>, ApiError> {
+    let user_id = user.user_id();
+    // Validate body shape BEFORE any DB work, mirroring create.
+    let input = req.into_update()?;
+
+    // Owner-scoped resolve for the profile itself. Foreign / missing
+    // collapses to 404 — the wire shape matches `get_by_id`.
+    state
+        .db
+        .server_profiles()
+        .get(id)
+        .await?
+        .filter(|p| p.owner_id == user_id)
+        .ok_or(ApiError::NotFound { entity: ENTITY })?;
+
+    // Ownership pre-check on any newly-referenced host / identity.
+    // The repository's COALESCE-shaped UPDATE doesn't enforce
+    // ownership on the new FK target — the FK alone only checks that
+    // the row EXISTS, not who owns it. Pre-checking here means a PATCH
+    // that tries to bind to another user's host / identity returns the
+    // same `host not found` / `ssh_identity not found` 404 a create
+    // would, instead of silently binding to a foreign row.
+    if let Some(new_host_id) = input.host_id {
+        state
+            .db
+            .hosts()
+            .get(new_host_id)
+            .await?
+            .filter(|h| h.owner_id == user_id)
+            .ok_or(ApiError::NotFound { entity: "host" })?;
+    }
+    if let Some(new_identity_id) = input.ssh_identity_id {
+        state
+            .db
+            .ssh_identities()
+            .get(new_identity_id)
+            .await?
+            .filter(|i| i.owner_id == user_id)
+            .ok_or(ApiError::NotFound {
+                entity: "ssh_identity",
+            })?;
+    }
+
+    let updated = state
+        .db
+        .server_profiles()
+        .update(id, user_id, input)
+        .await?;
+    write_lifecycle_audit(
+        &state,
+        user_id,
+        AuditEventKind::ServerProfileUpdated,
+        &updated,
+    )
+    .await?;
+    Ok(Json(updated.into()))
+}
+
+/// `DELETE /api/v1/server-profiles/:id`.
+///
+/// Refuses (409 `conflict { entity: "server_profile", reason:
+/// "referenced" }`) when any `terminal_sessions` row references the
+/// profile — live OR closed. `terminal_sessions` rows are NEVER
+/// deleted from the user UI (AGENTS.md "Things to avoid"); the schema
+/// FK `terminal_sessions.server_profile_id ON DELETE RESTRICT` is the
+/// race-safe backstop.
+///
+/// The recommended alternative for profiles that already have session
+/// history is the existing disable flow (`POST :id/disable`) — that
+/// preserves history and lifecycle audit AND blocks future launches.
+/// The UI surfaces this distinction.
+///
+/// Owner-scoped: foreign / missing collapses to 404.
+///
+/// Emits `server_profile_deleted` audit BEFORE the DELETE so the audit
+/// row exists even if the delete later fails. The audit row carries
+/// public metadata only (id, name, host_id, ssh_identity_id) — same
+/// shape as the other lifecycle audits.
+async fn delete_by_id(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(id): Path<ServerProfileId>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = user.user_id();
+    let profile = state
+        .db
+        .server_profiles()
+        .get(id)
+        .await?
+        .filter(|p| p.owner_id == user_id)
+        .ok_or(ApiError::NotFound { entity: ENTITY })?;
+
+    if state
+        .db
+        .server_profiles()
+        .any_dependents_for_user(id, user_id)
+        .await?
+    {
+        return Err(ApiError::Conflict {
+            entity: ENTITY,
+            reason: Some("referenced"),
+        });
+    }
+
+    // Audit before the delete: the row content (`profile`) is still
+    // available to build the public-metadata payload. If the delete
+    // then fails (FK race) the audit row is harmless — it records
+    // "operator intent to delete" with the row's last-known snapshot.
+    // The 409 from the FK conflict is the user-facing answer.
+    write_lifecycle_audit(
+        &state,
+        user_id,
+        AuditEventKind::ServerProfileDeleted,
+        &profile,
+    )
+    .await?;
+    state.db.server_profiles().delete(id, user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/v1/server-profiles/:id/disable`.

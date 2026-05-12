@@ -1,9 +1,13 @@
 <script lang="ts">
   import {
     createSshIdentity,
+    deleteSshIdentity,
     describeCreateSshIdentityError,
+    describeDeleteSshIdentityError,
+    describeUpdateSshIdentityError,
     listSshIdentities,
     publicKeyPreview,
+    updateSshIdentity,
     SUPPORTED_GENERATION_KEY_TYPES,
     type SshIdentity,
     type SshKeyType,
@@ -112,6 +116,128 @@
     if (view.kind !== "ready" || selectedIdentityId === null) return null;
     return view.identities.find((i) => i.id === selectedIdentityId) ?? null;
   });
+
+  // ----------------------------------------------------------------
+  // Rename + delete state. Mirrors the host / profile flow in
+  // `ServersView.svelte`: one row at a time, an inline form for
+  // rename, a deliberate-confirmation step for delete that requires
+  // the operator to echo the identity name verbatim. Private-key
+  // material is never touched by either action — the rename SQL only
+  // writes `name`, and delete removes the row outright AFTER the
+  // backend pre-checks for referencing profiles.
+  // ----------------------------------------------------------------
+
+  type RenameIdentityState =
+    | { kind: "idle" }
+    | { kind: "open"; identityId: string; name: string }
+    | { kind: "submitting"; identityId: string }
+    | { kind: "error"; identityId: string; summary: string };
+
+  type DeleteIdentityState =
+    | { kind: "idle" }
+    | { kind: "confirming"; identityId: string; typed: string }
+    | { kind: "submitting"; identityId: string }
+    | { kind: "error"; identityId: string; summary: string };
+
+  let renameIdentityState = $state<RenameIdentityState>({ kind: "idle" });
+  let deleteIdentityState = $state<DeleteIdentityState>({ kind: "idle" });
+
+  function replaceIdentityInView(updated: SshIdentity) {
+    if (view.kind !== "ready") return;
+    view = {
+      kind: "ready",
+      identities: view.identities.map((i) =>
+        i.id === updated.id ? updated : i,
+      ),
+    };
+  }
+
+  function removeIdentityFromView(id: string) {
+    if (view.kind !== "ready") return;
+    view = {
+      kind: "ready",
+      identities: view.identities.filter((i) => i.id !== id),
+    };
+  }
+
+  function openRenameIdentity(identity: SshIdentity) {
+    if (renameIdentityState.kind === "submitting") return;
+    renameIdentityState = {
+      kind: "open",
+      identityId: identity.id,
+      name: identity.name,
+    };
+  }
+
+  function cancelRenameIdentity() {
+    if (renameIdentityState.kind === "submitting") return;
+    renameIdentityState = { kind: "idle" };
+  }
+
+  function setRenameIdentityName(value: string) {
+    if (renameIdentityState.kind !== "open") return;
+    renameIdentityState = { ...renameIdentityState, name: value };
+  }
+
+  async function submitRenameIdentity(event: Event) {
+    event.preventDefault();
+    if (renameIdentityState.kind !== "open") return;
+    const { identityId, name } = renameIdentityState;
+    renameIdentityState = { kind: "submitting", identityId };
+    const result = await updateSshIdentity(identityId, { name });
+    if (!result.ok) {
+      renameIdentityState = {
+        kind: "error",
+        identityId,
+        summary: describeUpdateSshIdentityError(result.error),
+      };
+      return;
+    }
+    replaceIdentityInView(result.identity);
+    renameIdentityState = { kind: "idle" };
+  }
+
+  function openDeleteIdentity(identity: SshIdentity) {
+    if (deleteIdentityState.kind === "submitting") return;
+    deleteIdentityState = {
+      kind: "confirming",
+      identityId: identity.id,
+      typed: "",
+    };
+  }
+
+  function cancelDeleteIdentity() {
+    if (deleteIdentityState.kind === "submitting") return;
+    deleteIdentityState = { kind: "idle" };
+  }
+
+  function setDeleteIdentityInput(value: string) {
+    if (deleteIdentityState.kind !== "confirming") return;
+    deleteIdentityState = { ...deleteIdentityState, typed: value };
+  }
+
+  async function submitDeleteIdentity(identity: SshIdentity) {
+    if (
+      deleteIdentityState.kind !== "confirming" ||
+      deleteIdentityState.identityId !== identity.id
+    ) {
+      return;
+    }
+    if (deleteIdentityState.typed !== identity.name) return;
+    deleteIdentityState = { kind: "submitting", identityId: identity.id };
+    const result = await deleteSshIdentity(identity.id);
+    if (!result.ok) {
+      deleteIdentityState = {
+        kind: "error",
+        identityId: identity.id,
+        summary: describeDeleteSshIdentityError(result.error),
+      };
+      return;
+    }
+    removeIdentityFromView(identity.id);
+    selectedIdentityId = null;
+    deleteIdentityState = { kind: "idle" };
+  }
 
   // ----------------------------------------------------------------
   // Client-side search & filter state.
@@ -736,6 +862,160 @@
           </div>
         </div>
 
+        <section
+          class="flex flex-wrap items-center gap-2 border-t border-emerald-900/30 pt-3"
+          data-testid="identity-detail-actions"
+        >
+          {#if renameIdentityState.kind !== "open" || renameIdentityState.identityId !== selectedIdentity.id}
+            <button
+              type="button"
+              class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50"
+              onclick={() => openRenameIdentity(selectedIdentity)}
+              disabled={renameIdentityState.kind === "submitting" ||
+                deleteIdentityState.kind === "submitting"}
+              data-testid="identity-detail-rename-open"
+            >
+              Rename identity
+            </button>
+          {/if}
+          {#if deleteIdentityState.kind !== "confirming" || deleteIdentityState.identityId !== selectedIdentity.id}
+            <button
+              type="button"
+              class="rounded-md border border-red-800/60 bg-red-950/40 px-2.5 py-1 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50"
+              onclick={() => openDeleteIdentity(selectedIdentity)}
+              disabled={renameIdentityState.kind === "submitting" ||
+                deleteIdentityState.kind === "submitting"}
+              data-testid="identity-detail-delete-open"
+            >
+              Delete identity
+            </button>
+          {/if}
+        </section>
+
+        {#if renameIdentityState.kind === "open" && renameIdentityState.identityId === selectedIdentity.id}
+          <form
+            class="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-3"
+            onsubmit={submitRenameIdentity}
+            data-testid="identity-detail-rename-form"
+          >
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">Name</span>
+              <input
+                type="text"
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm text-zinc-100"
+                value={renameIdentityState.name}
+                oninput={(e) =>
+                  setRenameIdentityName(
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="identity-detail-rename-input"
+              />
+            </label>
+            <div class="flex items-center gap-2">
+              <button
+                type="submit"
+                class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700"
+                data-testid="identity-detail-rename-save"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                onclick={cancelRenameIdentity}
+                data-testid="identity-detail-rename-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {/if}
+
+        {#if renameIdentityState.kind === "submitting" && renameIdentityState.identityId === selectedIdentity.id}
+          <p
+            class="text-xs text-zinc-400"
+            data-testid="identity-detail-rename-submitting"
+          >
+            Saving…
+          </p>
+        {/if}
+
+        {#if renameIdentityState.kind === "error" && renameIdentityState.identityId === selectedIdentity.id}
+          <p
+            class="rounded-md border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200"
+            data-testid="identity-detail-rename-error"
+          >
+            {renameIdentityState.summary}
+          </p>
+        {/if}
+
+        {#if deleteIdentityState.kind === "confirming" && deleteIdentityState.identityId === selectedIdentity.id}
+          <div
+            class="flex flex-col gap-2 rounded-md border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200"
+            data-testid="identity-detail-delete-confirm"
+          >
+            <p>
+              Deleting <span class="font-mono">{selectedIdentity.name}</span>
+              is permanent. The encrypted private key and public-key
+              metadata are removed. Server profiles that still reference
+              this identity will block the delete — re-bind or remove
+              them first.
+            </p>
+            <label class="flex flex-col gap-1">
+              <span class="text-zinc-300">
+                Type the identity name to confirm
+              </span>
+              <input
+                type="text"
+                class="rounded border border-red-900/60 bg-zinc-950 px-2 py-1 font-mono text-sm text-zinc-100"
+                value={deleteIdentityState.typed}
+                oninput={(e) =>
+                  setDeleteIdentityInput(
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="identity-detail-delete-confirm-input"
+              />
+            </label>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="rounded-md border border-red-700 bg-red-800 px-2.5 py-1 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50"
+                onclick={() => submitDeleteIdentity(selectedIdentity)}
+                disabled={deleteIdentityState.typed !== selectedIdentity.name}
+                data-testid="identity-detail-delete-confirm-submit"
+              >
+                Delete identity
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                onclick={cancelDeleteIdentity}
+                data-testid="identity-detail-delete-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        {#if deleteIdentityState.kind === "submitting" && deleteIdentityState.identityId === selectedIdentity.id}
+          <p
+            class="text-xs text-zinc-400"
+            data-testid="identity-detail-delete-submitting"
+          >
+            Deleting…
+          </p>
+        {/if}
+
+        {#if deleteIdentityState.kind === "error" && deleteIdentityState.identityId === selectedIdentity.id}
+          <p
+            class="rounded-md border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200"
+            data-testid="identity-detail-delete-error"
+          >
+            {deleteIdentityState.summary}
+          </p>
+        {/if}
+
         <p
           class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
           data-testid="identity-detail-honesty"
@@ -752,7 +1032,7 @@
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Deletion, rename, private-key import, and password bootstrap /
+    Private-key import and password bootstrap /
     <code class="font-mono">ssh-copy-id</code> automation are deliberate
     later slices. This view never renders or copies private material.
   </p>

@@ -1,21 +1,29 @@
 <script lang="ts">
   import {
     createHost,
+    deleteHost,
     describeCreateHostError,
+    describeDeleteHostError,
+    describeUpdateHostError,
     listHosts,
+    updateHost,
     DEFAULT_SSH_PORT,
     type Host,
   } from "../../api/hosts.js";
   import {
     canSubmitServerProfile,
     createServerProfile,
+    deleteServerProfile,
     describeCreateServerProfileError,
+    describeDeleteServerProfileError,
     describeLifecycleError,
+    describeUpdateServerProfileError,
     disableServerProfile,
     enableServerProfile,
     listServerProfiles,
     parseTagsInput,
     resolveProfileLinks,
+    updateServerProfile,
     type ServerProfile,
   } from "../../api/serverProfiles.js";
   import {
@@ -496,6 +504,324 @@
     const next = { ...lifecycleStates };
     delete next[profileId];
     lifecycleStates = next;
+  }
+
+  // ----------------------------------------------------------------
+  // Host edit + delete state. Keyed implicitly by the currently-
+  // selected host (one detail panel at a time); the state carries the
+  // form fields so a re-render preserves them while the operator
+  // types. A separate `confirming` state for delete requires the
+  // operator to echo the host's `display_name` verbatim before the
+  // DELETE fires — same deliberate-confirmation pattern the disable
+  // flow uses.
+  // ----------------------------------------------------------------
+
+  type EditHostState =
+    | { kind: "idle" }
+    | {
+        kind: "open";
+        hostId: string;
+        displayName: string;
+        hostname: string;
+        port: number;
+        username: string;
+      }
+    | { kind: "submitting"; hostId: string }
+    | { kind: "error"; hostId: string; summary: string };
+
+  type DeleteHostState =
+    | { kind: "idle" }
+    | { kind: "confirming"; hostId: string; typed: string }
+    | { kind: "submitting"; hostId: string }
+    | { kind: "error"; hostId: string; summary: string };
+
+  let editHostState = $state<EditHostState>({ kind: "idle" });
+  let deleteHostState = $state<DeleteHostState>({ kind: "idle" });
+
+  function openEditHost(host: Host) {
+    if (editHostState.kind === "submitting") return;
+    editHostState = {
+      kind: "open",
+      hostId: host.id,
+      displayName: host.display_name,
+      hostname: host.hostname,
+      port: host.port,
+      username: host.default_username,
+    };
+  }
+
+  function cancelEditHost() {
+    if (editHostState.kind === "submitting") return;
+    editHostState = { kind: "idle" };
+  }
+
+  function replaceHostInView(updated: Host) {
+    if (view.kind !== "ready") return;
+    const next = view.hosts.map((h) => (h.id === updated.id ? updated : h));
+    view = {
+      kind: "ready",
+      hosts: next,
+      profiles: view.profiles,
+      identities: view.identities,
+    };
+  }
+
+  function removeHostFromView(id: string) {
+    if (view.kind !== "ready") return;
+    view = {
+      kind: "ready",
+      hosts: view.hosts.filter((h) => h.id !== id),
+      profiles: view.profiles,
+      identities: view.identities,
+    };
+  }
+
+  function setEditHostField(
+    field: "displayName" | "hostname" | "port" | "username",
+    value: string,
+  ) {
+    if (editHostState.kind !== "open") return;
+    if (field === "port") {
+      const n = Number.parseInt(value, 10);
+      editHostState = {
+        ...editHostState,
+        port: Number.isFinite(n) ? n : editHostState.port,
+      };
+      return;
+    }
+    editHostState = {
+      ...editHostState,
+      [field === "displayName"
+        ? "displayName"
+        : field === "hostname"
+          ? "hostname"
+          : "username"]: value,
+    };
+  }
+
+  async function submitEditHost(event: Event) {
+    event.preventDefault();
+    if (editHostState.kind !== "open") return;
+    const { hostId, displayName, hostname, port, username } = editHostState;
+    editHostState = { kind: "submitting", hostId };
+    const result = await updateHost(hostId, {
+      display_name: displayName,
+      hostname,
+      port,
+      default_username: username,
+    });
+    if (!result.ok) {
+      editHostState = {
+        kind: "error",
+        hostId,
+        summary: describeUpdateHostError(result.error),
+      };
+      return;
+    }
+    replaceHostInView(result.host);
+    editHostState = { kind: "idle" };
+  }
+
+  function openDeleteHost(host: Host) {
+    if (deleteHostState.kind === "submitting") return;
+    deleteHostState = { kind: "confirming", hostId: host.id, typed: "" };
+  }
+
+  function cancelDeleteHost() {
+    if (deleteHostState.kind === "submitting") return;
+    deleteHostState = { kind: "idle" };
+  }
+
+  function setDeleteHostInput(value: string) {
+    if (deleteHostState.kind !== "confirming") return;
+    deleteHostState = { ...deleteHostState, typed: value };
+  }
+
+  async function submitDeleteHost(host: Host) {
+    if (
+      deleteHostState.kind !== "confirming" ||
+      deleteHostState.hostId !== host.id
+    ) {
+      return;
+    }
+    if (deleteHostState.typed !== host.display_name) return;
+    deleteHostState = { kind: "submitting", hostId: host.id };
+    const result = await deleteHost(host.id);
+    if (!result.ok) {
+      deleteHostState = {
+        kind: "error",
+        hostId: host.id,
+        summary: describeDeleteHostError(result.error),
+      };
+      return;
+    }
+    removeHostFromView(host.id);
+    selectedHostId = null;
+    deleteHostState = { kind: "idle" };
+  }
+
+  // ----------------------------------------------------------------
+  // Profile edit + delete state. Same shape as the host flow above;
+  // the form mirrors the create-profile fields (name / host / identity
+  // / username override / tags).
+  // ----------------------------------------------------------------
+
+  type EditProfileState =
+    | { kind: "idle" }
+    | {
+        kind: "open";
+        profileId: string;
+        name: string;
+        hostId: string;
+        identityId: string;
+        usernameOverride: string;
+        tagsInput: string;
+      }
+    | { kind: "submitting"; profileId: string }
+    | { kind: "error"; profileId: string; summary: string };
+
+  type DeleteProfileState =
+    | { kind: "idle" }
+    | { kind: "confirming"; profileId: string; typed: string }
+    | { kind: "submitting"; profileId: string }
+    | { kind: "error"; profileId: string; summary: string };
+
+  let editProfileState = $state<EditProfileState>({ kind: "idle" });
+  let deleteProfileState = $state<DeleteProfileState>({ kind: "idle" });
+
+  function openEditProfile(profile: ServerProfile) {
+    if (editProfileState.kind === "submitting") return;
+    editProfileState = {
+      kind: "open",
+      profileId: profile.id,
+      name: profile.name,
+      hostId: profile.host_id,
+      identityId: profile.ssh_identity_id,
+      usernameOverride: profile.username_override ?? "",
+      tagsInput: profile.tags.join(", "),
+    };
+  }
+
+  function cancelEditProfile() {
+    if (editProfileState.kind === "submitting") return;
+    editProfileState = { kind: "idle" };
+  }
+
+  function replaceProfileInViewFull(updated: ServerProfile) {
+    replaceProfileInView(updated);
+  }
+
+  function removeProfileFromView(id: string) {
+    if (view.kind !== "ready") return;
+    view = {
+      kind: "ready",
+      hosts: view.hosts,
+      profiles: view.profiles.filter((p) => p.id !== id),
+      identities: view.identities,
+    };
+  }
+
+  function setEditProfileField(
+    field:
+      | "name"
+      | "hostId"
+      | "identityId"
+      | "usernameOverride"
+      | "tagsInput",
+    value: string,
+  ) {
+    if (editProfileState.kind !== "open") return;
+    editProfileState = { ...editProfileState, [field]: value };
+  }
+
+  async function submitEditProfile(
+    event: Event,
+    original: ServerProfile,
+  ) {
+    event.preventDefault();
+    if (editProfileState.kind !== "open") return;
+    const { profileId, name, hostId, identityId, usernameOverride, tagsInput } =
+      editProfileState;
+    // Build a delta. Only fields that actually differ from the original
+    // row are sent — this also avoids tripping the backend's
+    // empty-update guard if the operator opens the form, makes no
+    // changes, then clicks Save. The empty-update reason will fire if
+    // truly nothing changed, which is the desired UX.
+    const update: {
+      name?: string;
+      host_id?: string;
+      ssh_identity_id?: string;
+      username_override?: string | null;
+      tags?: string[];
+    } = {};
+    if (name !== original.name) update.name = name;
+    if (hostId !== original.host_id) update.host_id = hostId;
+    if (identityId !== original.ssh_identity_id) {
+      update.ssh_identity_id = identityId;
+    }
+    const overrideNormalized = usernameOverride.length === 0 ? null : usernameOverride;
+    if (overrideNormalized !== (original.username_override ?? null)) {
+      update.username_override = overrideNormalized;
+    }
+    const tags = parseTagsInput(tagsInput);
+    const originalTagSig = original.tags.join(" ");
+    const newTagSig = tags.join(" ");
+    if (originalTagSig !== newTagSig) update.tags = tags;
+
+    editProfileState = { kind: "submitting", profileId };
+    const result = await updateServerProfile(profileId, update);
+    if (!result.ok) {
+      editProfileState = {
+        kind: "error",
+        profileId,
+        summary: describeUpdateServerProfileError(result.error),
+      };
+      return;
+    }
+    replaceProfileInViewFull(result.profile);
+    editProfileState = { kind: "idle" };
+  }
+
+  function openDeleteProfile(profile: ServerProfile) {
+    if (deleteProfileState.kind === "submitting") return;
+    deleteProfileState = {
+      kind: "confirming",
+      profileId: profile.id,
+      typed: "",
+    };
+  }
+
+  function cancelDeleteProfile() {
+    if (deleteProfileState.kind === "submitting") return;
+    deleteProfileState = { kind: "idle" };
+  }
+
+  function setDeleteProfileInput(value: string) {
+    if (deleteProfileState.kind !== "confirming") return;
+    deleteProfileState = { ...deleteProfileState, typed: value };
+  }
+
+  async function submitDeleteProfile(profile: ServerProfile) {
+    if (
+      deleteProfileState.kind !== "confirming" ||
+      deleteProfileState.profileId !== profile.id
+    ) {
+      return;
+    }
+    if (deleteProfileState.typed !== profile.name) return;
+    deleteProfileState = { kind: "submitting", profileId: profile.id };
+    const result = await deleteServerProfile(profile.id);
+    if (!result.ok) {
+      deleteProfileState = {
+        kind: "error",
+        profileId: profile.id,
+        summary: describeDeleteServerProfileError(result.error),
+      };
+      return;
+    }
+    removeProfileFromView(profile.id);
+    selectedProfileId = null;
+    deleteProfileState = { kind: "idle" };
   }
 
   async function launchProfile(profile: ServerProfile) {
@@ -1324,6 +1650,206 @@
           {/if}
         </section>
 
+        <section
+          class="flex flex-wrap items-center gap-2 border-t border-emerald-900/30 pt-3"
+          data-testid="host-detail-actions"
+        >
+          {#if editHostState.kind !== "open" || editHostState.hostId !== host.id}
+            <button
+              type="button"
+              class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50"
+              onclick={() => openEditHost(host)}
+              disabled={editHostState.kind === "submitting" ||
+                deleteHostState.kind === "submitting"}
+              data-testid="host-detail-edit-open"
+            >
+              Edit host
+            </button>
+          {/if}
+          {#if deleteHostState.kind !== "confirming" || deleteHostState.hostId !== host.id}
+            <button
+              type="button"
+              class="rounded-md border border-red-800/60 bg-red-950/40 px-2.5 py-1 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50"
+              onclick={() => openDeleteHost(host)}
+              disabled={editHostState.kind === "submitting" ||
+                deleteHostState.kind === "submitting"}
+              data-testid="host-detail-delete-open"
+            >
+              Delete host
+            </button>
+          {/if}
+        </section>
+
+        {#if editHostState.kind === "open" && editHostState.hostId === host.id}
+          <form
+            class="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-3"
+            onsubmit={submitEditHost}
+            data-testid="host-detail-edit-form"
+          >
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">Display name</span>
+              <input
+                type="text"
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm text-zinc-100"
+                value={editHostState.displayName}
+                oninput={(e) =>
+                  setEditHostField(
+                    "displayName",
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="host-detail-edit-display-name"
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">Hostname</span>
+              <input
+                type="text"
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-sm text-zinc-100"
+                value={editHostState.hostname}
+                oninput={(e) =>
+                  setEditHostField(
+                    "hostname",
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="host-detail-edit-hostname"
+              />
+            </label>
+            <div class="grid grid-cols-2 gap-2">
+              <label class="flex flex-col gap-1 text-xs">
+                <span class="text-zinc-400">Port</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-sm text-zinc-100"
+                  value={editHostState.port}
+                  oninput={(e) =>
+                    setEditHostField(
+                      "port",
+                      (e.currentTarget as HTMLInputElement).value,
+                    )}
+                  data-testid="host-detail-edit-port"
+                />
+              </label>
+              <label class="flex flex-col gap-1 text-xs">
+                <span class="text-zinc-400">Default user</span>
+                <input
+                  type="text"
+                  class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-sm text-zinc-100"
+                  value={editHostState.username}
+                  oninput={(e) =>
+                    setEditHostField(
+                      "username",
+                      (e.currentTarget as HTMLInputElement).value,
+                    )}
+                  data-testid="host-detail-edit-username"
+                />
+              </label>
+            </div>
+            <div class="flex items-center gap-2">
+              <button
+                type="submit"
+                class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+                data-testid="host-detail-edit-save"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                onclick={cancelEditHost}
+                data-testid="host-detail-edit-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {/if}
+
+        {#if editHostState.kind === "submitting" && editHostState.hostId === host.id}
+          <p
+            class="text-xs text-zinc-400"
+            data-testid="host-detail-edit-submitting"
+          >
+            Saving…
+          </p>
+        {/if}
+
+        {#if editHostState.kind === "error" && editHostState.hostId === host.id}
+          <p
+            class="rounded-md border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200"
+            data-testid="host-detail-edit-error"
+          >
+            {editHostState.summary}
+          </p>
+        {/if}
+
+        {#if deleteHostState.kind === "confirming" && deleteHostState.hostId === host.id}
+          <div
+            class="flex flex-col gap-2 rounded-md border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200"
+            data-testid="host-detail-delete-confirm"
+          >
+            <p>
+              Deleting <span class="font-mono">{host.display_name}</span>
+              is permanent. The host row is removed; pinned host-key
+              entries that depend on this host MUST be cleared first or
+              the delete will be refused.
+            </p>
+            <label class="flex flex-col gap-1">
+              <span class="text-zinc-300">
+                Type the host display name to confirm
+              </span>
+              <input
+                type="text"
+                class="rounded border border-red-900/60 bg-zinc-950 px-2 py-1 font-mono text-sm text-zinc-100"
+                value={deleteHostState.typed}
+                oninput={(e) =>
+                  setDeleteHostInput(
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="host-detail-delete-confirm-input"
+              />
+            </label>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="rounded-md border border-red-700 bg-red-800 px-2.5 py-1 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50"
+                onclick={() => submitDeleteHost(host)}
+                disabled={deleteHostState.typed !== host.display_name}
+                data-testid="host-detail-delete-confirm-submit"
+              >
+                Delete host
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                onclick={cancelDeleteHost}
+                data-testid="host-detail-delete-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        {#if deleteHostState.kind === "submitting" && deleteHostState.hostId === host.id}
+          <p
+            class="text-xs text-zinc-400"
+            data-testid="host-detail-delete-submitting"
+          >
+            Deleting…
+          </p>
+        {/if}
+
+        {#if deleteHostState.kind === "error" && deleteHostState.hostId === host.id}
+          <p
+            class="rounded-md border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200"
+            data-testid="host-detail-delete-error"
+          >
+            {deleteHostState.summary}
+          </p>
+        {/if}
+
         <p
           class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
           data-testid="host-detail-honesty"
@@ -1825,6 +2351,230 @@
           </p>
         {/if}
 
+        <section
+          class="flex flex-wrap items-center gap-2 border-t border-emerald-900/30 pt-3"
+          data-testid="profile-detail-actions"
+        >
+          {#if editProfileState.kind !== "open" || editProfileState.profileId !== detail.profile.id}
+            <button
+              type="button"
+              class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50"
+              onclick={() => openEditProfile(detail.profile)}
+              disabled={editProfileState.kind === "submitting" ||
+                deleteProfileState.kind === "submitting"}
+              data-testid="profile-detail-edit-open"
+            >
+              Edit profile
+            </button>
+          {/if}
+          {#if deleteProfileState.kind !== "confirming" || deleteProfileState.profileId !== detail.profile.id}
+            <button
+              type="button"
+              class="rounded-md border border-red-800/60 bg-red-950/40 px-2.5 py-1 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50"
+              onclick={() => openDeleteProfile(detail.profile)}
+              disabled={editProfileState.kind === "submitting" ||
+                deleteProfileState.kind === "submitting"}
+              data-testid="profile-detail-delete-open"
+            >
+              Delete profile
+            </button>
+          {/if}
+        </section>
+
+        {#if editProfileState.kind === "open" && editProfileState.profileId === detail.profile.id}
+          <form
+            class="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-3"
+            onsubmit={(e) => submitEditProfile(e, detail.profile)}
+            data-testid="profile-detail-edit-form"
+          >
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">Name</span>
+              <input
+                type="text"
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm text-zinc-100"
+                value={editProfileState.name}
+                oninput={(e) =>
+                  setEditProfileField(
+                    "name",
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="profile-detail-edit-name"
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">Host</span>
+              <select
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm text-zinc-100"
+                value={editProfileState.hostId}
+                onchange={(e) =>
+                  setEditProfileField(
+                    "hostId",
+                    (e.currentTarget as HTMLSelectElement).value,
+                  )}
+                data-testid="profile-detail-edit-host"
+              >
+                {#each view.hosts as h (h.id)}
+                  <option value={h.id}>
+                    {h.display_name} — {h.hostname}:{formatPort(h.port)}
+                  </option>
+                {/each}
+              </select>
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">SSH identity</span>
+              <select
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm text-zinc-100"
+                value={editProfileState.identityId}
+                onchange={(e) =>
+                  setEditProfileField(
+                    "identityId",
+                    (e.currentTarget as HTMLSelectElement).value,
+                  )}
+                data-testid="profile-detail-edit-identity"
+              >
+                {#each view.identities as i (i.id)}
+                  <option value={i.id}>
+                    {i.name} ({i.key_type})
+                  </option>
+                {/each}
+              </select>
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">
+                Username override <span class="text-zinc-500">(blank → host default)</span>
+              </span>
+              <input
+                type="text"
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-sm text-zinc-100"
+                value={editProfileState.usernameOverride}
+                oninput={(e) =>
+                  setEditProfileField(
+                    "usernameOverride",
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="profile-detail-edit-username-override"
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="text-zinc-400">
+                Tags <span class="text-zinc-500">(comma separated)</span>
+              </span>
+              <input
+                type="text"
+                class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-sm text-zinc-100"
+                value={editProfileState.tagsInput}
+                oninput={(e) =>
+                  setEditProfileField(
+                    "tagsInput",
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="profile-detail-edit-tags"
+              />
+            </label>
+            <div class="flex items-center gap-2">
+              <button
+                type="submit"
+                class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700"
+                data-testid="profile-detail-edit-save"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                onclick={cancelEditProfile}
+                data-testid="profile-detail-edit-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {/if}
+
+        {#if editProfileState.kind === "submitting" && editProfileState.profileId === detail.profile.id}
+          <p
+            class="text-xs text-zinc-400"
+            data-testid="profile-detail-edit-submitting"
+          >
+            Saving…
+          </p>
+        {/if}
+
+        {#if editProfileState.kind === "error" && editProfileState.profileId === detail.profile.id}
+          <p
+            class="rounded-md border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200"
+            data-testid="profile-detail-edit-error"
+          >
+            {editProfileState.summary}
+          </p>
+        {/if}
+
+        {#if deleteProfileState.kind === "confirming" && deleteProfileState.profileId === detail.profile.id}
+          <div
+            class="flex flex-col gap-2 rounded-md border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200"
+            data-testid="profile-detail-delete-confirm"
+          >
+            <p>
+              Deleting <span class="font-mono">{detail.profile.name}</span>
+              is permanent. If this profile has any terminal session
+              history the delete will be refused — disable it instead to
+              keep the history while blocking new launches.
+            </p>
+            <label class="flex flex-col gap-1">
+              <span class="text-zinc-300">
+                Type the profile name to confirm
+              </span>
+              <input
+                type="text"
+                class="rounded border border-red-900/60 bg-zinc-950 px-2 py-1 font-mono text-sm text-zinc-100"
+                value={deleteProfileState.typed}
+                oninput={(e) =>
+                  setDeleteProfileInput(
+                    (e.currentTarget as HTMLInputElement).value,
+                  )}
+                data-testid="profile-detail-delete-confirm-input"
+              />
+            </label>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="rounded-md border border-red-700 bg-red-800 px-2.5 py-1 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50"
+                onclick={() => submitDeleteProfile(detail.profile)}
+                disabled={deleteProfileState.typed !== detail.profile.name}
+                data-testid="profile-detail-delete-confirm-submit"
+              >
+                Delete profile
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                onclick={cancelDeleteProfile}
+                data-testid="profile-detail-delete-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        {#if deleteProfileState.kind === "submitting" && deleteProfileState.profileId === detail.profile.id}
+          <p
+            class="text-xs text-zinc-400"
+            data-testid="profile-detail-delete-submitting"
+          >
+            Deleting…
+          </p>
+        {/if}
+
+        {#if deleteProfileState.kind === "error" && deleteProfileState.profileId === detail.profile.id}
+          <p
+            class="rounded-md border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-200"
+            data-testid="profile-detail-delete-error"
+          >
+            {deleteProfileState.summary}
+          </p>
+        {/if}
+
         <p
           class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
           data-testid="profile-detail-readiness"
@@ -1841,9 +2591,8 @@
     data-detached-ttl-seconds={detachedTtlSeconds}
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Edit / delete forms land in a later slice. Launch starts a live SSH
-    PTY using the xterm baseline renderer; detached sessions survive
-    for {formatDetachedTtl(detachedTtlSeconds)} and replay is in-memory
-    only — not durable across a backend restart.
+    Launch starts a live SSH PTY using the xterm baseline renderer;
+    detached sessions survive for {formatDetachedTtl(detachedTtlSeconds)}
+    and replay is in-memory only — not durable across a backend restart.
   </p>
 </section>

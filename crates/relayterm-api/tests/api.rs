@@ -863,6 +863,42 @@ fn json_post_with_origin(uri: &str, body: Value, cookie: &str, origin: &str) -> 
         .unwrap()
 }
 
+/// Build an authenticated `PATCH` request with the test allow-listed
+/// `Origin`. Mirrors [`json_post`] for inventory edit routes.
+fn json_patch(uri: &str, body: Value, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Build an authenticated `DELETE` request with the test allow-listed
+/// `Origin`. Mirrors [`json_post`] for inventory delete routes.
+fn json_delete(uri: &str, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `DELETE` without a session cookie — used to pin the "missing auth →
+/// 401" contract for delete routes.
+fn json_delete_no_auth(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .body(Body::empty())
+        .unwrap()
+}
+
 // ----------------------------------------------------------------------
 // Hosts
 // ----------------------------------------------------------------------
@@ -1156,6 +1192,335 @@ async fn create_host_missing_origin_returns_403(pool: PgPool) {
             })
             .to_string(),
         ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
+// ----- PATCH / DELETE -------------------------------------------------
+
+/// Create a host via the API and return its id as a string. Helper for
+/// the PATCH / DELETE tests below — keeps each test's body focused on
+/// the assertion it exists to make.
+async fn create_host_via_api(app: &Router, cookie: &str, name: &str, hostname: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/hosts",
+            json!({
+                "display_name": name,
+                "hostname": hostname,
+                "port": 22,
+                "default_username": "ops",
+            }),
+            cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    read_body(resp).await["id"].as_str().unwrap().to_owned()
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_updates_supplied_fields_only(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "Original", "a.example.com").await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_patch(
+            &format!("/api/v1/hosts/{id}"),
+            json!({ "display_name": "Renamed", "port": 2222 }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["display_name"], "Renamed");
+    assert_eq!(body["port"], 2222);
+    // Fields not in the PATCH body MUST be preserved.
+    assert_eq!(body["hostname"], "a.example.com");
+    assert_eq!(body["default_username"], "ops");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_empty_body_returns_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "Original", "a.example.com").await;
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/hosts/{id}"),
+            json!({}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_invalid_field_returns_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "Original", "a.example.com").await;
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/hosts/{id}"),
+            json!({ "hostname": "bad host with spaces" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_unknown_id_returns_404(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let resp = app
+        .oneshot(json_patch(
+            "/api/v1/hosts/00000000-0000-0000-0000-000000000000",
+            json!({ "display_name": "x" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool) {
+    // Two users, each owns a host. User A must not be able to PATCH
+    // user B's host — the wire shape MUST be byte-identical to a
+    // missing id so existence is not leaked.
+    let (app_a, _user_a, cookie_a) = setup(pool.clone()).await;
+    let id_a = create_host_via_api(&app_a, &cookie_a, "A's host", "a.example.com").await;
+
+    let (app_b, _user_b, cookie_b) = setup(pool.clone()).await;
+    let _id_b = create_host_via_api(&app_b, &cookie_b, "B's host", "b.example.com").await;
+
+    // User B tries to PATCH user A's host.
+    let resp = app_b
+        .oneshot(json_patch(
+            &format!("/api/v1/hosts/{id_a}"),
+            json!({ "display_name": "hijacked" }),
+            &cookie_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+    // Make sure A's row was NOT changed.
+    let check = app_a
+        .oneshot(get(&format!("/api/v1/hosts/{id_a}"), &cookie_a))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::OK);
+    let row = read_body(check).await;
+    assert_eq!(row["display_name"], "A's host");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_unauthenticated_returns_401(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "Original", "a.example.com").await;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/hosts/{id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .body(Body::from(json!({ "display_name": "x" }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_success_when_no_dependents(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "Removable", "removable.example.com").await;
+    let resp = app
+        .clone()
+        .oneshot(json_delete(&format!("/api/v1/hosts/{id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // Subsequent GET must 404.
+    let check = app
+        .oneshot(get(&format!("/api/v1/hosts/{id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_referenced_by_profile_returns_409(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let host_id = create_host_via_api(&app, &cookie, "Referenced", "ref.example.com").await;
+    // Create an identity and a profile referencing the host.
+    let identity_resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({ "name": "id-1" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(identity_resp.status(), StatusCode::CREATED);
+    let identity_id = read_body(identity_resp).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let profile_resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/server-profiles",
+            json!({
+                "name": "profile-using-host",
+                "host_id": host_id,
+                "ssh_identity_id": identity_id,
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(profile_resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(json_delete(&format!("/api/v1/hosts/{host_id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(body["error"]["message"], "host referenced");
+    // Host row MUST still exist.
+    let check = app
+        .oneshot(get(&format!("/api/v1/hosts/{host_id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_referenced_by_known_host_entry_returns_409(pool: PgPool) {
+    // Insert a `known_host_entries` row directly via the DB so the
+    // host has a dependency that does NOT route through a profile.
+    // This pins the "AGENTS.md: do not hard-delete known_host_entries"
+    // rule — host delete must refuse on a known-host pin even when no
+    // server_profile references the host.
+    let (app, _user_id, cookie) = setup(pool.clone()).await;
+    let host_id = create_host_via_api(&app, &cookie, "Pinned", "pinned.example.com").await;
+    let host_uuid: uuid::Uuid = host_id.parse().unwrap();
+    let db = Db::from_pool(pool.clone());
+    db.known_host_entries()
+        .record_trusted(CreateKnownHostEntry {
+            host_id: relayterm_core::ids::HostId::from_uuid(host_uuid),
+            key_type: SshKeyType::Ed25519,
+            fingerprint_sha256: "SHA256:test-fingerprint-host-delete-block".to_owned(),
+            public_key: b"ssh-ed25519 AAAA-test".to_vec(),
+        })
+        .await
+        .expect("seed known_host_entries row");
+
+    let resp = app
+        .oneshot(json_delete(&format!("/api/v1/hosts/{host_id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(body["error"]["message"], "host referenced");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_unknown_id_returns_404(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let resp = app
+        .oneshot(json_delete(
+            "/api/v1/hosts/00000000-0000-0000-0000-000000000000",
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_owned_by_other_user_returns_indistinguishable_404(pool: PgPool) {
+    let (app_a, _user_a, cookie_a) = setup(pool.clone()).await;
+    let id_a = create_host_via_api(&app_a, &cookie_a, "A", "a.example.com").await;
+    let (app_b, _user_b, cookie_b) = setup(pool.clone()).await;
+    let resp = app_b
+        .oneshot(json_delete(&format!("/api/v1/hosts/{id_a}"), &cookie_b))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+    // A's row MUST still exist.
+    let check = app_a
+        .oneshot(get(&format!("/api/v1/hosts/{id_a}"), &cookie_a))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_unauthenticated_returns_401(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "x", "x.example.com").await;
+    let resp = app
+        .oneshot(json_delete_no_auth(&format!("/api/v1/hosts/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_host_bad_origin_returns_403(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "x", "x.example.com").await;
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/hosts/{id}"))
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_host_bad_origin_returns_403(pool: PgPool) {
+    // PATCH MUST be CSRF-guarded the same as POST — the shared
+    // `CsrfGuard` extractor sits ahead of the JSON body extractor so a
+    // bad Origin returns 403 without parsing the body. Pinning this
+    // for every new mutation surface mirrors the
+    // `create_host_bad_origin_returns_403_before_body_parse` pattern.
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_host_via_api(&app, &cookie, "x", "x.example.com").await;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/hosts/{id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from("{ this is not valid JSON"))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1496,6 +1861,229 @@ async fn get_ssh_identity_omits_encrypted_private_key(pool: PgPool) {
     assert!(!raw.contains("REDACT-MARKER-API-9F2B"));
 }
 
+// ----- PATCH / DELETE -------------------------------------------------
+
+/// Create an SSH identity via the API and return its id as a string.
+async fn create_identity_via_api(app: &Router, cookie: &str, name: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({ "name": name }),
+            cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    read_body(resp).await["id"].as_str().unwrap().to_owned()
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_ssh_identity_renames(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_identity_via_api(&app, &cookie, "old-name").await;
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/ssh-identities/{id}"),
+            json!({ "name": "new-name" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["name"], "new-name");
+    // Public-metadata-only: no encrypted blob, no private-key field.
+    let raw = body.to_string();
+    assert!(!raw.contains("encrypted_private_key"));
+    assert!(!raw.contains("private_key"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_ssh_identity_rejects_blank_name(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_identity_via_api(&app, &cookie, "ok").await;
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/ssh-identities/{id}"),
+            json!({ "name": "  " }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(read_body(resp).await["error"]["code"], "invalid_input");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_ssh_identity_owned_by_other_returns_404(pool: PgPool) {
+    let (app_a, _user_a, cookie_a) = setup(pool.clone()).await;
+    let id_a = create_identity_via_api(&app_a, &cookie_a, "a-id").await;
+    let (app_b, _user_b, cookie_b) = setup(pool.clone()).await;
+    let resp = app_b
+        .oneshot(json_patch(
+            &format!("/api/v1/ssh-identities/{id_a}"),
+            json!({ "name": "hijacked" }),
+            &cookie_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let check = app_a
+        .oneshot(get(&format!("/api/v1/ssh-identities/{id_a}"), &cookie_a))
+        .await
+        .unwrap();
+    let body = read_body(check).await;
+    assert_eq!(body["name"], "a-id");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_ssh_identity_success_when_no_dependents(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_identity_via_api(&app, &cookie, "removable").await;
+    let resp = app
+        .clone()
+        .oneshot(json_delete(
+            &format!("/api/v1/ssh-identities/{id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let check = app
+        .oneshot(get(&format!("/api/v1/ssh-identities/{id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_ssh_identity_referenced_by_profile_returns_409(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let identity_id = create_identity_via_api(&app, &cookie, "linked").await;
+    let host_id = create_host_via_api(&app, &cookie, "host", "h.example.com").await;
+    let profile_resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/server-profiles",
+            json!({
+                "name": "uses-identity",
+                "host_id": host_id,
+                "ssh_identity_id": identity_id,
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(profile_resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(json_delete(
+            &format!("/api/v1/ssh-identities/{identity_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(body["error"]["message"], "ssh_identity referenced");
+    // Identity row MUST still exist.
+    let check = app
+        .oneshot(get(
+            &format!("/api/v1/ssh-identities/{identity_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_ssh_identity_writes_audit_and_redacts_payload(pool: PgPool) {
+    // The delete route emits one `ssh_identity_deleted` audit row.
+    // The payload MUST contain only public metadata — no
+    // `encrypted_private_key`, no plaintext PEM marker, no public-key
+    // bytes.
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let id = create_identity_via_api(&app, &cookie, "to-delete").await;
+    let resp = app
+        .oneshot(json_delete(
+            &format!("/api/v1/ssh-identities/{id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let audit_rows = PgAuditEventRepository::new(pool)
+        .recent_for_actor(user_id, 16)
+        .await
+        .expect("read audit events");
+    let row = audit_rows
+        .iter()
+        .find(|r| r.kind == AuditEventKind::SshIdentityDeleted)
+        .expect("ssh_identity_deleted audit row should exist");
+    let payload = row.payload.to_string();
+    assert!(!payload.contains("encrypted_private_key"));
+    assert!(!payload.contains("REDACT-MARKER-API-9F2B"));
+    assert!(!payload.contains("BEGIN OPENSSH PRIVATE KEY"));
+    // Public metadata only — ensure the row carries the id at least.
+    assert!(payload.contains(&id));
+    assert!(payload.contains("to-delete"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_ssh_identity_unauthenticated_returns_401(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_identity_via_api(&app, &cookie, "x").await;
+    let resp = app
+        .oneshot(json_delete_no_auth(&format!("/api/v1/ssh-identities/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_ssh_identity_bad_origin_returns_403(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_identity_via_api(&app, &cookie, "x").await;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/ssh-identities/{id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from("{ this is not valid JSON"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        read_body(resp).await["error"]["code"],
+        "csrf_origin_mismatch"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_ssh_identity_bad_origin_returns_403(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let id = create_identity_via_api(&app, &cookie, "x").await;
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/ssh-identities/{id}"))
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        read_body(resp).await["error"]["code"],
+        "csrf_origin_mismatch"
+    );
+}
+
 // ----------------------------------------------------------------------
 // Server profiles
 // ----------------------------------------------------------------------
@@ -1632,6 +2220,350 @@ async fn create_server_profile_missing_identity_returns_404(pool: PgPool) {
             .as_str()
             .unwrap()
             .contains("ssh_identity")
+    );
+}
+
+// ----- PATCH / DELETE for server profiles ----------------------------
+
+/// Create a host + identity + profile and return their ids. Helper for
+/// the PATCH / DELETE tests below.
+async fn create_profile_via_api(
+    app: &Router,
+    cookie: &str,
+    name: &str,
+) -> (String, String, String) {
+    let host_id = create_host_via_api(app, cookie, "p-host", "p-host.example.com").await;
+    let identity_id = create_identity_via_api(app, cookie, "p-id").await;
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/server-profiles",
+            json!({
+                "name": name,
+                "host_id": host_id,
+                "ssh_identity_id": identity_id,
+            }),
+            cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let profile_id = read_body(resp).await["id"].as_str().unwrap().to_owned();
+    (host_id, identity_id, profile_id)
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_updates_supplied_fields_only(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let (_host_id, _identity_id, profile_id) =
+        create_profile_via_api(&app, &cookie, "before-rename").await;
+
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({
+                "name": "after-rename",
+                "tags": ["prod", "edge"],
+                "username_override": "deploy"
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body(resp).await;
+    assert_eq!(body["name"], "after-rename");
+    assert_eq!(body["tags"], json!(["prod", "edge"]));
+    assert_eq!(body["username_override"], "deploy");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_can_clear_username_override(pool: PgPool) {
+    // `username_override: null` MUST clear the column (falling back to
+    // the host's default); `username_override` field absent MUST leave
+    // the existing value alone. The repository uses a tri-state to
+    // distinguish these — pin both shapes here.
+    let (app, _user, cookie) = setup(pool).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "p").await;
+
+    // Set first.
+    let r1 = app
+        .clone()
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({ "username_override": "deploy" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(read_body(r1).await["username_override"], "deploy");
+
+    // Clear.
+    let r2 = app
+        .clone()
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({ "username_override": null }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let body = read_body(r2).await;
+    assert!(body["username_override"].is_null());
+
+    // Renaming with no override field MUST preserve the current null.
+    let r3 = app
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({ "name": "renamed-again" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let body = read_body(r3).await;
+    assert_eq!(body["name"], "renamed-again");
+    assert!(body["username_override"].is_null());
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_empty_body_returns_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "p").await;
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(read_body(resp).await["error"]["code"], "invalid_input");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_foreign_host_returns_404(pool: PgPool) {
+    // PATCH that swaps host_id to a host owned by a different user
+    // MUST collapse to the same `host not found` 404 as a create
+    // would — cross-user existence is not leaked.
+    let (app_a, _ua, cookie_a) = setup(pool.clone()).await;
+    let (_, _, profile_id) = create_profile_via_api(&app_a, &cookie_a, "p").await;
+    let (app_b, _ub, cookie_b) = setup(pool.clone()).await;
+    let foreign_host = create_host_via_api(&app_b, &cookie_b, "b", "b.example.com").await;
+
+    let resp = app_a
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({ "host_id": foreign_host }),
+            &cookie_a,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "not_found");
+    assert!(body["error"]["message"].as_str().unwrap().contains("host"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_writes_audit(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "audited").await;
+    let resp = app
+        .oneshot(json_patch(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            json!({ "name": "audited-renamed" }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let audit = PgAuditEventRepository::new(pool)
+        .recent_for_actor(user_id, 16)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|r| r.kind == AuditEventKind::ServerProfileUpdated)
+        .expect("server_profile_updated audit row should exist");
+    let payload = row.payload.to_string();
+    assert!(payload.contains("audited-renamed"));
+    // Public metadata only — no secret material.
+    assert!(!payload.contains("encrypted_private_key"));
+    assert!(!payload.contains("REDACT-MARKER-API-9F2B"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_server_profile_success_when_no_sessions(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "deletable").await;
+    let resp = app
+        .clone()
+        .oneshot(json_delete(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let check = app
+        .oneshot(get(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_server_profile_with_terminal_sessions_returns_409(pool: PgPool) {
+    // Insert a terminal_sessions row referencing the profile (closed),
+    // then assert delete refuses. `terminal_sessions` rows are NEVER
+    // deleted from the user UI — disable is the recommended path for
+    // profiles with session history.
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "with-history").await;
+    let profile_uuid: uuid::Uuid = profile_id.parse().unwrap();
+    let db = Db::from_pool(pool.clone());
+    db.terminal_sessions()
+        .create(relayterm_core::repository::CreateTerminalSession {
+            owner_id: user_id,
+            server_profile_id: relayterm_core::ids::ServerProfileId::from_uuid(profile_uuid),
+            status: TerminalSessionStatus::Closed,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect("seed terminal_sessions row");
+
+    let resp = app
+        .clone()
+        .oneshot(json_delete(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(body["error"]["message"], "server_profile referenced");
+    let check = app
+        .oneshot(get(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_server_profile_writes_audit(pool: PgPool) {
+    let (app, user_id, cookie) = setup(pool.clone()).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "to-delete").await;
+    let resp = app
+        .oneshot(json_delete(
+            &format!("/api/v1/server-profiles/{profile_id}"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let audit = PgAuditEventRepository::new(pool)
+        .recent_for_actor(user_id, 16)
+        .await
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|r| r.kind == AuditEventKind::ServerProfileDeleted)
+        .expect("server_profile_deleted audit row should exist");
+    let payload = row.payload.to_string();
+    assert!(payload.contains(&profile_id));
+    assert!(payload.contains("to-delete"));
+    assert!(!payload.contains("encrypted_private_key"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_server_profile_owned_by_other_returns_404(pool: PgPool) {
+    let (app_a, _ua, cookie_a) = setup(pool.clone()).await;
+    let (_, _, profile_id_a) = create_profile_via_api(&app_a, &cookie_a, "a").await;
+    let (app_b, _ub, cookie_b) = setup(pool.clone()).await;
+    let resp = app_b
+        .oneshot(json_delete(
+            &format!("/api/v1/server-profiles/{profile_id_a}"),
+            &cookie_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let check = app_a
+        .oneshot(get(
+            &format!("/api/v1/server-profiles/{profile_id_a}"),
+            &cookie_a,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(check.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_unauthenticated_returns_401(pool: PgPool) {
+    let (app, _u, cookie) = setup(pool).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "p").await;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/server-profiles/{profile_id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, TEST_AUTH_ORIGIN)
+        .body(Body::from(json!({ "name": "x" }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn patch_server_profile_bad_origin_returns_403(pool: PgPool) {
+    let (app, _u, cookie) = setup(pool).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "p").await;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/server-profiles/{profile_id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from("{ this is not valid JSON"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        read_body(resp).await["error"]["code"],
+        "csrf_origin_mismatch"
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn delete_server_profile_bad_origin_returns_403(pool: PgPool) {
+    let (app, _u, cookie) = setup(pool).await;
+    let (_h, _i, profile_id) = create_profile_via_api(&app, &cookie, "p").await;
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/server-profiles/{profile_id}"))
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        read_body(resp).await["error"]["code"],
+        "csrf_origin_mismatch"
     );
 }
 

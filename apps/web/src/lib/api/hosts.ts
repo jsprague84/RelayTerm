@@ -18,6 +18,7 @@
 import {
   fetchJsonList,
   postJsonItem,
+  readErrorEnvelope,
   type LoadOptions,
   type LoadResult,
   type WireError,
@@ -313,4 +314,325 @@ export async function createHost(
     return { ok: false, error: result.error };
   }
   return { ok: true, host: result.data };
+}
+
+// ---------------------------------------------------------------------------
+// PATCH / DELETE helpers
+// ---------------------------------------------------------------------------
+//
+// Wire shapes mirror `crates/relayterm-api/src/dto/host.rs` (PATCH) and the
+// 204-No-Content response from `DELETE /api/v1/hosts/:id`. The helpers do
+// NOT throw, do NOT log raw response bodies, and do NOT echo wire / transport
+// detail through any user-facing string.
+
+/**
+ * Request body for `PATCH /api/v1/hosts/:id`.
+ *
+ * Every field is optional — only the fields the caller supplies are sent.
+ * An entirely-empty body is refused at the client validator AND at the
+ * backend (`400 invalid_input`).
+ */
+export interface UpdateHostRequest {
+  display_name?: string;
+  hostname?: string;
+  port?: number;
+  default_username?: string;
+}
+
+export type UpdateHostInvalidReason =
+  | "empty_update"
+  | CreateHostInvalidReason;
+
+export type UpdateHostValidation =
+  | {
+      ok: true;
+      body: {
+        display_name?: string;
+        hostname?: string;
+        port?: number;
+        default_username?: string;
+      };
+    }
+  | { ok: false; reason: UpdateHostInvalidReason };
+
+/**
+ * Validate a partial-update host request on the client. Mirrors the
+ * per-field validators in {@link validateCreateHostRequest} and adds
+ * the empty-body refusal so the UI does not ship a no-op PATCH.
+ */
+export function validateUpdateHostRequest(
+  raw: UpdateHostRequest,
+): UpdateHostValidation {
+  const out: {
+    display_name?: string;
+    hostname?: string;
+    port?: number;
+    default_username?: string;
+  } = {};
+  let touched = false;
+
+  if (raw.display_name !== undefined) {
+    touched = true;
+    // Delegate to the create validator with placeholder values for the
+    // other fields, so a single source of truth runs the per-field
+    // rules. The delegated call cannot accept partial input — it would
+    // fail with a missing-field reason for the absent ones — hence the
+    // placeholders. They are valid for the OTHER validators, so the
+    // ONLY reasons that can surface here are display-name-related.
+    const v = validateCreateHostRequest({
+      display_name: raw.display_name,
+      hostname: "placeholder.example.com",
+      port: DEFAULT_SSH_PORT,
+      default_username: "placeholder",
+    });
+    if (!v.ok) {
+      // Catch-all: any future display-name reason added to the validator
+      // surfaces here even if the prefix changes. The placeholders mean
+      // we cannot see any non-display-name reason — but if that ever
+      // changes (e.g. cross-field validation), failing closed is safer
+      // than silently passing.
+      return { ok: false, reason: v.reason };
+    }
+    out.display_name = raw.display_name;
+  }
+  if (raw.hostname !== undefined) {
+    touched = true;
+    const v = validateCreateHostRequest({
+      display_name: "placeholder",
+      hostname: raw.hostname,
+      port: DEFAULT_SSH_PORT,
+      default_username: "placeholder",
+    });
+    if (!v.ok) {
+      return { ok: false, reason: v.reason };
+    }
+    out.hostname = raw.hostname;
+  }
+  if (raw.port !== undefined) {
+    touched = true;
+    if (!Number.isInteger(raw.port) || raw.port < 1 || raw.port > 65535) {
+      return { ok: false, reason: "port_out_of_range" };
+    }
+    out.port = raw.port;
+  }
+  if (raw.default_username !== undefined) {
+    touched = true;
+    const v = validateCreateHostRequest({
+      display_name: "placeholder",
+      hostname: "placeholder.example.com",
+      port: DEFAULT_SSH_PORT,
+      default_username: raw.default_username,
+    });
+    if (!v.ok) {
+      return { ok: false, reason: v.reason };
+    }
+    out.default_username = raw.default_username;
+  }
+  if (!touched) {
+    return { ok: false, reason: "empty_update" };
+  }
+  return { ok: true, body: out };
+}
+
+export type UpdateHostError =
+  | { kind: "validation"; reason: UpdateHostInvalidReason }
+  | WireError;
+
+export type UpdateHostResult =
+  | { ok: true; host: Host }
+  | { ok: false; error: UpdateHostError };
+
+export interface UpdateHostOptions extends LoadOptions {
+  endpoint?: string;
+}
+
+/**
+ * PATCH a host and parse the updated row. The helper does not throw
+ * and does not echo wire / transport detail through `describeUpdateHostError`.
+ */
+export async function updateHost(
+  id: string,
+  raw: UpdateHostRequest,
+  options: UpdateHostOptions = {},
+): Promise<UpdateHostResult> {
+  const validation = validateUpdateHostRequest(raw);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      error: { kind: "validation", reason: validation.reason },
+    };
+  }
+  const endpoint =
+    options.endpoint ?? `/api/v1/hosts/${encodeURIComponent(id)}`;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "PATCH",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(validation.body),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+  if (!response.ok) {
+    const { code, message } = await readErrorEnvelope(response);
+    return {
+      ok: false,
+      error: { kind: "http", status: response.status, code, message },
+    };
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  const parsed = parseHost(body);
+  if (!parsed) {
+    return { ok: false, error: { kind: "malformed_response" } };
+  }
+  return { ok: true, host: parsed };
+}
+
+/**
+ * Format an {@link UpdateHostError} as a one-line UI summary. Stays a
+ * function of `kind` + `status` + `code` (and the validation `reason`
+ * enum) only — never echoes the wire `message` of an HTTP error or
+ * the thrown `Error.message` of a transport failure.
+ */
+export function describeUpdateHostError(err: UpdateHostError): string {
+  switch (err.kind) {
+    case "validation":
+      if (err.reason === "empty_update") {
+        return "Cannot save host: change at least one field";
+      }
+      return `Cannot save host: ${describeHostValidationReason(err.reason)}`;
+    case "http":
+      if (err.status === 404 && err.code === "not_found") {
+        return "Failed to save host: host not found";
+      }
+      if (err.status === 401) {
+        return "Failed to save host: not authenticated";
+      }
+      if (err.status === 403 && err.code === "csrf_origin_mismatch") {
+        return "Failed to save host: request blocked by browser security policy";
+      }
+      return `Failed to save host: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Failed to save host: transport error";
+    case "malformed_response":
+      return "Failed to save host: malformed response";
+  }
+}
+
+/**
+ * Typed error envelope returned by {@link deleteHost}. The 409 case
+ * carries the typed `reason` so the formatter can render precise copy
+ * without echoing the wire `message`.
+ */
+export type DeleteHostError =
+  | {
+      kind: "http";
+      status: number;
+      code: string;
+      message: string;
+      /** Derived 409 discriminator; `null` for non-409 statuses or
+       * unrecognised wire reasons. */
+      reason: "referenced" | null;
+    }
+  | { kind: "transport"; message: string };
+
+export type DeleteHostResult =
+  | { ok: true }
+  | { ok: false; error: DeleteHostError };
+
+export interface DeleteHostOptions extends LoadOptions {
+  endpoint?: string;
+}
+
+/**
+ * DELETE a host. Returns `{ ok: true }` on `204 No Content`; maps a
+ * `409 conflict { entity: "host", reason: "referenced" }` to a typed
+ * `referenced` discriminator. Does not throw, does not log.
+ */
+export async function deleteHost(
+  id: string,
+  options: DeleteHostOptions = {},
+): Promise<DeleteHostResult> {
+  const endpoint =
+    options.endpoint ?? `/api/v1/hosts/${encodeURIComponent(id)}`;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      error: { kind: "transport", message: "fetch unavailable" },
+    };
+  }
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, { method: "DELETE" });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "transport",
+        message: err instanceof Error ? err.message : "unknown",
+      },
+    };
+  }
+  if (response.status === 204) return { ok: true };
+  const { code, message } = await readErrorEnvelope(response);
+  // Map the 409 wire body to the typed reason. The on-wire form is
+  // `host referenced` per `ApiError::Conflict { entity: "host",
+  // reason: Some("referenced") }`. Anything else collapses to `null`
+  // so the formatter falls back to a generic 409 string and the wire
+  // message is never re-emitted to the UI.
+  const reason: "referenced" | null =
+    response.status === 409 && message === "host referenced" ? "referenced" : null;
+  return {
+    ok: false,
+    error: { kind: "http", status: response.status, code, message, reason },
+  };
+}
+
+/**
+ * Format a {@link DeleteHostError} as a one-line UI summary. Stays a
+ * function of `kind` + `status` + `code` + the derived `reason`
+ * discriminator only.
+ */
+export function describeDeleteHostError(err: DeleteHostError): string {
+  switch (err.kind) {
+    case "http":
+      if (err.status === 409 && err.reason === "referenced") {
+        return "Cannot delete host: it is still used by a saved server profile or has trusted host keys — remove the dependent items first";
+      }
+      if (err.status === 404 && err.code === "not_found") {
+        return "Cannot delete host: host not found";
+      }
+      if (err.status === 401) {
+        return "Cannot delete host: not authenticated";
+      }
+      if (err.status === 403 && err.code === "csrf_origin_mismatch") {
+        return "Cannot delete host: request blocked by browser security policy";
+      }
+      return `Cannot delete host: HTTP ${err.status} ${err.code}`;
+    case "transport":
+      return "Cannot delete host: transport error";
+  }
 }
