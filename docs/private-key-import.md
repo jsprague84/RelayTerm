@@ -2,14 +2,18 @@
 
 > Design doc for importing an existing SSH private key into RelayTerm's
 > backend-managed vault. **Status: v1 implemented on
-> `feat/private-key-import-v1` (2026-05-12).** The route, the vault
-> primitive, the audit-kind reuse + `source` discriminator, the
-> duplicate-fingerprint mapping, the SPA helper + Identities-view
-> Import panel, and the redaction-sentinel tests are all wired against
-> the design below; the deferred sections (§ 10, § 13.1 / § 13.2,
-> § 14) remain accurate as the v1.1+ roadmap. Sibling docs and
-> `SPEC.md` "SSH credential and trust surfaces" reflect the landed
-> shape.
+> `feat/private-key-import-v1` (2026-05-12); staging-smoked end-to-end
+> on 2026-05-13 — see
+> [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+> § "2026-05-13 · Private-key import (OpenSSH Ed25519) staging smoke"
+> for the full UI / API / DB / audit / log redaction verification.**
+> The route, the vault primitive, the audit-kind reuse + `source`
+> discriminator, the duplicate-fingerprint mapping, the SPA helper +
+> Identities-view Import panel, and the redaction-sentinel tests are
+> all wired against the design below; the deferred sections (§ 10,
+> § 13.1 / § 13.2, § 14) remain accurate as the v1.1+ roadmap.
+> Sibling docs and `SPEC.md` "SSH credential and trust surfaces"
+> reflect the landed shape.
 >
 > Sibling docs:
 >

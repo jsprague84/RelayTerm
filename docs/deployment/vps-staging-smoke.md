@@ -4663,6 +4663,346 @@ treat any of these as staging-verified by this entry):**
   surface (disable / re-enable round-trip) is the
   natural next slice.
 
+### 2026-05-13 · Private-key import (OpenSSH Ed25519) staging smoke
+
+Slice `docs/private-key-import-staging-smoke` verifies the
+v1 private-key import surface end-to-end on the staging
+slot: paste-textarea ingress on `IdentitiesView`, the
+backend `POST /api/v1/ssh-identities/import` route, the
+`ssh_identity_created` audit row's `source: "imported"`
+discriminator (`docs/private-key-import.md` § 7.3), the
+parity-with-generate guarantee on the downstream host /
+profile / trust / auth-check / terminal flow, and the
+`AGENTS.md` "Things to avoid" §§ 1 / 3 / 13 / 14 redaction
+backstops. The slice is docs-only —
+`feat(api): import OpenSSH Ed25519 identities` (`8af1fc9`)
+landed first and Forgejo CI's six checks (rust checks, web
+checks, docker build, desktop-linux, android, publish-
+images) were already green on the commit when the smoke
+started.
+
+**Image freshness finding (Category 1).** The Forgejo
+`:main` tags in the registry already pointed at the
+freshly-published images from the import commit (built
+`2026-05-13T02:55:38Z` backend, `2026-05-13T02:56:22Z`
+web), but the cloud-edge staging slot was still running
+the previous `:main` digests
+(`sha256:55e64c11…` backend / `sha256:63694b40…` web,
+both built `~2026-05-12T23:50Z` — ~3 hours **before**
+`8af1fc9` was authored at `2026-05-13T02:51:03Z`). The
+deployed pre-refresh web bundle (`index-CiiA2M_K.js`)
+did NOT contain `importSshIdentity` or
+`Import SSH identity` strings; an early `401` response
+from `GET /api/v1/ssh-identities/import` was a
+false-positive (path collision with
+`GET /api/v1/ssh-identities/:id`, whose
+`AuthenticatedUser` extractor runs before the method
+check, so any path that visually matches the parameter
+pattern returns `401` regardless of whether a specific
+sibling route was registered). A manual
+`docker compose pull relayterm-backend relayterm-web` +
+`docker compose up -d --no-deps relayterm-backend
+relayterm-web` against
+`/home/ubuntu/docker-compose/relayterm-staging/docker-compose.yml`
+pulled the new digests; postgres was untouched (the
+`--no-deps` flag enforces that). Post-refresh the web
+bundle hash became `index-BGG66G59.js` and the
+"Import SSH identity" button + `private_key_openssh`
+strings were grep-able inside the new bundle. The staging
+slot does NOT auto-redeploy on push to `main` — this is
+the documented procedure (`§ 5. Pull the images`) and
+not a new finding, but the SPA's content-hashed asset
+filename plus nginx's `Cache-Control: immutable` on
+`/assets/*` means the desktop / browser caches DO pick up
+the new bundle on next navigation without any cache
+purge, which is the production-correct behaviour and was
+confirmed here in passing.
+
+**Surface.** Playwright MCP
+(`mcp__playwright__browser_*`) driving a Chromium browser
+session against `https://relayterm-staging.js-node.cc`.
+No Tauri shell this slice (bundled-shell handoff is
+covered by the 2026-05-09 desktop / Android entries; the
+import panel uses the same SPA the shells wrap, so the
+testid surface is identical). The browser session
+re-used a still-valid cookie from a prior smoke run — no
+fresh login was needed. The staging smoke user is the
+existing throwaway
+`staging+throwaway-20260509173230@example.com`. The
+session was closed at end-of-smoke.
+
+**Throwaway key discipline.** A new Ed25519 keypair was
+generated on the operator workstation only,
+`ssh-keygen -t ed25519 -N '' -C
+relayterm-import-smoke-202605 -f
+/tmp/relayterm-private-key-import-smoke/id_ed25519`. No
+personal or production key was ever in scope. The
+private-key bytes never appear in this entry, never
+appeared in any log line, audit row, error message, or
+shell-history command body, and the file was `shred -u`'d
+at end-of-smoke (along with the `.pub` and the
+short-lived base64 sidecar used to ferry the PEM into the
+browser via `page.evaluate(atob(…))`, avoiding a literal
+PEM in the Playwright tool-call payload). The locally-
+computed SSH SHA-256 fingerprint is
+`SHA256:Mqf4E98YtdaO/DptUJ4RkKq9ogXXJVe4rXkyTn4hBqQ` —
+the value the SPA / DB / audit row must all agree on for
+the round-trip to be honest.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` (image
+`sha256:29d4e3f8…`, LSIO build `10.2_p1-r0-ls225`)
+container named `relayterm-staging-import-smoke-ssh`,
+attached only to the staging Compose network
+`relayterm-staging_relayterm-staging-internal` with DNS
+alias `import-smoke-host` resolving to `172.21.0.5`. **No
+host port was published** — the target is unreachable
+from anything outside the staging Compose network.
+`USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`, `PUBLIC_KEY=<contents of
+id_ed25519.pub>`. The throwaway public key landed in the
+target's `authorized_keys` exactly once and only via the
+`PUBLIC_KEY` env variable; no `ssh-copy-id`, no password
+bootstrap, no privileged channel (those are v1
+out-of-scope per `docs/private-key-import.md` § 10).
+DNS + TCP reachability from a sidecar on the same
+network was confirmed before any browser action
+(`nslookup import-smoke-host` + `nc -zv ... 2222`). The
+container was `docker stop && docker rm`'d during
+cleanup.
+
+**UI import.** Identities view → `identities-import-open`
+button → paste PEM into
+`identities-import-private-key` textarea + type
+`import-smoke-identity` into
+`identities-import-name` → `identities-import-submit`.
+The browser issued a single
+`POST /api/v1/ssh-identities/import` returning
+`201 Created` and a `SshIdentityResponse`-shaped body.
+The success card showed `Imported import-smoke-identity`
+with key type `ed25519`, fingerprint
+`SHA256:Mqf4E98Y…hBqQ` (byte-identical to the local
+`ssh-keygen -lf id_ed25519.pub` output), public-key
+preview
+`ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… import-smoke-identity`
+(the supplied name became the OpenSSH comment per design
+§ 5 step (d): `private.set_comment(name)` inside
+`VaultService::import_ssh_identity`), and the load-
+bearing footnote "The private key never reaches the
+browser. Only the public key is renderable here." The
+identities list went from `4 → 5 identities` with
+`import-smoke-identity` at the top. The name + textarea
+were both cleared on success (`value === ""`) and the
+submit button re-disabled, per design § 9.3.
+
+**DOM + storage redaction.** A post-import sweep over
+`document.documentElement.outerHTML`: the literal strings
+`-----BEGIN OPENSSH PRIVATE KEY-----` and
+`-----END OPENSSH PRIVATE KEY-----` DO appear, but only
+as the textarea's `placeholder` attribute and the panel's
+help-copy ("Paste the full file contents, including the
+BEGIN and END markers") — not as live private-key bytes.
+A second sweep against actual PEM-body byte sentinels
+(the `openssh-key-v1` magic base64 prefix and the
+private-scalar half of the key) returned `false` for
+both. `encrypted_private_key` and `private_key_openssh`
+appear nowhere in the DOM. `localStorage` contains only
+the pre-existing `relayterm.active-terminal.v1`
+(unchanged between pre- and post-import snapshots);
+`sessionStorage` is empty; `document.cookie.length === 0`
+in the browser (auth cookie is HttpOnly — JS cannot read
+it, which is the production-correct posture).
+
+**Backend / DB / audit shape** (`docker exec -i
+relayterm-staging-postgres-1 psql -U relayterm -d
+relayterm`). The `ssh_identities` row exists with
+`name=import-smoke-identity`, `key_type=ed25519`,
+`fingerprint_sha256=SHA256:Mqf4E98Y…hBqQ`,
+`length(encrypted_private_key)=456` bytes (an Ed25519
+PEM canonicalized through `to_openssh(LineEnding::LF)`
+is ~419 bytes; the +37-byte delta is the `RTV1` +
+version byte + 24-byte XChaCha20-Poly1305 nonce +
+16-byte tag envelope from
+`crates/relayterm-vault::cipher`, which matches the math
+§ 6 promises). `encrypted_private_key` itself was queried
+by `length()` only — the byte content was never read.
+The single `audit_events` row matching
+`kind='ssh_identity_created' AND
+payload->>'name'='import-smoke-identity'` had
+`recorded_at = 2026-05-13 03:29:36.387256+00` and payload
+keys exactly {`name`, `source`, `key_type`,
+`created_at`, `ssh_identity_id`, `fingerprint_sha256`} —
+six keys, no more, no less — with `source='imported'`
+(the design § 7.3 discriminator). The full payload was
+`{"name": "import-smoke-identity", "source": "imported",
+"key_type": "ed25519", "created_at":
+"2026-05-13T03:29:36.385186Z", "ssh_identity_id":
+"aff52897-62b7-4a13-998c-47f56a8ca349",
+"fingerprint_sha256":
+"SHA256:Mqf4E98YtdaO/DptUJ4RkKq9ogXXJVe4rXkyTn4hBqQ"}`.
+A redaction sweep with `payload::text LIKE '%' || s ||
+'%'` against `{private_key_openssh,
+encrypted_private_key, BEGIN OPENSSH, private_key,
+passphrase, session_token, token_hash, cookie, password,
+data_b64}` returned `f` (false) for every sentinel.
+
+**Host / profile / trust / auth-check.** Created host
+`import-smoke-host`
+(`servers-create-host-display-name` +
+`servers-create-host-hostname` +
+`servers-create-host-port=2222` +
+`servers-create-host-username=smoke`); created profile
+`import-smoke-profile` binding the new host to
+`import-smoke-identity` — its option label in the
+profile-host `select` confirmed the identity's UUID
+`aff52897-…` matched the DB row.
+`host-key-preflight-button` captured an ed25519 host key
+fingerprint `SHA256:2gQzimnp7rIh6cSVfkxOGFolJKG4RSUtd5G9klNo+XQ`,
+which is byte-identical to the locally-computed
+`ssh-keygen -lf` over the target's advertised ed25519
+host-key line (`docker logs
+relayterm-staging-import-smoke-ssh` had emitted all
+three host-key types — ed25519, ecdsa-sha2-nistp256, rsa
+— at container start). Typing the fingerprint into
+`host-key-confirm-input` enabled `host-key-trust-button`;
+clicking it flipped `host-key-status-badge` to `Trusted`
+("Host key matches an active pinned entry. Run auth-
+check below to confirm…"). `auth-check-run-button` ran
+in ~5 s and flipped `auth-check-status-badge` to
+`Authenticated` at `2026-05-13T03:34:40.370882510Z`,
+description "SSH public-key authentication succeeded for
+the configured username. No PTY was allocated and no
+command was executed. Terminal launch is a separate,
+deliberate action." The auth-check used the just-
+imported identity end-to-end, proving the round-trip
+through the vault's `RTV1` envelope is byte-identical to
+a backend-generated key from the operator's PoV.
+
+**Terminal launch (parity check).** Clicked
+`profile-launch-terminal`; the workspace flipped to
+`production-terminal-phase=live` with session
+`b08a5a88-fadc-4264-a17f-7de56b43dc3c`. Sent three
+harmless commands via the xterm helper textarea:
+`echo relayterm-import-smoke` → output
+`relayterm-import-smoke`, `whoami` → `smoke`, `pwd`
+→ `/config` (linuxserver/openssh-server's default home
+for `USER_NAME=smoke`). Closed via
+`production-terminal-close`. The session was
+authenticated, spawned a real PTY, executed real
+commands, and closed cleanly — the load-bearing parity
+check between an imported key and a generated key
+passes.
+
+**Referenced-identity delete refusal.** Opened
+`identity-detail-panel` for `import-smoke-identity`,
+clicked `identity-detail-delete-open`, typed
+`import-smoke-identity` into
+`identity-detail-delete-confirm-input`, clicked
+`identity-detail-delete-confirm-submit`. The wire was
+`DELETE /api/v1/ssh-identities/aff52897-… → 409` (per
+nginx access log; the SPA does not surface the wire
+status code directly). The SPA mapped it to the friendly
+copy "Cannot delete SSH identity: it is still used by a
+saved server profile — remove or re-bind the profile
+first" via `identity-detail-delete-error`. No raw backend
+text, no `409`, no `ssh_identity referenced` envelope
+string, no private-key material echoed. The identity row
+remained present in the list afterwards.
+
+**Negative path — encrypted PEM.** A second throwaway
+Ed25519 key was generated with `-N
+'throwawaypass1234'` (its base64-encoded byte sequence
+was used once to populate the import textarea, then both
+the file and the base64 sidecar were `shred -u`'d in
+cleanup; the literal passphrase string was used in NO
+production credential and is recorded here only as the
+sentinel for the redaction sweep below). Pasting it into
+the import panel and submitting produced
+`POST /api/v1/ssh-identities/import → 400` (per nginx
+access log). The SPA mapped it to "Cannot import SSH
+identity: passphrase-protected (encrypted) keys are not
+supported in this release — generate a new unencrypted
+key or wait for the v1.1 passphrase channel" — no raw
+`unsupported_key_format encrypted` envelope leaked.
+Textarea cleared on failure (`value === ""`); name field
+preserved at `neg-import-encrypted` (design § 9.3). DB
+confirmation: `SELECT count(*) FROM ssh_identities WHERE
+name='neg-import-encrypted'` → `0`. The negative-test
+key and its base64 fixture were shredded immediately.
+
+**Log + audit redaction sweep.** Backend log
+(`docker logs --since 2026-05-13T03:26:00Z
+relayterm-staging-relayterm-backend-1`, 6 lines —
+startup banner only, no per-request logging at the
+configured INFO verbosity) and nginx log (`30 lines`)
+were grepped for twelve sentinels:
+`BEGIN OPENSSH PRIVATE KEY`,
+`END OPENSSH PRIVATE KEY`, `private_key_openssh`,
+`encrypted_private_key`, `private_key`, `passphrase`,
+`session_token`, `token_hash`, `data_b64`,
+`REDACT-MARKER`, `throwawaypass1234`, and a short
+throwaway private-key byte fragment (a distinctive
+16-character slice of the imported key's private-scalar
+base64, derived locally on the workstation at sweep
+time, used only as a grep needle, and **deliberately not
+printed in this document** — referred to below as
+`<REDACT-MARKER-PRIVATE-KEY-FRAGMENT>` for the purposes
+of describing the sweep). All twelve returned `0`
+matches on both logs. The audit-payload sweep across
+every row recorded since `2026-05-13T03:26:00Z` (=
+exactly 2 rows: `ssh_identity_created` for the import,
+plus `server_profile_created` for the profile creation)
+returned `f` for eleven forbidden substrings including
+`throwawaypass1234` and the
+`<REDACT-MARKER-PRIVATE-KEY-FRAGMENT>` sentinel.
+Nginx access lines for the import flow showed exactly
+the wire shape claimed above: `201` on the successful
+import, `200` on the listing refresh, `409` on the
+referenced-delete attempt, `400` on the encrypted
+negative-test import.
+
+**Cleanup.** The profile was disabled through the SPA
+(`profile-disable-open` → typed name into
+`profile-disable-confirm-input` →
+`profile-disable-submit`); confirmed via `psql` that
+`server_profiles.disabled_at` was populated
+(`2026-05-13 03:45:00.90888+00`) and exactly one
+`audit_events` row with `kind='server_profile_disabled'`
+and `payload->>'name'='import-smoke-profile'` was
+appended (`4ebc21d9-028d-44de-983f-873d3ae43175`,
+`recorded_at = 2026-05-13 03:45:00.915667+00` — ~7 ms
+after the DB write, same transaction). Inventory rows
+(`hosts.import-smoke-host`,
+`server_profiles.import-smoke-profile`,
+`ssh_identities.import-smoke-identity`) were NOT
+deleted, per `AGENTS.md` "Inventory lifecycle and
+destructive-action policy" — the profile has a
+`terminal_sessions` history row from the launch above,
+so deletion is refused by design and disable is the
+correct non-destructive end state. The throwaway SSH
+target container was `docker stop`'d and `docker rm`'d;
+the `/tmp/relayterm-private-key-import-smoke/`
+directory was `shred -u`'d (private key, public key,
+base64 sidecar) and `rmdir`'d. The staging stack stays
+running on the refreshed `:main` digests; the throwaway
+staging smoke user is untouched.
+
+**Out of scope (re-stated for the next operator).**
+Passphrase-protected (encrypted) imports, RSA / ECDSA /
+DSA, PEM PKCS#1 / PKCS#8, PuTTY `.ppk`, file picker,
+`ssh-copy-id` / password bootstrap, hardware-backed /
+FIDO / U2F / smart-card SSH keys, SSH certificates, bulk
+import, and key-rotation workflow are all explicit
+`docs/private-key-import.md` § 10 / § 13 deferrals —
+the SPA's "future work" footer copy on the Identities
+view already reflects this. None were exercised this
+slice. A Tauri shell repeat of the same flow is also
+deferred — the bundled-shell handoff is covered
+separately (the 2026-05-09 desktop / Android entries
+above) and the import panel testid surface is the same
+SPA the shells wrap, so no shell-specific surface exists
+today.
+
 ---
 
 ## See also
