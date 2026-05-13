@@ -4258,6 +4258,411 @@ any of these as staging-verified by this entry):**
   applies — a follow-up commit on a separate branch
   should land the SPEC text update.
 
+### 2026-05-13 · Inventory management browser-driven SPA smoke (host / server-profile / SSH identity UI)
+
+Slice `docs/inventory-management-browser-smoke` is the
+follow-up the prior 2026-05-12 entry deferred: it drives
+the production SPA inventory-mutation UI in a real browser
+(Playwright MCP, headless) against the same live staging
+slot — same backend / web image digests, same throwaway
+operator user — and verifies the edit / delete / conflict
+copy is what the SPA actually surfaces to a human, not just
+what the wire protocol exposes. The prior entry stated its
+verification was "API + static UI-copy" (no real DOM
+drive); this entry closes that gap. The same six routes
+(`PATCH/DELETE` on `hosts`, `server-profiles`,
+`ssh-identities`) are exercised, but through the
+`host-detail-edit-*` / `profile-detail-edit-*` /
+`identity-detail-rename-*` and `*-delete-confirm-*` testid
+surfaces in `apps/web/src/lib/app/views/ServersView.svelte`
+(2598 lines) and `apps/web/src/lib/app/views/IdentitiesView.svelte`
+(1039 lines).
+
+**Surface.** Playwright MCP (`mcp__playwright__browser_*`)
+driving a Chromium browser session against
+`https://relayterm-staging.js-node.cc` (the MCP default;
+no explicit `--browser` override and no explicit
+`--headless` flag this slice — operator did not visually
+inspect the running browser, but the harness did not
+declare a mode either way, so do not over-claim a headed
+or headless rendering posture here). No Tauri shell
+involved in this entry — bundled-shell handoff was
+covered by 2026-05-09. Viewport 1440 × 900 for the main
+flow; a single 414 × 896 reachability check at the end.
+Browser session held only for the duration of the smoke;
+no cookie material was printed, stashed, or attached.
+
+**Image freshness.** No-op vs. 2026-05-12. Confirmed both
+service containers were still running the post-`f1f0691`
+digests:
+
+- `relayterm-backend` image `sha256:55e64c11…`
+  (built 2026-05-12T23:49:48Z)
+- `relayterm-web` image `sha256:63694b40…`
+  (built 2026-05-12T23:50:27Z)
+
+No `docker pull` / recreate this slice; the prior entry's
+deploy is what this smoke exercises. `postgres:17-alpine`
+still `Up 3 days (healthy)`.
+
+**Operator user.** Reused the same throwaway staging user
+the prior entry created
+(`staging+throwaway-20260509173230@example.com`). The
+existing browser session was still valid; no fresh login
+attempt was required. Password is operator-held and never
+crossed any tool argv this slice.
+
+**Production-route preflight.**
+- `GET /healthz` → 200, body `{"status":"ok"}`.
+- `GET /api/v1/auth/me` without cookies → 401
+  `{"error":{"code":"unauthorized","message":"unauthorized"}}`.
+- `GET /` (SPA) → 200, HTML contains the post-`f1f0691`
+  bundle (`index-CiiA2M_K.js`).
+- The six mutation routes return the expected gating
+  envelopes when probed without auth:
+  `PATCH /api/v1/hosts/<dummy>` → 403
+  `csrf_origin_mismatch` without an `Origin` header, 401
+  with `Origin` set — same shape across hosts /
+  `server-profiles` / `ssh-identities`. Routes are
+  mounted under the **hyphenated** paths
+  (`/server-profiles`, `/ssh-identities`), per
+  `crates/relayterm-api/src/routes/v1/mod.rs:26-27`; a
+  first-pass probe using underscored paths returned 404
+  before correction (worth pinning here so a future
+  smoke does not waste cycles on the same mismatch).
+
+**1. Hosts UI smoke.** Selected host
+`inv-smoke-host-edited-final-t20260512` (the one the
+prior smoke landed; 1 profile reference).
+
+- *Valid edit, round-trip:* set
+  display_name → `inv-smoke-host-uismoke-t20260513`,
+  hostname → `inv-smoke-uismoke.example.invalid`, port
+  → `2225`, default_user → `smoke-ui`. Inline edit form
+  closes; detail panel `data-testid="host-detail-*"`
+  fields reflect new values; list row text updates
+  byte-equal; `host-detail-updated-at` advances. Then
+  restored to the original values (same form, in reverse);
+  detail + row return to pre-edit text. Two `host_*`
+  PATCH 200s on the wire (no audit rows — host mutations
+  are intentionally excluded from the
+  `audit_events.kind` CHECK constraint per the route-
+  level doc-comment at
+  `crates/relayterm-api/src/routes/v1/hosts.rs:119`,
+  "No audit event is emitted (no `host_deleted` kind
+  exists; out of scope for this slice)"; the same
+  exclusion applies to the create + update paths so
+  the smoke window producing zero `host_*` audit rows
+  is correct, not a regression).
+- *Invalid edit copy:* blanked `display_name` and
+  submitted. Form closes; `data-testid="host-detail-edit-error"`
+  shows **`Cannot save host: display name is required`**
+  — short, user-facing, no raw backend text, no internal
+  field references. Row remained unchanged.
+- *Conflict-delete (host referenced by 1 profile):*
+  typed-name confirm at `host-detail-delete-confirm-input`
+  enabled the submit; submit fired `DELETE`, surfaced 409
+  in the browser console (standard
+  `Failed to load resource: server responded with a
+  status of 409` — no body printed by the browser, no
+  raw error text echoed by the SPA), and
+  `host-detail-delete-error` showed **`Cannot delete
+  host: it is still used by a saved server profile or
+  has trusted host keys — remove the dependent items
+  first`**. Host remained; `hosts-count = 15 hosts`
+  unchanged; `host-detail-profile-count = 1`.
+- *Successful unreferenced delete:* created a fresh host
+  through the `servers-create-host-*` form
+  (`uismoke-host-deleteme-t20260513`); success banner
+  appended is honest ("Reachability and host-key trust
+  are not verified by this action"). Selected it
+  (`host-detail-profile-count = 0`,
+  `host-detail-profiles-empty = "No profiles reference
+  this host yet."`), confirmed the delete via the typed-
+  name flow, and observed the detail panel auto-closes
+  and the row disappears from the list. `hosts-count`
+  returned to `15`.
+
+**2. Server profiles UI smoke.** Selected profile
+`inv-smoke-profile-edited-t20260512` from the prior
+slice.
+
+- *Valid edit, round-trip incl. username-override
+  set + clear:* `profile-detail-edit-*` allowed editing
+  name, host (select), identity (select), username
+  override (text), tags (comma-list text). Wrote
+  `inv-smoke-profile-uismoke-t20260513`,
+  username_override = `uismoke-override`,
+  tags = `smoke, inv, t20260512, uismoke`; detail
+  re-renders, list row text updates, the
+  `profile-detail-username` field switches from
+  `smoke2 (host default)` → `uismoke-override
+  (override)` — the `(override)` annotation is
+  rendered exactly when the column is non-NULL.
+  Restored: empty `username_override` is sent and the
+  field flips back to `smoke2 (host default)`; tags
+  trimmed back to the original three.
+- *Conflict-delete (terminal_sessions history):*
+  attempted delete on `desktop-smoke-profile` (used in
+  the 2026-05-09 published-desktop login + terminal
+  smoke; has closed `terminal_sessions` rows referencing
+  it via `terminal_sessions.server_profile_id
+  ON DELETE RESTRICT`). Backend returned 409;
+  `profile-detail-delete-error` showed **`Cannot delete
+  server profile: it has terminal session history —
+  disable it instead to keep the history while blocking
+  new launches`** — explicit pointer to the disable
+  affordance, no backend message echo. Profile remained.
+- *Successful unreferenced delete:* attempted delete on
+  `inv-smoke-profile-referenced-t20260512` (the prior
+  slice's "referenced" pair, which referenced
+  `inv-smoke-host-referenced-t20260512` and was the
+  *host*-conflict-blocker subject; it itself has zero
+  `terminal_sessions` rows). 200 OK on the wire,
+  `audit_events` shows `server_profile_deleted` at
+  2026-05-13T01:20:59Z with public-metadata-only payload
+  (`name`, `host_id`, `disabled_at = null`,
+  `ssh_identity_id`, `server_profile_id`); UI list
+  count `13 profiles → 12 profiles`; row gone; detail
+  panel auto-closed. `inv-smoke-host-referenced-t20260512`
+  is now unreferenced but kept (could become the
+  subject of a separate host-delete success in a future
+  smoke).
+
+  This is also the conflict-vs-success-path divergence
+  worth pinning: the *name* `*-referenced-*` referred
+  in the 2026-05-12 entry to "host-side referencing
+  blocker", **not** to "has terminal_sessions history",
+  so the profile itself was deletable without going
+  through the disable affordance. The 2026-05-12 entry's
+  fixture inventory does not contradict this — the
+  prior smoke deleted `inv-smoke-profile-delete-free-*`
+  (a different fixture) for the success path and never
+  tried the delete on `*-referenced-*`. Re-read carefully
+  before assuming a name-based shortcut in a later slice.
+
+**3. SSH identities UI smoke.**
+
+- *Generate:* `identities-generate-open` →
+  `identities-generate-name` = `inv-smoke-identity-uismoke-t20260513`,
+  `identities-generate-key-type` = `ed25519` (default;
+  the only supported option per the
+  `ssh-key 0.6` `ed25519`-feature-only pin in
+  AGENTS.md). Submit 200; row count `4 → 5`; new row
+  shows `ED25519`, a SHA-256 fingerprint, and a
+  truncated public-key preview
+  (`ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA…`) — public
+  material only.
+- *Rename round-trip:* `identity-detail-rename-open` →
+  set name to `inv-smoke-identity-uismoke-renamed-t20260513`,
+  save. Detail name and list row update. Notable: the
+  full public-key block at
+  `data-testid="identity-detail-public-key"` keeps the
+  *original* OpenSSH comment field
+  (`ssh-ed25519 AAAA… inv-smoke-identity-uismoke-t20260513`).
+  This is correct: rename mutates the DB row only,
+  it does NOT re-derive the keypair, so the embedded
+  comment (which was set at generation time) is
+  immutable post-rename. Worth knowing for any future
+  smoke that diffs the full public key across rename —
+  the comment is the historical name, the row's `name`
+  is the current display.
+- *Successful unreferenced delete:* same identity
+  (just renamed, never bound to a profile). Typed-name
+  confirm at `identity-detail-delete-confirm-input` →
+  200; row count `5 → 4`; detail panel auto-closes;
+  audit_events shows `ssh_identity_deleted` at
+  2026-05-13T01:24:26Z with public-metadata-only
+  payload (`name`, `key_type`, `created_at`,
+  `ssh_identity_id`, `fingerprint_sha256`). No
+  `encrypted_private_key`, no raw key bytes anywhere.
+- *Conflict-delete (identity referenced by profile):*
+  selected `inv-smoke-identity-renamed-t20260512`
+  (bound to `inv-smoke-profile-edited-t20260512` via
+  `server_profiles.ssh_identity_id ON DELETE RESTRICT`).
+  Submit fired 409;
+  `identity-detail-delete-error` shows **`Cannot delete
+  SSH identity: it is still used by a saved server
+  profile — remove or re-bind the profile first`** —
+  same safe, actionable shape as the other two
+  conflict copies. Identity remained.
+
+**4. Navigation / list-state / viewport.**
+
+- *Stale-row search:* set `servers-host-search` =
+  `uismoke` → `Showing 0 of 15 hosts` +
+  `data-testid="hosts-filter-empty"` =
+  `No hosts match this filter.` The deleted host does
+  not ghost. Set `servers-profile-search` =
+  `referenced-t20260512` → `Showing 0 of 12 profiles`;
+  same result. Clearing the filters restores full
+  list counts (15 / 12 / 4).
+- *Detail panel after delete:* both delete success
+  paths (host + profile + identity) cleared the detail
+  panel synchronously (`host-detail-panel`,
+  `profile-detail-panel`, `identity-detail-panel`
+  removed from the DOM on success). No "couldn't find
+  this resource" empty state was needed — selection
+  state is dropped immediately on delete success per
+  `ServersView.svelte` `submitDeleteHost`'s
+  `selectedHostId = null` line and the equivalent in
+  the profile / identity flows.
+- *Narrow viewport reachability:* resized to 414 × 896
+  (small-phone-ish), reopened
+  `inv-smoke-host-edited-final-t20260512` detail panel.
+  `host-detail-edit-open` rendered at x=49 w=71
+  (right-edge=120) and `host-detail-delete-open` at
+  x=128 w=86 (right-edge=214); both fully on-screen
+  inside the 414-wide viewport, `pointer-events: auto`,
+  not disabled, not clipped, no horizontal scroll on
+  the panel. This is a viewport-clip / button-reachable
+  check only; full mobile responsive UX is still out
+  of scope for this slice.
+
+**5. Redaction sweep.**
+
+- *UI side:* across every panel surfaced
+  (`host-detail-*`, `profile-detail-*`,
+  `identity-detail-*` incl. the
+  `identity-detail-public-key` `<pre>`), the only
+  identity-key material rendered is the OpenSSH public
+  key + SHA-256 fingerprint. There is no
+  `encrypted_private_key` field, no `BEGIN OPENSSH`
+  block, no token / cookie / password value, no raw
+  backend stack or error text on any path tested
+  (every error copy is a SPA-formatted summary string —
+  see the four error strings quoted above).
+- *Backend log sweep:* `docker compose logs --tail=2000
+  relayterm-backend` over the entire smoke window,
+  pattern-by-pattern hit counts:
+
+  | Pattern | backend hits | nginx web hits |
+  |---|---|---|
+  | `relayterm_session=[A-Za-z0-9_-]{20,}` | 0 | 0 |
+  | `encrypted_private_key` | 0 | 0 |
+  | `data_b64` | 0 | 0 |
+  | `BEGIN OPENSSH` | 0 | 0 |
+  | `REDACT-MARKER` | 0 | 0 |
+  | `token_hash=` | 0 | 0 |
+  | `password=` | 0 | 0 |
+
+  (The unfiltered grep does match the standard
+  `unauthorized request detail=missing session cookie`
+  WARN lines on the substring `cookie`; that diagnostic
+  is the documented safe form — it does NOT echo any
+  cookie *value*.)
+- *Audit-payload spot check:* the four audit rows
+  `audit_events` wrote this slice
+  (`server_profile_updated` × 2, `server_profile_deleted` × 1,
+  `ssh_identity_deleted` × 1) all carry only public
+  metadata fields (`name`, `host_id`, `disabled_at`,
+  `ssh_identity_id`, `server_profile_id`, `key_type`,
+  `created_at`, `fingerprint_sha256`). Mirrors the
+  field-list pinned by `docs/agent/redaction-rules.md`
+  § 1 + the `AUDIT_FORBIDDEN_SUBSTRINGS` sentinel
+  test. No `host_*` or `ssh_identity_updated` /
+  `ssh_identity_renamed` audit kind exists in the
+  schema CHECK constraint (intentional per
+  `crates/relayterm-api/src/routes/v1/hosts.rs:119`);
+  the four UI host-touching operations this slice did
+  (PATCH × 2, POST, DELETE) accordingly produced zero
+  audit rows, which is the expected post-deploy
+  behaviour, not a regression.
+
+**Resource state at end of smoke.**
+
+- Hosts: 15 (baseline; `uismoke-host-deleteme-t20260513`
+  was created **and** deleted through the UI, net zero).
+- Server profiles: 12 (one fewer than the
+  start-of-smoke baseline of 13 —
+  `inv-smoke-profile-referenced-t20260512` deleted on
+  purpose for the unreferenced-success path).
+- SSH identities: 4 (baseline;
+  `inv-smoke-identity-uismoke-t20260513` was generated,
+  renamed, and deleted through the UI, net zero).
+- Edited-and-restored: host
+  `inv-smoke-host-edited-final-t20260512`, profile
+  `inv-smoke-profile-edited-t20260512`. Both
+  `recorded_at` columns advanced (host: two PATCH
+  cycles ~145 s apart; profile: two PATCH cycles
+  ~21 s apart) — useful as an "edit happened" proof
+  for any future audit.
+- No `.env`, Compose template, nginx config, image
+  digest, or migration touched.
+- No throwaway SSH container created; no real SSH
+  connection initiated; no private-key material
+  imported or rendered.
+
+**Verified.**
+
+- The six inventory-mutation routes (hosts /
+  server-profiles / ssh-identities × PATCH + DELETE)
+  are wired end-to-end from SPA → CSRF → auth → DB →
+  conflict-or-audit-or-success, and the SPA surfaces
+  exactly the documented user-safe copy on the 200 /
+  400-style / 409 paths tested. Conflict and validation
+  copy stays free of raw backend text on every path.
+- The destructive-action policy from
+  `docs/agent/redaction-rules.md` § 3 holds at the UI
+  layer: every destructive action is gated behind a
+  typed-name confirmation, the typed-name match is
+  enforced client-side (the submit button is `disabled`
+  until the input equals the row's display name), and
+  the SPA never surfaces the underlying error text.
+- The "audit on real transitions only" rule (§ 2 of
+  the same file) holds: zero audit rows written for
+  any of the three 409-rejected delete attempts this
+  slice fired. Audit rows that *did* land carry
+  field-by-field public metadata only.
+- Backend + nginx redaction sentinel sweep zero hits
+  across all seven leak patterns on both services'
+  `--tail=2000` logs over the smoke window.
+
+**Deferred (intentional non-goals for this run; do NOT
+treat any of these as staging-verified by this entry):**
+
+- **Private-key import.** Same constraint as the prior
+  entry — no DTO field accepts external key material.
+  No UI surface for it tested or exists.
+- **`ssh-copy-id` / bootstrap automation.** Out of scope.
+- **Route-param detail pages** (`/servers/:id`,
+  `/hosts/:id`, `/identities/:id`). The list-view +
+  side-panel pattern is what this slice verifies; a
+  dedicated route-per-row surface is a separate slice
+  and not landed.
+- **Terminal renderer evaluation / live terminal
+  launch.** Out of scope — no renderer code, no
+  `WebSocket` upgrade, no PTY exercised this slice.
+- **Durable persistence guarantees beyond the current
+  Postgres inventory tables.** Same as the prior entry.
+- **`host_*` and `ssh_identity_renamed` audit kinds.**
+  Confirmed-absent from the schema CHECK constraint;
+  adding them is a separate slice with its own
+  migration + redaction-test pass and is named-and-
+  deferred here so a future spec-drift sweep picks it
+  up with full context. AGENTS.md "Maintenance protocol"
+  applies.
+- **Tauri shell (desktop / mobile) drive of the same
+  inventory UI.** The UI under test is the same SPA the
+  Tauri shells wrap (per `docs/spec/tauri-runtime-backend-url.md`
+  path A), so the same testid surface applies; an
+  explicit shell-driven repeat is a separate slice.
+- **Mobile responsive layout audit beyond the single
+  414 × 896 reachability spot-check.** The narrow-
+  viewport check confirmed `host-detail-edit-open` and
+  `host-detail-delete-open` are on-screen and clickable;
+  it did NOT exercise scroll behaviour, soft-keyboard
+  overlap, drawer affordances, or the rest of the
+  inventory surface at small widths. A full mobile UX
+  pass is a separate slice.
+- **Profile-disable affordance** (`server_profile_disabled` /
+  `server_profile_enabled` audit kinds). The
+  `Disable profile` button is visible on each profile
+  row and was NOT exercised this slice — only the
+  delete + conflict paths. Phase-2 destructive-action
+  surface (disable / re-enable round-trip) is the
+  natural next slice.
+
 ---
 
 ## See also
