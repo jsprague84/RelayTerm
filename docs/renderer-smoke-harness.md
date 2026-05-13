@@ -20,8 +20,13 @@
 ## Status
 
 **Draft, design-only. No source / CI / deploy changes ship from this
-slice.** The xterm production-baseline renderer smoke landed on
-2026-05-13 (see
+slice.** The Option A runbook (see § "Option A — runbook +
+permission-grant note (recommended)" below) landed alongside this
+plan in
+[`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § "D. Renderer
+evaluation smoke" — that section is the operator / Claude runbook
+that turns this plan into a repeatable smoke procedure. The
+xterm production-baseline renderer smoke landed on 2026-05-13 (see
 [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
 § "2026-05-13 · Xterm production-baseline renderer smoke") and
 deliberately recorded that four evaluation-matrix rows could not be

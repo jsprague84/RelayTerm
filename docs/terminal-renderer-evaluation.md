@@ -267,7 +267,10 @@ strategy for the rows the 2026-05-13 baseline could not exercise
 alternate-screen, mouse) is closed in
 [`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md) —
 each per-candidate smoke shape below inherits its input-path
-taxonomy and command matrix.
+taxonomy and command matrix. The operator / Claude runbook for the
+matrix lives in
+[`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § "D. Renderer
+evaluation smoke".
 
 ### Surfaces
 

@@ -1220,6 +1220,547 @@ straight into the production shell.
     `browser_console_messages level=error all=true` should report the
     favicon `404` only.
 
+### D. Renderer evaluation smoke (requires staging, requires a throwaway SSH target)
+
+This step exists to give a future operator (human or agent) a single
+repeatable procedure for measuring a candidate renderer (xterm baseline
+OR one of the experimental adapters `ghostty-web` / `restty` / `wterm`)
+against the same evaluation-matrix rows the 2026-05-13 xterm baseline
+staging smoke (see
+[`docs/deployment/vps-staging-smoke.md`](../../docs/deployment/vps-staging-smoke.md)
+§ "2026-05-13 · Xterm production-baseline renderer smoke") established
+AND the four rows it deliberately deferred (Unicode / box drawing /
+wide chars; copy-paste round-trip; alternate-screen; mouse mode).
+
+The design doc that motivates this section — input-path taxonomy, what
+each path proves, command matrix, and recommended fixture commands —
+lives in
+[`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md).
+Treat that doc as the source of truth for "why this row uses this
+input path"; this section is the runbook that turns it into a smoke
+procedure.
+
+#### Purpose
+
+- Establish repeatable manual / Playwright-MCP renderer smoke steps so a
+  ghostty-web / restty / wterm candidate can be compared against the
+  xterm baseline on the same dimensions, in the same order, against the
+  same throwaway target.
+- Carry forward the 2026-05-13 baseline's deferred matrix rows (Unicode,
+  paste, alternate-screen, mouse) without weakening any
+  architecture / redaction / CSRF rule.
+- Do **not** infer renderer behavior from visual appearance alone; every
+  row records the input path it used so the result can be replayed.
+
+xterm is and remains the production compatibility baseline and the
+default renderer per
+[`docs/terminal-renderer-evaluation.md`](../../docs/terminal-renderer-evaluation.md).
+A run of this smoke is one human-evaluator pass through the matrix; it
+is **not** a Gate-2 promotion decision (see "Explicit non-goals"
+below).
+
+#### Pre-conditions
+
+- A reachable RelayTerm staging URL (the canonical staging stack is
+  `https://relayterm-staging.js-node.cc`; private deployments may
+  differ).
+- A staging-only smoke user (created via the production sign-in flow on
+  the staging stack; **never** a production account). Sign-in posture
+  follows section C of this document.
+- A throwaway internal-only SSH target named
+  `relayterm-staging-<smoke-id>-ssh` attached only to the internal
+  Compose network, no host port published. The hermetic-target pattern
+  matches the 2026-05-13 baseline smoke entry; do **not** point the
+  smoke at a real internal service.
+- A throwaway SSH identity (generated backend-side OR imported via the
+  base64-sidecar + `atob` inside a single `page.evaluate` pattern
+  documented in the 2026-05-13 baseline smoke). The PEM bytes never
+  appear in any MCP tool-call payload, Error, log, audit row, or DOM
+  string. Public-key bytes are also not recorded in the smoke entry
+  (per the redaction rules for `audit_events.payload`; the smoke entry
+  mirrors that posture).
+- No production credentials. No personal / private SSH keys. No
+  reusable passwords.
+- Backend and web container images at the digests pinned in the smoke
+  entry's "Stack pin" line (record both `sha256:<digest>` values). If
+  the digests are stale, refresh the staging stack before starting.
+- Surface: desktop browser is the required pass; Tauri desktop and
+  Android WebView are optional add-ons per the renderer evaluation
+  plan's "Surfaces" list. Each optional surface adds a separate smoke
+  entry, not extra rows on the browser entry.
+
+#### Renderer path confirmation
+
+Before running any row, record exactly which renderer is mounted —
+visual cues alone (cursor shape, glyph appearance, scrollbar style) are
+**not** sufficient.
+
+- **xterm baseline.** Confirm
+  `apps/web/src/lib/app/terminal/ProductionTerminal.svelte` imports
+  `XtermRenderer` from `@relayterm/terminal-xterm` (today's production
+  wiring). Record the `production-terminal-renderer` `data-renderer`
+  attribute (if present) or the renderer label rendered in the
+  workspace footer. If the production shell does not surface a renderer
+  label at all, record the production-shell git revision the smoke was
+  run against so a future reader can prove which renderer it shipped.
+- **Experimental candidates.** For ghostty-web, restty, or wterm, the
+  promotion-gate slice (per
+  [`docs/terminal-renderer-evaluation.md`](../../docs/terminal-renderer-evaluation.md)
+  § "Promotion criteria") MUST land a stable production-shell selector
+  before any production-side renderer smoke runs. Until that selector
+  exists, experimental renderers are exercised through the dev lab only
+  (section A.6 of this document, `data-testid="renderer-option-<id>"`).
+  A dev-lab pass is **not** a production renderer pass — record which
+  surface drove the smoke.
+
+If renderer identity cannot be proven for a given run, mark every row
+as `deferred — renderer not identified` and stop.
+
+#### Input-path rules (load-bearing)
+
+Each command-matrix row below labels the input path it requires. The
+labels match
+[`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+§ "Input-path taxonomy":
+
+- **Path A (Playwright `keyboard.press` / `keyboard.type` — ASCII).**
+  Trusted keyboard events via MCP `browser_press_key` / `browser_type`.
+  This is the path the 2026-05-13 baseline used and is what every
+  ASCII command in the matrix below uses.
+- **Path C (clipboard write + trusted Ctrl+V).** Requires a one-time
+  `clipboard-read` / `clipboard-write` permission grant for the test
+  browser context (see "Clipboard permission step" below). Drives the
+  renderer's real `paste` event handler.
+- **Path D (remote-shell-generated output).** Run a non-paste shell
+  command via Path A; the **output** bytes are what is under test. Used
+  for Unicode / box-drawing / wide-char / emoji output, the
+  alternate-screen enter / leave transition, and the
+  mode-enable half of mouse-mode probes.
+- **Path E (direct WebSocket-client injection).** Backend-side only.
+  **Never** counted as a renderer-matrix row. If a future operator
+  wants to run a wire / replay regression check, record it as a
+  **separate** smoke entry (its own dated block in
+  `docs/deployment/vps-staging-smoke.md`); do not fold its results
+  into a renderer-evaluation matrix row.
+- **Path I (dev-only inject route).** Explicitly rejected per the
+  harness plan; not part of this runbook at any tier. If a slice
+  proposes such a route, refer it back to
+  [`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+  § "I. Dev-only test-harness route (rejected)" before approving.
+
+#### Clipboard permission step (one-time per smoke)
+
+Paste-row coverage (Path C) requires the browser context to hold
+`clipboard-read` and `clipboard-write` permissions. The smoke harness
+grants them; the production `apps/web` bundle does not request them at
+startup (current behavior — unchanged by this runbook).
+
+1. Inside `browser_evaluate`, call:
+
+   ```js
+   () =>
+     navigator.permissions
+       .query({ name: 'clipboard-write' })
+       .then((status) => status.state);
+   ```
+
+   - If the result is `"granted"`, proceed to the paste rows.
+   - If the result is `"prompt"` or `"denied"` AND the MCP browser
+     context exposes a permission-grant primitive, grant
+     `["clipboard-read", "clipboard-write"]` scoped to the staging
+     origin and re-query.
+   - If the MCP browser cannot grant the permission, **defer** every
+     Path-C row (paste safe / paste confirm / paste blocked) as
+     `deferred — clipboard permission unavailable`. Do **not** fall
+     back to a synthetic `ClipboardEvent` dispatch — the harness plan
+     rejects that path for renderer-fairness reasons (synthetic events
+     carry `isTrusted === false` and may be dropped by some adapters).
+     B.1's synthetic-dispatch fallback is a **paste-policy**
+     integration check, not a renderer comparison.
+
+2. Once granted, every paste-row payload is constructed inside a
+   single `browser_evaluate` from a local fixture string and written
+   via `navigator.clipboard.writeText(payload)`. The paste payload
+   itself **never** transits an MCP tool-call argument or return
+   value: the call returns only "wrote N bytes — `ok`," not the body.
+
+3. Never paste real secrets, real private keys, real passwords, or
+   any production-shaped string into the clipboard. Use the sentinel
+   strings from the command matrix below.
+
+#### Command matrix
+
+Each row records: input path, fixture command (illustrative — operator
+may substitute), the unique ASCII sentinel to look for, and the
+expected renderer behavior. Sentinels are the only ASCII recorded in
+the smoke entry; non-ASCII bytes (Unicode glyphs, box-drawing chars,
+emoji) are treated as opaque per
+[`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+§ "Security / redaction rules".
+
+The sentinel strings below intentionally diverge from the illustrative
+sentinels in
+[`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+§ "Command matrix" — the plan calls those examples illustrative and
+non-normative. The runbook's strings are chosen so each row's sentinel
+is a one-shot unique grep target (and so the redaction-sweep SENTINELS
+list below covers every smoke-run echo).
+
+1. **Basic ASCII I/O — Path A.** Type each, confirm round-trip:
+
+   ```sh
+   echo relayterm-renderer-baseline
+   whoami
+   pwd
+   uname -a
+   ```
+
+   Sentinel: `relayterm-renderer-baseline`. Expected: every command's
+   stdout renders in the viewport; no garbled bytes; no MCP-side
+   `Input.dispatchKeyEvent` errors.
+
+2. **Resize / fit — Path A + viewport handle.**
+
+   ```sh
+   stty size
+   printf 'cols-test:%*sEND\n' 80 ''
+   ```
+
+   Resize the browser viewport (e.g. 1440 × 900 → 1024 × 768) and
+   click `[data-testid="production-terminal-fit"]`. Re-run `stty size`
+   and verify the new rows / cols values match the renderer's reported
+   geometry. Confirm `session_events.resized` rises by exactly one row
+   per resize (operator-side DB check; **never** include row payload
+   in the smoke entry).
+
+3. **Long output — Path A.**
+
+   ```sh
+   seq 1 300
+   echo relayterm-after-long-output
+   ```
+
+   Sentinel: `relayterm-after-long-output`. Expected: all 300 lines
+   render; the post-`seq` echo round-trips cleanly; renderer's
+   scrollback contains the burst.
+
+4. **Unicode / CJK output — Path D.**
+
+   ```sh
+   printf 'unicode: café Ω λ 🚀\n'
+   ```
+
+   Sentinel: `unicode:` prefix only. The glyph bytes are opaque to the
+   smoke entry. Expected: characters render at the correct cell width
+   (full-width CJK / emoji take two cells; combining accent on `é`
+   renders as one glyph or is documented as not supported on this
+   renderer). Record honestly — emoji-with-variation-selector glyph
+   fallback is a `works with caveats`, not a `regression`.
+
+5. **Box drawing — Path D.**
+
+   ```sh
+   printf 'box: ┌─┬─┐\nbox: │a│b│\nbox: └─┴─┘\n'
+   ```
+
+   Sentinel: `box:` prefix only. Expected: the three lines align
+   column-for-column at the right cell width; no gaps; no spillover
+   into adjacent cells.
+
+6. **Wide chars — Path D.**
+
+   ```sh
+   printf 'wide: コンニチハ\n'
+   ```
+
+   Sentinel: `wide:` prefix only. Expected: each fullwidth katakana
+   character occupies two columns; the prompt that follows lands at
+   the correct column. If the renderer collapses wide chars to one
+   column, record as `regression vs. baseline` for this row.
+
+7. **Paste — safe sentinel (Path C, clipboard required).**
+
+   Build the paste payload as a multi-line block. Constructed in a
+   single `browser_evaluate`:
+
+   ```sh
+   echo relayterm-paste-1
+   echo relayterm-paste-2
+   ```
+
+   Focus the renderer viewport, dispatch a trusted `Control+V`. Expect
+   the production paste-safety pipeline to fire: if the remote shell
+   has bracketed paste on (fish / bash with readline / zsh do by
+   default — see section B.1 "Bracketed-paste reality") the panel
+   reason will be `bracketed_paste_markers`; if the shell has it off,
+   the reason will be `multiline`. Either way, expect
+   `[data-testid="production-terminal-paste-confirm"]` to render with
+   `data-paste-reason` set and **no** paste body in the panel text or
+   HTML. Record the panel reason + line count + byte length only —
+   **never** the body. Click
+   `[data-testid="production-terminal-paste-confirm-send"]` to
+   complete the round-trip; the two sentinels (`relayterm-paste-1`,
+   `relayterm-paste-2`) MUST appear in the viewport after Send. If
+   the renderer's own `paste` handler is bypassed (e.g. an experimental
+   renderer that does not subscribe to a real `paste` event), record
+   as `regression vs. baseline` — paste behavior is a renderer
+   correctness property here.
+
+8. **Paste — blocked sentinel (Path C, optional).**
+
+   Construct a paste of three concatenated parts: the ASCII string
+   `relayterm-x`, a single NUL byte (`\x00`), and the ASCII string
+   `y`. Write it via
+   `navigator.clipboard.writeText('relayterm-x' + '\x00' + 'y')`
+   inside a single `browser_evaluate` (the literal NUL is what trips
+   the `nul_byte` rule; the surrounding ASCII is the redaction
+   sentinel). Dispatch the trusted Ctrl+V. Expect
+   `[data-testid="production-terminal-paste-blocked"]` with
+   `data-paste-reason="nul_byte"`, no `safe` send, and the
+   `relayterm-x` sentinel does **not** appear in the viewport. Record
+   metadata only — line count + byte length +
+   `data-paste-reason` only; **never** the body (same redaction
+   posture as the paste-policy integration rows in section B.1 above).
+
+9. **Alternate screen — Path D (minimal probe).**
+
+   ```sh
+   tput smcup
+   printf 'alt-screen-probe\n'
+   sleep 1
+   tput rmcup
+   ```
+
+   Sentinel: `alt-screen-probe`. Expected: the renderer switches to
+   the alternate screen; `alt-screen-probe` renders inside it; on
+   `tput rmcup` the cursor returns to the pre-`smcup` cell and the
+   prior viewport is restored. The full-screen-app row (`htop` /
+   `vim` / `less`) stays partially deferred per the harness plan
+   until a target image with the larger tooling set is pinned;
+   record those as `deferred — fixture absent`. Do **not** use vim /
+   htop as the minimal-probe fixture.
+
+10. **Mouse mode enable (output half only) — Path D.**
+
+    ```sh
+    printf '\e[?1000h'
+    sleep 1
+    printf '\e[?1000l'
+    ```
+
+    Expected: the renderer enters mouse-tracking mode (visible
+    indicator depends on renderer — e.g. xterm stops auto-scrolling on
+    select). Record the mode-input half (clicks translating to wire
+    `Input`) as `deferred — fixture absent` until a purpose-built
+    click-coordinate fixture lands; this row is the **mode-enable**
+    half only per the harness plan.
+
+11. **Detach / reconnect / replay — Path A + production buttons.**
+
+    ```sh
+    echo relayterm-before-detach
+    ```
+
+    Click `[data-testid="production-terminal-detach"]`. Wait inside
+    the configured `DETACHED_LIVE_PTY_TTL` (default 30 s). Click
+    `[data-testid="production-terminal-reconnect"]` (or re-enter via
+    the Sessions list). Once attached, type:
+
+    ```sh
+    echo relayterm-after-reconnect
+    ```
+
+    Sentinels: `relayterm-before-detach`, `relayterm-after-reconnect`.
+    Expected: the post-reattach echo round-trips; the session UUID is
+    the same row in `terminal_sessions`. Renderer-side scrollback
+    parity across reattach is a **separate property** the 2026-05-13
+    baseline does not claim and this runbook does not assert — record
+    visible scrollback state honestly ("renderer remounted; viewport
+    empty until new output" is the baseline behavior for xterm).
+
+12. **Narrow / mobile viewport — Path A + viewport handle.**
+
+    Resize the browser viewport to roughly `390 × 844` (iPhone-class
+    portrait) and click
+    `[data-testid="production-terminal-fit"]`. Type:
+
+    ```sh
+    echo relayterm-mobile-width-renderer
+    ```
+
+    Sentinel: `relayterm-mobile-width-renderer`. Expected: the
+    renderer reflows the prior scrollback to the narrower width; the
+    echo round-trips; no MCP / renderer error.
+
+#### Clipboard permission deferral note
+
+If section "Clipboard permission step" could not grant the permission
+on this MCP setup, rows 7 and 8 are marked `deferred — clipboard
+permission unavailable`. A `deferred` row is **not** a renderer
+regression and is **not** a smoke failure — it is an input-path
+limitation. Re-run those rows when the permission becomes grantable
+(or when a future operator runs a small scripted Playwright wrapper
+per
+[`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+§ "Option A — runbook + permission-grant note").
+
+#### Recording results
+
+For every row, record in the staging-smoke entry:
+
+- **Status.** One of `pass` / `fail` / `deferred`. `fail` requires a
+  matching row in the classification table below to attribute the
+  failure.
+- **Surface.** `browser` / `desktop-tauri` / `android-tauri`. One row
+  set per surface; browser is required, the Tauri surfaces are
+  optional add-ons that record in their own dated blocks.
+- **Renderer.** Which renderer was mounted (`xterm` baseline OR the
+  experimental adapter id `ghostty-web` / `restty` / `wterm`). Match
+  the path-confirmation step above; never infer from glyphs.
+- **Observed rows / cols.** Where the row exercises geometry (resize,
+  narrow viewport), record the `stty size` output. Not the renderer's
+  internal width — the PTY-reported width.
+- **Visual notes.** Brief, factual, no overclaim. "All 300 lines
+  rendered; tail visible" is fine. "Looks identical to xterm" without
+  a side-by-side is not — record what you actually observed.
+- **Screenshots.** Optional. If included, MUST NOT contain paste
+  bodies, real host data, real usernames, or any secret. Capture the
+  renderer viewport only, not surrounding shell chrome.
+- **Input path.** Tag every row with the input path it used (A / C /
+  D). A row recorded without an input path tag is unreviewable.
+
+#### Redaction sweep (mandatory final step)
+
+Before closing the smoke entry, run a DOM scan and a console scan and
+record zero matches outside the terminal viewport for these
+sentinels. The list mirrors the 2026-05-13 baseline; do not soften.
+
+```js
+() => {
+  const SENTINELS = [
+    'private_key_openssh',
+    'encrypted_private_key',
+    'BEGIN OPENSSH PRIVATE KEY',
+    'openssh-key-v1',
+    'passphrase',
+    'session_token',
+    'token_hash',
+    'cookie',
+    'password',
+    'data_b64',
+    'REDACT-MARKER',
+    'relayterm-paste-1',
+    'relayterm-paste-2',
+    'relayterm-x',
+  ];
+  const html = document.documentElement.outerHTML;
+  return SENTINELS.map((s) => ({ s, found: html.includes(s) }));
+};
+```
+
+Expected: zero `found: true` rows for the auth / key / session
+sentinels; the paste sentinels are allowed inside the terminal
+viewport `[data-testid="production-terminal-viewport"]` only after a
+successful Path-C send, and **never** inside a paste-policy panel
+(`production-terminal-paste-confirm` / `production-terminal-paste-blocked`).
+
+Add the smoke-run's own ASCII sentinels (`relayterm-renderer-baseline`,
+`relayterm-after-long-output`, `alt-screen-probe`,
+`relayterm-before-detach`, `relayterm-after-reconnect`,
+`relayterm-mobile-width-renderer`) to the SENTINELS list and re-run;
+they are allowed inside the terminal viewport only. If the renderer
+under test introduced its own row sentinels, append those too.
+
+Run the equivalent sweep against `browser_console_messages
+level=error all=true`; only the favicon `404` and the initial
+`/api/v1/auth/me` 401 (pre-login) are allowed.
+
+#### Cleanup
+
+- If the smoke profile carries any terminal history rows that contain
+  the smoke's ASCII sentinels in audit-visible columns, **disable**
+  the profile rather than delete it (per the inventory lifecycle
+  policy in [`SPEC.md`](../../SPEC.md) "Inventory lifecycle and
+  destructive-action policy"; canonical pattern in
+  [`docs/spec/inventory.md`](../../docs/spec/inventory.md)).
+- `docker stop` and `docker rm` the throwaway SSH target. The
+  container name pattern is `relayterm-staging-<smoke-id>-ssh` so a
+  later operator can grep / clean stragglers safely.
+- Leave the staging stack running. The smoke does not bring the stack
+  up or down on its own.
+- **Do not** manually delete rows from `terminal_sessions`,
+  `session_events`, `known_host_entries`, or `audit_events`. The
+  retention purge primitive
+  ([`docs/agent/redaction-rules.md`](../../docs/agent/redaction-rules.md)
+  § 12) is the only sanctioned writer to those tables; manual deletes
+  bypass audit and are explicitly prohibited.
+- Shred any local key material (smoke key generated browser-side
+  base64-sidecar pattern), and confirm the host filesystem has no
+  copy of the OpenSSH PEM body.
+
+#### Result classification
+
+Every failed row maps to exactly one of these classes. A `fail`
+without a class is an unreviewable smoke entry.
+
+- **Renderer issue.** The renderer mis-rendered output it received
+  correctly on the wire. Example: wide chars collapsed to one column,
+  box-drawing gaps, paste handler did not fire on a trusted Ctrl+V.
+  This is the class that motivates a renderer-fairness verdict.
+- **Smoke harness limitation.** The MCP / browser environment could
+  not exercise the row, but a real user would not hit it. Example:
+  clipboard permission could not be granted in this MCP setup.
+  Recorded as `deferred — <reason>`, not `fail`.
+- **Backend / session issue.** The orchestrator, session, replay
+  ring, or detach TTL behaved incorrectly. Example: reconnect outside
+  the TTL did not surface `replay_window_lost`; resize did not write
+  exactly one `session_events.resized` row. Open a separate slice;
+  do **not** roll into a renderer verdict.
+- **Staging deploy issue.** The staging stack itself misbehaved
+  (image digest mismatch, nginx cache hit on stale `/assets/*`,
+  CSRF allowed-origin mismatch). Reference the 2026-05-09 and
+  2026-05-11 Encountered Lessons in AGENTS.md before re-classifying.
+- **Input permission issue.** Clipboard permission, `isTrusted`,
+  IME composition surface, etc. Same posture as "Smoke harness
+  limitation" but specifically about the input-path layer per
+  [`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+  § "Input-path taxonomy".
+- **Deferred row.** Fixture intentionally not available (e.g. tmux
+  for the in-target driver path, a click-coordinate fixture for the
+  mouse-input half). Record once per fixture, do not re-classify on
+  every run.
+
+#### Explicit non-goals
+
+- **No committed Playwright runner.** This runbook does NOT promote
+  the renderer smoke to a CI lane. A future slice can do so per
+  [`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+  § "Option B — committed Playwright runner (deliberate-later)".
+  Until then this smoke is human-driven against Playwright MCP.
+- **No performance benchmark automation.** Memory / CPU notes remain
+  free-form human-readable observations per
+  [`docs/terminal-renderer-evaluation.md`](../../docs/terminal-renderer-evaluation.md)
+  § "Memory / CPU rough observations".
+- **No renderer promotion decision.** A single run of this smoke is
+  a data point, not a Gate-2 promotion. Promotion follows the gates
+  in [`docs/terminal-renderer-evaluation.md`](../../docs/terminal-renderer-evaluation.md)
+  § "Promotion criteria"; the soak window and the default-flip slice
+  are separate.
+- **No backend protocol changes.** The renderer smoke drives the
+  existing wire surfaces; the wire protocol stays RelayTerm-shaped
+  per [`SPEC.md`](../../SPEC.md) "Architectural invariants" and
+  AGENTS.md "Architectural rule (load-bearing)".
+- **No tmux / screen persistence work.** Persistence across backend
+  restart is a separate roadmap in
+  [`docs/persistent-sessions.md`](../../docs/persistent-sessions.md);
+  it is independent of renderer evaluation and is not gated on this
+  smoke.
+- **No direct WebSocket injection counted as renderer input.** Path E
+  is backend-only; any wire / replay regression check recorded from a
+  WebSocket-client smoke goes into its own dated entry in
+  `docs/deployment/vps-staging-smoke.md`, never folded into a
+  renderer-evaluation row.
+
 ## What this smoke does NOT cover
 
 - A real SSH end-to-end browser test (no PTY bytes flow; no backend is
