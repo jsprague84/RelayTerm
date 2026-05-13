@@ -18,6 +18,23 @@ private-key import v1 smoke landed the same day. Renderer evaluation
 is the next product track. Quota / metrics / dashboard work is
 paused unless an explicit ask reopens it.
 
+A **reference smoke for the production xterm baseline renderer**
+landed on 2026-05-13 (see
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-13 · Xterm production-baseline renderer smoke"). It
+exercises launch, basic I/O, in-session resize / fit, 300-line
+burst, wire-side detach / reconnect inside the 30 s TTL,
+mobile-width workspace, and clean close against a hermetic
+throwaway SSH target with no host-port exposure and zero
+sentinel leakage in DOM / logs / audit. It is the comparison
+point future ghostty-web / restty / wterm candidate smokes are
+measured against. The baseline smoke deliberately did NOT
+exercise Unicode, copy / paste, alternate screen, or mouse
+support (input-path limitations recorded inline in the smoke
+entry); each is its own deferred slice. **xterm is and remains
+the production compatibility baseline and the default renderer**
+until a candidate clears the Gate 2 promotion criteria below.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

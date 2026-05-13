@@ -5374,6 +5374,439 @@ leakage in DOM / logs / audit, and no source / schema /
 API / auth / deploy changes required. Safe to start the
 terminal-renderer evaluation work next.
 
+### 2026-05-13 · Xterm production-baseline renderer smoke
+
+**Date.** 2026-05-13 17:01 UTC – 17:22 UTC (≈21 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** `git.js-node.cc/jsprague/relayterm-backend:main`
+(image `sha256:fc6799fc…`, built 2026-05-13T02:55:38Z) +
+`relayterm-web:main` (image `sha256:71bcc4f0…`, built
+2026-05-13T02:56:22Z). Both digests are byte-identical to
+the deployable-baseline smoke pin recorded immediately
+above. The only `main` commit landed after those images
+were built is `c860325 docs(design): define terminal
+renderer evaluation plan` — docs-only, no source the
+running images would need.
+**Branch.** `docs/xterm-baseline-renderer-smoke` off
+`main` (docs-only slice; no source changes).
+**Browser surface.** Playwright MCP (Chrome 148 / Linux)
+at 1440 × 900 (with one resize step to 1800 × 1000 and
+one resize step to 390 × 844, then back to 1440 × 900).
+Auth: existing `staging+throwaway-20260509173230@example.com`
+cookie session; no re-login required, no password entered
+or logged.
+
+**Goal.** Record a reference smoke for the **production
+xterm baseline renderer** (`@relayterm/terminal-xterm`)
+against staging so future experimental-renderer
+evaluations (ghostty-web, restty, wterm) have a stable
+comparison point. Slice boundaries: no source / schema /
+API / auth / CSRF / CORS / WebSocket-protocol / Tauri /
+CI / deploy file changes — this is a smoke + docs slice
+only. Experimental renderers were **not** exercised and
+remain deferred per
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md).
+
+**Renderer path (source-pinned, not UI-exposed).** Production
+shell instantiates exactly one renderer:
+`apps/web/src/lib/app/terminal/ProductionTerminal.svelte:43-44`
+imports `XtermRenderer` from `@relayterm/terminal-xterm`
+and `@relayterm/terminal-xterm/styles`. There is no
+production diagnostic surface that exposes a renderer
+name or radio group; the dev-only renderer lab lives
+behind `import.meta.env.DEV` and is tree-shaken out of
+the production bundle. The architectural isolation
+("`apps/web/src/lib/app/**` cannot import from `lib/dev/`
+or any experimental renderer adapter") is pinned by
+`apps/web/tests/appShellIsolation.test.ts`. This smoke
+exercised the production shell, so the renderer
+exercised was xterm baseline by construction — no
+runtime selector was needed.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-xterm-baseline-smoke-ssh`, attached
+only to the staging Compose network
+`relayterm-staging_relayterm-staging-internal` with DNS
+alias `xterm-baseline-smoke-host` resolving to
+`172.21.0.5`. **No host port was published** — `docker
+port` returned empty; verified the target was reachable
+only from inside the staging Compose network via a
+sidecar `busybox nc -zv xterm-baseline-smoke-host 2222`
+which succeeded. `USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`, `PUBLIC_KEY=<the
+RelayTerm-generated public OpenSSH line>`. The container
+was `docker stop && docker rm`'d during cleanup.
+
+**Identity path.** Generated (path A — backend-side
+keypair generation). One
+`POST /api/v1/ssh-identities` returned an
+`SshIdentityResponse` with `key_type=ed25519` and
+fingerprint
+`SHA256:mCaCBIMyh9n9Rjkf0Q+XiN95/hL5P712CoaCHCnmVG0`
+(identity UUID `6317698e-c8ce-46b2-be9f-a7e455f29ad7`).
+No local PEM, no base64 sidecar, no key-material shred
+step at cleanup — the only secret bytes lived in the
+backend vault and never crossed the wire. The 2026-05-13
+deployable-baseline smoke above already covers the
+**imported**-identity path against these same images;
+this slice deliberately took the lighter-touch generated
+path to keep the focus on renderer behaviour.
+
+**Host + profile create.** `Xterm-Baseline-Smoke-Host`
+(display name) / `xterm-baseline-smoke-host` (hostname,
+lowercase — load-bearing for DNS resolution on the
+Compose network) / `2222` / default user `smoke` via the
+`servers-create-host-*` form (host UUID
+`448b53d0-c732-4725-b83a-4fa429b34132`).
+`xterm-baseline-smoke-profile` binding that host to the
+generated identity with no username override and tags
+`smoke,xterm-baseline` via the `servers-create-profile-*`
+form (profile UUID `b568da7d-7624-46f0-9ea9-5529d4b89b4c`).
+The success card carried the load-bearing copy "The host
+key is not yet trusted and SSH authentication has not
+been verified for this profile."
+
+**Host-key preflight + trust.** `host-key-preflight-button`
+on the profile row captured fingerprint
+`SHA256:oLaQ5Ep4JimvJrQhUuaIOI7rPYvlYiuESO+pURNRrbg`
+during SSH key exchange. The value is **byte-identical**
+to the locally-computed `ssh-keygen -lf` value over the
+target container's advertised `ssh-ed25519` host-key
+line (the container emitted all three host-key types —
+ed25519, ecdsa-sha2-nistp256, rsa — at startup; preflight
+picked ed25519). Typed the fingerprint into
+`host-key-confirm-input` → `host-key-trust-button`;
+`host-key-status-badge` flipped to `Trusted` with the
+load-bearing copy "Host key pinned. Re-run preflight to
+confirm. Run auth-check below to verify the configured
+SSH identity authenticates …". `trusted_at` stamped at
+`2026-05-13 17:04:26.747+00`.
+
+**Auth-check.** `auth-check-run-button` ran in ~6 s;
+`auth-check-status-badge` flipped to `Authenticated`
+with the load-bearing copy "SSH public-key
+authentication succeeded for the configured username.
+No PTY was allocated and no command was executed.
+Terminal launch is a separate, deliberate action." The
+target sshd log confirmed the same moment:
+`Accepted publickey for smoke from 172.21.0.3 port
+33022 ssh2: ED25519 SHA256:mCaCBIMyh9n9Rjkf0Q+XiN95/hL5P712CoaCHCnmVG0`
+followed by an immediate clean disconnect — no PTY
+allocated.
+
+**Terminal launch.** `profile-launch-terminal` opened
+`/terminal` with phase=`live` immediately (no 60-s WS-
+close window required for this run — typing began
+within a few seconds). Session UUID
+`2e097bee-9405-4bd0-9f64-8bf4e5827c08`; initial PTY size
+`24 × 80` (xterm-default; the production-shell
+`XtermRenderer` is constructed with the renderer-neutral
+options on `ProductionTerminal.svelte`).
+
+**Basic I/O.** Four commands round-tripped end-to-end:
+- `echo relayterm-xterm-baseline` →
+  `relayterm-xterm-baseline`
+- `whoami` → `smoke`
+- `pwd` → `/config` (the `linuxserver/openssh-server`
+  default home for `USER_NAME=smoke`)
+- `uname -a` →
+  `Linux xterm-baseline-smoke-host 6.17.0-8-generic
+  #8-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 21:44:46
+  UTC 2025 x86_64 GNU/Linux` (wrapped across two visible
+  rows; the kernel version is the cloud-edge host
+  kernel — containers do not run their own kernel).
+
+Keystrokes were delivered exclusively through
+`page.keyboard.press('<char>')` — synthetic
+`InputEvent`-dispatch into `.xterm-helper-textarea`
+was rejected by xterm's input handler
+(it checks `event.isTrusted`), so per-char press_key
+was the only reliable input path over MCP for this
+slice.
+
+**Resize / fit.** Resized the browser viewport from
+1440 × 900 → 1800 × 1000 and clicked
+`production-terminal-fit`; the in-shell PTY size flipped
+from `24 × 80` to `28 × 112` (verified by running
+`stty size` in-terminal before and after). A
+`session_events.resized` row was appended at
+`17:09:43.355+00` — exactly one row, no chatter.
+
+**Long output / backpressure.** `seq 1 300` rendered all
+300 numbered lines; the visible tail was
+`296 / 297 / 298 / 299 / 300` followed by a clean prompt.
+A subsequent `echo relayterm-after-long-output` then
+`relayterm-after-long-output` confirmed the terminal
+remained responsive after the 300-line burst.
+
+**Unicode / box drawing / wide chars.** **Not exercised
+in this slice.** Per-char `page.keyboard.press('<char>')`
+was the only reliable input path (xterm rejected
+synthetic `InputEvent` payloads); typing non-ASCII
+glyphs through that path was not attempted. Deferred to
+a future slice or to an enhanced MCP input path. **Do
+not infer** that this means xterm baseline does or does
+not render Unicode well — the smoke simply did not
+exercise it.
+
+**Copy / paste.** **Not exercised in this slice.**
+Clipboard read/write over the MCP requires elevated
+permissions, and synthetic `ClipboardEvent` is rejected
+by xterm's paste handler for the same `isTrusted`
+reason. The production paste-safety flow
+(`evaluatePaste`, `production-terminal-paste-confirm`,
+`production-terminal-paste-blocked`) has unit-test
+coverage under `apps/web/tests/`. Deferred.
+
+**Alternate screen / full-screen apps.** **Not
+exercised in this slice.** Same input-path constraint
+as the Unicode and Copy / paste rows above; the
+"Alternate screen / full-screen apps" row is one of the
+evaluation-matrix dimensions in
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+§ "Core correctness" and is deferred to its own slice.
+
+**Mouse support.** **Not exercised.** Production today
+does not expose a renderer-neutral mouse-mode toggle;
+the dev lab is where mouse experiments live. Deferred
+to a future slice.
+
+**Detach + reconnect.** Echoed
+`echo relayterm-before-detach` →
+`relayterm-before-detach` to seed the replay buffer.
+`production-terminal-detach` at `17:11:22.925+00` —
+`production-terminal-phase` flipped to
+`detached (TTL window)`, `production-terminal-ttl-hint`
+rendered "Detached sessions stay reconnectable for
+about 30 seconds after the last client drop. Replay
+is in-memory and not durabl…". Clicked
+`production-terminal-reconnect` ~11 s later at
+`17:11:33.457+00` (the in-page button, not a Sessions-
+list round-trip — that hop can blow the 30 s detached
+TTL on a slow page navigation). Reattach landed on the
+**same** session UUID
+`2e097bee-9405-4bd0-9f64-8bf4e5827c08`; phase returned
+to `live`. The xterm DOM was a fresh mount on
+reattach — its `xterm-dom-renderer-owner` integer
+incremented from `-1` to `-2`, and the previous
+pre-detach lines were NOT visually replayed into the
+new mount. Wire-side replay correctness was instead
+verified by running a fresh
+`echo relayterm-after-reconnect` and observing
+`relayterm-after-reconnect` round-trip cleanly. The DB
+`session_events` rows match this account exactly:
+`detached` at `17:11:22.925`, `attached` and
+`reattached` both at `17:11:33.459` (~2 ms apart).
+**Do not overclaim** visual replay parity for the xterm
+baseline on these images — the renderer remounts and
+the new mount is empty until fresh PTY output arrives;
+this is what the production shell does today and is the
+behaviour future renderer candidates should be measured
+against, not improved on as part of an "xterm fix" slice.
+
+**Narrow / mobile viewport.** Resized to 390 × 844 and
+clicked `production-terminal-fit`; the terminal
+workspace remained reachable, the prompt + input bar
+stayed usable, and a fresh
+`echo relayterm-mobile-width-xterm` →
+`relayterm-mobile-width-xterm` round-tripped (with
+line wrap visible at the narrower column count, as
+expected on a width-constrained PTY). A second
+`session_events.resized` row was appended at
+`17:12:39.920+00`. Resized back to 1440 × 900 before
+close. A full Android / Tauri-shell smoke was NOT in
+scope of this slice; that has its own surface.
+
+**Close.** `production-terminal-close` at
+`17:13:17.616+00`. DB confirms `status=closed` and
+`closed_at` set. `session_events.closed` row appended.
+The target sshd log shows
+`Received disconnect from 172.21.0.3 port 48192:11:
+relayterm pty close` — the clean RelayTerm-initiated
+PTY teardown.
+
+**Session lifecycle events.** Exactly 8 rows on
+`session_events` for `2e097bee-…`, in this order:
+`created` (17:05:21.235) → `attached` (17:05:21.653) →
+`resized` (17:09:43.355) → `detached` (17:11:22.925) →
+`attached` (17:11:33.457) → `reattached` (17:11:33.459)
+→ `resized` (17:12:39.920) → `closed` (17:13:17.616).
+Per the schema's per-session telemetry contract, none
+of these crossed over into `audit_events`.
+
+**Audit events in the smoke window.** Exactly 2 rows
+between `2026-05-13T16:55:00Z` and
+`2026-05-13T17:15:00Z`:
+- `ssh_identity_created` at `17:01:38.418+00`, payload
+  `{name, source:"generated", key_type:"ed25519",
+  created_at, ssh_identity_id, fingerprint_sha256}` —
+  public-metadata only (no `encrypted_private_key`,
+  no PEM bytes).
+- `server_profile_created` at `17:03:45.694+00`,
+  payload `{name, host_id, disabled_at:null,
+  ssh_identity_id, server_profile_id}` —
+  public-metadata only.
+
+Host-key preflight, host-key trust, auth-check, and the
+terminal-session lifecycle ops deliberately emit **no**
+`audit_events` rows on these images — `host_*` kinds are
+absent from the schema CHECK constraint (per SPEC.md
+"Audit-event expectations"), and terminal-session
+lifecycle telemetry stays in `session_events`. The
+**zero** `audit_events` rows for those ops here are
+expected, not a redaction gap.
+
+**Cleanup-disable audit row.** After the smoke window
+proper, the cleanup step disabled
+`xterm-baseline-smoke-profile` via the SPA. The DB
+shows `disabled_at=2026-05-13 17:21:51.632220+00` and
+exactly one `server_profile_disabled` audit row at
+`17:21:51.634365+00` (~2 ms after the lifecycle
+transition — single audit row, matching the
+"idempotency early-return BEFORE audit append" rule
+from AGENTS.md § "Things to avoid"). Payload:
+`{name:"xterm-baseline-smoke-profile", host_id,
+disabled_at, ssh_identity_id, server_profile_id}` —
+public-metadata only.
+
+**Backend / web / target log redaction.** Bounded
+`docker logs --since 30m` over the smoke window:
+backend = 1 line (the literal text "missing session
+cookie" — pre-smoke WARN from an unauthenticated
+`/api/v1/auth/me` healthcheck at 16:55; not a cookie
+**value**; same explanation as the
+2026-05-13 deployable-baseline smoke above);
+web/nginx = 27 lines (request log only — no payloads,
+no cookies, no `data_b64`); target sshd = preflights
+(preauth, no PTY), one auth-check (no PTY), one
+terminal session ending `relayterm pty close`. Sentinel
+sweep against `{private_key_openssh,
+encrypted_private_key, BEGIN OPENSSH PRIVATE KEY,
+openssh-key-v1, passphrase, session_token, token_hash,
+data_b64, REDACT-MARKER, relayterm-xterm-baseline,
+relayterm-after-long-output, relayterm-before-detach,
+relayterm-after-reconnect, relayterm-mobile-width-xterm}`
+returned **0 hits in every log**, except the 1
+explained "cookie" mention above (the `cookie` sentinel
+matched ONLY the literal WARN-line text "missing
+session cookie" — not any cookie attribute, header
+name, OR cookie VALUE).
+
+**DOM + storage redaction.** Post-close sweep over
+`document.documentElement.outerHTML`: zero hits across
+all sentinels above. `document.cookie.length === 0`
+(the `relayterm_session` cookie is HttpOnly — JS cannot
+read it). `localStorage` empty, `sessionStorage` empty
+(the `relayterm.active-terminal.v1` pointer was cleared
+on close, as designed).
+
+**Audit-payload sentinel sweep.** Against the smoke-
+window audit_events: `payload::text ILIKE` filter for
+`{%private_key%, %BEGIN OPENSSH%, %passphrase%,
+%session_token%, %token_hash%, %data_b64%,
+%REDACT-MARKER%, %relayterm-xterm-baseline%,
+%relayterm-after-%, %relayterm-before-%,
+%relayterm-mobile-%}` returned **zero rows**.
+
+**Console noise (follow-up, not a redaction gap).** The
+production terminal page accumulated 16 console errors
+across the smoke (the bulk after the
+`production-terminal-detach → production-terminal-
+reconnect` re-mount step). **The captured console log
+content was NOT inspected in this slice.** Recording
+this as a follow-up rather than a finding: no payload
+bytes were observed in any of the tested redaction
+surfaces (DOM, `localStorage`, `sessionStorage`,
+`audit_events.payload`, backend/web/target logs); the
+console-noise count is being surfaced here so a later
+slice (or the future renderer-evaluation smoke for
+ghostty-web / restty / wterm) can verify the noise
+either does not contain sensitive bytes or document
+exactly what it does contain. The 2026-05-13
+deployable-baseline smoke above recorded a similar
+post-detach console signature on the same images, which
+is consistent with "expected re-mount chatter, not a
+new defect."
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-xterm-baseline-smoke-ssh` is
+`docker stop` + `docker rm`'d (verified `docker ps -a
+--filter name=…` returns empty). Profile
+`xterm-baseline-smoke-profile` disabled through the
+SPA (preserved with `disabled_at` set, not deleted, per
+the inventory-lifecycle policy). No local key cleanup
+was required because the identity was generated
+server-side. The browser session may remain logged in.
+Left in place per the slice plan: staging Compose stack
+running, Postgres untouched (no row deleted, no schema
+touched),
+`xterm-baseline-smoke-identity` (`6317698e-…`),
+`Xterm-Baseline-Smoke-Host` (`448b53d0-…`),
+`xterm-baseline-smoke-profile` (`b568da7d-…`, disabled),
+the 1 closed `terminal_sessions` history row, the 8
+`session_events` rows, the 1 trusted
+`known_host_entries` row, all 3 `audit_events` rows
+emitted during the smoke (`ssh_identity_created`,
+`server_profile_created`, `server_profile_disabled`),
+the staging smoke user.
+
+**Intentionally deferred** (out of scope for this
+slice; tracked in
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+or scheduled later):
+
+- ghostty-web / restty / wterm experimental renderer
+  evaluation against this same staging stack — the
+  promotion gates and matrix live in the evaluation
+  plan; this slice records the **xterm baseline only**;
+- desktop Tauri (path A bundled-shell handoff)
+  renderer smoke against this same staging stack;
+- Android Tauri renderer smoke (`@wterm/dom`'s
+  motivating surface;
+  `tauri android build --debug --apk --ci` path);
+- automated performance / benchmark harness for any
+  renderer candidate (a committed Playwright runner
+  for renderer smokes is itself deferred per
+  `apps/web/e2e/SMOKE.md`);
+- `tmux` / `screen` host-side multiplexer persistence
+  (Option C in
+  [`docs/persistent-sessions.md`](../persistent-sessions.md)) —
+  unrelated to renderer evaluation and not unlocked by
+  this work;
+- VT snapshots / durable terminal-display persistence
+  (Phase 2 of the persistent-sessions roadmap);
+- Unicode / box drawing / wide-char rendering check
+  (input-path limitation in this slice; see "Unicode"
+  row above);
+- copy / paste round-trip through the production
+  paste-safety flow (clipboard / `isTrusted`
+  limitations; see "Copy / paste" row above);
+- alternate-screen / full-screen-app behaviour;
+- renderer-aware mouse-mode support;
+- per-session-per-device renderer preference
+  persistence (the production shell has no renderer
+  selector today; this is a renderer-evaluation
+  follow-up).
+
+**Verdict.** The **production xterm baseline renderer**
+runs cleanly end-to-end against staging: launch, basic
+I/O, in-session resize / fit, 300-line burst,
+wire-side detach / reconnect inside the 30 s TTL,
+mobile-width workspace, and clean close — all on the
+same `:main` image digests yesterday's deployable-
+baseline smoke recorded. Redaction posture holds across
+DOM, `localStorage` / `sessionStorage`, backend / web /
+target logs, and `audit_events.payload`. The reattach
+behaviour (fresh xterm DOM mount with no visual replay
+of the pre-detach buffer) is **what xterm baseline does
+on these images today** — captured here as the reference
+point future renderer candidates are measured against,
+not as a defect to fix in an xterm-only slice. Safe
+reference smoke for the renderer-evaluation track to
+build on; ghostty-web / restty / wterm remain
+experimental and dev-lab-only.
+
 ---
 
 ## See also
