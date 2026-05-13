@@ -31,8 +31,15 @@ point future ghostty-web / restty / wterm candidate smokes are
 measured against. The baseline smoke deliberately did NOT
 exercise Unicode, copy / paste, alternate screen, or mouse
 support (input-path limitations recorded inline in the smoke
-entry); each is its own deferred slice. **xterm is and remains
-the production compatibility baseline and the default renderer**
+entry); each is its own deferred slice. The harness plan that
+carries those deferred rows forward — input-path taxonomy,
+recommended renderer-fairness strategy, command matrix, and
+next-slice options — lives in
+[`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md);
+the experimental renderer comparisons (ghostty-web → restty →
+wterm) stay deferred until that harness plan's recommended
+implementation slice lands. **xterm is and remains the
+production compatibility baseline and the default renderer**
 until a candidate clears the Gate 2 promotion criteria below.
 
 ## Purpose
@@ -254,7 +261,13 @@ Each gate above is verified by a manual smoke. The smoke is
 **deliberately manual** — committing a Playwright runner for the
 renderer surface is its own slice (see "Explicitly deferred"). The
 shape is the same shape used by every other staging smoke entry in
-`docs/deployment/vps-staging-smoke.md`.
+`docs/deployment/vps-staging-smoke.md`. The renderer-fairness
+strategy for the rows the 2026-05-13 baseline could not exercise
+(Unicode / box drawing / wide chars, copy / paste,
+alternate-screen, mouse) is closed in
+[`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md) —
+each per-candidate smoke shape below inherits its input-path
+taxonomy and command matrix.
 
 ### Surfaces
 
@@ -381,6 +394,12 @@ will be its own slice if and when it ships:
 - [`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) — manual
   smoke procedure with the dev-lab + production-shell selector
   table.
+- [`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md) —
+  the renderer-smoke input-harness plan that carries the
+  2026-05-13 baseline's deferred matrix rows forward (Unicode /
+  paste / alt-screen / mouse), including input-path taxonomy,
+  what each path proves, command matrix, and recommended
+  follow-up slice options.
 - AGENTS.md § "Task patterns" → renderer adapter task pattern
   (long form in [`docs/agent/task-patterns.md`](agent/task-patterns.md)
   § 1) — the recurring rules for renderer work.
