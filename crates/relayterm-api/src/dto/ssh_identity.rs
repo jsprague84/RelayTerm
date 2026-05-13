@@ -7,6 +7,7 @@
 //! ever observed is inside an SSH session task with the vault key.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use relayterm_core::ids::SshIdentityId;
@@ -18,6 +19,20 @@ use crate::error::ApiError;
 
 /// Maximum length for the user-supplied identity name.
 const MAX_NAME_LEN: usize = 64;
+
+/// Maximum size for the OpenSSH-format private key text supplied to the
+/// import route, in bytes. An Ed25519 OpenSSH PEM is ~400 bytes; an
+/// RSA-4096 OpenSSH PEM is ~3.3 KiB. 8 KiB is comfortably above both
+/// realistic shapes and well below the default axum body cap, so a
+/// malformed paste cannot chew CPU in the parser.
+const MAX_PRIVATE_KEY_OPENSSH_BYTES: usize = 8 * 1024;
+
+/// OpenSSH private-key PEM header sentinel. The DTO requires this
+/// substring before handing the body to the vault — a missing header
+/// short-circuits the parser. Public-key uploads (which use the
+/// `ssh-<algo>` prefix and no PEM envelope) and PEM PKCS#1 / PKCS#8
+/// bodies are rejected here BEFORE any `ssh-key` work runs.
+const OPENSSH_PRIVATE_KEY_HEADER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
 
 /// Request body for `POST /api/v1/ssh-identities`.
 ///
@@ -129,6 +144,104 @@ fn parse_supported_key_type(tag: &str) -> Result<SshKeyType, ApiError> {
                 "unsupported key_type {tag:?}"
             )))
         }
+    }
+}
+
+/// Request body for `POST /api/v1/ssh-identities/import`.
+///
+/// Carries the OpenSSH-format private-key PEM. **DO NOT derive `Debug`**
+/// on this struct — the manual impl below redacts `private_key_openssh`
+/// to a length-only summary. A derived impl would emit the PEM bytes
+/// through any `dbg!`, `format!("{:?}")`, tracing subscriber, or panic
+/// formatter that touches the type.
+///
+/// `passphrase` is intentionally absent in v1 — passphrase-protected
+/// keys are out of scope for this slice (see
+/// `docs/private-key-import.md` § 1 / § 13). Adding it later widens the
+/// redaction surface; it lands in v1.1.
+///
+/// `Deserialize` is the only auto-derive; serde does not call `Debug`,
+/// so it cannot leak the field through that path.
+#[derive(Deserialize)]
+pub(crate) struct ImportSshIdentityRequest {
+    pub name: String,
+    pub private_key_openssh: String,
+}
+
+impl fmt::Debug for ImportSshIdentityRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImportSshIdentityRequest")
+            .field("name", &self.name)
+            .field(
+                "private_key_openssh",
+                &format_args!("<redacted: {} bytes>", self.private_key_openssh.len()),
+            )
+            .finish()
+    }
+}
+
+/// Validated, normalized form of [`ImportSshIdentityRequest`].
+///
+/// `pem` is held in a `Zeroizing<Vec<u8>>` so the bytes wipe on drop —
+/// the validator consumes the request by value, the original `String`
+/// allocation is dropped at the end of `validate`, and the
+/// vault-bound copy here is the only durable form between validate and
+/// the vault call. **DO NOT** add `Debug` / `Clone` / `Serialize` here.
+pub(crate) struct ValidatedImportSshIdentity {
+    pub name: String,
+    pub pem: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for ValidatedImportSshIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedImportSshIdentity")
+            .field("name", &self.name)
+            .field("pem", &format_args!("<redacted: {} bytes>", self.pem.len()))
+            .finish()
+    }
+}
+
+impl ImportSshIdentityRequest {
+    /// Validate the request body. Failures map to `400 invalid_input`
+    /// with stable, operator-safe messages. The offending PEM bytes are
+    /// NEVER echoed in the wire `message` — only the rule that fired is
+    /// named.
+    ///
+    /// Validation rules:
+    ///  - `name` reuses [`validate_identity_name`] byte-for-byte with
+    ///    the generate path.
+    ///  - `private_key_openssh` must be ASCII (`< 0x80`).
+    ///  - `private_key_openssh` must be ≤
+    ///    [`MAX_PRIVATE_KEY_OPENSSH_BYTES`] bytes.
+    ///  - `private_key_openssh` must contain the OpenSSH PEM header
+    ///    sentinel.
+    pub(crate) fn validate(self) -> Result<ValidatedImportSshIdentity, ApiError> {
+        let name = validate_identity_name(&self.name)?;
+        // Move the PEM out of the request struct as early as possible so
+        // there is exactly one durable copy between here and the vault.
+        let raw = self.private_key_openssh;
+        if raw.is_empty() {
+            return Err(ApiError::Validation(
+                "private_key_openssh must not be empty".to_owned(),
+            ));
+        }
+        if raw.len() > MAX_PRIVATE_KEY_OPENSSH_BYTES {
+            return Err(ApiError::Validation(format!(
+                "private_key_openssh must not exceed {MAX_PRIVATE_KEY_OPENSSH_BYTES} bytes",
+            )));
+        }
+        if !raw.is_ascii() {
+            return Err(ApiError::Validation(
+                "private_key_openssh must be ASCII".to_owned(),
+            ));
+        }
+        if !raw.contains(OPENSSH_PRIVATE_KEY_HEADER) {
+            return Err(ApiError::Validation(
+                "private_key_openssh is missing OpenSSH PEM header".to_owned(),
+            ));
+        }
+        let pem = zeroize::Zeroizing::new(raw.into_bytes());
+        Ok(ValidatedImportSshIdentity { name, pem })
     }
 }
 
@@ -348,5 +461,154 @@ mod tests {
             key_type: None,
         };
         assert!(matches!(req.validate(), Err(ApiError::Validation(_))));
+    }
+
+    // ----------------------------------------------------------------
+    // Import-request DTO tests.
+    //
+    // PEM bytes here are throwaway test material — minimal valid-looking
+    // strings that exercise the validator branches. The real OpenSSH
+    // parser only runs at the vault layer; the DTO just enforces shape
+    // (size, ASCII, header sentinel) so a malformed paste is refused
+    // before the parser sees it.
+    // ----------------------------------------------------------------
+
+    /// Smallest PEM body that passes the DTO validator. Not a real
+    /// parseable key — `ssh-key` would reject the body in
+    /// `VaultService::import_ssh_identity`. The validator only inspects
+    /// shape, so this is sufficient to exercise the success branch.
+    fn minimal_valid_pem_shape() -> String {
+        format!(
+            "{}\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+            OPENSSH_PRIVATE_KEY_HEADER,
+        )
+    }
+
+    #[test]
+    fn import_request_accepts_well_formed_shape() {
+        let req = ImportSshIdentityRequest {
+            name: "imported-identity".to_owned(),
+            private_key_openssh: minimal_valid_pem_shape(),
+        };
+        let validated = req.validate().expect("shape-valid request must pass");
+        assert_eq!(validated.name, "imported-identity");
+        assert!(
+            validated
+                .pem
+                .starts_with(OPENSSH_PRIVATE_KEY_HEADER.as_bytes())
+        );
+    }
+
+    #[test]
+    fn import_request_rejects_blank_name() {
+        let req = ImportSshIdentityRequest {
+            name: "  ".to_owned(),
+            private_key_openssh: minimal_valid_pem_shape(),
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert_eq!(msg, "name must not be empty");
+    }
+
+    #[test]
+    fn import_request_rejects_empty_pem() {
+        let req = ImportSshIdentityRequest {
+            name: "ok".to_owned(),
+            private_key_openssh: String::new(),
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert_eq!(msg, "private_key_openssh must not be empty");
+    }
+
+    #[test]
+    fn import_request_rejects_oversized_pem() {
+        let req = ImportSshIdentityRequest {
+            name: "ok".to_owned(),
+            // One byte over the cap — the validator MUST refuse before any
+            // parser runs so a 9 KiB paste cannot chew CPU.
+            private_key_openssh: "A".repeat(MAX_PRIVATE_KEY_OPENSSH_BYTES + 1),
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.starts_with("private_key_openssh must not exceed "));
+    }
+
+    #[test]
+    fn import_request_rejects_non_ascii_pem() {
+        let mut body = minimal_valid_pem_shape();
+        body.push('\u{00ff}');
+        let req = ImportSshIdentityRequest {
+            name: "ok".to_owned(),
+            private_key_openssh: body,
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert_eq!(msg, "private_key_openssh must be ASCII");
+    }
+
+    #[test]
+    fn import_request_rejects_missing_pem_header() {
+        let req = ImportSshIdentityRequest {
+            name: "ok".to_owned(),
+            // Public-key shape — no PEM envelope. Pinning that the public-
+            // key path is refused before the vault parser ever sees it.
+            private_key_openssh: "ssh-ed25519 AAAA-not-a-private-key".to_owned(),
+        };
+        let err = req.validate().unwrap_err();
+        let ApiError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert_eq!(msg, "private_key_openssh is missing OpenSSH PEM header");
+    }
+
+    #[test]
+    fn import_request_debug_redacts_pem_bytes() {
+        // Sentinel bytes that would be unmistakable if the redaction
+        // discipline regressed.
+        let sentinel = "RT-DTO-DEBUG-LEAK-MARKER";
+        let body = format!(
+            "{}\n{sentinel}\n-----END OPENSSH PRIVATE KEY-----\n",
+            OPENSSH_PRIVATE_KEY_HEADER,
+        );
+        let req = ImportSshIdentityRequest {
+            name: "ok".to_owned(),
+            private_key_openssh: body,
+        };
+        let dbg = format!("{req:?}");
+        assert!(
+            !dbg.contains(sentinel),
+            "Debug must redact PEM bytes: {dbg}"
+        );
+        assert!(!dbg.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn validated_import_debug_redacts_pem_bytes() {
+        let sentinel = "RT-DTO-VALIDATED-DEBUG-LEAK";
+        let body = format!(
+            "{}\n{sentinel}\n-----END OPENSSH PRIVATE KEY-----\n",
+            OPENSSH_PRIVATE_KEY_HEADER,
+        );
+        let req = ImportSshIdentityRequest {
+            name: "ok".to_owned(),
+            private_key_openssh: body,
+        };
+        let validated = req.validate().unwrap();
+        let dbg = format!("{validated:?}");
+        assert!(
+            !dbg.contains(sentinel),
+            "Debug must redact PEM bytes: {dbg}"
+        );
+        assert!(dbg.contains("redacted"));
     }
 }

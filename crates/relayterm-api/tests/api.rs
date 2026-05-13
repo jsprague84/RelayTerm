@@ -2085,6 +2085,592 @@ async fn delete_ssh_identity_bad_origin_returns_403(pool: PgPool) {
 }
 
 // ----------------------------------------------------------------------
+// SSH identity import (POST /api/v1/ssh-identities/import)
+//
+// Throwaway test fixtures only — every PEM here is generated for the
+// test (or, for the encrypted/RSA fixtures, generated once with
+// `ssh-keygen` against `/tmp` and immediately discarded). Production
+// keys MUST never appear in this file. The encrypted fixture's
+// passphrase is deliberately not used because the test only asserts
+// that `is_encrypted()` detection fires.
+// ----------------------------------------------------------------------
+
+/// Sentinel embedded in the `name` of import-test requests so the
+/// audit-redaction sweep has a non-secret marker it can search for.
+/// The PEM bytes are not embedded as a sentinel — the AUDIT_FORBIDDEN
+/// list catches the literal `BEGIN OPENSSH PRIVATE KEY` substring.
+const IMPORT_NAME_SENTINEL: &str = "RT-IMPORT-AUDIT-NAME-SENTINEL";
+
+/// Encrypted Ed25519 OpenSSH PEM fixture — same bytes as the
+/// `relayterm-vault` `ENCRYPTED_ED25519_FIXTURE`. Throwaway test
+/// material; never decrypted in tests.
+///
+/// The fixture is intentionally duplicated rather than re-exported
+/// because `relayterm-api`'s integration test cannot pull a
+/// `cfg(test)` const out of the `relayterm-vault` crate. If this
+/// fixture is ever regenerated (e.g. an OpenSSH format-version bump
+/// that breaks the `is_encrypted()` detection), update BOTH copies in
+/// lockstep — `crates/relayterm-vault/src/identity.rs::ENCRYPTED_ED25519_FIXTURE`
+/// AND this one. Same applies to `UNENCRYPTED_RSA_FIXTURE` below.
+const ENCRYPTED_ED25519_FIXTURE: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDGGthwH6
+5HvKYta7+oUveZAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIK3NKUNWd0vLAj5U
+LXdNXGZkqk325MEKbaoK099DkEnRAAAAsH8PDi1T/YYQiYvbBUIJ7w8MnJqaxmY/PIodsv
+ViUddfryP2FpzZjwF1FYAkaKu5/wCuPlw1GsFEZ8PaD7B6Apvcqg1Zcrt+EtI1oYf4NhHj
+nsizmmEEBm9fa/TmMjc6zd+lH7NzgG3cZ2va51bWxl+qafIoon1h42WANBO8MT3Y6DaqM8
+k26TlD4VczWicURvSL8xj85+cwNCYIdBieUb3Ahyh0hKsZgI3f/88PcluO
+-----END OPENSSH PRIVATE KEY-----
+";
+
+/// Unencrypted RSA-2048 OpenSSH PEM fixture — same bytes as the
+/// `relayterm-vault` `UNENCRYPTED_RSA_FIXTURE`. Throwaway test material
+/// pin only.
+const UNENCRYPTED_RSA_FIXTURE: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAQEAg/E3ABtl3xAKWJ5Qdekp4ly59yHr8vExhHynP7om4DUS4eNkzsNm
+zDQI3KwKE+dJZZxLJZmgNPKw1Imj/EbwAEuvrBdShNf2jPlEKvaqnW1fjfxqAtguocISMh
+uFKduxjODOigWnKtiYE54b+OAjBcUEdQg5+LeKRGQCwb3olzhyCWQKSQGdGDTbpOTHjrWD
+CoTsBXcUWpCowkHzbdHajGgCbVwYJg5lfrvelG88JwNuogk+YL9rDMf5shQioqRv7WNAZ8
++Fn2SAsvdLWeFc5I43kKKiJnR1cZBLZOinrgi1BYNJbloA1uiJHvJd+Cpts75Au8wlRRHV
+hUqKqNX7EwAAA+B8rkMWfK5DFgAAAAdzc2gtcnNhAAABAQCD8TcAG2XfEApYnlB16SniXL
+n3Ievy8TGEfKc/uibgNRLh42TOw2bMNAjcrAoT50llnEslmaA08rDUiaP8RvAAS6+sF1KE
+1/aM+UQq9qqdbV+N/GoC2C6hwhIyG4Up27GM4M6KBacq2JgTnhv44CMFxQR1CDn4t4pEZA
+LBveiXOHIJZApJAZ0YNNuk5MeOtYMKhOwFdxRakKjCQfNt0dqMaAJtXBgmDmV+u96Ubzwn
+A26iCT5gv2sMx/myFCKipG/tY0Bnz4WfZICy90tZ4VzkjjeQoqImdHVxkEtk6KeuCLUFg0
+luWgDW6Ike8l34Km2zvkC7zCVFEdWFSoqo1fsTAAAAAwEAAQAAAQAA/dSQeyQ6V2gEf3gS
+UsS+Tz0Uhtw7kKVzHe6x02fMYom4SdmtlhlVKoTwh5hxytip21FTQILMMxCyIDCryiquje
+MNk4VKu0a+i3cALaddlH9V1VJEoDRFgexaFQvcoyqD6QKUVfOKJmOKLjN+nMyWlALzEDND
+U7nFxsyggRlY3ZB2qfDZm+IMXvOpg957Ymx9EKk6btlK5S7L9Q8tSNBH9r/LFsPRuntGSo
+J/h6Cj5Ey8RzmTqGsppX+eEFDC9y/6qiTJxcs+w2fQ84PLjyxdV3NgF+ptMI58R5pdXyw2
+v0Awd9KRLZtTQrD5siUlWFTwiBudiv9W4YfkuoxUMv61AAAAgEh20bdfG5ek+didpVF+LF
+PJr874Z9gHaWf4CW6vxsxn7d+6M79Qj8m5V7PrcpfatUVO+UH+acOaYTDAznJAKL973CUw
++pf2tE26/8HZwE1eg1MYbZxh/K6AX0Uom0ScUNOl+TEOcebFzlP3yVRvwkGiY6Cat9247+
+wMSJB5UIvJAAAAgQC49W/XTxmISC3l73yw+p1aOBehQj0hFon4mPJMtMkfoK1ccyjgBc22
+uTINkwLdWU3aRb+qbDcAhjSujuAFpYJC1UYAl8BZlJ3Cz9V8hgPWWRFrSF0j7AE4zi69PY
+qH8JqMyn+dBbiDSCL+AQaO8CMVWGbdOTnB4olWRP6BpnksrQAAAIEAtp7KFp8Us70N9bnP
+Am883wQ/6s+pVFdFe9lWVsFbFXstY8mRnDC61VrVCWIKTNxLeYzothAVol66JB7R9mCzfP
+W+aS4ZjwieaojGdJq0PcP7QXk9r43i5vTxdsaqfVhZI3BJkWEA3xawoQHKGqq8mzjADSU1
+qmZ/xxuugbvC/r8AAAAncmVsYXl0ZXJtLXRlc3QtZml4dHVyZS1kby1ub3QtdHJ1c3Qtcn
+NhAQIDBA==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+/// Generate a fresh Ed25519 OpenSSH PEM at test time. Returns the
+/// `(pem, expected_fingerprint)` pair so the assertions can compare
+/// without re-deriving the fingerprint from the imported public key.
+fn fresh_ed25519_pem(comment: &str) -> (String, String) {
+    use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, rand_core::OsRng};
+    let mut private = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+    if !comment.is_empty() {
+        private.set_comment(comment);
+    }
+    let fingerprint = private
+        .public_key()
+        .fingerprint(HashAlg::Sha256)
+        .to_string();
+    let pem = private.to_openssh(LineEnding::LF).unwrap();
+    (pem.to_string(), fingerprint)
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_returns_201_with_public_metadata_only(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let (pem, expected_fp) = fresh_ed25519_pem("upstream-comment");
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({
+                "name": IMPORT_NAME_SENTINEL,
+                "private_key_openssh": pem,
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        !raw.contains("encrypted_private_key"),
+        "import response must not expose encrypted_private_key: {raw}"
+    );
+    assert!(
+        !raw.contains("BEGIN OPENSSH PRIVATE KEY"),
+        "import response must not contain a plaintext PEM: {raw}"
+    );
+    assert!(
+        !raw.contains("private_key"),
+        "import response must not contain any private_key field: {raw}"
+    );
+
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    assert!(body["id"].is_string());
+    assert_eq!(body["name"], IMPORT_NAME_SENTINEL);
+    assert_eq!(body["key_type"], "ed25519");
+    let public_key = body["public_key"].as_str().expect("public_key");
+    assert!(
+        public_key.starts_with("ssh-ed25519 "),
+        "imported public_key must be the OpenSSH ed25519 line: {public_key}"
+    );
+    assert!(
+        public_key.ends_with(&format!(" {IMPORT_NAME_SENTINEL}")),
+        "imported public_key must bake the supplied name as the OpenSSH comment, got: {public_key}"
+    );
+    assert_eq!(body["fingerprint_sha256"], expected_fp);
+
+    // Subsequent GET also omits the encrypted blob.
+    let id = body["id"].as_str().unwrap();
+    let get_resp = app
+        .oneshot(get(&format!("/api/v1/ssh-identities/{id}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let bytes = get_resp.into_body().collect().await.unwrap().to_bytes();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!raw.contains("encrypted_private_key"));
+    assert!(!raw.contains("BEGIN OPENSSH PRIVATE KEY"));
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_persists_encrypted_blob(pool: PgPool) {
+    // After a successful import the row exists, the public key matches
+    // the API response, and the stored ciphertext does NOT contain the
+    // PEM marker — proving the imported key is actually encrypted at
+    // rest in the same envelope as a generated key.
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let (pem, _) = fresh_ed25519_pem("persist-check");
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "persist-check", "private_key_openssh": pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_body(resp).await;
+    let id_str = body["id"].as_str().unwrap();
+    let id_uuid: uuid::Uuid = id_str.parse().unwrap();
+
+    let row: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT public_key, encrypted_private_key FROM ssh_identities WHERE id = $1",
+    )
+    .bind(id_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let public_key_text = std::str::from_utf8(&row.0).unwrap();
+    assert!(public_key_text.starts_with("ssh-ed25519 "));
+    let needle = b"BEGIN OPENSSH PRIVATE KEY";
+    assert!(
+        !row.1.windows(needle.len()).any(|w| w == needle),
+        "stored encrypted_private_key must not contain plaintext PEM marker"
+    );
+    assert_eq!(&row.1[..4], b"RTV1");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_duplicate_fingerprint_returns_409(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let (pem, _) = fresh_ed25519_pem("dup-check");
+
+    let first = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "dup-1", "private_key_openssh": pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = app
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "dup-2", "private_key_openssh": pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = read_body(second).await;
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(
+        body["error"]["message"],
+        "ssh_identity duplicate_fingerprint"
+    );
+
+    // Exactly one row exists — the duplicate import did not create a
+    // second copy.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1);
+
+    // And exactly one `ssh_identity_created` audit row was written —
+    // the audit append on the duplicate-fingerprint path never fired.
+    let audit_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audit_events WHERE kind = 'ssh_identity_created'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audit_count.0, 1);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_same_fingerprint_two_users_succeeds(pool: PgPool) {
+    // The `(owner_id, fingerprint_sha256)` unique index is per-owner.
+    // User A imports a fingerprint, then user B imports the SAME
+    // fingerprint — the second import MUST succeed because the
+    // ownership scope differs. A future query rewrite that accidentally
+    // dropped the `owner_id` from the unique check would 409 user B
+    // here; pinning this test guards against that regression and
+    // mirrors the AGENTS.md "owner-scope every read; collapse foreign-
+    // vs-missing to byte-identical 404" rule for the write surface.
+    let (app_a, _user_a, cookie_a) = setup(pool.clone()).await;
+    let (app_b, _user_b, cookie_b) = setup(pool.clone()).await;
+    let (pem, expected_fp) = fresh_ed25519_pem("two-users");
+
+    let resp_a = app_a
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "user-a-copy", "private_key_openssh": pem}),
+            &cookie_a,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp_a.status(), StatusCode::CREATED);
+    let body_a = read_body(resp_a).await;
+    assert_eq!(body_a["fingerprint_sha256"], expected_fp);
+
+    let resp_b = app_b
+        .clone()
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "user-b-copy", "private_key_openssh": pem}),
+            &cookie_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_b.status(),
+        StatusCode::CREATED,
+        "different-owner duplicate fingerprint MUST succeed",
+    );
+    let body_b = read_body(resp_b).await;
+    assert_eq!(body_b["fingerprint_sha256"], expected_fp);
+    assert_ne!(body_a["id"], body_b["id"], "rows are owner-scoped");
+
+    // And user A's retry STILL 409s (the per-owner uniqueness still
+    // bites within their own inventory).
+    let resp_a_retry = app_a
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "user-a-retry", "private_key_openssh": pem}),
+            &cookie_a,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp_a_retry.status(), StatusCode::CONFLICT);
+    let body = read_body(resp_a_retry).await;
+    assert_eq!(
+        body["error"]["message"],
+        "ssh_identity duplicate_fingerprint"
+    );
+
+    // Exactly two rows total — user A's first import and user B's
+    // import; user A's retry was rejected.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 2);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_rejects_encrypted_with_typed_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "enc-reject", "private_key_openssh": ENCRYPTED_ED25519_FIXTURE}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(body["error"]["message"], "unsupported_key_format encrypted");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_rejects_malformed_with_typed_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    // Valid PEM envelope (passes the DTO header sentinel) but the
+    // openssh-key-v1 body is garbage — `ssh-key` parser collapses to
+    // `UnsupportedFormat { reason: "malformed" }`.
+    let bogus_pem = format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        "AAAAGGFnaXJsa3JoZWdrcg=="
+    );
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "malformed", "private_key_openssh": bogus_pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(body["error"]["message"], "unsupported_key_format malformed");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_rejects_rsa_with_typed_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "rsa-reject", "private_key_openssh": UNENCRYPTED_RSA_FIXTURE}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(body["error"]["message"], "unsupported key_type \"rsa\"");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_rejects_missing_pem_header_with_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    // Public-key shape — no PEM envelope. The DTO must short-circuit
+    // before the vault is ever called.
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({
+                "name": "pubkey-paste",
+                "private_key_openssh": "ssh-ed25519 AAAA-not-a-private-key",
+            }),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(
+        body["error"]["message"],
+        "private_key_openssh is missing OpenSSH PEM header",
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_rejects_oversized_body_with_400(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    // 9 KiB body — one full KiB over the 8 KiB cap.
+    let oversized = "A".repeat(9 * 1024);
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "too-big", "private_key_openssh": oversized}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("private_key_openssh must not exceed "),
+    );
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_unauthenticated_returns_401(pool: PgPool) {
+    let (app, _user, _cookie) = setup(pool.clone()).await;
+    let (pem, _) = fresh_ed25519_pem("never-create");
+    let resp = app
+        .oneshot(json_post_no_auth(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "x", "private_key_openssh": pem}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "unauthorized");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_bad_origin_rejects_before_body_parsing(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool).await;
+    // Deliberately malformed JSON body — if the request reached the body
+    // extractor it would 400. The 403 below proves CsrfGuard runs FIRST
+    // and short-circuits before the body is parsed.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ssh-identities/import")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example.com")
+        .header(header::COOKIE, format!("relayterm_session={cookie}"))
+        .body(Body::from("{ this is not valid JSON"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_returns_503_when_vault_disabled(pool: PgPool) {
+    let user_id = create_user(&pool, "dev").await;
+    let db = Db::from_pool(pool.clone());
+    let terminal_sessions = test_terminal_manager(&db);
+    let __auth = test_auth(&db);
+    let __auth_routes = test_auth_routes();
+    let cookie = bootstrap_test_session(&__auth, user_id).await;
+    let state = AppState {
+        db,
+        vault: None,
+        preflight: Arc::new(HostKeyPreflightService::new(default_probe())),
+        auth_check: Arc::new(SshAuthCheckService::new(default_auth_checker())),
+        pty_bridge: default_pty_bridge(),
+        terminal_sessions,
+        auth: __auth.clone(),
+        auth_routes: __auth_routes.clone(),
+        login_throttler: test_login_throttler(),
+    };
+    let app = router(state);
+    let (pem, _) = fresh_ed25519_pem("never-create");
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "x", "private_key_openssh": pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body(resp).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+    assert_eq!(body["error"]["message"], "service unavailable");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ssh_identities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_writes_audit_with_imported_source(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let (pem, expected_fp) = fresh_ed25519_pem("audit-source");
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": IMPORT_NAME_SENTINEL, "private_key_openssh": pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let payloads: Vec<(serde_json::Value,)> =
+        sqlx::query_as("SELECT payload FROM audit_events WHERE kind = 'ssh_identity_created'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(payloads.len(), 1, "exactly one ssh_identity_created row");
+    let payload = &payloads[0].0;
+    assert_eq!(payload["source"], "imported");
+    assert_eq!(payload["name"], IMPORT_NAME_SENTINEL);
+    assert_eq!(payload["key_type"], "ed25519");
+    assert_eq!(payload["fingerprint_sha256"], expected_fp);
+    assert!(payload["ssh_identity_id"].is_string());
+    assert!(payload["created_at"].is_string());
+    assert_audit_payload_redacted(payload, AuditEventKind::SshIdentityCreated);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn create_ssh_identity_writes_audit_with_generated_source(pool: PgPool) {
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities",
+            json!({"name": IMPORT_NAME_SENTINEL}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let payloads: Vec<(serde_json::Value,)> =
+        sqlx::query_as("SELECT payload FROM audit_events WHERE kind = 'ssh_identity_created'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(payloads.len(), 1);
+    let payload = &payloads[0].0;
+    assert_eq!(payload["source"], "generated");
+    assert_eq!(payload["name"], IMPORT_NAME_SENTINEL);
+    assert_audit_payload_redacted(payload, AuditEventKind::SshIdentityCreated);
+}
+
+#[sqlx::test(migrations = "../../apps/backend/migrations")]
+async fn import_ssh_identity_audit_payload_redacted(pool: PgPool) {
+    // Sentinel-based redaction sweep: feed an import request, then
+    // ensure no audit row's payload contains any `AUDIT_FORBIDDEN_SUBSTRINGS`
+    // (`encrypted_private_key`, `private_key`, `BEGIN OPENSSH PRIVATE
+    // KEY`, password / session / bootstrap shapes, `client_info`, etc.)
+    // — even though the import request body itself contained a valid
+    // PEM, the audit payload must carry only public metadata.
+    let (app, _user, cookie) = setup(pool.clone()).await;
+    let (pem, _) = fresh_ed25519_pem("redaction-sweep");
+    let resp = app
+        .oneshot(json_post(
+            "/api/v1/ssh-identities/import",
+            json!({"name": "redaction-sweep", "private_key_openssh": pem}),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let payloads: Vec<(serde_json::Value,)> = sqlx::query_as("SELECT payload FROM audit_events")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    for (payload,) in &payloads {
+        assert_audit_payload_redacted(payload, AuditEventKind::SshIdentityCreated);
+    }
+}
+
+// ----------------------------------------------------------------------
 // Server profiles
 // ----------------------------------------------------------------------
 

@@ -1,10 +1,15 @@
 # Private-key import — design
 
 > Design doc for importing an existing SSH private key into RelayTerm's
-> backend-managed vault. Status: **design only, not implemented**. This
-> document does not bind any line of code yet — it captures the v1 scope
-> the next implementation slice should land against, and the deferred
-> work it should refuse to land in v1.
+> backend-managed vault. **Status: v1 implemented on
+> `feat/private-key-import-v1` (2026-05-12).** The route, the vault
+> primitive, the audit-kind reuse + `source` discriminator, the
+> duplicate-fingerprint mapping, the SPA helper + Identities-view
+> Import panel, and the redaction-sentinel tests are all wired against
+> the design below; the deferred sections (§ 10, § 13.1 / § 13.2,
+> § 14) remain accurate as the v1.1+ roadmap. Sibling docs and
+> `SPEC.md` "SSH credential and trust surfaces" reflect the landed
+> shape.
 >
 > Sibling docs:
 >

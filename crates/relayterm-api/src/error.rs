@@ -451,14 +451,25 @@ impl From<VaultError> for ApiError {
     fn from(err: VaultError) -> Self {
         match err {
             // Defense-in-depth: the DTO's `parse_supported_key_type` already
-            // 400s every non-Ed25519 tag before the vault is called, so this
-            // arm is unreachable in normal flow. Kept so a future
-            // `SshKeyType` variant added to the DTO allowlist before the
-            // vault grows a generator falls through as a clean 400 instead
-            // of a 500. Format mirrors the DTO (`{tag:?}`) so the wire
-            // message stays identical regardless of which gate fires.
+            // 400s every non-Ed25519 tag before the vault is called for the
+            // generate route. The import route also hits this arm — when an
+            // imported PEM parses cleanly but bears a non-Ed25519 algorithm,
+            // the vault funnels it through `UnsupportedKeyType(tag)` and the
+            // `tag` is one of the `SshKeyType::as_str()` strings (`"rsa"`,
+            // `"ecdsa_p256"`, etc). Format mirrors the DTO (`{tag:?}`) so
+            // both routes' wire messages stay byte-identical.
             VaultError::UnsupportedKeyType(tag) => {
                 Self::Validation(format!("unsupported key_type {tag:?}"))
+            }
+            // Import-only: the imported PEM was structurally a private-key
+            // PEM but the vault refuses the format (passphrase-protected,
+            // openssh-key-v1 body malformed, or — reserved for future —
+            // public-key material). `reason` is the closed `&'static str`
+            // discriminant set by the vault; the wire message is a stable
+            // `unsupported_key_format <reason>` shape so the SPA can map by
+            // suffix without parsing parser internals.
+            VaultError::UnsupportedFormat { reason } => {
+                Self::Validation(format!("unsupported_key_format {reason}"))
             }
             // Master key issues are an operator/deploy problem, not a
             // client problem. Crash with 503 rather than leaking why.

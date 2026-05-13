@@ -45,6 +45,11 @@ futures = { workspace = true }
 http-body-util = "0.1"
 serde_json = { workspace = true }
 sqlx = { workspace = true }
+# Used by the SSH-identity import integration tests to mint a fresh
+# Ed25519 OpenSSH PEM at test time. Same workspace pin as the
+# production vault crate; only the alloc + ed25519 features are needed
+# (we never construct or decrypt encrypted keys in tests).
+ssh-key = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 # WebSocket client for end-to-end lifecycle tests against an in-process
 # axum::serve. Pinned to the same minor as the `tungstenite` axum 0.8

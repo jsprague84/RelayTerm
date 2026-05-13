@@ -19,7 +19,8 @@ use axum::{
 use relayterm_core::audit_event::AuditEventKind;
 use relayterm_core::ids::{SshIdentityId, UserId};
 use relayterm_core::repository::{
-    AuditEventRepository, CreateAuditEvent, CreateSshIdentity, SshIdentityRepository,
+    AuditEventRepository, CreateAuditEvent, CreateSshIdentity, RepositoryError,
+    SshIdentityRepository,
 };
 use relayterm_core::ssh_identity::SshIdentity;
 use serde_json::json;
@@ -27,15 +28,36 @@ use serde_json::json;
 use crate::AppState;
 use crate::auth::{AuthenticatedUser, CsrfGuard};
 use crate::dto::ssh_identity::{
-    CreateSshIdentityRequest, SshIdentityResponse, UpdateSshIdentityRequest,
+    CreateSshIdentityRequest, ImportSshIdentityRequest, SshIdentityResponse,
+    UpdateSshIdentityRequest,
 };
 use crate::error::ApiError;
 
 const ENTITY: &str = "ssh_identity";
 
+/// Discriminator carried in the `ssh_identity_created` audit payload so a
+/// reader can tell `POST /ssh-identities` (`generated`) from
+/// `POST /ssh-identities/import` (`imported`) without inspecting the
+/// route. Public metadata only — see `write_ssh_identity_create_audit`.
+#[derive(Debug, Clone, Copy)]
+enum AuditSource {
+    Generated,
+    Imported,
+}
+
+impl AuditSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generated => "generated",
+            Self::Imported => "imported",
+        }
+    }
+}
+
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create).get(list))
+        .route("/import", post(import))
         .route("/{id}", get(get_by_id).patch(update).delete(delete_by_id))
 }
 
@@ -50,11 +72,7 @@ async fn create(
     // The vault is the single point that owns the master key and the
     // generated private bytes. If it isn't configured we 503 — refusing
     // to silently degrade to an unencrypted or no-op path.
-    let vault = state.vault.as_ref().ok_or_else(|| {
-        ApiError::ServiceUnavailable(
-            "vault is disabled; backend-generated SSH identities require a master key".to_owned(),
-        )
-    })?;
+    let vault = vault_or_503(&state)?;
 
     // Generate inside the vault. The plaintext PEM exists only inside this
     // call and is wiped before `encrypted_private_key` is handed back.
@@ -71,9 +89,120 @@ async fn create(
             encrypted_private_key: generated.encrypted_private_key.into_bytes(),
             fingerprint_sha256: generated.fingerprint_sha256,
         })
+        .await
+        .map_err(map_create_repository_error)?;
+
+    write_ssh_identity_create_audit(&state, user.user_id(), &identity, AuditSource::Generated)
         .await?;
 
     Ok((StatusCode::CREATED, Json(identity.into())))
+}
+
+/// `POST /api/v1/ssh-identities/import`.
+///
+/// Imports an existing OpenSSH-format Ed25519 private key into the
+/// vault. v1 scope (see `docs/private-key-import.md` § 1):
+///
+/// * Unencrypted OpenSSH-format Ed25519 only.
+/// * Paste-into-textarea ingress (no file picker, no passphrase
+///   channel, no RSA / ECDSA / DSA, no Putty `.ppk`, no PEM PKCS#1 /
+///   PKCS#8). Each rejection collapses to a typed `400 invalid_input`
+///   with a stable `unsupported_key_format <reason>` /
+///   `unsupported key_type "<tag>"` message — never the parser's text,
+///   never the supplied PEM bytes.
+/// * Reuses the existing `EncryptedBlob` envelope; an imported row is
+///   indistinguishable at rest from a generated row.
+/// * Duplicate fingerprint (per `(owner_id, fingerprint_sha256)` unique
+///   constraint) collapses to a typed `409 conflict { entity:
+///   "ssh_identity", reason: "duplicate_fingerprint" }`.
+/// * Audits via `ssh_identity_created` with `source: "imported"`.
+///
+/// Extractor order matches every other browser-write route in the
+/// crate: `_csrf` runs FIRST so a bad `Origin` returns 403 BEFORE the
+/// JSON body extractor parses anything (mirroring
+/// `bad_origin_rejects_before_body_parsing` from
+/// `crates/relayterm-api/tests/api.rs`).
+async fn import(
+    _csrf: CsrfGuard,
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Json(req): Json<ImportSshIdentityRequest>,
+) -> Result<(StatusCode, Json<SshIdentityResponse>), ApiError> {
+    let validated = req.validate()?;
+
+    let vault = vault_or_503(&state)?;
+
+    // The vault parses, validates, re-serializes to canonical PEM, and
+    // encrypts. Parser/encryption failures collapse to typed
+    // `VaultError` variants; the `From<VaultError> for ApiError` impl in
+    // `crate::error` maps them to safe wire shapes — the original
+    // parser text never crosses the API boundary.
+    let imported = vault.import_ssh_identity(&validated.pem, &validated.name)?;
+    // Drop the `Zeroizing<Vec<u8>>` PEM buffer as soon as the vault is
+    // done with it — explicitly, BEFORE the DB-create await — so the
+    // plaintext bytes are wiped right now rather than at function
+    // return (which would be after `db.create(...)` AND
+    // `write_ssh_identity_create_audit(...)`). The only durable form
+    // from this point on is `imported.encrypted_private_key`.
+    drop(validated.pem);
+
+    let identity = state
+        .db
+        .ssh_identities()
+        .create(CreateSshIdentity {
+            owner_id: user.user_id(),
+            name: validated.name,
+            key_type: imported.key_type,
+            public_key: imported.public_key_openssh,
+            encrypted_private_key: imported.encrypted_private_key.into_bytes(),
+            fingerprint_sha256: imported.fingerprint_sha256,
+        })
+        .await
+        .map_err(map_create_repository_error)?;
+
+    write_ssh_identity_create_audit(&state, user.user_id(), &identity, AuditSource::Imported)
+        .await?;
+
+    Ok((StatusCode::CREATED, Json(identity.into())))
+}
+
+/// Resolve `state.vault` or return the static 503 the create + import
+/// routes share. Centralised so both creation paths produce
+/// byte-identical wire bodies when the vault is disabled.
+fn vault_or_503(state: &AppState) -> Result<&relayterm_vault::VaultService, ApiError> {
+    state.vault.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "vault is disabled; backend-generated SSH identities require a master key".to_owned(),
+        )
+    })
+}
+
+/// Map a [`RepositoryError`] from `ssh_identities().create(...)` to a
+/// typed [`ApiError`]. The unique index on
+/// `(owner_id, fingerprint_sha256)` (`ssh_identities_owner_fingerprint_key`)
+/// is the source of truth for "this caller already owns a key with this
+/// fingerprint" — both the generate and the import routes hit it; on
+/// import the 409 is the routine duplicate-paste case, on generate it
+/// is essentially unreachable (a fresh keypair colliding with an
+/// existing fingerprint is astronomically unlikely) but the mapping is
+/// shared so the wire shape is uniform.
+///
+/// Anything else flows through the generic `RepositoryError → ApiError`
+/// path (e.g. a Database driver failure turns into a 500).
+fn map_create_repository_error(err: RepositoryError) -> ApiError {
+    if let RepositoryError::Conflict {
+        entity: ENTITY,
+        constraint,
+    } = &err
+    {
+        if constraint == "ssh_identities_owner_fingerprint_key" {
+            return ApiError::Conflict {
+                entity: ENTITY,
+                reason: Some("duplicate_fingerprint"),
+            };
+        }
+    }
+    err.into()
 }
 
 async fn list(
@@ -194,6 +323,53 @@ async fn delete_by_id(
     write_ssh_identity_delete_audit(&state, user_id, &identity).await?;
     state.db.ssh_identities().delete(id, user_id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Build the public-metadata-only payload for an `ssh_identity_created`
+/// audit event and append it to `audit_events`.
+///
+/// **Payload contract (security-critical):** the JSON object MUST
+/// contain only public metadata. It MUST NOT contain
+/// `encrypted_private_key`, `public_key` bytes, plaintext PEM, vault
+/// internals, raw russh / parser / DB error text, peer banners, or the
+/// `client_info` blob from `terminal_session_attachments`. The
+/// sentinel-based redaction tests in the API test crate
+/// (`AUDIT_FORBIDDEN_SUBSTRINGS`) guard this invariant for both the
+/// generate-route emission (`source: "generated"`) and the
+/// import-route emission (`source: "imported"`).
+///
+/// **Failure policy:** fail-closed (mirror of
+/// `write_ssh_identity_delete_audit`). A failed audit insert surfaces
+/// as `RepositoryError → ApiError::Internal`. The audit append happens
+/// AFTER the DB row is created (mirroring the generate-path
+/// precedent); on a route retry the unique-fingerprint constraint
+/// would refuse the second insert with a clean 409, so a duplicate
+/// audit row from a routine retry cannot accumulate.
+async fn write_ssh_identity_create_audit(
+    state: &AppState,
+    actor_id: UserId,
+    identity: &SshIdentity,
+    source: AuditSource,
+) -> Result<(), ApiError> {
+    let payload = json!({
+        "ssh_identity_id": identity.id,
+        "name": identity.name.as_str(),
+        "key_type": identity.key_type,
+        "fingerprint_sha256": identity.fingerprint_sha256,
+        "created_at": identity.created_at,
+        "source": source.as_str(),
+    });
+    state
+        .db
+        .audit_events()
+        .create(CreateAuditEvent {
+            actor_id: Some(actor_id),
+            kind: AuditEventKind::SshIdentityCreated,
+            payload,
+            remote_addr: None,
+        })
+        .await?;
+    Ok(())
 }
 
 /// Build the public-metadata-only payload for an `ssh_identity_deleted`

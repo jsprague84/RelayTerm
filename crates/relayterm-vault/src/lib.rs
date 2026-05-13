@@ -98,4 +98,15 @@ pub enum VaultError {
     /// Currently only Ed25519 is supported.
     #[error("ssh key type not supported by vault: {0}")]
     UnsupportedKeyType(&'static str),
+
+    /// Imported PEM bytes parsed but the format is not one the vault accepts.
+    /// `reason` is a closed, short, operator-safe discriminant — never raw
+    /// parser text. Today's reasons: `"encrypted"` (passphrase-protected),
+    /// `"malformed"` (PEM envelope was valid but the openssh-key-v1 body
+    /// failed to parse). The third reason `"not_a_private_key"` is reserved
+    /// for a future surface that detects public-key-only material; the v1
+    /// DTO rejects missing `BEGIN OPENSSH PRIVATE KEY` headers before the
+    /// vault is ever called, so the variant is unreachable today.
+    #[error("ssh key format not supported by vault: {reason}")]
+    UnsupportedFormat { reason: &'static str },
 }

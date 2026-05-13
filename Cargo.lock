@@ -3618,6 +3618,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "ssh-key",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",

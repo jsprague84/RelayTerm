@@ -4,10 +4,14 @@
     deleteSshIdentity,
     describeCreateSshIdentityError,
     describeDeleteSshIdentityError,
+    describeImportSshIdentityError,
     describeUpdateSshIdentityError,
+    importSshIdentity,
     listSshIdentities,
     publicKeyPreview,
     updateSshIdentity,
+    MAX_IDENTITY_NAME_LEN,
+    MAX_PRIVATE_KEY_OPENSSH_BYTES,
     SUPPORTED_GENERATION_KEY_TYPES,
     type SshIdentity,
     type SshKeyType,
@@ -48,10 +52,42 @@
    */
   let selectedIdentityId = $state<string | null>(null);
 
-  let panelOpen = $state(false);
+  /**
+   * Which create-style panel is currently open. The "Generate" and
+   * "Import" panels are mutually exclusive — opening one closes the
+   * other so there is at most one form-with-secret-material on screen.
+   */
+  type CreatePanel = "none" | "generate" | "import";
+  let activePanel = $state<CreatePanel>("none");
+  let panelOpen = $derived(activePanel === "generate");
+  let importPanelOpen = $derived(activePanel === "import");
+
   let formName = $state("");
   let formKeyType = $state<SshKeyType>(SUPPORTED_GENERATION_KEY_TYPES[0]);
   let generate = $state<GenerateState>({ kind: "idle" });
+
+  // ----------------------------------------------------------------
+  // Import-panel state.
+  //
+  // The pasted private-key text is held in `pendingImportPrivateKey`
+  // and is cleared:
+  //   - on successful import (BEFORE the success card is shown);
+  //   - on every failure branch (validation / HTTP / transport / parse);
+  //   - on panel close.
+  //
+  // The string is bound to a `<textarea>`. It is NEVER persisted to
+  // localStorage / sessionStorage / `data-*` / a store — the only
+  // durable form is the encrypted blob the backend produces.
+  // ----------------------------------------------------------------
+  type ImportState =
+    | { kind: "idle" }
+    | { kind: "submitting" }
+    | { kind: "success"; identity: SshIdentity }
+    | { kind: "error"; summary: string };
+
+  let importFormName = $state("");
+  let pendingImportPrivateKey = $state("");
+  let importState = $state<ImportState>({ kind: "idle" });
 
   async function load() {
     view = { kind: "loading" };
@@ -301,7 +337,8 @@
   }
 
   function openPanel() {
-    panelOpen = true;
+    if (importState.kind === "submitting") return;
+    activePanel = "generate";
     if (generate.kind !== "submitting") {
       generate = { kind: "idle" };
     }
@@ -309,10 +346,74 @@
 
   function closePanel() {
     if (generate.kind === "submitting") return;
-    panelOpen = false;
+    activePanel = "none";
     formName = "";
     formKeyType = SUPPORTED_GENERATION_KEY_TYPES[0];
     generate = { kind: "idle" };
+  }
+
+  function openImportPanel() {
+    if (generate.kind === "submitting") return;
+    activePanel = "import";
+    if (importState.kind !== "submitting") {
+      importState = { kind: "idle" };
+    }
+  }
+
+  function closeImportPanel() {
+    if (importState.kind === "submitting") return;
+    activePanel = "none";
+    importFormName = "";
+    // Always wipe the PEM string when leaving the panel — it must NOT
+    // outlive the form scope.
+    pendingImportPrivateKey = "";
+    importState = { kind: "idle" };
+  }
+
+  function appendImportedToView(identity: SshIdentity) {
+    if (view.kind === "ready") {
+      const exists = view.identities.some((i) => i.id === identity.id);
+      view = exists
+        ? view
+        : { kind: "ready", identities: [identity, ...view.identities] };
+    } else {
+      void load();
+    }
+  }
+
+  async function submitImport(event: Event) {
+    event.preventDefault();
+    if (importState.kind === "submitting") return;
+    // Snapshot the pasted PEM into a local variable, then immediately
+    // clear the bound state. The remainder of this function references
+    // only the local snapshot — the textarea is empty for the rest of
+    // the request lifecycle. Mirrors the redaction discipline the
+    // backend keeps for the in-memory plaintext.
+    const pem = pendingImportPrivateKey;
+    const name = importFormName;
+    pendingImportPrivateKey = "";
+    importState = { kind: "submitting" };
+    const result = await importSshIdentity({
+      name,
+      private_key_openssh: pem,
+    });
+    if (!result.ok) {
+      // describeImportSshIdentityError is the only redaction-safe
+      // formatter — never echo `result.error.message` directly. The
+      // textarea is already cleared above; the formatter output never
+      // contains PEM bytes either.
+      importState = {
+        kind: "error",
+        summary: describeImportSshIdentityError(result.error),
+      };
+      return;
+    }
+    appendImportedToView(result.identity);
+    // Clear the name too on success — the operator typically wants a
+    // fresh entry next time. (Generate keeps the name for retry; import
+    // is a one-shot per imported key, so wiping is the right default.)
+    importFormName = "";
+    importState = { kind: "success", identity: result.identity };
   }
 
   async function submitGenerate(event: Event) {
@@ -384,6 +485,17 @@
         data-testid="identities-generate-open"
       >
         Generate SSH identity
+      </button>
+    {/if}
+    {#if !importPanelOpen}
+      <button
+        type="button"
+        class="rounded-md border border-sky-800/60 bg-sky-900/20 px-3 py-1.5 text-sm text-sky-100 transition hover:border-sky-700 hover:bg-sky-900/40"
+        onclick={openImportPanel}
+        data-testid="identities-import-open"
+      >
+        <span class="hidden sm:inline">Import SSH identity</span>
+        <span class="sm:hidden">Import</span>
       </button>
     {/if}
   </div>
@@ -550,6 +662,194 @@
               <span class="text-[11px] text-emerald-200/60">
                 Append to the target server's
                 <code class="font-mono">~/.ssh/authorized_keys</code>.
+              </span>
+            </div>
+          </div>
+        </article>
+      {/if}
+    </article>
+  {/if}
+
+  {#if importPanelOpen}
+    <article
+      class="flex flex-col gap-4 rounded-lg border border-sky-900/40 bg-sky-950/10 p-6"
+      data-testid="identities-import-panel"
+    >
+      <header class="flex items-baseline justify-between gap-2">
+        <h3 class="text-sm font-semibold text-zinc-100">
+          Import an existing SSH identity
+        </h3>
+        <button
+          type="button"
+          class="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800 disabled:opacity-50"
+          onclick={closeImportPanel}
+          disabled={importState.kind === "submitting"}
+          data-testid="identities-import-close"
+        >
+          Close
+        </button>
+      </header>
+
+      <p
+        class="rounded-md border border-sky-900/40 bg-sky-950/20 px-3 py-2 text-xs text-sky-200/80"
+        data-testid="identities-import-honesty"
+      >
+        The private key is sent to your RelayTerm server over HTTPS and
+        encrypted into the server-side vault. It is not stored in the
+        browser. The textarea is cleared on success and on every
+        failure.
+      </p>
+
+      <ul class="flex flex-col gap-1 text-xs text-zinc-400">
+        <li>
+          Only OpenSSH-format Ed25519 private keys without a passphrase
+          are supported in this release.
+        </li>
+        <li>
+          Encrypted (passphrase-protected) keys, RSA / ECDSA, file
+          pickers, and <code class="font-mono text-zinc-300">ssh-copy-id</code>
+          automation are explicit later slices.
+        </li>
+        <li>
+          The imported public key adopts the supplied name as its
+          OpenSSH comment so the
+          <code class="font-mono text-zinc-300">authorized_keys</code>
+          line on the target host stays self-identifying.
+        </li>
+      </ul>
+
+      <form
+        class="flex flex-col gap-3"
+        onsubmit={submitImport}
+        data-testid="identities-import-form"
+      >
+        <label class="flex flex-col gap-1 text-sm text-zinc-200">
+          <span class="text-xs uppercase tracking-wide text-zinc-400">
+            Name
+          </span>
+          <input
+            type="text"
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-700 focus:outline-none disabled:opacity-50"
+            bind:value={importFormName}
+            placeholder="e.g. workstation-imported"
+            maxlength={MAX_IDENTITY_NAME_LEN}
+            disabled={importState.kind === "submitting"}
+            data-testid="identities-import-name"
+            autocomplete="off"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+            inputmode="text"
+            required
+          />
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm text-zinc-200">
+          <span class="text-xs uppercase tracking-wide text-zinc-400">
+            OpenSSH private key (PEM)
+          </span>
+          <textarea
+            class="min-h-[10rem] w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-700 focus:outline-none disabled:opacity-50"
+            bind:value={pendingImportPrivateKey}
+            rows="10"
+            placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"}
+            maxlength={MAX_PRIVATE_KEY_OPENSSH_BYTES}
+            disabled={importState.kind === "submitting"}
+            data-testid="identities-import-private-key"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            inputmode="text"
+            required
+          ></textarea>
+          <span class="text-[11px] text-zinc-500">
+            Paste the full file contents, including the
+            <code class="font-mono">BEGIN</code> and
+            <code class="font-mono">END</code> markers.
+          </span>
+        </label>
+
+        <div class="flex items-center gap-2">
+          <button
+            type="submit"
+            class="rounded-md border border-sky-700 bg-sky-800 px-3 py-1.5 text-sm text-sky-50 transition hover:border-sky-600 hover:bg-sky-700 disabled:opacity-50"
+            disabled={importState.kind === "submitting" ||
+              importFormName.trim().length === 0 ||
+              pendingImportPrivateKey.length === 0}
+            data-testid="identities-import-submit"
+          >
+            {#if importState.kind === "submitting"}
+              Importing…
+            {:else}
+              <span class="hidden sm:inline">Import SSH identity</span>
+              <span class="sm:hidden">Import</span>
+            {/if}
+          </button>
+          {#if importState.kind === "submitting"}
+            <span class="text-xs text-zinc-400">
+              Encrypting into the backend vault…
+            </span>
+          {/if}
+        </div>
+      </form>
+
+      {#if importState.kind === "error"}
+        <p
+          class="rounded-md border border-rose-900/40 bg-rose-950/20 px-3 py-2 text-xs text-rose-200/80"
+          data-testid="identities-import-error"
+        >
+          {importState.summary}
+        </p>
+      {:else if importState.kind === "success"}
+        {@const imported = importState.identity}
+        <article
+          class="flex flex-col gap-2 rounded-md border border-sky-900/50 bg-sky-950/30 p-4 text-sm text-sky-50"
+          data-testid="identities-import-success"
+        >
+          <header class="flex items-baseline justify-between gap-2">
+            <span class="text-sm font-semibold">
+              Imported <span data-testid="identities-import-success-name"
+                >{imported.name}</span
+              >
+            </span>
+            <span
+              class="font-mono text-xs uppercase tracking-wide text-sky-200/80"
+              data-testid="identities-import-success-key-type"
+            >
+              {imported.key_type}
+            </span>
+          </header>
+          <span
+            class="font-mono text-xs text-sky-100/80"
+            data-testid="identities-import-success-fingerprint"
+          >
+            {imported.fingerprint_sha256}
+          </span>
+          <span class="text-xs text-sky-200/70">
+            Created
+            <time class="font-mono">{imported.created_at}</time>
+          </span>
+          <div class="flex flex-col gap-1">
+            <span class="text-xs uppercase tracking-wide text-sky-200/70">
+              Public key
+            </span>
+            <pre
+              class="overflow-x-auto rounded-md border border-sky-900/40 bg-zinc-950/60 p-3 font-mono text-[11px] text-sky-50/90"
+              data-testid="identities-import-success-public-key"><code
+                >{imported.public_key}</code
+              ></pre>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="rounded-md border border-sky-700 bg-sky-800 px-2.5 py-1 text-xs text-sky-50 transition hover:border-sky-600 hover:bg-sky-700"
+                onclick={() => copyPublicKey(imported)}
+                data-testid="identities-import-success-copy"
+              >
+                {copyLabel(copy[imported.id])}
+              </button>
+              <span class="text-[11px] text-sky-200/60">
+                The private key never reaches the browser. Only the
+                public key is renderable here.
               </span>
             </div>
           </div>
@@ -1032,8 +1332,9 @@
     class="rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80"
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
-    Private-key import and password bootstrap /
-    <code class="font-mono">ssh-copy-id</code> automation are deliberate
-    later slices. This view never renders or copies private material.
+    Passphrase-protected key import, RSA / ECDSA, file pickers, and
+    password bootstrap / <code class="font-mono">ssh-copy-id</code>
+    automation are deliberate later slices. This view never renders or
+    copies private material.
   </p>
 </section>

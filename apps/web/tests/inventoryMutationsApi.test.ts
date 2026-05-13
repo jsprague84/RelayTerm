@@ -29,8 +29,12 @@ import {
 import {
   deleteSshIdentity,
   describeDeleteSshIdentityError,
+  describeImportSshIdentityError,
   describeUpdateSshIdentityError,
+  importSshIdentity,
+  MAX_PRIVATE_KEY_OPENSSH_BYTES,
   updateSshIdentity,
+  validateImportSshIdentityRequest,
   validateUpdateSshIdentityRequest,
 } from "../src/lib/api/sshIdentities.js";
 
@@ -447,5 +451,317 @@ describe("describeUpdateServerProfileError", () => {
       message: `server_profile some-unique-conflict ${SENTINEL_OPERATOR}`,
     });
     expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SSH identity import (POST /api/v1/ssh-identities/import)
+//
+// Throwaway test fixtures only — the PEM strings here are minimal
+// shape-valid placeholders. The redaction sentinels (`SENTINEL_PEM`,
+// `SENTINEL_OPERATOR`) prove that PEM bytes and wire `message` text
+// never reach the typed result envelope or the formatter output.
+// ---------------------------------------------------------------------------
+
+const SENTINEL_PEM = "RT-SENTINEL-IMPORT-PEM-MARKER";
+
+/** Shape-valid PEM body the local validator accepts. The backend
+ * parser would reject this — the helper test never runs the real
+ * parser; it only asserts the wire / formatter contracts. */
+function pemFixture(extra = ""): string {
+  return `-----BEGIN OPENSSH PRIVATE KEY-----\n${SENTINEL_PEM}${extra}\n-----END OPENSSH PRIVATE KEY-----\n`;
+}
+
+describe("validateImportSshIdentityRequest", () => {
+  it("accepts a shape-valid pasted PEM", () => {
+    const v = validateImportSshIdentityRequest({
+      name: "imported",
+      private_key_openssh: pemFixture(),
+    });
+    expect(v.ok).toBe(true);
+    if (v.ok) {
+      expect(v.body.name).toBe("imported");
+      expect(v.body.private_key_openssh).toContain(SENTINEL_PEM);
+    }
+  });
+
+  it("rejects a blank name", () => {
+    const v = validateImportSshIdentityRequest({
+      name: "  ",
+      private_key_openssh: pemFixture(),
+    });
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toBe("missing_name");
+  });
+
+  it("rejects a missing PEM", () => {
+    const v = validateImportSshIdentityRequest({
+      name: "imported",
+      private_key_openssh: "",
+    });
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toBe("missing_private_key");
+  });
+
+  it("rejects an oversized PEM", () => {
+    const v = validateImportSshIdentityRequest({
+      name: "imported",
+      private_key_openssh: "A".repeat(MAX_PRIVATE_KEY_OPENSSH_BYTES + 1),
+    });
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toBe("private_key_too_long");
+  });
+
+  it("rejects a non-ASCII PEM", () => {
+    const v = validateImportSshIdentityRequest({
+      name: "imported",
+      private_key_openssh: `${pemFixture()}ÿ`,
+    });
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toBe("private_key_not_ascii");
+  });
+
+  it("rejects a PEM with no OpenSSH header (e.g. a public-key paste)", () => {
+    const v = validateImportSshIdentityRequest({
+      name: "imported",
+      private_key_openssh: "ssh-ed25519 AAAA-not-a-private-key",
+    });
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toBe("private_key_missing_pem_header");
+  });
+});
+
+describe("importSshIdentity", () => {
+  it("POSTs the right endpoint with the validated body", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(201, {
+        id: "iid",
+        name: "imported",
+        key_type: "ed25519",
+        public_key: "ssh-ed25519 AAAA imported",
+        fingerprint_sha256: "SHA256:abc",
+        created_at: "2026-05-12T00:00:00Z",
+        last_used_at: null,
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "imported", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(result.ok).toBe(true);
+    const [endpoint, init] = fetchImpl.mock.calls[0];
+    expect(endpoint).toBe("/api/v1/ssh-identities/import");
+    expect((init as RequestInit).method).toBe("POST");
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.name).toBe("imported");
+    expect(body.private_key_openssh).toContain(SENTINEL_PEM);
+  });
+
+  it("does not echo private-key material in the parsed DTO", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(201, {
+        id: "iid",
+        name: "imported",
+        key_type: "ed25519",
+        public_key: "ssh-ed25519 AAAA imported",
+        fingerprint_sha256: "SHA256:abc",
+        created_at: "2026-05-12T00:00:00Z",
+        last_used_at: null,
+        // Hostile fields the parser must drop.
+        encrypted_private_key: SENTINEL_PEM,
+        private_key: SENTINEL_PEM,
+        private_key_openssh: SENTINEL_PEM,
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "imported", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(result.ok).toBe(true);
+    const raw = JSON.stringify(result);
+    expect(raw).not.toContain(SENTINEL_PEM);
+    expect(raw).not.toContain("encrypted_private_key");
+    expect(raw).not.toContain("private_key");
+  });
+
+  it("classifies a 409 ssh_identity-duplicate-fingerprint", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(409, {
+        error: { code: "conflict", message: "ssh_identity duplicate_fingerprint" },
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "dup", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    if (!result.ok && result.error.kind === "http") {
+      expect(result.error.reason).toBe("duplicate_fingerprint");
+    } else {
+      throw new Error("expected http duplicate_fingerprint reason");
+    }
+  });
+
+  it("classifies a 400 unsupported_key_format encrypted", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: { code: "invalid_input", message: "unsupported_key_format encrypted" },
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "enc", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    if (!result.ok && result.error.kind === "http") {
+      expect(result.error.reason).toBe("unsupported_format_encrypted");
+    } else {
+      throw new Error("expected unsupported_format_encrypted reason");
+    }
+  });
+
+  it("classifies a 400 unsupported_key_format malformed", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: { code: "invalid_input", message: "unsupported_key_format malformed" },
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "bad", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    if (!result.ok && result.error.kind === "http") {
+      expect(result.error.reason).toBe("unsupported_format_malformed");
+    } else {
+      throw new Error("expected unsupported_format_malformed reason");
+    }
+  });
+
+  it('classifies a 400 unsupported key_type "rsa"', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: { code: "invalid_input", message: 'unsupported key_type "rsa"' },
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "rsa", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    if (!result.ok && result.error.kind === "http") {
+      expect(result.error.reason).toBe("unsupported_key_type");
+    } else {
+      throw new Error("expected unsupported_key_type reason");
+    }
+  });
+
+  it("does not echo PEM bytes on a transport failure", async () => {
+    const fetchImpl = vi.fn().mockRejectedValueOnce(
+      new Error(`transport oops ${SENTINEL_OPERATOR}`),
+    );
+    const result = await importSshIdentity(
+      { name: "x", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(result.ok).toBe(false);
+    const raw = JSON.stringify(result);
+    expect(raw).not.toContain(SENTINEL_PEM);
+  });
+
+  it("collapses a non-JSON response to malformed_response without echoing PEM", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      new Response("not json", {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const result = await importSshIdentity(
+      { name: "x", private_key_openssh: pemFixture() },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.kind).toBe("malformed_response");
+    }
+    expect(JSON.stringify(result)).not.toContain(SENTINEL_PEM);
+  });
+});
+
+describe("describeImportSshIdentityError", () => {
+  it("guides operator past a duplicate-fingerprint 409", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "http",
+      status: 409,
+      code: "conflict",
+      message: `ssh_identity duplicate_fingerprint ${SENTINEL_OPERATOR}`,
+      reason: "duplicate_fingerprint",
+    });
+    expect(summary).toMatch(/already imported/i);
+    expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+
+  it("explains encrypted-key rejection without echoing wire message", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "http",
+      status: 400,
+      code: "invalid_input",
+      message: `unsupported_key_format encrypted ${SENTINEL_OPERATOR}`,
+      reason: "unsupported_format_encrypted",
+    });
+    expect(summary).toMatch(/passphrase/i);
+    expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+
+  it("explains malformed-PEM rejection without echoing wire message", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "http",
+      status: 400,
+      code: "invalid_input",
+      message: `unsupported_key_format malformed ${SENTINEL_OPERATOR}`,
+      reason: "unsupported_format_malformed",
+    });
+    expect(summary).toMatch(/not a valid OpenSSH private key/i);
+    expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+
+  it("explains RSA / non-Ed25519 rejection without echoing wire message", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "http",
+      status: 400,
+      code: "invalid_input",
+      message: `unsupported key_type "rsa" ${SENTINEL_OPERATOR}`,
+      reason: "unsupported_key_type",
+    });
+    expect(summary).toMatch(/Ed25519/);
+    expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+
+  it("flat-maps a CSRF 403 to safe browser-policy copy", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "http",
+      status: 403,
+      code: "csrf_origin_mismatch",
+      message: `forbidden ${SENTINEL_OPERATOR}`,
+      reason: null,
+    });
+    expect(summary).toMatch(/browser security policy/i);
+    expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+
+  it("never echoes Error.message on a transport failure", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "transport",
+      message: `boom ${SENTINEL_OPERATOR}`,
+    });
+    expect(summary).toBe("Cannot import SSH identity: transport error");
+    expect(summary).not.toContain(SENTINEL_OPERATOR);
+  });
+
+  it("renders a stable 503 vault-disabled summary", () => {
+    const summary = describeImportSshIdentityError({
+      kind: "http",
+      status: 503,
+      code: "service_unavailable",
+      message: "service unavailable",
+      reason: null,
+    });
+    expect(summary).toMatch(/vault is not configured/i);
   });
 });
