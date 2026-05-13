@@ -42,6 +42,77 @@ implementation slice lands. **xterm is and remains the
 production compatibility baseline and the default renderer**
 until a candidate clears the Gate 2 promotion criteria below.
 
+### 2026-05-13 · ghostty-web renderer-evaluation status (docs-only)
+
+A docs-only evaluation slice on 2026-05-13 attempted to carry the
+ghostty-web experimental renderer through the renderer evaluation
+runbook (`apps/web/e2e/SMOKE.md` § "D. Renderer evaluation smoke")
+and the input-path taxonomy in
+[`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md), then
+compare it against the 2026-05-13 xterm production-baseline smoke.
+The slice stopped at the gate check below before running any
+matrix row, on the rule already stated in `apps/web/e2e/SMOKE.md`
+§ "Renderer path confirmation": "Until [a stable production-shell
+selector] exists, experimental renderers are exercised through the
+dev lab only … A dev-lab pass is **not** a production renderer
+pass."
+
+Findings on this date, **without source changes**:
+
+- **Where the adapter is wired today.** `@relayterm/terminal-ghostty-web`
+  is reachable only through the dev-only live terminal lab —
+  `apps/web/src/lib/dev/XtermLiveTerminalLab.svelte` constructs the
+  adapter at `new GhosttyWebRenderer(themed)` and exposes a
+  `data-testid="renderer-option-ghostty-web"` radio in its renderer
+  picker. `DevTerminalWorkbench` (the lab's host) is mounted only
+  inside the `import.meta.env.DEV` branch of `App.svelte`. The
+  production-shell isolation rule
+  ("`apps/web/src/lib/app/**` cannot import from `lib/dev/` or any
+  experimental renderer adapter package") is pinned by
+  `apps/web/tests/appShellIsolation.test.ts`.
+- **Production status.** **Production-excluded by both gates** — the
+  `import.meta.env.DEV` constant inlines as `false` in production
+  builds, Rollup eliminates the dev branch, and the
+  `appShellIsolation` test forbids any production-shell import of
+  the experimental adapter packages. ghostty-web's inlined WASM
+  data URL is tree-shaken out of the production `apps/web` bundle.
+- **Selection surface today, without code changes.** Only the
+  **local Vite dev server** (`pnpm --filter @relayterm/web dev`,
+  or equivalent), which serves the dev-mode build with the dev
+  lab mounted. The staging stack, the production stack, and the
+  packaged Tauri shells all consume the production build and
+  cannot select ghostty-web. A `tauri dev` against a local Vite
+  dev server could in principle reach the dev lab inside the
+  Tauri WebView, but that is a different surface (WebKitGTK on
+  Linux / WebView2 on Windows / Android WebView) and is out of
+  scope for the first ghostty-web pass per the "Surfaces" list
+  below.
+- **Fairness vs. the 2026-05-13 xterm production-baseline smoke.**
+  The xterm baseline ran against the **production shell**
+  (`apps/web/src/lib/app/terminal/ProductionTerminal.svelte`), which
+  drives the production paste-safety pipeline, the production
+  detach / reconnect buttons, the production audit-event surface,
+  and the production-shell selector hooks. A local-dev-lab
+  ghostty-web pass would run through the lab UI — different
+  attach/detach controls, a different event log, no production
+  paste-policy panels, no production telemetry surface — so any
+  side-by-side reading would compare two **surfaces** as much as
+  two renderers. Recording dev-lab ghostty-web results next to
+  the xterm production-baseline entry would overstate parity, so
+  this slice deliberately does **not** run that smoke.
+- **Promotion posture.** ghostty-web remains **experimental** and
+  is **not promoted**. The production default remains xterm.
+  Gate 1 and Gate 2 criteria are unchanged. No backend protocol,
+  session, orchestrator, `terminal-core`, production-shell, CI,
+  or deploy file was touched by this slice.
+
+The evaluation cannot move further without the Gate 1 production-
+shell experimental-renderer selector that the runbook's "Renderer
+path confirmation" step assumes. The recommended next
+implementation slice is captured under [§ "Smoke plan" →
+"Recommended next implementation slice"](#recommended-next-implementation-slice)
+below.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
@@ -336,8 +407,106 @@ The dev lab already exposes the renderer radio hooks
 (`renderer-option-xterm`, `renderer-option-ghostty-web`,
 `renderer-option-restty`, `renderer-option-wterm`). The Gate 1
 slice for each candidate adds the matching production-shell
-selector under a stable name (TBD when the production renderer-
-swap UX lands; not in this slice).
+selector under a stable name; the concrete next slice that lands
+that selector is captured in [§ "Recommended next implementation
+slice"](#recommended-next-implementation-slice) below — that slice
+is not part of the current renderer-evaluation plan slice.
+
+### Recommended next implementation slice
+
+(Suggested branch: `feat/experimental-renderer-production-selector`
+— name is illustrative; the slice can pick its own.) Concrete next
+slice to unblock production-side renderer smokes for the
+ghostty-web / restty / wterm experimental adapters on the same
+surface the 2026-05-13 xterm baseline smoke established. Surfaced
+here so the renderer-evaluation track has a named successor; the
+slice itself is **not** part of this docs-only plan slice and is
+**not** authorised by this entry — it is described so the next
+deliberate slice has a starting point.
+
+**Goal.** Add a production-shell renderer selector that exposes
+the experimental renderers (ghostty-web, restty, wterm) **only when
+explicitly opted in**, so a future operator can run the renderer
+evaluation runbook (`apps/web/e2e/SMOKE.md` § "D. Renderer
+evaluation smoke") against each experimental candidate on the
+**same surface** as the 2026-05-13 xterm production-baseline smoke
+(`docs/deployment/vps-staging-smoke.md` § "2026-05-13 · Xterm
+production-baseline renderer smoke"). The selector is the missing
+piece per the runbook's "Renderer path confirmation" section.
+
+**Slice boundary (in scope).**
+
+- A production-shell experimental-renderer selector behind an
+  **explicit experimental / local-only / operator-enabled gate**.
+  Concrete mechanism is for the implementation slice to pick from
+  e.g. a build-time env flag, an operator-set runtime config row,
+  a hidden URL parameter, or a hidden settings switch — this entry
+  proposes the boundary, not the mechanism.
+- **xterm stays the production default.** The selector is opt-in,
+  never changes the default, and closing or clearing the selector
+  returns the production shell to xterm.
+- **Do not promote ghostty-web** (or restty or wterm). Gate 1
+  (production opt-in) is the ceiling for this next slice; Gate 2
+  (default flip) is a separate, later, deliberate slice gated on
+  the criteria already in [§ "Promotion criteria"](#promotion-criteria).
+- **Do not change backend protocol, session, or orchestrator
+  behaviour.** The wire `Output` / `Input` envelope, the replay
+  ring, the detach TTL, `terminal-core`, and the renderer-neutral
+  seam stay byte-identical. Rule (1) of [§ "Non-negotiable
+  architecture rules"](#non-negotiable-architecture-rules) is
+  load-bearing for this next slice.
+- **Do not expose the experimental renderers to ordinary users.**
+  The selector MUST be hidden by default — the default UX must
+  not show, hint at, or document a renderer-switch affordance in
+  any user-visible surface unless the operator gate is explicitly
+  flipped.
+- **Selector usable from the staging smoke surface.** The Gate 1
+  state of the selector (operator gate flipped, or however the
+  slice models opt-in) MUST be reachable from a staging smoke
+  context so the renderer evaluation runbook can drive each
+  candidate end-to-end against the production shell. The
+  data-testid hook is `data-testid="renderer-option-<id>"` to
+  match the existing dev-lab selectors.
+- **Dynamic import for each experimental adapter.** Each adapter
+  remains a dynamic `import()` gated by the selector being
+  explicitly enabled, so the default-renderer bundle does not
+  regress (the inlined WASM payloads stay tree-shaken on the
+  common path).
+
+**Non-goals (explicit out-of-scope for the next slice).**
+
+- No backend / WebSocket protocol changes (rule (1) above).
+- No renderer-specific UI inside `apps/web/src/lib/app/` beyond
+  the selector itself and the matching `TerminalRenderer`-bridged
+  workspace.
+- No persistent per-user / per-device renderer preference; the
+  current "Explicitly deferred" entry on that row stays deferred.
+- No default flip away from xterm (Gate 2 belongs to its own
+  slice).
+- No promotion decision. One production-side renderer smoke per
+  candidate is a data point, **not** a Gate 2 default flip —
+  Gate 2 still requires the soak window and per-surface coverage
+  already specified.
+- No change to the runbook's posture that a dev-lab pass is not a
+  production-side renderer pass; the selector unlocks the
+  production-side path, it does not retroactively reclassify
+  earlier dev-lab passes.
+
+**After the slice lands.**
+
+- The runbook's "Renderer path confirmation" step can identify
+  ghostty-web (and restty, wterm) on the production shell at
+  staging instead of marking it `deferred — renderer not
+  identified`.
+- A separate docs / smoke slice can run the renderer evaluation
+  matrix against ghostty-web on the production shell and record a
+  peer entry under `docs/deployment/vps-staging-smoke.md` § with
+  matrix results comparable, row-for-row, to the 2026-05-13 xterm
+  production-baseline entry.
+- ghostty-web (and the other experimental adapters) remain
+  experimental and unpromoted until and unless [§ "Promotion
+  criteria" → Gate 2](#gate-2--production-opt-in--production-default)
+  is met as its own deliberate slice.
 
 ## Explicitly deferred
 
