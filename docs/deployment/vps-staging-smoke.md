@@ -5809,6 +5809,429 @@ experimental and dev-lab-only.
 
 ---
 
+### 2026-05-13 · Ghostty-web production-shell renderer smoke (CSP-blocked; xterm fallback verified)
+
+**Date.** 2026-05-13 20:30 UTC – 21:02 UTC (≈32 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** `git.js-node.cc/jsprague/relayterm-web:main`
+(image `sha256:d5fa038b…`, built 2026-05-13 20:27 UTC) +
+`git.js-node.cc/jsprague/relayterm-backend:main` (image
+`sha256:9ab478a3…`, built 2026-05-13 20:26 UTC). Both
+were pulled and force-recreated at the start of this
+slice (`docker compose up -d --no-deps --force-recreate
+--pull never relayterm-web relayterm-backend`) so the
+running web bundle includes
+`a9f3ed5 feat(web): add experimental renderer selector`.
+Postgres `postgres:17-alpine` was left untouched
+(`Up 4 days` before and after the slice).
+**Branch.** `docs/ghostty-web-production-renderer-smoke`
+off `main` (docs-only slice; no source / CI / deploy /
+schema changes).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900. Auth: existing
+`staging+throwaway-20260509173230@example.com` cookie
+session, no re-login.
+
+**Goal.** Carry the ghostty-web experimental adapter
+through the same production-shell evaluation matrix as
+the 2026-05-13 xterm production-baseline entry above,
+using the gated experimental renderer selector that
+landed on the same date in
+`apps/web/src/lib/app/views/SettingsView.svelte` +
+`apps/web/src/lib/app/terminal/rendererLoader.ts`. Slice
+boundaries: no source / schema / API / auth / CSRF / CORS
+/ WebSocket-protocol / Tauri / CI / deploy file changes,
+no renderer promotion. xterm is and remains the
+production compatibility baseline and the default
+renderer.
+
+**Renderer path (gated, operator-opt-in).** Production
+shell exposes the experimental renderer evaluation card
+at `[data-testid="settings-experimental-renderer"]`.
+The card and gate toggle are always rendered; the
+warning copy, renderer radio group, and effective-
+renderer diagnostic reveal only when the gate is on.
+Pre-gate state: `data-renderer-gate="off"`. After
+clicking `settings-experimental-renderer-toggle`,
+selecting `renderer-option-ghostty-web`, and clicking
+`settings-apply`:
+- `localStorage["relayterm.terminal-settings.v1"]`
+  carries `rendererId="ghostty-web"` and
+  `experimentalRendererEvaluationEnabled=true`.
+- `settings-renderer-effective` reads "Effective
+  renderer on next session: ghostty-web experimental."
+- `settings-status-saved` reads "Saved locally. Applies
+  to the next terminal session."
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-ghostty-web-smoke-ssh`, attached only
+to the staging Compose network
+`relayterm-staging_relayterm-staging-internal` with DNS
+alias `ghostty-web-smoke-host` resolving to
+`172.21.0.5`. **No host port was published**
+(`docker port` returned empty; verified). `USER_NAME=smoke`,
+`SUDO_ACCESS=false`, `PASSWORD_ACCESS=false`,
+`PUBLIC_KEY=<the RelayTerm-generated OpenSSH line>`.
+The container was `docker stop && docker rm`'d during
+cleanup.
+
+**Identity path.** Generated (backend-side keypair
+generation). One `POST /api/v1/ssh-identities` via the
+`identities-generate-submit` form returned an
+`SshIdentityResponse` with `key_type=ed25519` and
+fingerprint
+`SHA256:PJk5xEIrd3kOOdbr5OwcVqMeZHksgItWq2hW570k3zw`
+(identity UUID `c85ffbe8-ef2a-4ce5-9e1b-efcf25f6f7cb`).
+The public-key OpenSSH line was extracted via a single
+`browser_evaluate` call that wrote the value to a
+local file (`ghostty-web-pubkey.txt`); the file was
+piped through `printf %q` into the `docker run`
+invocation on `cloud-edge` and **shredded immediately
+after** the container started. No PEM, no base64
+sidecar, no private-key bytes touched the operator
+filesystem at any point.
+
+**Host + profile create.** `Ghostty-Web-Smoke-Host`
+(display name) / `ghostty-web-smoke-host` (hostname) /
+`2222` / default user `smoke` (host UUID
+`84ea011c-c69e-4c49-8e2e-c50fbc2c0a68`).
+`ghostty-web-smoke-profile` binding that host to
+`ghostty-web-smoke-identity` with no username override
+and tags `renderer,ghostty-web` (profile UUID
+`efbe170e-8ff7-48b2-9421-8da5f80a3227`). Success card
+carried the load-bearing copy "The host key is not yet
+trusted and SSH authentication has not been verified
+for this profile."
+
+**Host-key preflight + trust.** Preflight captured
+fingerprint
+`SHA256:wDUNS9iLKyR3Shor16U/lAWG1b0cl9dXNKdcUYSSCmg`,
+which is **byte-identical** to the locally-computed
+`ssh-keygen -lf` value over the target container's
+advertised `ssh-ed25519` host-key line (the linuxserver
+image emits ecdsa-sha2-nistp256, ed25519, and rsa at
+startup; preflight picks ed25519). Typed the
+fingerprint into `host-key-confirm-input` →
+`host-key-trust-button`; `host-key-status-badge`
+flipped to `Trusted`.
+
+**Auth-check.** `auth-check-run-button` flipped
+`auth-check-status-badge` to `Authenticated` after a
+few seconds — public-key authentication succeeded with
+no PTY allocated.
+
+**Terminal launch — ghostty-web attempt.**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID
+`f78210b2-e170-477d-8759-f851a915b693`. After ≥20 s of
+waiting, the workspace stayed wedged at:
+- `data-phase="idle"`
+- `data-renderer="unmounted"`
+- `data-renderer-experimental="false"`
+- `data-renderer-fallback=""` (empty)
+- `data-renderer-gate="on"`
+- `production-terminal-renderer-diagnostic` not rendered
+- viewport empty (zero children)
+- `production-terminal-error` not rendered
+
+Console captured exactly the failure shape:
+
+1. `Connecting to 'data:application/wasm;base64,…'
+   violates the following Content Security Policy
+   directive: "default-src 'self'". Note that
+   'connect-src' was not explicitly set, so
+   'default-src' is used as a fallback.`
+2. `Fetch API cannot load
+   data:application/wasm;base64,… Refused to connect
+   because it violates the document's Content Security
+   Policy.`
+3. `CompileError: WebAssembly.compile(): Compiling or
+   instantiating WebAssembly module violates the
+   following Content Security policy directive because
+   'unsafe-eval' is not an allowed source of script in
+   the following Content Security Policy directive:
+   "default-src 'self'".` (Stack: `wA.mount` →
+   `T`.)
+
+**Result classification: renderer issue (load /
+deploy interaction).** ghostty-web 0.4.0 ships its
+WASM payload as an inlined `data:application/wasm;base64,…`
+URL and `await init()`s it via `WebAssembly.compile()`
+inside its `Terminal.open` / `loadFromPath` path. The
+staging stack's nginx CSP is `default-src 'self'`
+without `'unsafe-eval'` or `'wasm-unsafe-eval'` and
+without an explicit `connect-src`, which blocks BOTH
+the `data:` URL fetch AND the WASM compile step. The
+dynamic `import()` itself succeeded (Vite/Rollup
+chunk-split the adapter to a separate asset that the
+gated loader fetched cleanly), so
+`rendererLoader.ts`'s `adapter_load_failed` fallback
+DID NOT fire — the load resolved successfully and the
+rejection occurred later inside `r.mount(mountTarget)`,
+which `attach()` does not have a catch block for. The
+workspace is therefore wedged at `idle` with no
+fallback diagnostic, no error panel, and no user-
+visible explanation. **xterm baseline does not hit
+this path** because xterm is statically imported and
+contains no WASM init. The renderer-loader's fallback
+taxonomy
+(`experimental_gate_off` / `unknown_renderer_id` /
+`adapter_load_failed`) is exhaustive for synchronous
+loader paths but does not cover asynchronous `mount()`
+rejection — a real product gap exposed by this smoke,
+to be addressed in a separate slice. **Do not infer**
+that ghostty-web cannot render anything; this smoke
+proves only that the adapter cannot initialize under
+the staging stack's current CSP. A future smoke
+against a stack that allows `'wasm-unsafe-eval'` (and
+either widens `connect-src` to allow `data:` or pins a
+ghostty-web build that ships WASM as an asset rather
+than a data URL) is required before the matrix rows
+can be exercised at all.
+
+**Matrix rows (browser surface).** Every
+evaluation-matrix row below is marked
+`deferred — renderer not identified (ghostty-web
+adapter failed to mount; see failure narrative
+above)`. The label uses the closed-vocabulary
+"renderer not identified" form per
+`apps/web/e2e/SMOKE.md` § "Renderer path
+confirmation" — the only conforming deferred-label
+options are `deferred — renderer not identified` and
+`deferred — renderer fell back to <id>`, and neither
+exactly fits a `data-renderer="unmounted"` +
+`data-renderer-fallback=""` wedge. The closer of the
+two is "renderer not identified" because no
+candidate renderer code path ran, even though the
+attribute set does technically pin the cause; the
+free-form suffix is documentation-only and not part
+of the contract vocabulary. Rows: basic ASCII I/O,
+resize / fit, long output, Unicode CJK, box-drawing,
+wide chars, paste safe / confirm / blocked, alternate
+screen, mouse mode enable, detach / reconnect /
+replay, narrow viewport — **all deferred**.
+
+**Xterm fallback verification (NOT a ghostty-web smoke
+pass).** After capturing the failure, the gate toggle
+was flipped OFF in Settings (which the
+`onExperimentalGateChange` handler explicitly resets to
+`rendererId="xterm"`), saved, and a new terminal launch
+opened on the same profile. Session UUID
+`aec95bfd-40f1-4bbb-916a-7f525493f6ff` mounted in
+under a second with:
+- `data-renderer="xterm"`
+- `data-renderer-experimental="false"`
+- `data-renderer-fallback=""`
+- `data-renderer-gate="off"`
+- diagnostic strip: "Renderer. xterm baseline"
+
+The xterm session went detached during the
+verification idle wait (no prompt output had been
+received yet so `lastSeenSeq=0`, which the
+`enablement.reconnect` predicate uses as an
+unreconnectable signal) and closed cleanly via the
+detached-TTL janitor at 20:50:05 UTC (91 s after
+create). **This is the same xterm production-baseline
+behaviour the 2026-05-13 xterm entry recorded** and is
+NOT counted as a ghostty-web smoke pass; it only
+proves the production shell remains usable after a
+gated experimental renderer fails to load.
+
+**Session lifecycle rows.**
+- `terminal_sessions.f78210b2-…`: status `active`,
+  closed_at NULL — created server-side but no WS
+  attach ever happened (mount rejection short-circuited
+  `attach()` before the WebSocket handshake), so the
+  backend orchestrator has no russh channel for this
+  id. Will be reaped by the orphan-session janitor.
+- `terminal_sessions.aec95bfd-…`: status `closed`,
+  91 s lifetime.
+- `session_events` for `f78210b2-…`: exactly 1 row
+  (`created`). No `attached`, no `detached`, no
+  `closed` — consistent with the mount failure
+  happening before the WS attach handshake.
+- `session_events` for `aec95bfd-…`: 4 rows in
+  order `created → attached → detached → closed`.
+- Per the schema's per-session telemetry contract,
+  none of these crossed into `audit_events`.
+
+**Audit events in the smoke window.** Exactly 2 rows
+created during the smoke proper (between identity-
+generate and stack-recreate-time):
+- `ssh_identity_created` at `20:40:33.826514Z`,
+  payload `{name, source:"generated", key_type:"ed25519",
+  created_at, ssh_identity_id, fingerprint_sha256}` —
+  public-metadata only.
+- `server_profile_created` at `20:43:38.…Z`, payload
+  `{name, host_id, disabled_at:null, ssh_identity_id,
+  server_profile_id}` — public-metadata only.
+
+Host-key preflight, host-key trust, auth-check, and
+terminal-session lifecycle ops deliberately emit no
+`audit_events` rows on these images (same posture as
+the 2026-05-13 xterm baseline above). **Zero**
+`audit_events` rows for the ghostty-web mount failure
+itself — the failure path is browser-side only.
+
+**Cleanup-disable audit row.** Cleanup step disabled
+`ghostty-web-smoke-profile` via the SPA
+(`profile-disable-open` → `profile-disable-confirm-input`
+→ `profile-disable-submit`). DB shows
+`disabled_at=2026-05-13 21:01:06.754349+00` and
+exactly one `server_profile_disabled` audit row at
+`21:01:06.758595+00` (~4 ms after the lifecycle
+transition — single audit row, matching the
+"idempotency early-return BEFORE audit append" rule
+from AGENTS.md § "Things to avoid"). Payload:
+`{name:"ghostty-web-smoke-profile", host_id,
+disabled_at, ssh_identity_id, server_profile_id}` —
+public-metadata only.
+
+**Backend / web / target log redaction.** Bounded
+`docker logs --since 30m` over the smoke window:
+backend = 7 lines (1 `WARN missing session cookie`
+pre-smoke line — same explanation as the 2026-05-13
+xterm baseline entry, a literal WARN string, not a
+cookie value); web/nginx = 66 lines (request log only,
+no payloads); target sshd = 40 lines (linuxserver
+entrypoint chatter only; no auth lines on stdout
+because the `linuxserver/openssh-server` image keeps
+`LogLevel INFO` events to `/var/log/auth.log` inside
+the container). Sentinel sweep against
+`{private_key_openssh, encrypted_private_key,
+BEGIN OPENSSH PRIVATE KEY, openssh-key-v1, passphrase,
+session_token, token_hash, data_b64, REDACT-MARKER,
+relayterm-ghostty-web-baseline, relayterm-after-long-output,
+relayterm-before-detach, relayterm-after-reconnect,
+relayterm-mobile-width-ghostty-web}` returned **0
+real hits** in every log. The `cookie` sentinel
+matched the backend's `WARN missing session cookie`
+text (same false-positive as the xterm baseline); the
+`password` sentinel matched the target sshd's
+linuxserver entrypoint message
+`User/password ssh access is disabled.` confirming
+`PASSWORD_ACCESS=false` was honored. Neither match
+represents a real secret-bytes leak; both are static
+diagnostic strings.
+
+**DOM + storage redaction.** Post-cleanup sweep over
+`document.documentElement.outerHTML`: zero hits across
+all sentinels. `document.cookie.length === 0` (the
+`relayterm_session` cookie is HttpOnly — JS cannot
+read it). `localStorage` carried only
+`relayterm.active-terminal.v1` (empty after the
+"Back to servers" nav) and
+`relayterm.terminal-settings.v1` (cosmetic +
+renderer fields; no payload bytes). `sessionStorage`
+empty.
+
+**Audit-payload sentinel sweep.** Against the
+smoke-window `audit_events`: `payload::text ~*`
+filter for
+`{private_key, BEGIN OPENSSH, passphrase,
+session_token, token_hash, data_b64, REDACT-MARKER,
+relayterm-ghostty-web, relayterm-after-,
+relayterm-before-, relayterm-mobile-}` returned
+**zero rows**.
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-ghostty-web-smoke-ssh` is
+`docker stop` + `docker rm`'d (verified
+`docker ps -a --filter name=… --format {{.Names}}`
+returns empty). Profile
+`ghostty-web-smoke-profile` disabled through the SPA
+(preserved with `disabled_at` set, not deleted, per
+the inventory-lifecycle policy). Local public-key
+sidecar file `ghostty-web-pubkey.txt` was shredded
+immediately after the container started. Settings
+reset to `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false` so a
+future browser session against this staging surface
+starts on the production default. Left in place per
+the slice plan: staging Compose stack running,
+Postgres untouched (uptime `Up 4 days` before and
+after the slice), `ghostty-web-smoke-identity`
+(`c85ffbe8-…`), `Ghostty-Web-Smoke-Host`
+(`84ea011c-…`), `ghostty-web-smoke-profile`
+(`efbe170e-…`, disabled), the 1 `active` (orphan) +
+1 `closed` `terminal_sessions` history rows, the 5
+total `session_events` rows, the 1 trusted
+`known_host_entries` row, all 3 `audit_events` rows
+emitted during the smoke (`ssh_identity_created`,
+`server_profile_created`,
+`server_profile_disabled`), the staging smoke user.
+
+**Intentionally deferred** (out of scope for this
+slice; tracked in
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+or scheduled later):
+
+- ghostty-web evaluation-matrix rows (basic ASCII I/O,
+  resize / fit, long output, Unicode CJK, box-drawing,
+  wide chars, paste safe / confirm / blocked,
+  alternate screen, mouse mode enable, detach /
+  reconnect / replay, narrow viewport) — every row is
+  deferred because the adapter never mounted; rerun
+  is gated on either a CSP-compatible ghostty-web
+  build or a deploy-side CSP change that allows
+  `'wasm-unsafe-eval'` plus `data:` in `connect-src`.
+  Both are separate slices;
+- restty / wterm experimental renderer evaluation —
+  not exercised in this slice;
+- desktop Tauri (path A bundled-shell handoff)
+  renderer smoke for ghostty-web on this stack;
+- Android Tauri renderer smoke;
+- automated performance / benchmark harness for any
+  renderer candidate;
+- a renderer-loader source slice that catches
+  asynchronous `mount()` rejection and surfaces a
+  fourth `mount_failed` value on `data-renderer-fallback`
+  so a future smoke run trips a typed diagnostic
+  rather than a wedged `idle` workspace (the loader's
+  current `adapter_load_failed` taxonomy only covers
+  synchronous load paths);
+- `tmux` / `screen` host-side multiplexer persistence;
+- VT snapshots / durable terminal-display persistence;
+- renderer production-default switch (Gate 2);
+- per-session-per-device renderer preference
+  persistence beyond the current
+  `relayterm.terminal-settings.v1` localStorage entry.
+
+**Promotion decision.** **ghostty-web remains
+experimental.** The production default remains xterm.
+Gate 1 and Gate 2 criteria are unchanged. No backend
+protocol, session, orchestrator, `terminal-core`,
+production-shell-non-loader, CI, or deploy file was
+touched by this slice. This smoke is a single
+human-evaluator pass that did not produce a single
+graded matrix row for ghostty-web; the
+`adapter_load_failed`-equivalent finding it surfaces
+is documented as a real product gap for a separate
+slice but does not itself promote or demote any
+renderer.
+
+**Verdict.** The production-shell experimental
+renderer selector lands cleanly: gate toggle reaches
+`localStorage`, persists the selection, surfaces the
+warning + radio + effective-renderer diagnostic
+exactly as `apps/web/e2e/SMOKE.md` § "Renderer path
+confirmation" assumed. ghostty-web 0.4.0's inlined
+WASM data URL cannot initialise under the staging
+stack's current CSP, which (a) blocks the entire
+evaluation matrix for this slice, and (b) exposes a
+real gap in `rendererLoader.ts`'s fallback taxonomy
+(async `mount()` rejection lands in a wedged `idle`
+workspace rather than a typed `data-renderer-fallback`
+diagnostic). xterm baseline mounts cleanly on the
+same surface after the gate is flipped off,
+confirming the production shell remains usable when
+an experimental adapter fails. Safe carry-forward
+data point for the renderer-evaluation track;
+ghostty-web stays experimental and unpromoted.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

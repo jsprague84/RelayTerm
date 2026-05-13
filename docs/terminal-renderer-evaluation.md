@@ -172,6 +172,89 @@ references to experimental adapter package names are now allowed
 ONLY inside the renderer loader file AND only inside dynamic
 `import()` expressions.
 
+### 2026-05-13 · ghostty-web production-shell smoke (CSP-blocked, remains experimental)
+
+The Gate-1 production-shell selector that landed earlier the same
+day unblocked the first production-side renderer-evaluation pass for
+ghostty-web. The full smoke entry is in
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-13 · Ghostty-web production-shell renderer smoke
+(CSP-blocked; xterm fallback verified)".
+
+**Operator pass posture.** Gate flipped on through Settings, renderer
+`ghostty-web` selected, persisted to
+`relayterm.terminal-settings.v1`, terminal launched against a
+hermetic throwaway target on the staging Compose network. The
+selector + diagnostic surface (`data-renderer`,
+`data-renderer-experimental`, `data-renderer-fallback`,
+`data-renderer-gate`, `[data-testid="production-terminal-renderer-diagnostic"]`)
+worked exactly as `apps/web/e2e/SMOKE.md` § "Renderer path
+confirmation" specifies.
+
+**ghostty-web result.** **All evaluation-matrix rows deferred under
+`deferred — renderer not identified`** (per
+`apps/web/e2e/SMOKE.md` § "Renderer path confirmation" closed
+vocabulary; the staging smoke entry records the same label with a
+"ghostty-web adapter failed to mount" free-form suffix). The
+proof that no renderer code ran is the post-launch attribute
+dump: `data-renderer="unmounted"` (never transitioned to a
+renderer id), `data-renderer-experimental="false"`,
+`data-renderer-fallback=""` (empty), `data-renderer-gate="on"`,
+`data-phase="idle"`. ghostty-web 0.4.0 inlines its WASM payload as
+a `data:application/wasm;base64,…` URL and calls
+`WebAssembly.compile()` from inside its
+`Terminal.open`/`loadFromPath` path during `r.mount(mountTarget)`.
+The staging stack's nginx CSP (`default-src 'self'` with no
+`'unsafe-eval'`, no `'wasm-unsafe-eval'`, no explicit `connect-src`)
+blocked the data-URL fetch AND the WASM compile step. The dynamic
+`import()` itself resolved, so the loader's
+`adapter_load_failed` fallback (synchronous-load-failure path) did
+NOT fire — the rejection happened later inside `r.mount(...)`, and
+the production workspace's `attach()` does not catch errors thrown
+by `mount()`. The result is a wedged workspace with no
+operator-visible error panel.
+
+This is a real gap in the loader's fallback taxonomy: today's three
+values (`experimental_gate_off`, `unknown_renderer_id`,
+`adapter_load_failed`) cover synchronous loader paths but not
+asynchronous `mount()` rejection. A separate slice should extend
+`apps/web/src/lib/app/terminal/rendererLoader.ts` (or the
+production workspace's `attach()` body) to convert a rejected
+`mount()` into a fourth typed fallback diagnostic (suggested:
+`adapter_mount_failed`) and a workspace error panel, so the next
+operator hitting this CSP / WASM / data-URL gotcha sees honest copy
+instead of a stuck `idle` phase. The same slice should add the
+new value to `apps/web/e2e/SMOKE.md`'s `data-renderer-fallback`
+selector-vocabulary row so the contract stays exhaustive.
+
+**xterm fallback verification.** After flipping the gate OFF (which
+the `onExperimentalGateChange` handler resets to `rendererId="xterm"`
+explicitly), a fresh launch on the same profile mounted with
+`data-renderer="xterm"`, `data-renderer-experimental="false"`,
+`data-renderer-gate="off"`, diagnostic strip "Renderer. xterm
+baseline". This proves the production shell stays usable when an
+experimental adapter fails — it does **not** count as a
+ghostty-web matrix pass and is not graded as one in the staging
+smoke entry. xterm's path is unchanged from the
+2026-05-13 xterm production-baseline entry.
+
+**Promotion posture.** **ghostty-web remains experimental.** xterm
+remains the production compatibility baseline and the default
+renderer. No backend protocol, session, orchestrator,
+`terminal-core`, production-shell-non-loader, CI, or deploy file
+was touched by this slice. A future smoke able to grade ghostty-web
+matrix rows requires either (a) a ghostty-web build that ships WASM
+as an asset rather than a data URL, or (b) a deploy-side CSP change
+that allows `'wasm-unsafe-eval'` plus `data:` in `connect-src`.
+Both are separate slices and out of scope here.
+
+**Deferred from this slice (per the staging smoke entry).** restty
+/ wterm experimental evaluation, desktop / Android Tauri renderer
+smokes, automated performance / benchmark harness, the
+loader-fallback taxonomy extension above, `tmux` / `screen` host-side
+multiplexer persistence, VT snapshot persistence, Gate-2 default
+flip, persistent per-user / per-device renderer preference.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
