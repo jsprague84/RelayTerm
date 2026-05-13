@@ -5,12 +5,14 @@ import {
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE,
   DEFAULT_LINE_HEIGHT,
+  DEFAULT_RENDERER_ID,
   DEFAULT_SCROLLBACK_LINES,
   FONT_FAMILY_MAX_LEN,
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
   LINE_HEIGHT_MAX,
   LINE_HEIGHT_MIN,
+  RENDERER_IDS,
   SCROLLBACK_MAX,
   SCROLLBACK_MIN,
   TERMINAL_SETTINGS_STORAGE_KEY,
@@ -19,10 +21,14 @@ import {
   clampScrollbackLines,
   clearTerminalSettings,
   defaultTerminalSettings,
+  effectiveRendererId,
   isCursorStyle,
+  isExperimentalRenderer,
+  isRendererId,
   loadTerminalSettings,
   normalizeTerminalSettings,
   parseTerminalSettings,
+  rendererLabel,
   resolveTheme,
   saveTerminalSettings,
   sanitizeFontFamily,
@@ -89,6 +95,9 @@ describe("defaults", () => {
     expect(d.cursorBlink).toBe(true);
     expect(d.scrollbackLines).toBe(DEFAULT_SCROLLBACK_LINES);
     expect(d.themePresetId).toBe(DEFAULT_THEME_PRESET_ID);
+    expect(d.rendererId).toBe(DEFAULT_RENDERER_ID);
+    expect(d.rendererId).toBe("xterm");
+    expect(d.experimentalRendererEvaluationEnabled).toBe(false);
   });
 
   it("returns a fresh object so callers can mutate without aliasing", () => {
@@ -251,6 +260,8 @@ describe("parseTerminalSettings", () => {
       cursorBlink: false,
       scrollbackLines: 5_000,
       themePresetId: TERMINAL_THEME_PRESETS[1]?.id ?? DEFAULT_THEME_PRESET_ID,
+      rendererId: "ghostty-web",
+      experimentalRendererEvaluationEnabled: true,
     };
     expect(parseTerminalSettings(input)).toEqual(input);
   });
@@ -307,6 +318,8 @@ describe("loadTerminalSettings (localStorage)", () => {
         "cursorBlink",
         "scrollbackLines",
         "themePresetId",
+        "rendererId",
+        "experimentalRendererEvaluationEnabled",
       ].sort(),
     );
     expect(keys).not.toContain("private_key");
@@ -395,6 +408,113 @@ describe("serializeSettings redaction", () => {
     expect(json).not.toMatch(/encrypted_private_key/);
     expect(json).not.toMatch(/session_output/);
     expect(json).not.toMatch(/access_token/);
+  });
+});
+
+describe("renderer id helpers", () => {
+  it("RENDERER_IDS covers exactly the four documented adapters", () => {
+    expect([...RENDERER_IDS].sort()).toEqual(
+      ["xterm", "ghostty-web", "restty", "wterm"].sort(),
+    );
+  });
+
+  it("isRendererId rejects everything outside the closed set", () => {
+    for (const id of RENDERER_IDS) {
+      expect(isRendererId(id)).toBe(true);
+    }
+    expect(isRendererId("XTERM")).toBe(false);
+    expect(isRendererId("native")).toBe(false);
+    expect(isRendererId(undefined)).toBe(false);
+    expect(isRendererId(null)).toBe(false);
+    expect(isRendererId(0)).toBe(false);
+  });
+
+  it("rendererLabel matches the dev-lab wording (smoke contract)", () => {
+    expect(rendererLabel("xterm")).toBe("xterm baseline");
+    expect(rendererLabel("ghostty-web")).toBe("ghostty-web experimental");
+    expect(rendererLabel("restty")).toBe("restty experimental");
+    expect(rendererLabel("wterm")).toBe("wterm experimental");
+  });
+
+  it("isExperimentalRenderer is true for everything but xterm", () => {
+    expect(isExperimentalRenderer("xterm")).toBe(false);
+    expect(isExperimentalRenderer("ghostty-web")).toBe(true);
+    expect(isExperimentalRenderer("restty")).toBe(true);
+    expect(isExperimentalRenderer("wterm")).toBe(true);
+  });
+});
+
+describe("rendererId / experimental gate parsing", () => {
+  it("defaults to xterm when the persisted value is unknown", () => {
+    const parsed = parseTerminalSettings({ rendererId: "native" });
+    expect(parsed.rendererId).toBe("xterm");
+  });
+
+  it("keeps a valid persisted renderer id verbatim", () => {
+    const parsed = parseTerminalSettings({ rendererId: "ghostty-web" });
+    expect(parsed.rendererId).toBe("ghostty-web");
+  });
+
+  it("only accepts the literal boolean `true` for the experimental gate", () => {
+    expect(
+      parseTerminalSettings({}).experimentalRendererEvaluationEnabled,
+    ).toBe(false);
+    expect(
+      parseTerminalSettings({ experimentalRendererEvaluationEnabled: "true" })
+        .experimentalRendererEvaluationEnabled,
+    ).toBe(false);
+    expect(
+      parseTerminalSettings({ experimentalRendererEvaluationEnabled: 1 })
+        .experimentalRendererEvaluationEnabled,
+    ).toBe(false);
+    expect(
+      parseTerminalSettings({ experimentalRendererEvaluationEnabled: true })
+        .experimentalRendererEvaluationEnabled,
+    ).toBe(true);
+  });
+
+  it("persisted renderer survives a save/load round-trip", () => {
+    saveTerminalSettings({
+      ...defaultTerminalSettings(),
+      rendererId: "restty",
+      experimentalRendererEvaluationEnabled: true,
+    });
+    const back = loadTerminalSettings();
+    expect(back.rendererId).toBe("restty");
+    expect(back.experimentalRendererEvaluationEnabled).toBe(true);
+  });
+});
+
+describe("effectiveRendererId", () => {
+  it("returns xterm when an experimental id is selected but the gate is off", () => {
+    const s: TerminalSettings = {
+      ...defaultTerminalSettings(),
+      rendererId: "ghostty-web",
+      experimentalRendererEvaluationEnabled: false,
+    };
+    expect(effectiveRendererId(s)).toBe("xterm");
+  });
+
+  it("returns the experimental id when both are set", () => {
+    const s: TerminalSettings = {
+      ...defaultTerminalSettings(),
+      rendererId: "wterm",
+      experimentalRendererEvaluationEnabled: true,
+    };
+    expect(effectiveRendererId(s)).toBe("wterm");
+  });
+
+  it("returns xterm verbatim even when the gate is on (baseline always allowed)", () => {
+    const s: TerminalSettings = {
+      ...defaultTerminalSettings(),
+      rendererId: "xterm",
+      experimentalRendererEvaluationEnabled: true,
+    };
+    expect(effectiveRendererId(s)).toBe("xterm");
+  });
+
+  it("a fresh defaults snapshot effectively resolves to xterm", () => {
+    expect(effectiveRendererId(defaultTerminalSettings())).toBe("xterm");
   });
 });
 

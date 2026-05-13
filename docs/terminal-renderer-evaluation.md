@@ -113,6 +113,65 @@ implementation slice is captured under [§ "Smoke plan" →
 "Recommended next implementation slice"](#recommended-next-implementation-slice)
 below.
 
+### 2026-05-13 · production-shell experimental-renderer selector landed (Gate 1 prerequisite, not promotion)
+
+The recommended next slice from the entry above landed on the same
+date. The production shell now carries an operator-opt-in
+**experimental renderer evaluation** gate:
+
+- Hidden by default. Off by default. xterm is and remains the
+  production compatibility baseline and the default renderer.
+- Gate UI lives in the Settings view at
+  `[data-testid="settings-experimental-renderer"]` (toggle, warning
+  copy, renderer radio group, effective-renderer diagnostic). When
+  the operator flips the toggle off, the persisted renderer id is
+  reset back to `xterm` so a stale experimental selection cannot
+  survive a future flip.
+- Renderer selection persists only in `localStorage`
+  (`relayterm.terminal-settings.v1` — same store as the existing
+  cosmetic preferences). No backend / per-user / per-device
+  persistence work was introduced. Validation is strict: any unknown
+  renderer id collapses to `xterm`, and the gate flag only accepts
+  the literal boolean `true`.
+- Experimental adapters reach the production shell ONLY through
+  `apps/web/src/lib/app/terminal/rendererLoader.ts`, and ONLY via
+  `dynamic import()`. The default-renderer attach path still pulls
+  no experimental WASM into the main bundle — Vite/Rollup
+  chunk-splits each experimental adapter into its own asset.
+- The production terminal workspace surfaces which renderer was
+  actually mounted via:
+  - `data-renderer` (= `xterm` | `ghostty-web` | `restty` | `wterm`)
+  - `data-renderer-experimental` (`"true"` / `"false"`)
+  - `data-renderer-fallback` (closed vocabulary:
+    `""` | `experimental_gate_off` | `unknown_renderer_id` |
+    `adapter_load_failed`)
+  - `data-renderer-gate` (`"on"` / `"off"`)
+  - the visible diagnostic strip
+    `[data-testid="production-terminal-renderer-diagnostic"]`
+- Any failure path (gate off + experimental id selected, unknown
+  persisted id, dynamic import / constructor failure) falls back
+  silently to xterm with the reason surfaced on
+  `data-renderer-fallback`. The underlying `Error.message` is
+  never echoed to the workspace, the audit log, or the console —
+  the fallback taxonomy is a closed vocabulary by design.
+
+This slice is the prerequisite the "Renderer path confirmation" step
+in `apps/web/e2e/SMOKE.md` § "D. Renderer evaluation smoke" assumed.
+It is explicitly **not** a Gate 1 / Gate 2 promotion: ghostty-web,
+restty, and wterm remain experimental. xterm remains the default and
+the only supported production baseline. Promotion still requires the
+full Gate 1 / Gate 2 evidence under
+[§ "Promotion criteria"](#promotion-criteria), and is its own
+deliberate later slice.
+
+Architectural posture unchanged by this slice: no backend protocol
+change, no session / orchestrator change, no `terminal-core` change,
+no schema or migration change. The static-import isolation rule that
+`apps/web/tests/appShellIsolation.test.ts` enforces was sharpened —
+references to experimental adapter package names are now allowed
+ONLY inside the renderer loader file AND only inside dynamic
+`import()` expressions.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

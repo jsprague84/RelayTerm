@@ -4,10 +4,17 @@
    * lifecycle for ONE attached session; the parent (`TerminalView`)
    * remounts via `{#key sessionId}` to start a fresh attachment.
    *
-   * Architectural rule (load-bearing): xterm baseline only. The
-   * production shell does not import ghostty-web, restty, or wterm —
-   * the experimental adapters stay in `lib/dev/`. A renderer selector
-   * is explicitly out of scope for this slice.
+   * Architectural rule (load-bearing): xterm is the production
+   * compatibility baseline and the default renderer. The experimental
+   * adapters (`@relayterm/terminal-{ghostty-web,restty,wterm}`) are
+   * reachable from production ONLY through the gated lazy loader in
+   * `./rendererLoader.ts`, and ONLY when the operator has explicitly
+   * flipped the experimental-renderer-evaluation gate in Settings.
+   * Every fallback path (gate off, unknown id, dynamic import failure)
+   * collapses to xterm — the production shell never lands on a
+   * renderer the operator did not opt into. xterm remains the only
+   * statically-imported adapter; the static-import isolation rule in
+   * `apps/web/tests/appShellIsolation.test.ts` pins this.
    *
    * Redaction rule (load-bearing):
    *  - Raw input bytes (`renderer.onInput`) flow straight to
@@ -38,9 +45,14 @@
     WebSocketTerminalTransport,
     decodeOutputData,
     type TerminalClientError,
+    type TerminalRenderer,
     type TerminalSessionState,
   } from "@relayterm/terminal-core";
-  import { XtermRenderer } from "@relayterm/terminal-xterm";
+  // xterm is the production compatibility baseline — kept as a static
+  // import so a default-renderer attach has zero dynamic-import latency
+  // and the production bundle never grows on a default path. The
+  // experimental adapters are loaded behind the gate via
+  // `./rendererLoader.ts`'s dynamic imports.
   import "@relayterm/terminal-xterm/styles";
   import {
     buildAttachWsUrl,
@@ -62,9 +74,17 @@
     loadSessionPolicy,
   } from "../../api/sessionPolicy.js";
   import {
+    effectiveRendererId,
+    isExperimentalRenderer,
     loadTerminalSettings,
+    rendererLabel as describeRenderer,
     settingsToRendererOptions,
+    type RendererId,
   } from "../settings/terminalSettings.js";
+  import {
+    loadRenderer,
+    type RendererLoadFallback,
+  } from "./rendererLoader.js";
   import {
     evaluatePaste,
     type PasteDecision,
@@ -175,7 +195,23 @@
   let blockedPasteDecision = $state<PasteDecision | null>(null);
 
   let client: TerminalSessionClient | null = null;
-  let renderer: XtermRenderer | null = null;
+  /**
+   * Active renderer for the current attach. Typed against the neutral
+   * {@link TerminalRenderer} surface so xterm / ghostty-web / restty /
+   * wterm all sit behind one variable. `null` between mounts AND while
+   * an attach is in flight.
+   */
+  let renderer: TerminalRenderer | null = null;
+  /**
+   * Diagnostic state surfaced via `data-renderer-*` attributes so the
+   * staging smoke can prove which renderer was actually mounted, without
+   * relying on visual cues. Mirrors {@link RendererLoadResult.rendererId}
+   * (the renderer that ended up mounted) and the fallback taxonomy.
+   * Never carries payload bytes — operator-facing IDs only.
+   */
+  let activeRendererId = $state<RendererId | null>(null);
+  let activeRendererFallback = $state<RendererLoadFallback | null>(null);
+  let experimentalRendererGate = $state(false);
   /**
    * Plaintext paste content held between `evaluatePaste` returning a
    * `confirm` decision and the operator confirming/cancelling. Lives at
@@ -231,15 +267,48 @@
     // truth; a parse failure or missing entry collapses to defaults
     // silently inside `loadTerminalSettings`. Mid-session live-updates
     // are explicit future work — applying font/theme to a mounted
-    // xterm involves more than option-merging (re-fit, atlas reset),
+    // renderer involves more than option-merging (re-fit, atlas reset),
     // so the slice ships "applies on next session" behaviour.
+    //
+    // Renderer selection is also a per-attach read: a Settings change
+    // (renderer id, experimental gate) takes effect on the NEXT attach,
+    // never mid-session. The loader gates every experimental path on
+    // both the persisted id AND the operator's explicit
+    // `experimentalRendererEvaluationEnabled` opt-in; any other path
+    // (unknown id, dynamic-import failure) falls back to xterm with a
+    // typed reason that surfaces on `data-renderer-fallback`.
     const settings = loadTerminalSettings();
-    const r = new XtermRenderer(settingsToRendererOptions(settings));
-    r.mount(mountTarget);
+    experimentalRendererGate = settings.experimentalRendererEvaluationEnabled;
+    const requestedRenderer = effectiveRendererId(settings);
+    const loadResult = await loadRenderer({
+      id: requestedRenderer,
+      experimentalEnabled: settings.experimentalRendererEvaluationEnabled,
+      options: settingsToRendererOptions(settings),
+      cols,
+      rows,
+    });
+    if (myGen !== generation) {
+      // A teardown happened while we were awaiting the dynamic import.
+      // Discard the freshly-built renderer instead of mounting into a
+      // stale target.
+      loadResult.renderer.dispose();
+      return;
+    }
+    const r = loadResult.renderer;
+    await r.mount(mountTarget);
     if (myGen !== generation) {
       r.dispose();
       return;
     }
+    // Record the active-renderer diagnostic ONLY after the post-mount
+    // generation guard passes — otherwise a teardown that races with
+    // the mount could leave `data-renderer` pointing at a renderer the
+    // workspace disposed before it ever drew a frame. The SMOKE
+    // runbook reads `data-renderer` as proof of which renderer
+    // actually mounted; that proof would be unreliable if we wrote it
+    // pre-mount.
+    activeRendererId = loadResult.rendererId;
+    activeRendererFallback = loadResult.fallback ?? null;
     r.focus();
     renderer = r;
 
@@ -547,6 +616,14 @@
   data-testid="production-terminal"
   data-session-id={sessionId}
   data-phase={phase}
+  data-renderer={activeRendererId ?? "unmounted"}
+  data-renderer-experimental={activeRendererId === null
+    ? "false"
+    : isExperimentalRenderer(activeRendererId)
+      ? "true"
+      : "false"}
+  data-renderer-fallback={activeRendererFallback ?? ""}
+  data-renderer-gate={experimentalRendererGate ? "on" : "off"}
 >
   <header class="flex flex-wrap items-baseline justify-between gap-3">
     <div class="flex flex-col gap-0.5">
@@ -798,4 +875,32 @@
       {TERMINAL_UX_COPY.copyPasteNote}
     </p>
   </div>
+
+  {#if activeRendererId}
+    <p
+      class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[11px] text-zinc-500"
+      data-testid="production-terminal-renderer-diagnostic"
+    >
+      <span class="font-medium text-zinc-400">Renderer.</span>
+      <span class="font-mono text-zinc-300"
+        >{describeRenderer(activeRendererId)}</span
+      >
+      {#if isExperimentalRenderer(activeRendererId)}
+        <span class="ml-1 text-amber-300">· experimental</span>
+      {/if}
+      {#if activeRendererFallback === "experimental_gate_off"}
+        <span class="ml-1 text-zinc-400"
+          >· experimental gate off — fell back to xterm</span
+        >
+      {:else if activeRendererFallback === "adapter_load_failed"}
+        <span class="ml-1 text-amber-300"
+          >· experimental adapter failed to load — fell back to xterm</span
+        >
+      {:else if activeRendererFallback === "unknown_renderer_id"}
+        <span class="ml-1 text-amber-300"
+          >· unknown renderer id — fell back to xterm</span
+        >
+      {/if}
+    </p>
+  {/if}
 </section>

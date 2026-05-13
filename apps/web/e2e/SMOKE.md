@@ -158,7 +158,12 @@ update this file in the same change.
 | `[data-testid="production-terminal-ttl-hint"]`    | Detach TTL hint banner (visible only in the `detached` phase, before explicit close). |
 | `[data-testid="production-terminal-closed"]`      | Closed-state hint banner.                                     |
 | `[data-testid="production-terminal-error"]`       | Workspace error summary (safe formatter only — never echoes wire `message` or transport detail). |
-| `[data-testid="production-terminal-viewport"]`    | xterm renderer host element (terminal output renders inside).  |
+| `[data-testid="production-terminal-viewport"]`    | Renderer host element (terminal output renders inside; xterm by default).  |
+| `[data-testid="production-terminal-renderer-diagnostic"]` | Renderer diagnostic strip rendered in the workspace footer after the renderer mounts (text body includes `rendererLabel` + experimental/fallback hint). Provides a visible "which renderer am I looking at" cue alongside the `data-renderer` attribute on `production-terminal`. |
+| `data-renderer` (attribute on `production-terminal`) | The renderer id the workspace actually mounted: `xterm`, `ghostty-web`, `restty`, `wterm`, or `unmounted` before the attach resolves. Use this — not visual cues — when proving renderer identity for a smoke row. |
+| `data-renderer-experimental` (attribute on `production-terminal`) | `"true"` when the mounted renderer is experimental, `"false"` otherwise (including `unmounted`). |
+| `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
+| `data-renderer-gate` (attribute on `production-terminal`) | `"on"` when the operator's experimental-renderer-evaluation gate is enabled in Settings, `"off"` otherwise. Independent of which renderer ended up mounted. |
 | `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer; enabled while live). |
 | `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). |
 | `[data-testid="production-terminal-clear"]`       | "Clear local viewport" button (renderer-only; never sends a wire frame, never mutates backend replay buffer, never asks the remote shell to run `clear`). |
@@ -277,6 +282,15 @@ update this file in the same change.
 | `[data-testid="settings-status-failed"]`          | Save-failure status text (rendered when localStorage write throws). |
 | `[data-testid="settings-apply-note"]`             | Settings view inline copy mirroring `production-terminal-settings-note` (sourced from `TERMINAL_UX_COPY`). |
 | `[data-testid="settings-copy-paste-note"]`        | Settings view inline copy mirroring `production-terminal-copy-paste-note` (sourced from `TERMINAL_UX_COPY`). |
+| `[data-testid="settings-experimental-renderer"]`  | Experimental renderer evaluation card root inside the Settings view. The card and its gate toggle are ALWAYS rendered when the Settings view is open; the warning copy, renderer radio group, and effective-renderer diagnostic only reveal when the gate toggle is flipped on. A smoke check that wants to assert "experimental renderer surface is gated" must check the radio testids (`renderer-option-<id>`) and `settings-experimental-renderer-warning`, NOT this card root. |
+| `[data-testid="settings-experimental-renderer-toggle"]` | Gate toggle (checkbox). Off by default. Persists to localStorage as `experimentalRendererEvaluationEnabled`. Turning it OFF resets the persisted `rendererId` back to `xterm` so a stale experimental selection cannot survive a future gate flip. |
+| `[data-testid="settings-experimental-renderer-warning"]` | Warning panel rendered ONLY when the gate is on (`role="alert"`). Static copy — does not echo any operator-supplied value. |
+| `[data-testid="settings-renderer-selector"]`      | Renderer radio-group fieldset rendered ONLY when the gate is on. |
+| `[data-testid="renderer-option-xterm"]`           | xterm baseline radio (default-checked; same selector name as the dev lab — both surfaces share the contract). |
+| `[data-testid="renderer-option-ghostty-web"]`     | ghostty-web experimental radio (visible ONLY when the gate is on). |
+| `[data-testid="renderer-option-restty"]`          | restty experimental radio (visible ONLY when the gate is on). |
+| `[data-testid="renderer-option-wterm"]`           | wterm experimental radio (visible ONLY when the gate is on). |
+| `[data-testid="settings-renderer-effective"]`     | Effective-renderer diagnostic strip rendered next to the radio group. Mirrors `effectiveRendererId(draft)` — when an experimental id is selected but the gate is off, surfaces "currently fall back to xterm." Useful for proving the gate logic in a smoke without launching a terminal session. |
 | `[data-testid="settings-recent-activity"]`        | Recent-audit panel root inside the Settings view (current-user audit feed; read-only; not an admin view). |
 | `[data-testid="settings-recent-activity-refresh"]` | Manual refresh button inside the recent-audit panel (no auto-refresh, no polling). |
 | `[data-testid="settings-recent-activity-loading"]` | Recent-audit loading state. |
@@ -313,7 +327,7 @@ update this file in the same change.
 | `[data-testid="dev-terminal-workbench"]`          | Dev workbench root (only visible under `vite dev`).           |
 | `[data-testid="xterm-live-terminal-lab"]`         | Live terminal lab root (renderer host + diagnostics).         |
 | `[data-testid="renderer-selector"]`               | Radio group containing the four renderer options.             |
-| `[data-testid="renderer-option-xterm"]`           | xterm baseline radio (default-checked).                       |
+| `[data-testid="renderer-option-xterm"]`           | xterm baseline radio (default-checked). Same selector also appears in the production Settings view when the experimental gate is on; the surface is disambiguated by the parent root (`xterm-live-terminal-lab` vs `settings-experimental-renderer`). |
 | `[data-testid="renderer-option-ghostty-web"]`     | ghostty-web experimental radio.                               |
 | `[data-testid="renderer-option-restty"]`          | restty experimental radio.                                    |
 | `[data-testid="renderer-option-wterm"]`           | wterm experimental radio.                                     |
@@ -1295,23 +1309,49 @@ Before running any row, record exactly which renderer is mounted —
 visual cues alone (cursor shape, glyph appearance, scrollbar style) are
 **not** sufficient.
 
-- **xterm baseline.** Confirm
-  `apps/web/src/lib/app/terminal/ProductionTerminal.svelte` imports
-  `XtermRenderer` from `@relayterm/terminal-xterm` (today's production
-  wiring). Record the `production-terminal-renderer` `data-renderer`
-  attribute (if present) or the renderer label rendered in the
-  workspace footer. If the production shell does not surface a renderer
-  label at all, record the production-shell git revision the smoke was
-  run against so a future reader can prove which renderer it shipped.
-- **Experimental candidates.** For ghostty-web, restty, or wterm, the
-  promotion-gate slice (per
-  [`docs/terminal-renderer-evaluation.md`](../../docs/terminal-renderer-evaluation.md)
-  § "Promotion criteria") MUST land a stable production-shell selector
-  before any production-side renderer smoke runs. Until that selector
-  exists, experimental renderers are exercised through the dev lab only
-  (section A.6 of this document, `data-testid="renderer-option-<id>"`).
-  A dev-lab pass is **not** a production renderer pass — record which
-  surface drove the smoke.
+- **xterm baseline.** Read the `data-renderer` attribute on
+  `[data-testid="production-terminal"]` (should be `xterm`) and the
+  visible renderer diagnostic at
+  `[data-testid="production-terminal-renderer-diagnostic"]` (should
+  contain the literal string `xterm baseline`). The
+  `data-renderer-experimental` attribute should be `"false"` and
+  `data-renderer-fallback` should be the empty string. xterm is the
+  default; on a fresh browser the workspace mounts xterm without any
+  operator action.
+- **Experimental candidates.** Enable the operator gate via the
+  Settings view BEFORE launching the smoke session:
+  1. `browser_click [data-testid="nav-settings"]`.
+  2. Confirm `[data-testid="settings-experimental-renderer"]` is
+     present.
+  3. `browser_click
+     [data-testid="settings-experimental-renderer-toggle"]` to flip
+     the gate on; confirm
+     `[data-testid="settings-experimental-renderer-warning"]` is now
+     rendered (the warning copy is static).
+  4. `browser_click [data-testid="renderer-option-<id>"]` for the
+     candidate (`ghostty-web` / `restty` / `wterm`).
+  5. `browser_click [data-testid="settings-apply"]` to persist the
+     selection; confirm `[data-testid="settings-status-saved"]`.
+  6. Launch a new terminal session as per the regular smoke flow.
+     After the workspace mounts, assert:
+     - `data-renderer` on `production-terminal` equals the candidate id.
+     - `data-renderer-experimental` is `"true"`.
+     - `data-renderer-fallback` is the empty string.
+     - `data-renderer-gate` is `"on"`.
+
+  If `data-renderer-fallback` is non-empty (`experimental_gate_off`
+  / `unknown_renderer_id` / `adapter_load_failed`), the workspace fell
+  back to xterm. A renderer-evaluation row taken under fallback is NOT
+  a candidate run — record the fallback reason verbatim, do not infer
+  candidate behavior, and either remediate (re-enable the gate; pick a
+  different candidate; re-check the production build) or mark every
+  subsequent row `deferred — renderer fell back to <id>`.
+
+- **Cleanup.** At smoke end, re-open Settings, flip the gate OFF, save.
+  The toggle's onChange handler also resets the persisted renderer
+  back to xterm so a future smoke against this browser starts clean.
+  Confirm `data-renderer` on the next session is `xterm` and
+  `data-renderer-gate` is `"off"`.
 
 If renderer identity cannot be proven for a given run, mark every row
 as `deferred — renderer not identified` and stop.

@@ -20,16 +20,21 @@
     FONT_SIZE_MIN,
     LINE_HEIGHT_MAX,
     LINE_HEIGHT_MIN,
+    RENDERER_IDS,
     SCROLLBACK_MAX,
     SCROLLBACK_MIN,
     clampFontSize,
     clampLineHeight,
     clampScrollbackLines,
     defaultTerminalSettings,
+    effectiveRendererId,
+    isRendererId,
     loadTerminalSettings,
     normalizeTerminalSettings,
+    rendererLabel,
     resolveTheme,
     saveTerminalSettings,
+    type RendererId,
     type TerminalSettings,
   } from "../settings/terminalSettings.js";
   import {
@@ -140,6 +145,31 @@
     };
     markDirty();
   }
+
+  function onExperimentalGateChange(event: Event) {
+    const checked = (event.target as HTMLInputElement).checked;
+    // Turning the gate OFF also resets the selection back to xterm so a
+    // future operator does not end up with a stale persisted
+    // experimental id that the loader silently downgrades — the
+    // `effectiveRendererId` helper does this at attach time too, but
+    // making it explicit at toggle time means the UI and the persisted
+    // settings stay in agreement and a "save changes" then "toggle off"
+    // dance does not leave a confusing draft.
+    draft = {
+      ...draft,
+      experimentalRendererEvaluationEnabled: checked,
+      rendererId: checked ? draft.rendererId : "xterm",
+    };
+    markDirty();
+  }
+
+  function onRendererChange(id: RendererId) {
+    if (!isRendererId(id)) return;
+    draft = { ...draft, rendererId: id };
+    markDirty();
+  }
+
+  const draftEffectiveRenderer = $derived(effectiveRendererId(draft));
 </script>
 
 <section
@@ -334,6 +364,108 @@ Last login: Mon May  1 14:02:51
     </article>
   </article>
 
+  <article
+    class="flex flex-col gap-4 rounded-lg border border-amber-900/40 bg-amber-950/10 p-6"
+    data-testid="settings-experimental-renderer"
+  >
+    <header class="flex flex-col gap-1">
+      <h3 class="text-sm font-semibold text-zinc-100">
+        Experimental renderer evaluation
+      </h3>
+      <p class="text-xs text-zinc-500">
+        Hidden by default. <code class="font-mono">xterm</code> is the
+        production compatibility baseline and the default renderer. Turning
+        the gate on exposes the experimental renderer adapters
+        (<code class="font-mono">ghostty-web</code>,
+        <code class="font-mono">restty</code>,
+        <code class="font-mono">wterm</code>) so an operator can run the
+        renderer-evaluation smoke runbook against the same production shell.
+        The gate and selection persist to this browser only.
+      </p>
+    </header>
+
+    <label class="flex items-start gap-2 text-sm text-zinc-200">
+      <input
+        type="checkbox"
+        class="mt-0.5 size-4 accent-amber-600"
+        checked={draft.experimentalRendererEvaluationEnabled}
+        onchange={onExperimentalGateChange}
+        data-testid="settings-experimental-renderer-toggle"
+      />
+      <span class="flex flex-col gap-0.5">
+        <span class="text-sm text-zinc-100">
+          Enable experimental renderer evaluation
+        </span>
+        <span class="text-[11px] text-zinc-500">
+          Off by default. Turning this on does not affect the default
+          renderer — only future terminal sessions where you have also
+          selected an experimental renderer below.
+        </span>
+      </span>
+    </label>
+
+    {#if draft.experimentalRendererEvaluationEnabled}
+      <p
+        class="rounded-md border border-amber-900/40 bg-amber-950/40 px-3 py-2 text-xs text-amber-200"
+        data-testid="settings-experimental-renderer-warning"
+        role="alert"
+      >
+        Experimental renderers are for evaluation only. They may be broken,
+        slow, or visually wrong, and they are not promoted into production.
+        <code class="font-mono">xterm</code> remains the supported
+        production baseline; selecting an experimental renderer applies to
+        the next terminal session you launch. If a renderer fails to load
+        the workspace falls back to <code class="font-mono">xterm</code>.
+      </p>
+
+      <fieldset
+        class="flex flex-col gap-2 text-sm text-zinc-200"
+        data-testid="settings-renderer-selector"
+      >
+        <legend class="text-xs uppercase tracking-wide text-zinc-400">
+          Renderer
+        </legend>
+        {#each RENDERER_IDS as id (id)}
+          <label class="flex items-baseline gap-2">
+            <input
+              type="radio"
+              name="renderer"
+              value={id}
+              class="size-4 accent-emerald-600"
+              checked={draft.rendererId === id}
+              onchange={() => onRendererChange(id)}
+              data-testid={`renderer-option-${id}`}
+            />
+            <span class="font-mono text-zinc-100">{rendererLabel(id)}</span>
+            {#if id === "xterm"}
+              <span class="text-[11px] text-zinc-500">
+                (production compatibility baseline; always available)
+              </span>
+            {/if}
+          </label>
+        {/each}
+      </fieldset>
+
+      <p
+        class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[11px] text-zinc-400"
+        data-testid="settings-renderer-effective"
+      >
+        Effective renderer on next session:
+        <span class="font-mono text-zinc-200"
+          >{rendererLabel(draftEffectiveRenderer)}</span
+        >.
+        {#if draft.rendererId !== draftEffectiveRenderer}
+          <span class="text-amber-300">
+            Your selection (<span class="font-mono"
+              >{rendererLabel(draft.rendererId)}</span
+            >) requires the experimental gate above; the workspace will
+            currently fall back to xterm.
+          </span>
+        {/if}
+      </p>
+    {/if}
+  </article>
+
   <div class="flex flex-wrap items-center gap-2">
     <button
       type="button"
@@ -390,9 +522,12 @@ Last login: Mon May  1 14:02:51
   >
     <span class="font-mono uppercase tracking-wide">future work</span> ·
     Per-server-profile preferences, custom palettes, keybinding editor,
-    copy/paste policy editor, production renderer selection, and
-    mobile/Tauri settings are deliberate later slices. Today's settings
-    are stored locally in this browser only.
+    copy/paste policy editor, and mobile/Tauri settings are deliberate
+    later slices. Today's settings are stored locally in this browser only.
+    The experimental renderer evaluation gate above unlocks
+    renderer-evaluation smoke coverage; it is not a promotion mechanism
+    (see <code class="font-mono">docs/terminal-renderer-evaluation.md</code>
+    § "Promotion criteria" for the Gate 1 / Gate 2 path).
   </p>
 
   <PasswordPanel />

@@ -36,6 +36,67 @@ import {
 } from "./themePresets.js";
 
 /**
+ * Stable identifiers for the swappable renderer adapters as seen by the
+ * production shell. Mirrors the dev-lab's {@link RendererId} type from
+ * `lib/dev/rendererDiagnostics.ts` so the SMOKE selectors
+ * (`renderer-option-<id>`) match across surfaces; both lists must stay
+ * in sync, but they cannot share a module (the production shell is
+ * forbidden from importing `lib/dev/` per the isolation rule).
+ *
+ * xterm is the production compatibility baseline and the default; the
+ * other three are experimental and only mount when the operator flips
+ * the experimental-renderer-evaluation gate AND picks them. See
+ * `docs/terminal-renderer-evaluation.md` § "Promotion criteria".
+ */
+export type RendererId = "xterm" | "ghostty-web" | "restty" | "wterm";
+
+export const RENDERER_IDS: readonly RendererId[] = [
+  "xterm",
+  "ghostty-web",
+  "restty",
+  "wterm",
+] as const;
+
+/**
+ * The production compatibility baseline. Used as the fallback for every
+ * "unknown / experimental-but-gate-off / load-failed" path so the
+ * production shell never lands on a renderer the operator did not
+ * explicitly opt into.
+ */
+export const DEFAULT_RENDERER_ID: RendererId = "xterm";
+
+export function isRendererId(value: unknown): value is RendererId {
+  return (
+    typeof value === "string" &&
+    (RENDERER_IDS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Operator-facing label for a renderer. The exact wording is the same
+ * shape as the dev lab's labels (`xterm baseline`, `ghostty-web
+ * experimental`, …) so the SMOKE runbook can read it directly off the
+ * production shell. A future promotion would flip the wording in lockstep
+ * with the gate posture.
+ */
+export function rendererLabel(id: RendererId): string {
+  switch (id) {
+    case "xterm":
+      return "xterm baseline";
+    case "ghostty-web":
+      return "ghostty-web experimental";
+    case "restty":
+      return "restty experimental";
+    case "wterm":
+      return "wterm experimental";
+  }
+}
+
+export function isExperimentalRenderer(id: RendererId): boolean {
+  return id !== DEFAULT_RENDERER_ID;
+}
+
+/**
  * Default font stack — same string `ProductionTerminal` shipped before
  * this slice. Ordering matters: ui-monospace first so the OS picks the
  * native programmer font; the named fonts cover users who installed
@@ -87,6 +148,22 @@ export interface TerminalSettings {
   cursorBlink: boolean;
   scrollbackLines: number;
   themePresetId: string;
+  /**
+   * Selected renderer. Persisted but only honored at attach time when
+   * {@link experimentalRendererEvaluationEnabled} is also true (or the
+   * id is `xterm`). The loader collapses every "selected but blocked"
+   * path back to {@link DEFAULT_RENDERER_ID}, so a stale persisted
+   * `ghostty-web` after the gate was turned back off does not mount
+   * the experimental adapter.
+   */
+  rendererId: RendererId;
+  /**
+   * Operator opt-in for the experimental renderer evaluation. Off by
+   * default. Carries the SAME contract whether read from a fresh entry,
+   * a stale entry, or an unrecognised value: only an explicit `true`
+   * unlocks the experimental adapters.
+   */
+  experimentalRendererEvaluationEnabled: boolean;
 }
 
 export const TERMINAL_SETTINGS_STORAGE_KEY = "relayterm.terminal-settings.v1";
@@ -106,6 +183,8 @@ export function defaultTerminalSettings(): TerminalSettings {
     cursorBlink: DEFAULT_CURSOR_BLINK,
     scrollbackLines: DEFAULT_SCROLLBACK_LINES,
     themePresetId: DEFAULT_THEME_PRESET_ID,
+    rendererId: DEFAULT_RENDERER_ID,
+    experimentalRendererEvaluationEnabled: false,
   };
 }
 
@@ -179,11 +258,14 @@ function pickBoolean(raw: Record<string, unknown>, key: string): boolean | null 
  * Coerce an arbitrary parsed value (typically `JSON.parse(localStorage)`
  * output) into a complete {@link TerminalSettings}. Unknown / wrongly-
  * typed fields fall back to defaults; out-of-range numerics are clamped;
- * unknown theme preset ids fall back to the default preset id.
+ * unknown theme preset ids fall back to the default preset id; unknown
+ * renderer ids fall back to {@link DEFAULT_RENDERER_ID}; and the
+ * experimental gate boolean only accepts the literal `true`.
  *
- * The function NEVER throws and NEVER reads keys other than the seven
- * documented fields — a hostile entry that injects extra keys cannot
- * smuggle anything onto the parsed object.
+ * The function NEVER throws and NEVER reads keys other than the nine
+ * documented fields (the seven cosmetic ones plus `rendererId` and
+ * `experimentalRendererEvaluationEnabled`) — a hostile entry that
+ * injects extra keys cannot smuggle anything onto the parsed object.
  */
 export function parseTerminalSettings(input: unknown): TerminalSettings {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
@@ -226,6 +308,17 @@ export function parseTerminalSettings(input: unknown): TerminalSettings {
       ? themePresetIdRaw
       : DEFAULT_THEME_PRESET_ID;
 
+  const rendererIdRaw = raw["rendererId"];
+  const rendererId: RendererId = isRendererId(rendererIdRaw)
+    ? rendererIdRaw
+    : DEFAULT_RENDERER_ID;
+
+  // Only the literal boolean `true` enables the gate. Any other value
+  // (missing, malformed, truthy-string) collapses to `false` — the
+  // experimental gate must be explicit, not coerced.
+  const experimentalRaw = raw["experimentalRendererEvaluationEnabled"];
+  const experimentalRendererEvaluationEnabled = experimentalRaw === true;
+
   return {
     fontFamily,
     fontSize,
@@ -234,6 +327,8 @@ export function parseTerminalSettings(input: unknown): TerminalSettings {
     cursorBlink,
     scrollbackLines,
     themePresetId,
+    rendererId,
+    experimentalRendererEvaluationEnabled,
   };
 }
 
@@ -350,8 +445,12 @@ export function resolveTheme(settings: TerminalSettings): RendererTheme {
 /**
  * Map a settings snapshot onto the renderer-neutral options shape every
  * `TerminalRenderer` adapter accepts. The production terminal workspace
- * passes the result straight to `new XtermRenderer(...)`; a future
- * production renderer would consume the same object unchanged.
+ * passes the result through the renderer loader
+ * (`apps/web/src/lib/app/terminal/rendererLoader.ts`) which constructs
+ * the selected adapter — xterm on the default path, or one of the
+ * experimental adapters when the operator gate is on. Every adapter
+ * accepts the same renderer-neutral shape; nothing here is xterm-
+ * specific.
  */
 export function settingsToRendererOptions(
   settings: TerminalSettings,
@@ -365,4 +464,23 @@ export function settingsToRendererOptions(
     scrollbackLines: settings.scrollbackLines,
     theme: resolveTheme(settings),
   };
+}
+
+/**
+ * Pick the renderer to mount for a given settings snapshot. xterm is the
+ * compatibility baseline and is always allowed; an experimental id is
+ * honored only when {@link TerminalSettings.experimentalRendererEvaluationEnabled}
+ * is `true`. This is the single place gate evaluation happens — the
+ * production terminal workspace, the diagnostics surface, and the
+ * Settings UI all flow through this helper so a future tweak (adding a
+ * URL-parameter override, scoping the gate per-device) lands in one
+ * place.
+ */
+export function effectiveRendererId(settings: TerminalSettings): RendererId {
+  if (settings.rendererId === DEFAULT_RENDERER_ID) {
+    return DEFAULT_RENDERER_ID;
+  }
+  return settings.experimentalRendererEvaluationEnabled
+    ? settings.rendererId
+    : DEFAULT_RENDERER_ID;
 }

@@ -11,16 +11,41 @@
 > renderer adapter packages do. Drift from any rule here is a spec bug.
 >
 > **Production baseline / experimental rule (load-bearing).** xterm.js is
-> the **production compatibility baseline**. The other three adapters
-> (ghostty-web, restty, wterm) are **experimental and dev-only** — they
-> are wired in the dev lab and tree-shaken out of the production
-> `apps/web` bundle. Production shell components MUST NOT import any
-> experimental renderer adapter (the rule is pinned by
-> `apps/web/tests/appShellIsolation.test.ts`). Renderer-neutral rules
-> (`terminal-core` imports nothing renderer-specific; the wire protocol
-> stays RelayTerm-shaped) live in [`terminal.md`](terminal.md) §
-> "Frontend terminal-core contract" and are re-affirmed below per
-> adapter for forensic clarity.
+> the **production compatibility baseline** and the production default
+> renderer. The other three adapters (ghostty-web, restty, wterm) are
+> **experimental and not promoted** — every production attach defaults
+> to xterm.
+>
+> Production shell components MUST NOT statically import any experimental
+> renderer adapter. The static-import rule is pinned by
+> `apps/web/tests/appShellIsolation.test.ts`.
+>
+> **Production-shell experimental access path (since 2026-05-13).** The
+> production shell may reach an experimental adapter ONLY through the
+> gated lazy loader at
+> `apps/web/src/lib/app/terminal/rendererLoader.ts`. The loader uses
+> `dynamic import()` so Vite/Rollup chunk-splits each experimental
+> adapter into its own asset; the default-renderer attach path never
+> fetches an experimental WASM payload. The loader instantiates an
+> experimental adapter only when (a) the operator has flipped the
+> `experimentalRendererEvaluationEnabled` gate in Settings AND (b) the
+> operator has picked the matching renderer id. Any other path (gate
+> off, unknown id, dynamic-import or constructor failure) collapses to
+> xterm with a typed fallback reason surfaced on
+> `data-renderer-fallback`. This access path is NOT a promotion of
+> ghostty-web / restty / wterm — see
+> [`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+> § "Promotion criteria" for the Gate 1 / Gate 2 path.
+>
+> The isolation test also pins that the experimental adapter package
+> names are referenced ONLY inside the renderer loader file AND only
+> inside `dynamic import()` expressions — a static
+> `from "@relayterm/terminal-ghostty-web"` line anywhere in
+> `apps/web/src/lib/app/` (including the loader file itself) is a
+> regression. Renderer-neutral rules (`terminal-core` imports nothing
+> renderer-specific; the wire protocol stays RelayTerm-shaped) live in
+> [`terminal.md`](terminal.md) § "Frontend terminal-core contract" and
+> are re-affirmed below per adapter for forensic clarity.
 
 ## Contents
 

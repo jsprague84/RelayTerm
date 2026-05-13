@@ -301,16 +301,32 @@ The redaction backstop is
 
 ## 13. Production app shell isolation
 
-**Don't** import from `lib/dev/` inside `apps/web/src/lib/app/`, OR
-import an experimental renderer adapter
-(`@relayterm/terminal-{ghostty-web,restty,wterm}`) inside
-`apps/web/src/lib/app/`.
+**Don't** import from `lib/dev/` inside `apps/web/src/lib/app/`, AND
+**don't** STATICALLY import an experimental renderer adapter
+(`@relayterm/terminal-{ghostty-web,restty,wterm}`) anywhere inside
+`apps/web/src/lib/app/`, AND **don't** reference an experimental
+adapter package name outside the single file
+`apps/web/src/lib/app/terminal/rendererLoader.ts`.
 
-**Do** keep the production shell dev-free; the production terminal
+**Do** keep the production shell dev-free. The production terminal
 workspace uses `@relayterm/terminal-core` + `@relayterm/terminal-xterm`
-(the baseline) only. Reach the dev lab via the `devTools` snippet in
-`App.svelte`, gated by `import.meta.env.DEV` — see
-`tests/appShellIsolation.test.ts`.
+(the baseline) on the default path. The experimental adapters
+(`ghostty-web`, `restty`, `wterm`) reach the production shell ONLY
+through `apps/web/src/lib/app/terminal/rendererLoader.ts`, AND only
+via dynamic `import()` (never `from "..."`), AND only when the
+operator has flipped the `experimentalRendererEvaluationEnabled` gate
+in Settings. Every fallback path (gate off, unknown id, dynamic-
+import or constructor failure) collapses to xterm with a typed
+fallback reason on `data-renderer-fallback`. The static-import rule,
+the single-file rule, and the dynamic-only rule are all pinned by
+`apps/web/tests/appShellIsolation.test.ts`. Reach the dev lab via the
+`devTools` snippet in `App.svelte`, gated by `import.meta.env.DEV`.
+
+The lazy-loader exception is NOT a renderer promotion. xterm remains
+the production compatibility baseline and the production default
+renderer; the experimental adapters remain experimental. See
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+§ "Promotion criteria" for the Gate 1 / Gate 2 path.
 
 ## 14. Placeholder views
 

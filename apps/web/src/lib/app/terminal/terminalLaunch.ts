@@ -388,12 +388,22 @@ export function safeFocus(renderer: FocusableRenderer | null | undefined): boole
  * Lessons" for the double-emit rule and the regression that prompted
  * it.
  */
-export function safeFit(
-  renderer: FittableRenderer | null | undefined,
-): { cols: number; rows: number } | null {
-  if (!renderer) return null;
+export function safeFit(renderer: unknown): { cols: number; rows: number } | null {
+  // `fit` is an xterm-specific capability — it is not on the neutral
+  // {@link TerminalRenderer} surface, so an experimental renderer
+  // (ghostty-web, restty, wterm) may not expose it. Probe at runtime
+  // so a Fit click on a non-fittable renderer is a clean no-op rather
+  // than a TypeError. The `unknown` parameter type lets the production
+  // workspace pass its neutrally-typed renderer variable without an
+  // explicit cast at every call site.
+  if (renderer === null || typeof renderer !== "object") return null;
+  const fit = (renderer as { fit?: unknown }).fit;
+  if (typeof fit !== "function") return null;
   try {
-    return renderer.fit();
+    const result = (fit as () => { cols: number; rows: number } | null).call(
+      renderer,
+    );
+    return result ?? null;
   } catch {
     return null;
   }
@@ -405,12 +415,15 @@ export function safeFit(
  * mutates the backend replay buffer, and NEVER asks the remote shell
  * to run `clear`. Returns `true` when the call was made.
  */
-export function safeClearViewport(
-  renderer: ClearableRenderer | null | undefined,
-): boolean {
-  if (!renderer) return false;
+export function safeClearViewport(renderer: unknown): boolean {
+  // Same xterm-specific-capability rule as {@link safeFit} — probe at
+  // runtime so a Clear click on a renderer without a `clear()`
+  // affordance no-ops cleanly.
+  if (renderer === null || typeof renderer !== "object") return false;
+  const clear = (renderer as { clear?: unknown }).clear;
+  if (typeof clear !== "function") return false;
   try {
-    renderer.clear();
+    (clear as () => void).call(renderer);
     return true;
   } catch {
     return false;
