@@ -26,9 +26,11 @@
 
 import type {
   TerminalClientError,
+  TerminalRenderer,
   TerminalSessionState,
 } from "@relayterm/terminal-core";
 import type { CreateTerminalSessionError } from "../../api/terminalSessions.js";
+import type { RendererLoadFallback } from "./rendererLoader.js";
 import {
   DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS,
   DEFAULT_MAX_LIVE_PTY_SESSIONS_PER_USER,
@@ -443,6 +445,73 @@ export const TERMINAL_UX_COPY = {
   copyPasteNote:
     "Use your browser's selection + clipboard shortcuts (Ctrl/Cmd+C / Ctrl/Cmd+V, or right-click Paste). Bracketed-paste confirmation, OSC 52, and a clipboard policy editor are future work.",
 } as const;
+
+/**
+ * Operator-facing copy rendered when {@link mountRendererSafely}
+ * reports a failed asynchronous mount. The string is intentionally a
+ * fixed constant: it carries the failure taxonomy (`adapter_mount_failed`)
+ * and the remediation (Settings → xterm → reopen) but NEVER echoes
+ * the underlying `Error.message`, the renderer id, the WASM init URL,
+ * or any other detail the renderer adapter raised. The SMOKE redaction
+ * test and `terminalLaunch.test.ts` both pin this rule.
+ */
+export const RENDERER_MOUNT_FAILED_MESSAGE =
+  "Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.";
+
+/**
+ * Outcome of {@link mountRendererSafely}. The success arm carries
+ * nothing; the failure arm carries the typed fallback taxonomy value
+ * the workspace mirrors onto its `data-renderer-fallback` attribute.
+ *
+ * The shape is a discriminated union so the caller's `switch` is
+ * exhaustive at compile time — a future taxonomy expansion would break
+ * the workspace's `attach()` typecheck rather than silently fall
+ * through.
+ */
+export type MountRendererOutcome =
+  | { kind: "mounted" }
+  | { kind: "failed"; fallback: Extract<RendererLoadFallback, "adapter_mount_failed"> };
+
+/**
+ * Await `renderer.mount(target)` and translate a rejection into a
+ * typed fallback diagnostic.
+ *
+ * The 2026-05-13 ghostty-web production-shell smoke surfaced a real
+ * gap: the renderer loader's synchronous fallback paths
+ * (`experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed`)
+ * cover gate + dynamic-import + constructor failures, but the
+ * adapter's WASM init runs inside `mount()` and rejects ASYNCHRONOUSLY
+ * after the loader resolved cleanly. The workspace was left wedged at
+ * `data-renderer="unmounted"` with no operator-visible explanation.
+ *
+ * Redaction posture (mirrors `rendererLoader.ts`'s `catch` block):
+ *  - The thrown `Error.message` is swallowed deliberately. It can
+ *    include the WASM init URL, a CSP directive verbatim, or stack
+ *    frames into the renderer adapter — operator noise that does not
+ *    help the recovery action. The fallback string is the safe signal.
+ *  - The renderer reference is NOT disposed inside this helper; the
+ *    caller owns the mount target and the lifecycle. Disposing here
+ *    would compose badly with the workspace's generation-guard reentry
+ *    (a teardown that races with the rejection would double-dispose).
+ *  - This function NEVER receives or surfaces payload bytes; its only
+ *    side effect is the renderer's own `mount()` reaching the DOM.
+ *
+ * The caller is the production workspace's `attach()` — see
+ * `ProductionTerminal.svelte`. The dev lab does not use this helper
+ * because the dev workspace exposes a renderer switcher that re-mounts
+ * on every selection change with its own diagnostics panel.
+ */
+export async function mountRendererSafely(
+  renderer: TerminalRenderer,
+  target: HTMLElement,
+): Promise<MountRendererOutcome> {
+  try {
+    await renderer.mount(target);
+    return { kind: "mounted" };
+  } catch {
+    return { kind: "failed", fallback: "adapter_mount_failed" };
+  }
+}
 
 /**
  * Build the WebSocket URL for a session-id attach. The path is the

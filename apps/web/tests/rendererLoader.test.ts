@@ -313,4 +313,59 @@ describe("loadRenderer — fallback safety", () => {
     expect(JSON.stringify(result)).not.toContain("BEGIN OPENSSH");
     expect(JSON.stringify(result)).not.toContain("PEM body leak");
   });
+
+  it("never emits adapter_mount_failed — that value is owned by the workspace's mount path", async () => {
+    // The mount-failure value `adapter_mount_failed` lives in the same
+    // closed vocabulary as the loader's synchronous fallbacks BUT the
+    // loader never produces it: by contract, the asynchronous
+    // `renderer.mount(target)` runs in `ProductionTerminal.svelte`,
+    // not here. Mirror every adjacent failure flavour and prove none
+    // of them mis-classify as `adapter_mount_failed`.
+    const cases: Array<{
+      label: string;
+      build: () => RendererImporters;
+      id: "ghostty-web" | "restty" | "wterm";
+    }> = [
+      {
+        label: "dynamic import rejects",
+        build: () => {
+          const { importers } = stubImporters();
+          importers.ghosttyWeb = vi
+            .fn()
+            .mockRejectedValue(new Error("import rejected"));
+          return importers;
+        },
+        id: "ghostty-web",
+      },
+      {
+        label: "constructor throws",
+        build: () => {
+          const { importers } = stubImporters();
+          importers.wterm = vi.fn().mockResolvedValue({
+            WtermRenderer: class {
+              constructor() {
+                throw new Error("ctor blew up");
+              }
+            },
+          });
+          return importers;
+        },
+        id: "wterm",
+      },
+    ];
+    for (const c of cases) {
+      const result = await loadRendererWithImporters(
+        {
+          id: c.id,
+          experimentalEnabled: true,
+          options: baseOptions(),
+          cols: 80,
+          rows: 24,
+        },
+        c.build(),
+      );
+      expect(result.fallback, c.label).not.toBe("adapter_mount_failed");
+      expect(result.fallback, c.label).toBe("adapter_load_failed");
+    }
+  });
 });

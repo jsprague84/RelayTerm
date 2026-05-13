@@ -48,11 +48,26 @@ import {
  * SMOKE runbook can read them off `data-renderer-fallback` without
  * having to ad-hoc-parse copy. None of the values include any payload
  * byte; they are operator-facing taxonomy only.
+ *
+ * Taxonomy split by failure stage:
+ *  - `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed`
+ *    fire SYNCHRONOUSLY inside this loader's gate + dynamic-import +
+ *    constructor paths. The loader emits these as `RendererLoadResult.fallback`
+ *    and the caller never sees a thrown error.
+ *  - `adapter_mount_failed` fires ASYNCHRONOUSLY at the workspace's
+ *    `renderer.mount(target)` call site. The loader cannot emit it
+ *    because it does not own the mount target; instead the production
+ *    workspace catches the rejection (see
+ *    `terminalLaunch.ts::mountRendererSafely`) and writes this value
+ *    onto its own `data-renderer-fallback` attribute. Keeping the value
+ *    in the shared taxonomy means the SMOKE runbook reads ONE closed
+ *    vocabulary across both stages.
  */
 export type RendererLoadFallback =
   | "experimental_gate_off"
   | "unknown_renderer_id"
-  | "adapter_load_failed";
+  | "adapter_load_failed"
+  | "adapter_mount_failed";
 
 export interface RendererLoadResult {
   renderer: TerminalRenderer;

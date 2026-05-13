@@ -144,16 +144,24 @@ date. The production shell now carries an operator-opt-in
   - `data-renderer-experimental` (`"true"` / `"false"`)
   - `data-renderer-fallback` (closed vocabulary:
     `""` | `experimental_gate_off` | `unknown_renderer_id` |
-    `adapter_load_failed`)
+    `adapter_load_failed` | `adapter_mount_failed`)
   - `data-renderer-gate` (`"on"` / `"off"`)
   - the visible diagnostic strip
     `[data-testid="production-terminal-renderer-diagnostic"]`
-- Any failure path (gate off + experimental id selected, unknown
-  persisted id, dynamic import / constructor failure) falls back
-  silently to xterm with the reason surfaced on
-  `data-renderer-fallback`. The underlying `Error.message` is
-  never echoed to the workspace, the audit log, or the console —
-  the fallback taxonomy is a closed vocabulary by design.
+- Synchronous failure paths (gate off + experimental id selected,
+  unknown persisted id, dynamic import / constructor failure) fall
+  back silently to xterm — `data-renderer="xterm"` AND the reason on
+  `data-renderer-fallback` ∈ `{experimental_gate_off,
+  unknown_renderer_id, adapter_load_failed}`. The asynchronous
+  mount-failure path landed 2026-05-13 (see the ghostty-web
+  CSP-blocked entry below): if `renderer.mount(target)` rejects, the
+  workspace stays `data-renderer="unmounted"` AND surfaces
+  `data-renderer-fallback="adapter_mount_failed"` plus the
+  operator-facing error copy `Renderer failed to mount. Switch back
+  to xterm in Settings and reopen the terminal.` The underlying
+  `Error.message` is never echoed to the workspace, the audit log,
+  or the console — the fallback taxonomy is a closed vocabulary by
+  design.
 
 This slice is the prerequisite the "Renderer path confirmation" step
 in `apps/web/e2e/SMOKE.md` § "D. Renderer evaluation smoke" assumed.
@@ -214,18 +222,28 @@ the production workspace's `attach()` does not catch errors thrown
 by `mount()`. The result is a wedged workspace with no
 operator-visible error panel.
 
-This is a real gap in the loader's fallback taxonomy: today's three
-values (`experimental_gate_off`, `unknown_renderer_id`,
-`adapter_load_failed`) cover synchronous loader paths but not
-asynchronous `mount()` rejection. A separate slice should extend
-`apps/web/src/lib/app/terminal/rendererLoader.ts` (or the
-production workspace's `attach()` body) to convert a rejected
-`mount()` into a fourth typed fallback diagnostic (suggested:
-`adapter_mount_failed`) and a workspace error panel, so the next
-operator hitting this CSP / WASM / data-URL gotcha sees honest copy
-instead of a stuck `idle` phase. The same slice should add the
-new value to `apps/web/e2e/SMOKE.md`'s `data-renderer-fallback`
-selector-vocabulary row so the contract stays exhaustive.
+This gap was a real one in the loader's fallback taxonomy at the
+time of the smoke: the loader's three synchronous values
+(`experimental_gate_off`, `unknown_renderer_id`,
+`adapter_load_failed`) covered synchronous loader paths but not
+asynchronous `mount()` rejection. The gap was closed in
+`feat/renderer-mount-failure-diagnostics`: the production workspace
+now wraps `r.mount(mountTarget)` in `mountRendererSafely` (defined
+in `apps/web/src/lib/app/terminal/terminalLaunch.ts`), translates
+any rejection into a fourth taxonomy value `adapter_mount_failed`,
+disposes the half-built renderer, and surfaces a fixed operator-
+facing copy (`Renderer failed to mount. Switch back to xterm in
+Settings and reopen the terminal.`) in `production-terminal-error`.
+The closed vocabulary on `data-renderer-fallback` is now
+`{experimental_gate_off, unknown_renderer_id, adapter_load_failed,
+adapter_mount_failed}`; `apps/web/e2e/SMOKE.md`'s selector
+vocabulary row mirrors the same set. A future operator hitting the
+same CSP / WASM / data-URL gotcha sees the typed diagnostic + error
+panel instead of a stuck `idle` phase. The fix did NOT attempt to
+make ghostty-web CSP-compatible; that is its own slice. xterm
+remains the production default; the operator must still flip the
+persisted renderer back to xterm in Settings to recover (the
+workspace deliberately does not auto-mutate persisted settings).
 
 **xterm fallback verification.** After flipping the gate OFF (which
 the `onExperimentalGateChange` handler resets to `rendererId="xterm"`

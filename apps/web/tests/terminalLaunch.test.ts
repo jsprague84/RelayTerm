@@ -1,4 +1,10 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect, vi } from "vitest";
+import type {
+  RendererInput,
+  RendererOutput,
+  TerminalRenderer,
+} from "@relayterm/terminal-core";
 import {
   buildAttachWsUrl,
   classifyReconnectAttempt,
@@ -6,10 +12,12 @@ import {
   derivePhase,
   describeLaunchError,
   describeWorkspaceError,
+  mountRendererSafely,
   phaseLabel,
   phaseTone,
   RECONNECT_CLOSED_MESSAGE,
   RECONNECT_INELIGIBLE_MESSAGE,
+  RENDERER_MOUNT_FAILED_MESSAGE,
   safeClearViewport,
   safeFit,
   safeFocus,
@@ -711,6 +719,280 @@ describe("buildAttachWsUrl", () => {
     });
     expect(url).toBe(
       "ws://localhost/api/v1/terminal-sessions/abc%2F..%2Fdef%3Fx%3D1/ws",
+    );
+  });
+});
+
+/**
+ * Minimal `TerminalRenderer` stub. The renderer-neutral interface is
+ * the integration seam between the loader/workspace and the concrete
+ * drawing backend; the helper only needs `mount` to honour, so the
+ * other methods are inert. `disposed` is a test-side counter so the
+ * "helper does NOT dispose" rule can be pinned directly.
+ */
+/**
+ * The vitest config uses the `node` environment (no jsdom), so a real
+ * `HTMLElement` is not available here. `mountRendererSafely` forwards
+ * the target to `renderer.mount(target)` without inspecting it, and the
+ * stub renderer below ignores the target too — a placeholder cast lets
+ * the helper signature stay honest without dragging jsdom in.
+ */
+function fakeTarget(): HTMLElement {
+  return {} as HTMLElement;
+}
+
+class StubMountRenderer implements TerminalRenderer {
+  public disposed = 0;
+  constructor(
+    private readonly mountImpl: (
+      target: HTMLElement,
+    ) => void | Promise<void>,
+  ) {}
+  mount(target: HTMLElement): void | Promise<void> {
+    return this.mountImpl(target);
+  }
+  write(_chunk: RendererOutput): void {}
+  resize(_cols: number, _rows: number): void {}
+  focus(): void {}
+  dispose(): void {
+    this.disposed += 1;
+  }
+  onInput(_cb: (data: RendererInput) => void): () => void {
+    return () => {};
+  }
+  onResize(
+    _cb: (size: { cols: number; rows: number }) => void,
+  ): () => void {
+    return () => {};
+  }
+}
+
+describe("RENDERER_MOUNT_FAILED_MESSAGE", () => {
+  it("names the failure taxonomy AND the remediation path, in stable copy", () => {
+    // SMOKE runbook + redaction sentinel + the workspace error panel
+    // all read this exact string; a copy drift would either silently
+    // confuse the operator (no remediation hint) or break the
+    // structural pins below. Lock it.
+    expect(RENDERER_MOUNT_FAILED_MESSAGE).toBe(
+      "Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.",
+    );
+  });
+
+  it("never includes the renderer id, WASM URL, or any sentinel-shaped detail", () => {
+    // The 2026-05-13 ghostty-web staging smoke surfaced three distinct
+    // pieces of operator noise inside the underlying `Error` chain: the
+    // adapter package name, the inlined `data:application/wasm;base64,…`
+    // URL, and a CSP directive verbatim. The fixed message MUST NOT
+    // contain any of them — only the taxonomy + the recovery action.
+    const lowered = RENDERER_MOUNT_FAILED_MESSAGE.toLowerCase();
+    expect(lowered).not.toContain("ghostty");
+    expect(lowered).not.toContain("restty");
+    expect(lowered).not.toContain("wterm");
+    expect(lowered).not.toContain("wasm");
+    expect(lowered).not.toContain("data:");
+    expect(lowered).not.toContain("default-src");
+    expect(lowered).not.toContain(SENTINEL.toLowerCase());
+  });
+});
+
+describe("mountRendererSafely — success path", () => {
+  it("returns { kind: 'mounted' } when the renderer's mount resolves", async () => {
+    const r = new StubMountRenderer(async () => {});
+    const outcome = await mountRendererSafely(r, fakeTarget());
+    expect(outcome).toEqual({ kind: "mounted" });
+    expect(r.disposed).toBe(0);
+  });
+
+  it("awaits a Promise-returning mount before resolving", async () => {
+    let resolved = false;
+    const r = new StubMountRenderer(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            resolved = true;
+            resolve();
+          }, 0);
+        }),
+    );
+    const outcome = await mountRendererSafely(
+      r,
+      fakeTarget(),
+    );
+    expect(resolved).toBe(true);
+    expect(outcome.kind).toBe("mounted");
+  });
+
+  it("returns 'mounted' for a synchronous (void) mount", async () => {
+    // xterm's `mount()` is sync today; helper must honour that.
+    let called = false;
+    const r = new StubMountRenderer(() => {
+      called = true;
+    });
+    const outcome = await mountRendererSafely(
+      r,
+      fakeTarget(),
+    );
+    expect(called).toBe(true);
+    expect(outcome).toEqual({ kind: "mounted" });
+  });
+});
+
+describe("mountRendererSafely — failure path", () => {
+  it("returns adapter_mount_failed when mount rejects asynchronously", async () => {
+    // Models the ghostty-web 0.4.0 staging smoke: dynamic import
+    // resolved, constructor ran, but `await init()` inside `mount()`
+    // rejected because the staging stack's CSP blocked the
+    // `data:application/wasm;base64,…` URL fetch + `WebAssembly.compile`.
+    const r = new StubMountRenderer(async () => {
+      throw new Error(
+        "CompileError: WebAssembly.compile(): default-src 'self' violation",
+      );
+    });
+    const outcome = await mountRendererSafely(
+      r,
+      fakeTarget(),
+    );
+    expect(outcome).toEqual({
+      kind: "failed",
+      fallback: "adapter_mount_failed",
+    });
+  });
+
+  it("returns adapter_mount_failed when mount throws synchronously", async () => {
+    const r = new StubMountRenderer(() => {
+      throw new Error("synchronous mount blew up");
+    });
+    const outcome = await mountRendererSafely(
+      r,
+      fakeTarget(),
+    );
+    expect(outcome.kind).toBe("failed");
+    if (outcome.kind === "failed") {
+      expect(outcome.fallback).toBe("adapter_mount_failed");
+    }
+  });
+
+  it("does NOT surface the underlying Error.message on failure", async () => {
+    // Mirror of the `rendererLoader.test.ts` redaction sentinel: a
+    // future "be helpful and include err.message in the outcome"
+    // regression would expose a CSP directive, the WASM URL, or
+    // stack frames into the renderer adapter. The outcome must stay
+    // a closed-vocabulary string.
+    const payload = "BEGIN OPENSSH PRIVATE KEY: leaked-via-stack";
+    const r = new StubMountRenderer(async () => {
+      throw new Error(payload);
+    });
+    const outcome = await mountRendererSafely(
+      r,
+      fakeTarget(),
+    );
+    expect(JSON.stringify(outcome)).not.toContain("OPENSSH");
+    expect(JSON.stringify(outcome)).not.toContain("leaked-via-stack");
+  });
+
+  it("does NOT dispose the renderer on failure (caller owns lifecycle)", async () => {
+    // The workspace's `attach()` disposes the failed renderer itself
+    // and then bumps state under the generation guard. If the helper
+    // also disposed, a teardown that races with the rejection would
+    // double-dispose; pinning the rule here keeps the responsibility
+    // explicit.
+    const r = new StubMountRenderer(async () => {
+      throw new Error("nope");
+    });
+    await mountRendererSafely(r, fakeTarget());
+    expect(r.disposed).toBe(0);
+  });
+
+  it("does NOT swallow a non-Error rejection — same closed-vocabulary outcome", async () => {
+    // A renderer adapter that rejects with a non-Error value
+    // (e.g., a string or object literal) MUST still collapse to the
+    // same typed fallback. The catch-all matches `catch` semantics:
+    // any thrown value lands in the failure arm.
+    const r = new StubMountRenderer(() => {
+      // eslint-disable-next-line @typescript-eslint/no-throw-literal
+      return Promise.reject("CSP blocked data:application/wasm;base64,...");
+    });
+    const outcome = await mountRendererSafely(
+      r,
+      fakeTarget(),
+    );
+    expect(outcome).toEqual({
+      kind: "failed",
+      fallback: "adapter_mount_failed",
+    });
+    expect(JSON.stringify(outcome)).not.toContain("CSP blocked");
+    expect(JSON.stringify(outcome)).not.toContain("base64");
+  });
+});
+
+/**
+ * Structural assertions against `ProductionTerminal.svelte`. Raw-text
+ * scans (same style as `appShellIsolation.test.ts`) — the goal is to
+ * pin the wiring rules that a future refactor could silently break:
+ *
+ *  - The workspace MUST import and call `mountRendererSafely`.
+ *  - The workspace MUST handle the `adapter_mount_failed` arm AND set
+ *    `lastError` to `RENDERER_MOUNT_FAILED_MESSAGE`.
+ *  - The diagnostic strip MUST render the `adapter_mount_failed`
+ *    branch (so the SMOKE runbook's
+ *    `production-terminal-renderer-diagnostic` row stays exhaustive).
+ *  - The renderer diagnostic block MUST be reachable when the
+ *    renderer never mounted but a fallback fired — without that, the
+ *    mount-failure path would surface ONLY the rose error panel and
+ *    drop its share of the closed vocabulary.
+ *
+ * These are intentionally NOT AST checks; they remain cheap, robust
+ * to formatting drift, and false-positive-free on the small surface
+ * area of one component file.
+ */
+describe("ProductionTerminal.svelte — mount-failure wiring", () => {
+  const TERMINAL_PATH = new URL(
+    "../src/lib/app/terminal/ProductionTerminal.svelte",
+    import.meta.url,
+  ).pathname;
+  const text = readFileSync(TERMINAL_PATH, "utf8");
+
+  it("imports and calls mountRendererSafely + RENDERER_MOUNT_FAILED_MESSAGE", () => {
+    expect(text).toMatch(/\bmountRendererSafely\b/);
+    expect(text).toMatch(/\bRENDERER_MOUNT_FAILED_MESSAGE\b/);
+    expect(text).toMatch(/await\s+mountRendererSafely\(/);
+  });
+
+  it("handles the adapter_mount_failed outcome and sets lastError to the stable string", () => {
+    // The mount-failure arm of `attach()` sets:
+    //   activeRendererFallback = mountOutcome.fallback
+    //   lastError = RENDERER_MOUNT_FAILED_MESSAGE
+    // and disposes the renderer. The grep stays loose enough to
+    // tolerate intervening comments + blank lines.
+    expect(text).toMatch(/mountOutcome\.kind\s*===\s*["']failed["']/);
+    expect(text).toMatch(/lastError\s*=\s*RENDERER_MOUNT_FAILED_MESSAGE/);
+  });
+
+  it("renders the adapter_mount_failed branch inside the diagnostic strip", () => {
+    expect(text).toMatch(
+      /activeRendererFallback\s*===\s*["']adapter_mount_failed["']/,
+    );
+    expect(text).toMatch(/switch back to xterm in Settings/i);
+  });
+
+  it("does NOT echo a raw Error.message anywhere inside the mount-failure path", () => {
+    // Sanity sentinel against a future regression that built the
+    // workspace's error copy from `err.message`. We search the whole
+    // component for `err.message` / `Error.message` / `mountOutcome.message`;
+    // none should appear.
+    expect(text).not.toMatch(/err\.message/);
+    expect(text).not.toMatch(/Error\.message/);
+    expect(text).not.toMatch(/mountOutcome\.message/);
+  });
+
+  it("keeps the renderer diagnostic block reachable when only a fallback is set", () => {
+    // Pinned condition: `{#if activeRendererId || activeRendererFallback}`.
+    // The original `{#if activeRendererId}` form hid the diagnostic
+    // entirely on the mount-failure path, which left the SMOKE
+    // selector with nothing to read and reduced the
+    // closed-vocabulary surface area.
+    expect(text).toMatch(
+      /\{#if\s+activeRendererId\s*\|\|\s*activeRendererFallback\}/,
     );
   });
 });

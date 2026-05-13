@@ -162,7 +162,7 @@ update this file in the same change.
 | `[data-testid="production-terminal-renderer-diagnostic"]` | Renderer diagnostic strip rendered in the workspace footer after the renderer mounts (text body includes `rendererLabel` + experimental/fallback hint). Provides a visible "which renderer am I looking at" cue alongside the `data-renderer` attribute on `production-terminal`. |
 | `data-renderer` (attribute on `production-terminal`) | The renderer id the workspace actually mounted: `xterm`, `ghostty-web`, `restty`, `wterm`, or `unmounted` before the attach resolves. Use this — not visual cues — when proving renderer identity for a smoke row. |
 | `data-renderer-experimental` (attribute on `production-terminal`) | `"true"` when the mounted renderer is experimental, `"false"` otherwise (including `unmounted`). |
-| `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
+| `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed` / `adapter_mount_failed`. The first three are produced by `rendererLoader.ts`'s synchronous paths (gate, unknown id, dynamic-import / constructor failure) AND fall back to xterm with `data-renderer="xterm"`. `adapter_mount_failed` is produced by `ProductionTerminal.svelte`'s `mountRendererSafely` call when the renderer's asynchronous `mount(target)` rejects (e.g., CSP-blocked WASM init); the workspace stays `data-renderer="unmounted"` and surfaces the operator-facing copy `Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.` in `production-terminal-error`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
 | `data-renderer-gate` (attribute on `production-terminal`) | `"on"` when the operator's experimental-renderer-evaluation gate is enabled in Settings, `"off"` otherwise. Independent of which renderer ended up mounted. |
 | `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer; enabled while live). |
 | `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). |
@@ -1339,13 +1339,22 @@ visual cues alone (cursor shape, glyph appearance, scrollbar style) are
      - `data-renderer-fallback` is the empty string.
      - `data-renderer-gate` is `"on"`.
 
-  If `data-renderer-fallback` is non-empty (`experimental_gate_off`
-  / `unknown_renderer_id` / `adapter_load_failed`), the workspace fell
-  back to xterm. A renderer-evaluation row taken under fallback is NOT
-  a candidate run — record the fallback reason verbatim, do not infer
-  candidate behavior, and either remediate (re-enable the gate; pick a
-  different candidate; re-check the production build) or mark every
-  subsequent row `deferred — renderer fell back to <id>`.
+  If `data-renderer-fallback` is non-empty
+  (`experimental_gate_off` / `unknown_renderer_id` /
+  `adapter_load_failed` / `adapter_mount_failed`), the workspace did
+  not mount the candidate. The first three fall back to xterm
+  (`data-renderer="xterm"`) — record the fallback reason verbatim,
+  do not infer candidate behavior, and either remediate (re-enable
+  the gate; pick a different candidate; re-check the production
+  build) or mark every subsequent row `deferred — renderer fell back
+  to xterm`. `adapter_mount_failed` is the asynchronous-mount-failure
+  signal added 2026-05-13 after the ghostty-web staging smoke surfaced
+  a CSP/WASM wedge; on this value the workspace stays
+  `data-renderer="unmounted"` AND surfaces the
+  `production-terminal-error` panel with `Renderer failed to mount.
+  Switch back to xterm in Settings and reopen the terminal.` Mark
+  every subsequent row `deferred — renderer not identified` and
+  remediate per the workspace copy (Settings → xterm → relaunch).
 
 - **Cleanup.** At smoke end, re-open Settings, flip the gate OFF, save.
   The toggle's onChange handler also resets the persisted renderer

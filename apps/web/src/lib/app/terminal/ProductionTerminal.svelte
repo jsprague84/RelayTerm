@@ -60,8 +60,10 @@
     computeWorkspaceEnablement,
     derivePhase,
     describeWorkspaceError,
+    mountRendererSafely,
     phaseLabel,
     phaseTone,
+    RENDERER_MOUNT_FAILED_MESSAGE,
     safeClearViewport,
     safeFit,
     safeFocus,
@@ -295,9 +297,33 @@
       return;
     }
     const r = loadResult.renderer;
-    await r.mount(mountTarget);
+    // `mountRendererSafely` translates an async `mount()` rejection
+    // into a typed fallback. The 2026-05-13 ghostty-web staging smoke
+    // landed on a wedged `data-renderer="unmounted"` /
+    // `data-renderer-fallback=""` workspace because the dynamic
+    // `import()` resolved cleanly but the adapter's WASM init rejected
+    // later inside `r.mount(mountTarget)` (staging nginx CSP blocked
+    // the inlined `data:application/wasm;base64,…` URL plus
+    // `WebAssembly.compile`). The helper closes that gap; the workspace
+    // surfaces the diagnostic AND a remediation message instead of
+    // staying silent.
+    const mountOutcome = await mountRendererSafely(r, mountTarget);
     if (myGen !== generation) {
       r.dispose();
+      return;
+    }
+    if (mountOutcome.kind === "failed") {
+      // Mount rejected. Dispose the half-built renderer so it cannot
+      // hold references / DOM nodes; do NOT attempt to mount xterm
+      // automatically — the persisted renderer setting belongs to the
+      // operator and the recovery is documented in
+      // `RENDERER_MOUNT_FAILED_MESSAGE`. Skip client construction and
+      // attach entirely; the workspace stays at `idle` but now carries
+      // an honest fallback + error panel rather than a silent wedge.
+      r.dispose();
+      activeRendererId = null;
+      activeRendererFallback = mountOutcome.fallback;
+      lastError = RENDERER_MOUNT_FAILED_MESSAGE;
       return;
     }
     // Record the active-renderer diagnostic ONLY after the post-mount
@@ -876,17 +902,28 @@
     </p>
   </div>
 
-  {#if activeRendererId}
+  {#if activeRendererId || activeRendererFallback}
     <p
       class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[11px] text-zinc-500"
       data-testid="production-terminal-renderer-diagnostic"
     >
       <span class="font-medium text-zinc-400">Renderer.</span>
-      <span class="font-mono text-zinc-300"
-        >{describeRenderer(activeRendererId)}</span
-      >
-      {#if isExperimentalRenderer(activeRendererId)}
-        <span class="ml-1 text-amber-300">· experimental</span>
+      {#if activeRendererId}
+        <span class="font-mono text-zinc-300"
+          >{describeRenderer(activeRendererId)}</span
+        >
+        {#if isExperimentalRenderer(activeRendererId)}
+          <span class="ml-1 text-amber-300">· experimental</span>
+        {/if}
+      {:else}
+        <!--
+          Mount-failure path: no renderer mounted, but the workspace
+          still surfaces the typed fallback so the operator and the
+          SMOKE runbook share one vocabulary across load + mount
+          stages. `activeRendererId === null` is reflected in
+          `data-renderer="unmounted"` on the section element.
+        -->
+        <span class="font-mono text-zinc-400">unmounted</span>
       {/if}
       {#if activeRendererFallback === "experimental_gate_off"}
         <span class="ml-1 text-zinc-400"
@@ -899,6 +936,11 @@
       {:else if activeRendererFallback === "unknown_renderer_id"}
         <span class="ml-1 text-amber-300"
           >· unknown renderer id — fell back to xterm</span
+        >
+      {:else if activeRendererFallback === "adapter_mount_failed"}
+        <span class="ml-1 text-rose-300"
+          >· renderer failed to mount — switch back to xterm in Settings and
+          reopen the terminal</span
         >
       {/if}
     </p>
