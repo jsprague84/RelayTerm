@@ -148,7 +148,9 @@ The first production-safe write flow on the Identities view: an operator can ask
 
 **Future work (explicit out-of-scope for this slice).**
 
-Private-key import (BYOK); password bootstrap and `ssh-copy-id` to automate `authorized_keys` install; per-identity audit log surface (the global Settings-view audit feed already surfaces `ssh_identity_deleted` rows); multi-vault key rotation. Each is a separate slice. (Identity rename and delete have landed — `PATCH /api/v1/ssh-identities/:id` is rename-only; `DELETE /api/v1/ssh-identities/:id` refuses `409 ssh_identity referenced` when any owned `server_profiles` row references the identity, and writes a `ssh_identity_deleted` audit BEFORE the DELETE on success.)
+Private-key import (BYOK) is the next planned slice — closed design at [`docs/private-key-import.md`](../private-key-import.md): v1 import scope is unencrypted OpenSSH Ed25519 only, paste-into-textarea on the Identities view, new `POST /api/v1/ssh-identities/import` route, reuses the existing vault envelope and the `ssh_identity_created` audit kind (payload gains a `source: "imported" | "generated"` discriminator), no new audit-CHECK migration. Passphrase-protected keys, RSA / ECDSA, PEM PKCS#1 / PKCS#8, Putty `.ppk`, file pickers, bulk import, and `ssh-copy-id` automation are deliberate later slices.
+
+Other deferred work, still each a separate slice: per-identity audit log surface (the global Settings-view audit feed already surfaces `ssh_identity_deleted` rows); multi-vault key rotation. (Identity rename and delete have landed — `PATCH /api/v1/ssh-identities/:id` is rename-only; `DELETE /api/v1/ssh-identities/:id` refuses `409 ssh_identity referenced` when any owned `server_profiles` row references the identity, and writes a `ssh_identity_deleted` audit BEFORE the DELETE on success.)
 
 ### Production host & server-profile creation UI
 
