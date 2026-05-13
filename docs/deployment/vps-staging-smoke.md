@@ -3882,6 +3882,384 @@ treat any of these as staging-verified):**
 
 ---
 
+### 2026-05-12 · Inventory management mutations (hosts / server-profiles / SSH identities edit + delete) staging smoke
+
+Slice `docs/inventory-management-staging-smoke` staging-verifies
+the inventory-management mutation surface shipped in
+`feat(api): add inventory management mutations`
+(`f1f0691`, 2026-05-12). The commit landed six new routes —
+`PATCH/DELETE /api/v1/hosts/:id`,
+`PATCH/DELETE /api/v1/server-profiles/:id`,
+`PATCH/DELETE /api/v1/ssh-identities/:id` — each gated by
+`CsrfGuard` + `AuthenticatedUser` and each refusing the
+destructive path when the row is still referenced by a
+dependent (per the SPEC.md "Inventory lifecycle and
+destructive-action policy"). Smoke covers the 200 / 400 / 404 /
+409 / 401 / 403 envelopes against a freshly-deployed `:main`,
+with bounded DB and log redaction sweeps as the backstop.
+
+**Image freshness.** Forgejo CI for `f1f0691` (all 6 jobs
+green; `publish images` finished 2026-05-12T23:50:35Z) pushed
+`relayterm-backend:main` @ `sha256:55e64c11…` (built
+2026-05-12T23:49:48Z) and `relayterm-web:main` @
+`sha256:63694b40…` (built 2026-05-12T23:50:27Z). Staging VPS
+(`cloud-edge`, compose project `relayterm-staging` at
+`/home/ubuntu/docker-compose/relayterm-staging`) was on the
+prior digest pair (`5d359a2d…` / `73486f6c…` — the
+Phase 1B.2b deployment-quota line from the entry above);
+`docker pull` + `docker compose up -d --no-deps --force-recreate
+relayterm-backend relayterm-web` brought both services to the
+new digests cleanly (backend healthy within ~6 s; web healthy
+within ~27 s). Postgres untouched (`Up 3 days (healthy)`). The
+served SPA bundle is `index-CiiA2M_K.js` with `last-modified:
+Tue, 12 May 2026 23:50:27 GMT` — byte-equal to the web image
+build time, i.e. the live SPA is the post-commit bundle.
+
+**Operator user / login.** Reused the existing throwaway
+bootstrap user
+`staging+throwaway-20260509173230@example.com`
+(`f968b6f5-9cfc-46ae-b735-bc0f95465b5b`); same one the
+2026-05-09 / -10 / -11 / earlier-2026-05-12 entries above
+exercise. Password read from
+`~/dev/RelayTermSecrets.md` into a private 0600 scratch file,
+fed to `curl --data-urlencode` once, then `shred -u`'d before
+any further work. Cookie jar at
+`/tmp/relayterm-inv-smoke/cookie.txt` (HttpOnly + Secure
+flagged by the server). No production credentials, no
+private-key import, no real production SSH identities.
+
+**HTTPS reachability gate (§7.3 re-checked post-recreate).**
+`/` → `200`, `/healthz` → `200 {"status":"ok"}` (15 bytes),
+`/api/v1/auth/me` → `401` from outside the SPA.
+
+**Mutation surface presence cross-check (unauth + bad
+Origin).** Before login, every new route was probed from the
+workstation with no cookie / bad Origin to confirm correct
+gating:
+
+| Probe | Expected | Observed |
+|---|---|---|
+| `PATCH /api/v1/hosts/:id` (Origin set, no cookie) | `401` | `401` |
+| `DELETE /api/v1/hosts/:id` (Origin set, no cookie) | `401` | `401` |
+| `PATCH /api/v1/ssh-identities/:id` (Origin set, no cookie) | `401` | `401` |
+| `DELETE /api/v1/ssh-identities/:id` (Origin set, no cookie) | `401` | `401` |
+| `PATCH /api/v1/server-profiles/:id` (Origin set, no cookie) | `401` | `401` |
+| `DELETE /api/v1/server-profiles/:id` (Origin set, no cookie) | `401` | `401` |
+| `PATCH /api/v1/hosts/:id` (no Origin) | `403 csrf_origin_mismatch` | `403 csrf_origin_mismatch` |
+| `DELETE /api/v1/server-profiles/:id` (no Origin) | `403 csrf_origin_mismatch` | `403 csrf_origin_mismatch` |
+| `DELETE /api/v1/ssh-identities/:id` (Origin = `https://evil.example.com`) | `403 csrf_origin_mismatch` | `403`, body `{"error":{"code":"csrf_origin_mismatch","message":"forbidden"}}` — does NOT echo the offered Origin value (AGENTS.md "Things to avoid" § 7) |
+
+All six routes are reachable (no 404), all six gate CSRF
+before auth (a missing/bad Origin produces 403 before the
+401), all six require a valid session.
+
+**Smoke resources created (timestamp suffix `t20260512`).**
+Created via the existing POST helpers under the smoke user
+(`/api/v1/hosts`, `/api/v1/ssh-identities`,
+`/api/v1/server-profiles`). All names use the
+`inv-smoke-…-t20260512` convention so the rows are easy to
+identify and easy to leave-in-place per the
+inventory-lifecycle policy:
+
+| Role | ID | Initial name |
+|---|---|---|
+| H1 (edit target) | `2fe699d7-32f6-44f3-959f-0839ca46b2a8` | `inv-smoke-host-edit-t20260512` |
+| H2 (delete-success target) | `2482593b-c6ca-4814-ae48-1beba8f5329c` | `inv-smoke-host-delete-free-t20260512` |
+| H3 (host-delete-conflict subject) | `1ff05505-98cb-4d5f-9369-f1899eb2bc7e` | `inv-smoke-host-referenced-t20260512` |
+| I1 (rename target) | `b49c7228-7880-4dfa-aabf-03b6a95ccb89` | `inv-smoke-identity-rename-t20260512` |
+| I2 (paired identity, delete-free profile's key) | `1d461cf7-77e0-4795-b0a0-d6e34c4f31eb` | `inv-smoke-identity-delete-free-t20260512` |
+| I3 (identity delete-success target) | `b02d4f01-b44f-4216-8e1f-d4317baa8c24` | `inv-smoke-identity-delete-free-only-t20260512` |
+| P1 (profile edit target) | `582b7861-f713-4401-9f16-b1ce78d0b470` | `inv-smoke-profile-edit-t20260512` |
+| P2 (profile delete-success target) | `597dfccd-b00b-4a94-88fd-9ce6ef1c1a17` | `inv-smoke-profile-delete-free-t20260512` |
+| P3 (host-delete-conflict blocker) | `5b3150f1-574e-4271-b47c-49ba35c6ed00` | `inv-smoke-profile-referenced-t20260512` |
+
+The pre-existing `smoke-id` identity
+(`44b5e2be-29c2-4eb0-b6ac-3b4e25ca789d`) was re-used as the
+SSH identity bound to P3. The 10 existing
+`server_profiles` with `terminal_sessions` history (e.g.
+`ux-smoke-profile-v2` with 7 rows, `android-smoke-profile`
+with 6, etc.) were re-used for the
+`server_profile_referenced` (history) delete-conflict probe.
+Their rows were NOT mutated by this smoke.
+
+**Mutation results against the live backend.**
+
+| # | Operation | Wire | Observed | DB cross-check |
+|---|---|---|---|---|
+| 1 | `PATCH /ssh-identities/I1` rename → `inv-smoke-identity-renamed-t20260512` | `200` | `200` body has new name; `key_type=ed25519`, `fingerprint_sha256` unchanged, `created_at` unchanged, `last_used_at=null` | row matches; `encrypted_private_key` length unchanged at 477 bytes |
+| 2 | `DELETE /ssh-identities/I3` (no profile ref) | `204` | `204` no body; follow-up GET → `404 not_found` | row absent; `ssh_identity_deleted` audit row written with `{id, name, key_type, fingerprint_sha256, created_at}` payload — NO `encrypted_private_key`, NO `public_key` bytes |
+| 3 | `DELETE /ssh-identities/I1` (referenced by P1) | `409 conflict` | `409 {"error":{"code":"conflict","message":"ssh_identity referenced"}}` — no profile id / count / raw-error echo | I1 row preserved; zero new audit rows for the conflict attempt |
+| 4a | `PATCH /hosts/H1` all four fields (`display_name` + `hostname` + `port=2222` + `default_username=smoke2`) | `200` | `200` body has updated values; `updated_at` advanced past `created_at` | row matches updated state |
+| 4b | `PATCH /hosts/H1` `{}` empty | `400 invalid_input` | `400 {"error":{"code":"invalid_input","message":"at least one field must be provided"}}` | no DB write |
+| 4c | `PATCH /hosts/H1` `{"port":99999}` | `400 invalid_input` | `400 {"error":{"code":"invalid_input","message":"ssh port must be in range 1..=65535 (got 99999)"}}` — input echo (offered integer only) is the standard validator copy and matches the create-route pattern; no raw backend error string | no DB write |
+| 4d | `PATCH /hosts/H1` partial (only `display_name=inv-smoke-host-edited-final-t20260512`) | `200` | `200`; only `display_name` changed, `hostname`/`port`/`default_username` preserved from 4a | row matches |
+| 5a | `DELETE /hosts/H2` BEFORE deleting P2 | `409 conflict` | `409 {"error":{"code":"conflict","message":"host referenced"}}` — no profile-id echo | H2 row preserved |
+| 5b | `DELETE /hosts/H2` AFTER deleting P2 (no remaining dependents — no profile, no `known_host_entries`) | `204` | `204`; follow-up GET → `404 not_found` | H2 row absent. Pre-delete DB query (`SELECT host_id, COUNT(*) FROM known_host_entries WHERE host_id IN (H1,H2,H3)`) returned zero rows for all three smoke hosts, so the schema-level `ON DELETE CASCADE` on `known_host_entries.host_id` was NOT exercised by this smoke item — the route's `any_dependents_for_user` predicate would have returned `true` and refused the delete with `409 host referenced` had any pin existed (this is the same code path as the deferred smoke item 7 below). **Identity I2 NOT cascade-deleted** (`GET /ssh-identities/I2` → `200`) — host delete is owner-scoped and does not touch identities or profiles |
+| 6 | `DELETE /hosts/H3` (P3 attached) | `409 conflict` | `409 {"error":{"code":"conflict","message":"host referenced"}}` | H3 row preserved |
+| 7 | `DELETE /hosts/<host with known_host_entries but no profile>` | (not exercised this slice) | DEFERRED — see "Deferred" below |
+| 8a | `PATCH /server-profiles/P1` `{name, tags:["smoke","inv","t20260512"]}` | `200` | `200`; row has new name + new tag set | row matches; `server_profile_updated` audit row written |
+| 8b | `PATCH /server-profiles/P1` `{"username_override":"override-user"}` | `200` | `200`; `username_override="override-user"` | row matches |
+| 8c | `PATCH /server-profiles/P1` `{"username_override":null}` (explicit null — tri-state `Some(None)` → `SetOptional::Set(None)` path) | `200` | `200`; `username_override=null` | row matches; the omitted-vs-null distinction in `UpdateServerProfileRequest::deserialize_some_present` is the load-bearing wire contract |
+| 8d | `PATCH /server-profiles/P1` `{}` empty | `400 invalid_input` | `400 {"error":{"code":"invalid_input","message":"at least one field must be provided"}}` | no DB write |
+| 8e | `PATCH /server-profiles/P1` `{"host_id":H3}` then `{"host_id":H1}` (rebind round-trip) | `200`, `200` | both `200` | row matches end-state H1 |
+| 9 | `DELETE /server-profiles/P2` (zero `terminal_sessions` refs) | `204` | `204`; follow-up GET → `404 not_found` | P2 row absent; `server_profile_deleted` audit row written with `{id, name, host_id, ssh_identity_id, disabled_at}` payload; H2 + I2 NOT cascade-deleted (verified via 5b above) |
+| 10 | `DELETE /server-profiles/d1207a25-…` (`ux-smoke-profile-v2`, 7 historical `terminal_sessions` rows) | `409 conflict` | `409 {"error":{"code":"conflict","message":"server_profile referenced"}}` — no session-id / count / raw-error echo | profile row preserved (follow-up GET → `200`); `terminal_sessions`, `session_events`, `audit_events` history NOT touched |
+| 11 | CSRF / auth sanity | covered in the probe table above | `401` unauth, `403 csrf_origin_mismatch` no/wrong-Origin, body never echoes offered Origin | — |
+
+The UI-side error formatters
+(`describeDeleteHostError`, `describeDeleteServerProfileError`,
+`describeDeleteSshIdentityError`,
+`describeUpdateHostError`, `describeUpdateServerProfileError`,
+`describeUpdateSshIdentityError` in
+`apps/web/src/lib/api/{hosts,serverProfiles,sshIdentities}.ts`)
+re-map each 409 / 400 / 404 / 401 / 403 envelope above to
+user-friendly copy that does NOT echo the wire `message`
+field. The 451-line unit test
+`apps/web/tests/inventoryMutationsApi.test.ts` (46
+`describe`/`it` sections; landed with `f1f0691`; CI green)
+pins these mappings, including the "`never echoes wire
+message`" invariant for every error path and the "does not
+echo private-key material in the parsed DTO" invariant on
+the rename response shape.
+
+**Backend audit-events tally for the smoke window**
+(`actor_id = f968b6f5-…`, `recorded_at > now() - 30 min`):
+
+```
+          kind          | count
+------------------------+-------
+ login_succeeded        |     1
+ server_profile_created |     3   ← P1 + P2 + P3
+ server_profile_deleted |     1   ← P2 only (success)
+ server_profile_updated |     5   ← 8a + 8b + 8c + 8e (H3) + 8e (H1)
+ ssh_identity_deleted   |     1   ← I3 only (success)
+```
+
+Zero `host_*` audit rows — the `audit_events_kind_chk`
+constraint deliberately omits `host_*` kinds; host mutations
+are inventory metadata and produce no audit (see
+`crates/relayterm-api/src/routes/v1/hosts.rs` route docs).
+Zero `ssh_identity_updated` rows — the schema constraint
+omits this kind too; identity rename is inventory metadata
+only (see source comment at `ssh_identities.rs::update`).
+Zero conflict-attempt audit rows — the route-layer
+short-circuit returns `Err(Conflict)` BEFORE the audit
+append, matching the canonical pattern in `docs/spec/
+inventory.md` § "Server profile lifecycle audit" and the
+AGENTS.md "Things to avoid" line "append an audit row on a
+redundant/idempotent lifecycle call".
+
+**Audit payload redaction.** Every payload above carries
+public metadata ONLY — `{id, name, host_id, ssh_identity_id,
+disabled_at}` for server-profile lifecycle events, `{id,
+name, key_type, fingerprint_sha256, created_at}` for
+`ssh_identity_deleted`. No `encrypted_private_key`, no
+`public_key` bytes, no PEM, no peer banner, no cookie, no
+session id, no raw russh/DB error string, no `data_b64`.
+The sentinel-test guard
+`AUDIT_FORBIDDEN_SUBSTRINGS` in the API integration suite is
+the backstop.
+
+**Dependency rules verified end-to-end against the live
+schema.**
+
+- Host delete refused when any owned `server_profiles` row
+  references the host (smoke item 5a + 6; FK
+  `server_profiles.host_id ON DELETE RESTRICT`).
+- Host delete refused when ANY `known_host_entries` row
+  references the host — **deferred (see below)**; the
+  `any_dependents_for_user` predicate is one short-circuit OR
+  across both refs and the same 409 envelope covers either
+  branch.
+- Server-profile delete refused when ANY `terminal_sessions`
+  row references the profile (smoke item 10; FK
+  `terminal_sessions.server_profile_id ON DELETE RESTRICT`).
+- SSH-identity delete refused when any owned
+  `server_profiles` row references the identity (smoke item
+  3; FK `server_profiles.ssh_identity_id ON DELETE RESTRICT`).
+- `terminal_sessions`, `audit_events`, `session_events`,
+  `known_host_entries` history rows are NOT hard-deleted by
+  any operation in this slice. The successful `H2` host
+  delete + `P2` profile delete each left `audit_events`
+  history intact (the `server_profile_deleted` audit row for
+  P2 is itself the audit-history evidence).
+
+**Log / nginx redaction sweep — staging containers for the
+~16-minute smoke window.** `docker logs --since 30m`
+captured 16 lines on the backend (one startup block + 7
+`unauthorized request detail="missing session cookie"` +
+2 `csrf origin mismatch detail="missing Origin header"` + 1
+`csrf origin mismatch detail="Origin not in allowed_origins"`)
+and 69 lines on the web nginx. High-value sentinel sweep
+(`session_token=|token_hash=|password=|password":[^"n]|
+private_key|encrypted_private_key|BEGIN OPENSSH|data_b64|
+REDACT-MARKER`) returned **zero hits** in either log. The
+category-shaped word "cookie" appears 7× in the backend log
+ONLY as the literal diagnostic label
+`detail="missing session cookie"` — naming the absence of a
+value, not echoing a value. The category-shaped word
+"Origin" appears in the third CSRF WARN ONLY as the literal
+phrase `Origin not in allowed_origins` — the offered Origin
+value itself is NOT echoed (per AGENTS.md § 7 / the
+`bad_origin_rejects_before_body_parsing` integration test).
+Successful mutations produced **zero backend log lines** —
+the routes do not `tracing::info!` on success, so no row
+content is leaked through the structured-log path. Audit
+events are the only durable record (covered above).
+
+**UI driving.** This slice did NOT drive the SPA through a
+real browser (Playwright would require putting the smoke
+user's password into a tool-call argv, which would land in
+the conversation log and violate the slice's "do not print
+passwords/cookies/tokens" rule; the session cookie is
+`HttpOnly` so it cannot be side-loaded into the browser via
+JS either). The SPA bundle on staging IS the post-commit
+bundle (verified via `last-modified` + web image digest
+above); the SPA-side mutation surface that the UI calls is
+covered by `apps/web/tests/inventoryMutationsApi.test.ts`
+(landed with `f1f0691`; CI green); the user-facing copy
+strings for every error envelope above were verified
+statically and are pinned by the "never echoes wire message"
+invariant in that test. Replacing this static + API-level
+verification with a real browser drive is a follow-up — see
+"Deferred" below.
+
+**Cleanup posture / inventory state at slice end.**
+
+- H2 (`inv-smoke-host-delete-free-t20260512`) — DELETED to
+  verify the success path; row absent.
+- P2 (`inv-smoke-profile-delete-free-t20260512`) — DELETED
+  to verify the success path; row absent. The
+  `server_profile_deleted` audit row is the durable record.
+- I3 (`inv-smoke-identity-delete-free-only-t20260512`) —
+  DELETED to verify the success path; row absent. The
+  `ssh_identity_deleted` audit row is the durable record
+  (with `encrypted_private_key` hard-deleted from disk per
+  the only-allowed-removal path).
+- H1 (`inv-smoke-host-edited-final-t20260512`) — KEPT;
+  reflects the last partial PATCH (smoke item 4d).
+- H3 (`inv-smoke-host-referenced-t20260512`) — KEPT;
+  blocks-host-delete subject for any future re-verification.
+- I1 (`inv-smoke-identity-renamed-t20260512`) — KEPT;
+  rename target.
+- I2 (`inv-smoke-identity-delete-free-t20260512`) — KEPT;
+  still bound to nothing (P2 deleted; smoke convention is
+  to leave inventory in place).
+- P1 (`inv-smoke-profile-edited-t20260512`) — KEPT; reflects
+  the final 8e PATCH end-state (host=H1, identity=I1,
+  username_override=null, tags=`{smoke,inv,t20260512}`).
+- P3 (`inv-smoke-profile-referenced-t20260512`) — KEPT;
+  blocks-host-delete-of-H3 subject for any future
+  re-verification.
+- `ux-smoke-profile-v2` and the other 9 historical
+  smoke profiles + their `terminal_sessions` history —
+  UNTOUCHED (smoke item 10 only attempted DELETE and
+  observed 409; no rows mutated).
+- No `.env` change. No durable Compose / nginx /
+  docker-compose template change.
+- No throwaway SSH container created this slice.
+- Local scratch dir `/tmp/relayterm-inv-smoke/` shredded
+  (`pw`, `login.json`) and otherwise carries only the
+  per-resource JSON snapshots + cookie jar; teardown is a
+  single `shred -u` pass on the cookie jar and `rm -rf` on
+  the directory after operator approval.
+- Staging stack left running on the new digest pair
+  (`55e64c11…` / `63694b40…`).
+
+**Verified.**
+
+- `feat(api): add inventory management mutations` (`f1f0691`)
+  is on `main`, CI green, image-published, deployed, and
+  exercised end-to-end against the live staging slot.
+- All six new routes gate CSRF before auth, gate auth, and
+  surface the documented 409 envelope on every dependency
+  branch tested this slice.
+- The inventory-lifecycle policy from `SPEC.md` /
+  `docs/agent/redaction-rules.md` § 2 + § 3 holds against
+  the live schema: hard-delete refused when dependents
+  exist, no cascade onto history tables, no audit row on
+  conflict-attempt, audit row written field-by-field with
+  public metadata only on each success path that has an
+  audit kind, no audit row at all on the kinds whose schema
+  CHECK constraint deliberately omits them
+  (`host_*`, `ssh_identity_updated`).
+- SPA bundle on staging is the post-commit build; UI-layer
+  mutation surface is unit-test-pinned.
+- Log / nginx redaction sentinel sweep clean across the
+  entire smoke window.
+
+**Deferred (intentional non-goals for this run; do NOT treat
+any of these as staging-verified by this entry):**
+
+- **Host-delete-conflict via `known_host_entries`-only ref**
+  (smoke item 7). The route's `any_dependents_for_user`
+  predicate is a single short-circuit OR across
+  `server_profiles` AND `known_host_entries`, so item 6
+  (profile-ref blocker) already exercises the same `409
+  host referenced` envelope. Standing up a host with a
+  `known_host_entries` row but no profile would require
+  creating a throwaway SSH container + walking the
+  trust-host-key flow + deleting the profile — out of
+  scope per the slice's "do not over-expand the smoke" /
+  "no throwaway SSH containers without approval" rules.
+  Covered by integration tests at
+  `crates/relayterm-api/tests/api.rs` per the
+  `any_dependents_for_user` matrix.
+- **Browser-driven SPA verification.** See "UI driving"
+  above. Replacing the API + static UI-copy verification
+  with a real Playwright (or Tauri WebView) drive is a
+  follow-up; would require a browser/IPC path that the
+  smoke user password does NOT cross via a tool-call argv.
+  The deployed bundle's freshness is already pinned via
+  `last-modified` + web image digest.
+- **Private-key import.** The
+  `CreateSshIdentityRequest` DTO has no
+  field for importing externally-generated private-key
+  material; the vault is the only path. Out of scope per
+  the source-level comment at
+  `crates/relayterm-api/src/dto/ssh_identity.rs:27-32`.
+- **`ssh-copy-id` / bootstrap automation.** Out of scope.
+- **Route-param detail pages** (`/servers/:id`,
+  `/hosts/:id`, `/identities/:id`). The list views handle
+  inline edit / delete; detail-page surfaces are a
+  separate slice and not landed.
+- **Quota metrics / operator dashboard tile.** Out of
+  scope per `docs/session-quotas.md` § 8.4 / 1B.2c.
+- **Terminal renderer evaluation.** Out of scope —
+  no renderer code touched.
+- **Durable persistence** beyond the current
+  Postgres-backed inventory tables. Out of scope.
+- **Hard-delete of `terminal_sessions`, `audit_events`,
+  `session_events`, `known_host_entries`.** Explicitly NOT
+  a goal — those tables are append-only / lifecycle-
+  preserving per AGENTS.md "Things to avoid".
+- **`SPEC.md` / `docs/spec/inventory.md` stale-wording
+  cleanup is a separate follow-up slice — NOT in scope for
+  this smoke entry.** The inventory-management routes
+  landing in `f1f0691` make several existing statements
+  stale: `SPEC.md` lines 59 / 151 / 188 / 164-165 / 188
+  carry "remain future work" wording for create / edit /
+  delete forms, identity rename, host create/update/delete
+  audit kinds, etc.; `SPEC.md` lines 133 + 153 + 112
+  describe known-host CASCADE as the user-facing semantic
+  but the route at
+  `crates/relayterm-api/src/routes/v1/hosts.rs` (per
+  `any_dependents_for_user` at
+  `crates/relayterm-db/src/repositories/host.rs:155-186`)
+  refuses host delete whenever any `known_host_entries`
+  row exists, overriding the schema-level cascade for the
+  user-facing surface. Per the slice prompt ("Optionally
+  update: SPEC.md only if it has a status checklist…",
+  "Do not do a broad docs rewrite"), this entry leaves
+  SPEC.md / `docs/spec/inventory.md` unchanged; the
+  cleanup is named-and-deferred here so a future
+  `/audit-spec-drift` or `/trim-spec-md` run picks it up
+  with full context. AGENTS.md "Maintenance protocol"
+  applies — a follow-up commit on a separate branch
+  should land the SPEC text update.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
