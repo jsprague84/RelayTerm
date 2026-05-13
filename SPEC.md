@@ -15,6 +15,10 @@ RelayTerm is a web/mobile SSH terminal where SSH sessions live on a Rust backend
 **Goals:** TODO — top 2-3 outcomes (e.g. "tabs survive flaky mobile networks," "single audited backend issues all SSH credentials," "renderer is swappable per device class").
 **Non-goals:** TODO — things this is NOT (e.g. NOT a web-based VS Code; NOT an SSH proxy that exposes raw keys to clients).
 
+## Current roadmap pointer
+
+The single-user deployable baseline (auth, inventory CRUD + lifecycle, private-key import v1, host-key trust, auth-check, terminal launch, detach / reconnect / replay, staging smokes) is on `main` and was exercised end-to-end against the throwaway staging stack on 2026-05-13 (see [`docs/deployment/vps-staging-smoke.md`](docs/deployment/vps-staging-smoke.md) § "2026-05-13 · Deployable-baseline end-to-end staging smoke" and § "2026-05-13 · Private-key import (OpenSSH Ed25519) staging smoke"). The next product track is **terminal renderer evaluation and high-performance terminal UX** — the staged plan, evaluation matrix, and promotion criteria live in [`docs/terminal-renderer-evaluation.md`](docs/terminal-renderer-evaluation.md). The renderer-adapter contracts that evaluation builds on stay in [`docs/spec/terminal-adapters.md`](docs/spec/terminal-adapters.md); xterm.js remains the production compatibility baseline and the default renderer until a candidate clears the Gate 2 promotion criteria in that plan. Quota / metrics / dashboard work is **paused** unless an explicit ask reopens it, and tmux / screen-style host-side persistence remains an optional future integration in [`docs/persistent-sessions.md`](docs/persistent-sessions.md) — it is not the current backend primitive (the in-memory replay ring + bounded `DETACHED_LIVE_PTY_TTL` reconnect window is) and is not unlocked by renderer work.
+
 ## Architectural invariants (load-bearing)
 
 These are normative. Drift from any of these is a spec bug, not an implementation freedom.
