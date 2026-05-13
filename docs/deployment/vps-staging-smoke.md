@@ -5003,6 +5003,377 @@ above) and the import panel testid surface is the same
 SPA the shells wrap, so no shell-specific surface exists
 today.
 
+### 2026-05-13 · Deployable-baseline end-to-end staging smoke
+
+**Date.** 2026-05-13 04:43 UTC – 05:17 UTC (≈35 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** `git.js-node.cc/jsprague/relayterm-backend:main`
+(image `sha256:fc6799fc…`, built 2026-05-13T02:55:38Z) +
+`relayterm-web:main` (image `sha256:71bcc4f0…`, built
+2026-05-13T02:56:22Z). Both digests post-date the most
+recent backend-changing commit on `main` (`8af1fc9
+feat(api): import OpenSSH Ed25519 identities`, 2026-05-13
+02:51 UTC), so this smoke ran against the published images
+that carry inventory mutations, private-key import,
+session-policy TTL, and the per-user / deployment quotas.
+**Branch.** `docs/deployable-baseline-e2e-smoke` off
+`main` (docs-only slice; no source changes).
+**Browser surface.** Playwright MCP (Firefox) at
+1440 × 900. The Tauri desktop / Android shells were
+explicitly NOT in scope — those have their own smoke
+entries above and wrap this same SPA. Auth: existing
+`staging+throwaway-20260509173230@example.com` cookie
+session; no re-login required, no password entered or
+logged.
+
+**Goal.** Confirm RelayTerm's single-user deployable
+baseline is usable end-to-end against published `:main`
+images before terminal-renderer-evaluation work begins.
+Slice boundaries: no source / schema / API / auth / CSRF /
+CORS / WebSocket-protocol / Tauri / CI / deploy file
+changes — this is a smoke + docs slice only.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-baseline-smoke-ssh`, attached only to
+the staging Compose network
+`relayterm-staging_relayterm-staging-internal` with DNS
+alias `baseline-smoke-host` resolving to `172.21.0.5`.
+**No host port was published** — the target was
+unreachable from anything outside the staging Compose
+network. `USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`, `PUBLIC_KEY=<contents of
+id_ed25519.pub>` (piped over a single `IFS= read -r` so
+the public-key bytes never landed in remote shell argv).
+DNS + TCP reachability from a `busybox` sidecar on the
+same internal network was confirmed before any browser
+action (`baseline-smoke-host → 172.21.0.5` + `nc -zv …
+2222 open`). The container was `docker stop && docker rm`'d
+during cleanup.
+
+**Identity path.** Imported (path B — verifies the newest
+deployability gap). A throwaway Ed25519 keypair was
+generated locally under
+`/tmp/relayterm-baseline-smoke.XXXXXX/id_ed25519` (no
+passphrase — passphrase-protected key import is
+explicitly deferred per `docs/design/private-key-import.md`
+§ 10). Locally-computed fingerprint:
+`SHA256:GDA6/gBYwJ8POXNTsEjDDLykeKSm+2WT+NACLutMLAU`. The
+private-key PEM bytes never appeared in any tool-call
+payload, audit row, log line, Error, or browser DOM:
+the PEM was carried into the browser via a base64
+sidecar + `atob()` inside a single `page.evaluate` call,
+then `shred -u`'d at cleanup along with the public-key
+and the base64 sidecar. The generated-identity path
+was intentionally skipped to keep the slice tight; the
+import path is the load-bearing parity check vs. a
+backend-generated key (yesterday's 2026-05-12 import
+smoke covers both halves of the round-trip in detail).
+
+**UI import + rename.** Identities view →
+`identities-import-open` → PEM pasted into
+`identities-import-private-key` textarea + name
+`baseline-smoke-identity` into `identities-import-name`
+→ `identities-import-submit`. One
+`POST /api/v1/ssh-identities/import` returned a
+`SshIdentityResponse` with `key_type=ed25519` and
+fingerprint
+`SHA256:GDA6/gBYwJ8POXNTsEjDDLykeKSm+2WT+NACLutMLAU`
+byte-identical to the locally-computed value. The
+success card showed the public-key preview line
+`ssh-ed25519 AAAA…40z baseline-smoke-identity` (the
+supplied name became the OpenSSH comment per design
+§ 5 step (d)). Name + textarea were cleared on success
+and submit was re-disabled. Identity then renamed to
+`baseline-smoke-identity-renamed` via
+`identity-detail-rename-open` → input fill →
+`identity-detail-rename-save`; the detail panel and
+list both flipped to the new name.
+
+**DOM + storage redaction.** Post-import sweep over
+`document.documentElement.outerHTML`: the literal markers
+`-----BEGIN OPENSSH PRIVATE KEY-----` and
+`-----END OPENSSH PRIVATE KEY-----` appear only as the
+import-textarea's `placeholder` attribute (one host node,
+class `min-h-[10rem] … bg-zinc-900 …`), not as live
+private-key bytes. The `openssh-key-v1` base64 magic
+prefix (`b3BlbnNzaC1rZXktdjE`) was confirmed **absent**
+from the DOM (the sweep is the load-bearing redaction
+check, not the placeholder mention).
+`encrypted_private_key`, `private_key_openssh`,
+`session_token`, `token_hash` all absent. `localStorage`
+empty, `sessionStorage` empty, `document.cookie.length
+=== 0` (auth cookie is HttpOnly — JS cannot read it).
+The string `passphrase` appears in the deferred-future
+help copy at the bottom of the panel (`Passphrase-
+protected key import … deliberate later slices`); that
+is the design-pinned wording, not a leak.
+
+**Host create + edit.** Created
+`Baseline-Smoke-Host` (display name) /
+`baseline-smoke-host` (hostname) / `2222` / default user
+`smoke` via the `servers-create-host-*` form. Edited the
+display name from `baseline-smoke-host` to
+`Baseline-Smoke-Host` through
+`host-detail-edit-display-name` →
+`host-detail-edit-save`: mixed-case display name was
+preserved verbatim while the lowercase hostname (load-
+bearing for DNS resolution on the internal Compose
+network) was left untouched. Port and default user
+unchanged. `hosts-count` flipped from `16 hosts → 17
+hosts`.
+
+**Profile create + edit.** Created `baseline-smoke-profile`
+binding `Baseline-Smoke-Host` (UUID
+`b60bfcb9-7bfe-406a-…`) to
+`baseline-smoke-identity-renamed` (UUID
+`4c8cab84-917d-…`) with no username override and tag
+`smoke`. Success card noted "host key not yet trusted
+and SSH authentication has not been verified for this
+profile" — accurate honesty copy. Edited the profile
+through `profile-detail-edit-open`: set username
+override = `smoke` and tags = `smoke,baseline` →
+saved; the detail panel re-rendered as `smoke
+(override)` and tags `smoke / baseline`. Then re-opened
+the edit form, cleared the override (empty string) and
+reverted tags to `smoke` → saved; the detail panel
+flipped back to `smoke (host default)` with a single
+`smoke` tag. UI state refresh was synchronous each
+time; no manual reload required.
+
+**Host-key trust.** `host-key-preflight-button` on the
+profile row captured a key during SSH key exchange.
+The displayed fingerprint
+`SHA256:QWefVlx+L4mvZOTAUQ8BABPJNiderYOwc8vxRPFRhas`
+is byte-identical to the locally-computed
+`ssh-keygen -lf` value over the target container's
+advertised `ssh-ed25519` host-key line (the container
+emitted all three host-key types — ed25519, ecdsa-
+sha2-nistp256, rsa — at startup; preflight picked
+ed25519). Typed the fingerprint into
+`host-key-confirm-input` → `host-key-trust-button`;
+`host-key-status-badge` flipped to `Trusted` with the
+load-bearing copy "Host key matches an active pinned
+entry. Run auth-check below to confirm the configured
+SSH identity authenticates before launching a terminal
+session." Host-key replacement was NOT exercised — that
+has its own smoke history (2026-05-10 entries above).
+
+**Auth-check.** `auth-check-run-button` ran in ~5 s;
+`auth-check-status-badge` flipped to `Authenticated`
+at `2026-05-13T04:54:38.819702Z`, copy "SSH public-key
+authentication succeeded for the configured username.
+No PTY was allocated and no command was executed.
+Terminal launch is a separate, deliberate action." The
+sshd container's auth log confirmed the same moment:
+`Accepted publickey for smoke from 172.21.0.3 port
+48118 ssh2: ED25519 SHA256:GDA6/gBYwJ8POXNTsEjDDLykeKSm+2WT+NACLutMLAU`
+followed by an immediate clean disconnect — exactly the
+auth-check shape (no shell allocated).
+
+**Terminal launch.** `profile-launch-terminal` opened
+`/terminal` with phase=`attached`. The very first
+attempt closed at WS 1006 after 60 s with
+`last_seen_seq=0` — expected idle-reaper behaviour
+because no keystrokes flowed during the focus + WS-
+capture setup window, NOT a defect. The SSH-target log
+made the cause explicit:
+`Accepted publickey for smoke … then 2026-05-13
+04:56:49 Received disconnect from 172.21.0.3 port
+52144:11: relayterm pty close` — the backend reaper
+killed the live PTY after 60 s of zero client traffic
+(no keystrokes during the focus / patched-WS setup
+window). A fresh launch (session
+`8e477f44-26a1-…`) with immediate focus →
+`page.keyboard` keystrokes worked end-to-end. A
+WebSocket-level capture (a `window.WebSocket`
+wrapper that buffered every text/binary frame)
+recorded:
+outgoing 1 × `{"type":"attach", session_id, last_seen_seq:null,
+client_id:"relayterm-web"}` (control plane),
+outgoing N × binary RTB1 frames (one per keystroke),
+incoming 1 × `{"type":"session_attached", status:"active", …}`
+followed by binary RTB1 frames for every shell-output
+byte. Three commands:
+`echo relayterm-baseline-smoke` → output
+`relayterm-baseline-smoke`; `whoami` → `smoke`;
+`pwd` → `/config` (linuxserver/openssh-server's
+default home for `USER_NAME=smoke`). The active session
+appeared in `/api/v1/terminal-sessions` with
+`status=active`, was visible in the Sessions list as
+`detached · attached here` after detach, and the same
+session UUID was visible in
+`relayterm.active-terminal.v1` localStorage. The
+"zero-input → 60 s WS-close" behaviour is not a defect
+— it is the documented idle-reaper closing a live PTY
+that received no client traffic; a session that
+actually types within the window persists. No source
+changes were required.
+
+**Detach + reconnect.** Sent
+`echo before-detach` to seed replay (`last_seen_seq=17`)
+→ `production-terminal-detach` → phase=`detached`.
+Immediately clicked `production-terminal-reconnect`
+(the in-page button — Sessions-list → /terminal
+navigation can blow the 30 s detached TTL on a slow
+hop, as one earlier session
+`8e477f44…` demonstrated). Reattach succeeded against
+the **same** session UUID
+`f329b32f-1afb-497f-aa1e-1097afc9cb74` with replay
+bookmark intact; phase went back to `attached`,
+`page.keyboard.type("echo relayterm-baseline-
+reconnected")` produced
+`relayterm-baseline-reconnected` in the rendered
+viewport, and `production-terminal-close` shut the
+session cleanly at `2026-05-13T05:08:42.711412Z`
+(`status=closed`, `closed_at` matches `last_seen_at`
+within 1 ms). The staging slot's detached-live-PTY
+TTL is `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS=30`
+(per backend boot line); the long-TTL (1800 s) reconnect
+smoke covers the bigger envelope in the 2026-05-10
+entries above.
+
+**Inventory delete-refusal / disable.** All three
+refusals from `docs/spec/inventory.md` § "Inventory
+lifecycle and destructive-action policy" surfaced
+exactly as designed; no destructive route was reachable
+from the UI for any of them:
+
+- Profile delete with terminal-session history →
+  `profile-detail-delete-confirm-submit` returned the
+  conflict copy "Cannot delete server profile: it has
+  terminal session history — disable it instead to keep
+  the history while blocking new launches." The
+  `terminal_sessions` rows (5 closed sessions UUIDs
+  `5abe6081…`, `477ab072…`, `1e93862b…`, `8e477f44…`,
+  `f329b32f…`) were preserved; no audit row was emitted
+  for the refused delete.
+- Identity delete while a profile referenced it →
+  "Cannot delete SSH identity: it is still used by a
+  saved server profile — remove or re-bind the profile
+  first."
+- Host delete while a profile referenced it AND a
+  trusted `known_host_entries` row pinned it → "Cannot
+  delete host: it is still used by a saved server
+  profile or has trusted host keys — remove the
+  dependent items first."
+
+Cleanup-path disable then exercised:
+`profile-disable-open` → `profile-disable-confirm-
+input` typed `baseline-smoke-profile` →
+`profile-disable-submit`. The row's
+`profile-disabled-notice` rendered with the
+load-bearing copy "New terminal launches, host-key
+preflight / trust, and auth-check are blocked. Existing
+live sessions are unaffected." The DB confirmed
+`disabled_at=2026-05-13 05:17:21.319753+00` and the
+audit table got exactly **one**
+`server_profile_disabled` row at
+`2026-05-13 05:17:21.327981+00` (8 ms after the
+lifecycle transition — single audit row, matching the
+"idempotency early-return BEFORE audit append" rule
+from AGENTS.md § "Things to avoid").
+
+**Backend / DB shape** (read-only, public-safe fields
+only — never queried `encrypted_private_key`,
+`payload`, or any byte content via `length()` or
+otherwise). `hosts`: `display_name=Baseline-Smoke-Host`,
+`hostname=baseline-smoke-host`, `port=2222`,
+`default_username=smoke`. `server_profiles`:
+`tags={smoke}`, `disabled_at=2026-05-13 05:17:21…`,
+no `username_override`. `ssh_identities`:
+`name=baseline-smoke-identity-renamed`,
+`key_type=ed25519`,
+`length(public_key)=104` bytes (raw Ed25519 wire form),
+`length(fingerprint_sha256)=50` chars (the
+`SHA256:base64…` text). `known_host_entries`:
+`key_type=ed25519`, `length(fingerprint_sha256)=50`,
+`trusted_at IS NOT NULL`, `revoked_at IS NULL`,
+`length(public_key)=51` bytes. `terminal_sessions`:
+5 rows, all `status=closed`, `80×24`. The smoke-window
+`audit_events` kinds (filtered to
+`recorded_at > 2026-05-13T04:43:00Z AND <
+05:13:00Z`) were exactly
+`ssh_identity_created` × 1,
+`server_profile_created` × 1,
+`server_profile_updated` × 2 — the disable row
+(`server_profile_disabled` at 05:17:21) was the only
+later event. **Zero** refused-delete audit rows. The
+sentinel sweep
+`payload::text LIKE '%' || s || '%'` against
+`{private_key_openssh, encrypted_private_key,
+BEGIN OPENSSH, private_key, passphrase, session_token,
+token_hash, cookie, password, data_b64}` returned
+false for every sentinel on every smoke-window audit
+row.
+
+**Backend + nginx log redaction.** Bounded
+`docker logs --since 30m` over the smoke window:
+backend = 3 lines (all the literal text "missing
+session cookie" — pre-smoke WARN from an unauth
+`/api/v1/auth/me` probe at 04:42; not a cookie
+**value**); nginx/web = 76 lines (request log entries).
+Sentinel sweep against
+`{private_key_openssh, encrypted_private_key,
+BEGIN OPENSSH PRIVATE KEY, passphrase, session_token,
+token_hash, cookie, password, data_b64, REDACT-MARKER}`:
+0 hits in both, except the 3 explained "cookie"
+mentions above (the `cookie` sentinel matched ONLY the
+literal WARN-line text "missing session cookie" — not
+any cookie attribute, header name, OR cookie VALUE; the
+mirror of the audit-payload sweep rationale above). `terminal_recording_chunks` rows for this
+profile: 0 (staging boot-line is `recording_enabled=false`).
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-baseline-smoke-ssh` is `docker stop`
++ `docker rm`'d (verified `docker ps -a --filter
+name=…` returns empty). Local throwaway PEM, public-key
+file, base64 sidecar, JSON-wrapped sidecar, backend-tail
+log, bounded log captures, health-check curl output,
+and the SPA index curl response were all `shred -u`'d
+or `rm -f`'d; the `mktemp -d` directory was `rmdir`'d.
+The browser session may remain logged in. Left in place
+per the slice plan: staging Compose stack running,
+Postgres untouched (no row deleted, no schema touched),
+`baseline-smoke-host`, `baseline-smoke-profile`
+(disabled), `baseline-smoke-identity-renamed`,
+5 `terminal_sessions` history rows, 1 trusted
+`known_host_entries` row, all `audit_events` rows
+(including `server_profile_disabled`), the staging
+smoke user.
+
+**Intentionally deferred** (out of scope for this
+slice; tracked elsewhere or scheduled later):
+
+- passphrase-protected private-key import (design
+  `docs/design/private-key-import.md` § 10);
+- `ssh-copy-id` / password-bootstrap automation for
+  installing the public key on a target server (same
+  design § 10);
+- route-param identity / host / profile detail pages
+  (today's detail panel is a `?id=…`-aware drawer);
+- terminal renderer evaluation / performance work
+  (xterm vs. ghostty-web vs. restty vs. wterm — that
+  starts after this baseline lands);
+- durable persistence beyond the current in-memory
+  replay buffer + 30 s detached-PTY TTL (no schema
+  for terminal output is in scope today);
+- production release / signing / App Store / Play Store
+  workflows for the Tauri shells
+  (`docs/deployment/tauri-ci-release-plan.md` is the
+  staged plan; this smoke covers only the web SPA).
+
+**Verdict.** The single-user deployable baseline —
+inventory CRUD with conflict refusals, OpenSSH Ed25519
+import, host-key trust, auth-check, terminal launch,
+detach + reconnect within TTL, lifecycle disable, and
+public-metadata-only audit — works end-to-end on the
+published `:main` images against a hermetic throwaway
+target with no host port exposure, no plaintext-secret
+leakage in DOM / logs / audit, and no source / schema /
+API / auth / deploy changes required. Safe to start the
+terminal-renderer evaluation work next.
+
 ---
 
 ## See also
