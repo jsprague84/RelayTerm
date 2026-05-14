@@ -7,7 +7,13 @@
 > deploy / CSP change. Every implementation slice below is a separate,
 > deliberate slice that must be approved on its own merits.
 >
-> Status: **proposed** (2026-05-13). Author: see git log on this file.
+> Status: **proposed** (2026-05-13). **Option D landed on staging
+> 2026-05-14**, host-side only; production deploy templates remain
+> strict and a production-side CSP decision is still deferred. See
+> [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+> § 2026-05-14c — Staging-only CSP wasm-unsafe-eval +
+> ghostty-web production-shell mount. Author: see git log on this
+> file.
 
 ## 1 · Status / decision summary
 

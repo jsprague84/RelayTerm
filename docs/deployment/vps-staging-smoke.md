@@ -7068,6 +7068,468 @@ that wants to actually grade ghostty-web matrix
 rows must take one of the two deferred options
 above; neither is authorised here.
 
+### 2026-05-14c · Staging-only CSP `'wasm-unsafe-eval'` + ghostty-web production-shell mount (first successful ghostty-web mount; matrix rows deferred; xterm recovery still works)
+
+**Date.** 2026-05-14 04:31 UTC – 04:47 UTC (≈16 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Same `:main` images as the 2026-05-14b
+WASM-asset resmoke
+(`git.js-node.cc/jsprague/relayterm-web:main` and
+`git.js-node.cc/jsprague/relayterm-backend:main` — no
+image rebuild; this slice is **CSP-only**). The web
+container was recreated via
+`docker compose up -d --no-deps --pull never
+relayterm-web` so Traefik would see the updated
+`middlewares=` label; Postgres and backend were NOT
+recreated (`--no-deps`; Postgres `Up 4 days` before
+AND after).
+**Branch.** `deploy/staging-csp-wasm-unsafe-eval` off
+`main` (host-side Traefik file-provider edit; the repo
+branch carries only docs).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900. Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Land Option D from
+[`docs/ghostty-web-wasm-csp.md`](../ghostty-web-wasm-csp.md):
+add `'wasm-unsafe-eval'` (and **only** that) to the
+staging surface's CSP `script-src` so the
+ghostty-web experimental renderer can call
+`WebAssembly.compile` inside its `Ghostty.loadFromPath`
+mount path. Then verify the mount actually progresses
+past the 2026-05-14b blocker on the production shell.
+
+**Slice boundary (host-only; repo deploy templates
+unchanged).** All edits live on cloud-edge:
+- `/home/ubuntu/docker/traefik/config.yml` — appended
+  two new file-provider middlewares
+  (`relayterm-staging-security-headers` mirroring
+  `default-security-headers` field-for-field, except
+  `contentSecurityPolicy`, plus
+  `relayterm-staging-secure-chain` that wraps it).
+  Existing `default-security-headers`, `secure-chain`,
+  `dashboard-*` middlewares were NOT modified — other
+  consumers of `secure-chain@file` (rstify, weathrs,
+  tinyauth) retain the original
+  `default-src 'self'` CSP.
+- `/home/ubuntu/docker-compose/relayterm-staging/docker-compose.yml`
+  — single-line label change on the staging router:
+  `traefik.http.routers.relayterm-staging.middlewares=secure-chain@file`
+  →
+  `traefik.http.routers.relayterm-staging.middlewares=relayterm-staging-secure-chain@file`.
+  Repo `deploy/docker-compose.traefik-staging.example.yml`
+  was NOT edited (and intentionally still shows
+  `secure-chain@file` — that is the production-strict
+  baseline this staging instance opted away from).
+
+Timestamped backups before the edit:
+- `…/config.yml.bak-2026-05-14T04-29-40Z`
+- `…/docker-compose.yml.bak-2026-05-14T04-29-40Z`
+
+No repo source / CI / schema / migration / auth /
+session / orchestrator / `terminal-core` /
+production-shell-non-loader / nginx-template /
+production-Compose-example file was edited.
+
+**CSP posture — before vs after.**
+
+`curl -sSI https://relayterm-staging.js-node.cc/`
+before the slice (matches the 2026-05-14b entry):
+
+```
+content-security-policy: default-src 'self'
+referrer-policy: strict-origin-when-cross-origin
+strict-transport-security: max-age=3153600; includeSubDomains; preload
+x-content-type-options: nosniff
+```
+
+Same `curl` after the slice:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+referrer-policy: strict-origin-when-cross-origin
+strict-transport-security: max-age=3153600; includeSubDomains; preload
+x-content-type-options: nosniff
+```
+
+Diff is a single new directive on `script-src`. The new
+header is precisely what
+[`docs/ghostty-web-wasm-csp.md`](../ghostty-web-wasm-csp.md)
+§ 4.D recommended:
+- `'unsafe-eval'` is **NOT** added.
+- `data:` is **NOT** added to any directive (the
+  `aa6bf9f fix(web): load ghostty wasm as an asset`
+  same-origin asset path remains the load shape).
+- `blob:` is **NOT** added.
+- `connect-src` is **NOT** changed (still inherits
+  `default-src 'self'`; the same-origin WASM fetch
+  already worked under that posture per the 2026-05-14b
+  entry).
+- No wildcard sources, no new external origins.
+- `style-src` / `img-src` / `font-src` /
+  `frame-ancestors` / `base-uri` / `form-action` /
+  `worker-src` / `manifest-src` are unchanged.
+- HSTS / Referrer-Policy / X-Content-Type-Options /
+  X-Forwarded-Proto are byte-identical (the new
+  `relayterm-staging-security-headers` middleware
+  mirrors `default-security-headers` field-for-field).
+
+**Blast-radius containment.** Other host-side consumers
+of `secure-chain@file` (`weathrs.js-node.cc`,
+`rstify.js-node.cc`, `ta.js-node.cc`) were checked via
+`curl -sSI` after the edit and still serve
+`content-security-policy: default-src 'self'` with no
+`script-src` override. The widening is contained to
+`relayterm-staging.js-node.cc` exactly.
+
+**Endpoint smoke (post-edit, pre-resmoke).** `GET /` →
+`200`. `GET /healthz` → `200`. `GET /api/v1/auth/me`
+without cookie → `401` (auth boundary unchanged).
+`GET /assets/ghostty-vt-DOMeXDrv.wasm` → `HTTP/2 200`,
+`content-type: application/wasm`,
+`cache-control: public, immutable, max-age=31536000` —
+the same same-origin asset the 2026-05-14b entry
+locked in.
+
+**Renderer setup (Settings → gate ON → ghostty-web).**
+Pre-state: `experimentalRendererEvaluationEnabled=false`,
+`rendererId="xterm"`. Flipped
+`settings-experimental-renderer-toggle` ON (warning
+copy rendered), selected
+`renderer-option-ghostty-web`, clicked
+`settings-apply`. Post-state:
+`localStorage["relayterm.terminal-settings.v1"]`
+carried `rendererId="ghostty-web"` and
+`experimentalRendererEvaluationEnabled=true`;
+`settings-renderer-effective` read "Effective renderer
+on next session: ghostty-web experimental.";
+`settings-status-saved` read "Saved locally. Applies
+to the next terminal session."
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-ghostty-csp-resmoke-ssh`, attached
+only to the staging Compose network
+`relayterm-staging_relayterm-staging-internal` with
+DNS alias `ghostty-csp-resmoke-host` resolving to
+`172.21.0.5`. **No host port was published**
+(`docker port` returned empty; verified).
+`USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`,
+`PUBLIC_KEY=<the RelayTerm-generated OpenSSH line>`.
+The public-key line was extracted from the SPA's
+generate-success card via a single `browser_evaluate`,
+returned to the operator as base64, decoded inline
+inside one `ssh cloud-edge` shell session straight
+into `docker run -e PUBLIC_KEY=…`, and unset
+immediately. No PEM, no base64 sidecar, no private-key
+bytes touched the operator filesystem at any point.
+Stop+remove is recorded once below under "Cleanup
+state."
+
+**Identity / host / profile.**
+- Identity `ghostty-csp-resmoke-identity` (generated
+  ed25519, fingerprint
+  `SHA256:thFCBSVz4E+io35xbYolbee6kpp3jpAifokPwWjjF/4`).
+- Host `Ghostty-CSP-Resmoke-Host` (hostname
+  `ghostty-csp-resmoke-host`, port `2222`, default
+  user `smoke`).
+- Profile `ghostty-csp-resmoke-profile` (tags
+  `renderer, ghostty-web, csp`).
+
+**Host-key preflight + trust.** Preflight returned
+fingerprint
+`SHA256:iRphyKn6IvjSnG/MTXitYp/PIYp9ckq+7uS3e6LoPyg`,
+**byte-identical** to the target container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+output. Typed via the host-key-confirm input and
+trusted; `host-key-status-badge` flipped to
+`Trusted`.
+
+**Auth-check.** `auth-check-status-badge` flipped to
+`Authenticated`. Target sshd log confirmed:
+`Accepted publickey for smoke from 172.21.0.3 …
+ssh2: ED25519 SHA256:thFCBSVz4E+io35xbYolbee6kpp3jpAifokPwWjjF/4`
+— matches the RelayTerm-managed identity exactly.
+
+**Terminal launch — ghostty-web mount on the
+production shell (the load-bearing assertion).**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID
+`7cb3535b-22bb-4195-870b-da38a47ae2be`. After ≥3 s the
+production-terminal workspace surfaced:
+
+- `data-phase="attached"`
+- `data-renderer="ghostty-web"` (NOT `unmounted`)
+- `data-renderer-experimental="true"`
+- **`data-renderer-fallback=""`** (empty — the
+  `adapter_mount_failed` taxonomy did NOT fire)
+- `data-renderer-gate="on"`
+- `production-terminal-renderer-diagnostic`:
+  `Renderer. ghostty-web experimental · experimental`
+- `production-terminal-error` panel NOT rendered
+- `production-terminal-phase` text: `live`
+- viewport contained 2 children (the renderer canvas
+  + helper textarea)
+
+**This is the first successful production-shell
+ghostty-web mount on RelayTerm.** The `'wasm-unsafe-eval'`
+CSP relaxation directly closed the `WebAssembly.compile`
+blocker the 2026-05-14b entry pinned as the remaining
+half of the gap.
+
+**Network proof.**
+`performance.getEntriesByType('resource')` showed
+exactly one ghostty entry:
+`https://relayterm-staging.js-node.cc/assets/ghostty-vt-DOMeXDrv.wasm`
+with `initiatorType="fetch"`, `responseStatus=200`,
+`decodedBodySize=423045`, `duration ≈ 1 ms` (cached
+under the immutable `/assets/*` policy from the
+2026-05-14b run). The
+`data:application/wasm;base64,…` URL is **not** in the
+load path; `connect-src` was **not** widened.
+
+**Console errors during ghostty-web mount + use.**
+`browser_console_messages level=error all=true`
+returned **0 messages**. No
+`CompileError: WebAssembly.compile() … 'unsafe-eval'
+is not an allowed source of script`, no
+`Fetch API cannot load data:application/wasm…`,
+no `Refused to compile or instantiate WebAssembly
+module …` — the entire CSP/WASM rejection class
+that the 2026-05-13 and 2026-05-14 ghostty-web
+entries recorded **did not fire**.
+
+**End-to-end input proof.** One keystroke + Enter
+(`e` → `bash: e: command not found` echoed back)
+round-tripped through the renderer's canvas. The
+bash prompt `6f8e69b21375:~$ ` rendered correctly
+(libghostty-vt parsed the PS1 ANSI escapes). Target
+sshd's auth log captured the matching publickey
+accept line above.
+
+**Matrix rows — deferred.** The broader renderer-
+evaluation matrix rows for ghostty-web (Unicode / box
+drawing / wide chars; copy-paste; alternate-screen;
+mouse; 300-line burst; detach-reconnect-replay) are
+**not graded** in this slice. ghostty-web's
+xterm-compat shim did not pick up
+`Locator.pressSequentially` / `keyboard.press`
+keystrokes consistently after the first character
+(focus-target ambiguity between the
+`production-terminal-viewport` DIV and the helper
+`textarea[aria-label="Terminal input"]`). This is a
+renderer-fairness gap in the MCP input path, not a
+renderer defect, and is the renderer-evaluation
+slice's responsibility — not the CSP slice's. Per
+`apps/web/e2e/SMOKE.md` § "Renderer path
+confirmation", matrix rows are marked
+`deferred — renderer-fairness input strategy pending`.
+The slice goal — CSP precondition unblocked, mount
+verified — is met without grading the matrix.
+
+**Detach window observed (incidental).** During the
+input attempts the workspace transitioned from
+`data-phase="attached"` to `data-phase="detached"
+(TTL window)` while `data-renderer="ghostty-web"`
+and `data-renderer-fallback=""` were preserved — the
+renderer did NOT unmount or fall back on the detach
+transition. The session was then disposed via
+`production-terminal-dispose`. This is consistent
+with ghostty-web honouring the
+orchestrator-owned detach lifecycle; it is **not**
+a graded matrix row.
+
+**Xterm recovery row (production-default still
+works).** Settings toggle flipped OFF (the
+`onExperimentalGateChange` handler reset
+`rendererId="xterm"` automatically), saved. A fresh
+launch on the same `ghostty-csp-resmoke-profile`
+opened session UUID
+`5583204f-1e7d-4b5a-aa2a-a32dd749a08e` with:
+- `data-phase="attached"`
+- `data-renderer="xterm"`
+- `data-renderer-experimental="false"`
+- `data-renderer-fallback=""`
+- `data-renderer-gate="off"`
+- `production-terminal-renderer-diagnostic` text
+  `Renderer. xterm baseline`
+
+Typed `echo relayterm-ghostty-csp-xterm-recovery`
+via Path A; bash echoed
+`relayterm-ghostty-csp-xterm-recovery` back; viewport
+tail read
+`echo relayterm-ghostty-csp-xterm-recovery\n
+relayterm-ghostty-csp-xterm-recovery\n
+6f8e69b21375:~$`. Closed cleanly via `End session`.
+**The xterm production-default remains fully usable
+under the relaxed CSP.**
+
+**Pre-existing xterm `style-src` console errors
+observed (NOT a regression).** Six
+`Applying inline style violates the following Content
+Security Policy directive 'default-src 'self''…`
+errors were captured from `index-DZbrwXwu.js:9`
+during the xterm attach. These are **NOT new**: the
+CSP was already `default-src 'self'` before this
+slice (and `style-src` falls through to it the same
+way before and after). This slice's edit added
+`script-src 'self' 'wasm-unsafe-eval'`; it did not
+touch `style-src` or `default-src`. The errors would
+have fired identically on the 2026-05-14b stack —
+they were simply not surfaced in that entry's
+console dump. xterm continues to mount and operate
+correctly despite the warnings; a future slice can
+choose whether to add a CSP `style-src` allowance or
+to refactor xterm's renderer to avoid inline styles.
+**No action taken in this slice.**
+
+**Session lifecycle rows.**
+- `terminal_sessions.7cb3535b-…` (ghostty-web
+  attempt): briefly `attached`, then `detached`, then
+  disposed via `production-terminal-dispose`.
+  Will be reaped by the orphan-session janitor; status
+  not delete-action material.
+- `terminal_sessions.5583204f-…` (xterm recovery):
+  `closed` after the `End session` click.
+
+**Audit events in the smoke window.** Exactly 3 rows
+written (Postgres timestamps, UTC):
+- `04:33:15 ssh_identity_created` — public-metadata
+  only.
+- `04:34:59 server_profile_created` — public-metadata
+  only.
+- `04:46:32 server_profile_disabled` — public-metadata
+  only (cleanup row).
+
+Per-payload sentinel sweep
+(`payload::text ~*`
+`{private_key, encrypted_private_key, BEGIN OPENSSH,
+openssh-key-v1, passphrase, session_token,
+token_hash, data_b64, REDACT-MARKER,
+relayterm-ghostty-csp, CompileError,
+wasm-unsafe-eval, data:application/wasm}`) over the
+smoke-window rows: **0 hits**.
+
+**Backend / web / target log sweep.** Bounded
+`docker compose logs --since 30m` over the smoke
+window: backend = 2 lines (1 routine INFO retention
+sweep at 04:18, 1 pre-smoke
+`WARN missing session cookie` literal at 04:30 — a
+known false-positive); web/nginx = request log only,
+status codes, no payloads; target sshd = startup
+banner + the `Accepted publickey for smoke …` line.
+Sentinel grep across all three streams returned 2
+matches: `cookie` matched the backend's
+`missing session cookie` WARN string; `password`
+matched the target's
+`User/password ssh access is disabled.` Both are
+literal static diagnostics, not secret-bytes leaks
+(same false-positives the 2026-05-14b entry
+recorded). All other sentinels —
+`{private_key_openssh, encrypted_private_key,
+BEGIN OPENSSH PRIVATE KEY, openssh-key-v1, passphrase,
+session_token, token_hash, data_b64, REDACT-MARKER,
+relayterm-ghostty-csp-mounted,
+relayterm-ghostty-csp-xterm-recovery, CompileError,
+wasm-unsafe-eval, data:application/wasm}` —
+returned **0 hits**.
+
+**DOM + storage redaction.** Sweep over
+`document.documentElement.outerHTML` AND
+`localStorage`, `sessionStorage`, `document.cookie`
+at end of session: 0 hits across the secrets sentinel
+list above PLUS the renderer-mount-failure sentinels
+`{CompileError, WebAssembly, unsafe-eval,
+data:application/wasm}` (proving the
+`'wasm-unsafe-eval'` source-expression itself never
+reached a DOM-readable surface despite being present
+in the response header — the header is part of the
+HTTP envelope, not document content).
+`document.cookie.length === 0` (HttpOnly).
+`localStorage` carried only
+`relayterm.terminal-settings.v1` with the post-cleanup
+values
+`{rendererId: "xterm", experimentalRendererEvaluationEnabled: false}`.
+`sessionStorage` empty.
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-ghostty-csp-resmoke-ssh` is
+`docker stop`+`docker rm`'d
+(`docker ps -a --filter name=…` empty). Profile
+`ghostty-csp-resmoke-profile` **disabled** through
+the SPA (not deleted, per the inventory-lifecycle
+policy); the resulting `server_profile_disabled`
+audit row was the 3rd smoke-window entry above.
+Settings reset to
+`rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`.
+**The staging CSP change is left in place** per the
+slice plan — the relaxed CSP is the new staging
+baseline going forward, scoped to
+`relayterm-staging.js-node.cc` only. Left in place
+per the slice plan, in addition to everything
+itemised above ("Session lifecycle rows", "Audit
+events in the smoke window"): staging Compose stack
+running, Postgres untouched (`Up 4 days` before AND
+after — recreate used `--no-deps`), the
+ghostty-csp-resmoke identity / host / disabled
+profile / 1 trusted `known_host_entries` row /
+`session_events` rows / the staging smoke user. No
+durable row is deleted from this slice.
+
+**Intentionally deferred** (out of scope for this
+slice):
+- ghostty-web evaluation-matrix rows (Unicode / box
+  drawing / wide chars / paste / alternate-screen /
+  mouse / 300-line burst / detach-reconnect-replay).
+  Renderer-fairness input strategy is the
+  renderer-evaluation slice's responsibility, not
+  this CSP slice's.
+- Production deploy CSP change. Production deploy
+  examples
+  (`deploy/docker-compose.example.yml`,
+  `deploy/docker-compose.images.example.yml`,
+  `deploy/docker-compose.traefik-staging.example.yml`)
+  remain strict (`default-src 'self'`); a separate
+  later slice may decide to extend the relaxation
+  after a staging soak.
+- xterm CSP `style-src` inline-style warnings —
+  pre-existing; out of scope here.
+- restty / wterm experimental renderer CSP probes
+  and evaluation.
+- Desktop Tauri / Android Tauri renderer smokes for
+  any candidate.
+- Automated performance / benchmark harness.
+- Renderer production-default switch (Gate 2);
+  persistent per-user / per-device renderer
+  preference beyond `relayterm.terminal-settings.v1`.
+
+**Promotion decision.** **ghostty-web remains
+experimental.** The production default remains
+xterm. Gate 1 and Gate 2 criteria are unchanged. No
+repo source / backend protocol / session /
+orchestrator / `terminal-core` /
+production-shell-non-loader / CI / production deploy
+template was touched by this slice.
+
+**Verdict.** Option D from
+[`docs/ghostty-web-wasm-csp.md`](../ghostty-web-wasm-csp.md)
+lands cleanly on the staging surface. The single
+new source expression `'wasm-unsafe-eval'` in
+`script-src` is the smallest possible widening that
+unblocks `WebAssembly.compile` for the
+ghostty-web mount path; `'unsafe-eval'`, `data:`,
+`blob:`, and `connect-src` widenings were
+**deliberately not** introduced; the change is
+**staging-only**; production deploy templates stay
+strict; ghostty-web stays experimental and xterm
+stays the production default; redaction posture is
+unaffected; xterm recovery still works. The
+production-side CSP decision remains a separate,
+deferred slice.
+
 ---
 
 ## See also

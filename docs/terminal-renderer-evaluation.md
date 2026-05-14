@@ -495,6 +495,75 @@ deferral list above remains deferred until that slice lands
 and a fresh staging resmoke records ghostty-web matrix
 evidence under the relaxed CSP.
 
+### 2026-05-14c · Staging-only CSP `'wasm-unsafe-eval'` landed; first ghostty-web production-shell mount (matrix rows still deferred)
+
+The Option D recommendation from the 2026-05-13 CSP
+decision doc landed on the staging surface only. Full
+smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14c · Staging-only CSP `'wasm-unsafe-eval'` +
+ghostty-web production-shell mount".
+
+What landed:
+
+- Host-side Traefik file-provider middleware
+  `relayterm-staging-secure-chain@file` (new, scoped to
+  the staging router only — `secure-chain@file` and
+  `default-security-headers` are unchanged, so other
+  consumers like `weathrs`/`rstify`/`tinyauth` keep the
+  original strict CSP).
+- Staging router CSP header is now
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+  `'unsafe-eval'` is **NOT** added; `data:` is **NOT**
+  added; `blob:` is **NOT** added; `connect-src` is
+  unchanged.
+- ghostty-web mounted on the production shell —
+  `data-renderer="ghostty-web"`, `data-phase="attached"`,
+  `data-renderer-fallback=""` — for the first time. The
+  same-origin `ghostty-vt-<hash>.wasm` asset fetches at
+  HTTP 200; `WebAssembly.compile` no longer rejects.
+  Zero console errors during the ghostty-web mount.
+- xterm recovery on the same profile still works
+  end-to-end (`data-renderer="xterm"`, sentinel
+  `relayterm-ghostty-csp-xterm-recovery` round-tripped
+  cleanly).
+
+What did **not** change:
+
+- Repo production deploy templates
+  (`deploy/docker-compose.example.yml`,
+  `deploy/docker-compose.images.example.yml`,
+  `deploy/docker-compose.traefik-staging.example.yml`)
+  remain strict and **were not edited**.
+- Repo nginx `web.conf.template` was not edited (still
+  emits no CSP — the staging CSP comes from host-side
+  Traefik).
+- ghostty-web evaluation-matrix rows
+  (Unicode / box drawing / paste / alternate-screen /
+  mouse / 300-line burst / detach-reconnect-replay)
+  remain `deferred` under the closed
+  `apps/web/e2e/SMOKE.md` § "Renderer path
+  confirmation" vocabulary — this slice's MCP input
+  path could not consistently drive ghostty-web's
+  xterm-compat shim, which is a renderer-fairness gap
+  that belongs to the renderer-evaluation harness
+  slice, not the CSP slice. The slice goal (CSP
+  precondition unblocked, mount verified) is met
+  without grading the matrix.
+- Gate 1 / Gate 2 promotion criteria are unchanged.
+  ghostty-web stays **experimental and unpromoted**;
+  xterm stays the **production compatibility baseline
+  and default renderer**. No backend protocol,
+  session, orchestrator, `terminal-core`, or
+  production-shell-non-loader file was touched.
+- A separate later slice is required to actually grade
+  ghostty-web matrix rows under the relaxed CSP
+  (renderer-fairness input strategy is its
+  precondition). The production-side CSP decision —
+  whether to extend the relaxation to the production
+  deploy examples — is its own deliberate later slice,
+  not authorised by this entry.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
