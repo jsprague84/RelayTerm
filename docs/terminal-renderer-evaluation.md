@@ -922,6 +922,141 @@ per-device renderer preference; the production-side
 CSP decision; `tmux` / `screen` and VT-snapshot
 persistence.
 
+### 2026-05-14i · wterm production-shell renderer matrix smoke (first graded wterm matrix; not a promotion)
+
+The staging smoke slice the 2026-05-14g gate entry and
+the 2026-05-14h `focusTarget()` entry both named as
+deferred landed. The full smoke entry is in
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14i · wterm production-shell renderer matrix
+smoke".
+
+This is the **first graded** wterm run of the
+renderer-evaluation matrix on the production shell.
+The 2026-05-14g wterm gate smoke proved wterm loads,
+mounts, and renders functionally on the staging surface
+but **deferred every matrix row** because
+`WtermRenderer` had no `focusTarget()` — so
+`data-renderer-input` was `"none"` and the
+renderer-fair input seam was unavailable. The
+2026-05-14h slice landed `WtermRenderer.focusTarget()`
+in `bde039e feat(web): expose wterm focus target`. With
+that, the production workspace stamps the
+renderer-neutral `[data-relayterm-terminal-input]`
+marker on a wterm mount, and this slice drove the
+matrix.
+
+**What the matrix found, on the production shell, with
+no source / CI / deploy / CSP changes** (the staging
+stack's web + backend were recreated from fresh
+`:main` images that include `bde039e`; Postgres
+untouched via `--no-deps`):
+
+- wterm mounted cleanly — `data-renderer="wterm"`,
+  `data-renderer-experimental="true"`,
+  `data-renderer-fallback=""` (no `adapter_mount_failed`),
+  `data-renderer-gate="on"`,
+  `data-renderer-input="marked"` (the new state — the
+  gate smoke had `"none"`), exactly one
+  `[data-relayterm-terminal-input]` element (a
+  `TEXTAREA`, wterm's `InputHandler.textarea`), the
+  `.wterm` DOM grid sized correctly, **0 console
+  errors** during the wterm session.
+- Input was driven renderer-fairly through the
+  `[data-relayterm-terminal-input]` marker + the
+  `production-terminal-focus` button, with
+  `document.activeElement` verified before every Path A
+  / Path C row. The same selector resolved to xterm's
+  `xterm-helper-textarea` on the recovery row — one
+  selector, correct element per renderer.
+- **Core correctness** rows: basic I/O, long output
+  (300-line burst), and copy-paste (trusted Ctrl+V →
+  wterm's DOM textarea `paste` handler → production
+  paste-safety pipeline → `bracketed_paste_markers`
+  confirm panel → send) all `pass`. Detach / reconnect /
+  replay is `pass` **wire-side** (same session UUID,
+  renderer + marker re-stamped, fresh input round-trips)
+  — renderer-side visual scrollback parity is NOT
+  claimed; see the Detach/reconnect bullet below.
+  Alternate-screen `works` (raw `\033[?1049h`/`l` — the
+  target image lacks `tput`): wterm switched to the alt
+  buffer and restored the normal buffer correctly.
+- **Text / typography** row: unicode / emoji / box
+  drawing / wide CJK all render with correct codepoints
+  in wterm's DOM grid (`works`). wterm renders each
+  `.term-row` as a single text node, not per-cell
+  spans, so codepoint correctness was confirmed but
+  precise per-glyph cell-width was not measured;
+  typography precision beyond "renders legibly" not
+  measured.
+- Resize / fit and narrow-viewport are `works with
+  caveats` — wterm does not expose an xterm-style
+  `fit()` and does not reflow its cell grid on
+  container resize (the adapter defaults `autoResize`
+  to `false`; the `.wterm` DOM host pixel-width tracks
+  the container but the grid / PTY geometry does not
+  reflow). This is documented adapter behaviour, **not**
+  a `regression vs. baseline` — the same posture
+  ghostty-web's matrix smoke recorded.
+- Detach / reconnect: wterm remounted **fresh** on
+  reattach — the DOM grid was empty until new output,
+  matching the documented xterm-baseline behaviour
+  ("renderer remounted; viewport empty until new
+  output"). Wire-side replay is correct (same session
+  row, still active); renderer-side scrollback parity
+  is a separate property not claimed.
+- Mouse is `deferred — fixture absent` (no
+  click-coordinate fixture; harness plan defers the
+  mouse-input half).
+- xterm recovery verified end-to-end after the wterm
+  session (gate OFF → fresh launch →
+  `data-renderer="xterm"` → renderer-fair focus →
+  commands round-trip). The 6 xterm `style-src`
+  inline-style console errors are pre-existing
+  (2026-05-14c/e/f/g), not a regression, and did NOT
+  fire during the wterm session.
+- Redaction posture intact: 0 sentinel hits across DOM
+  / `localStorage` / `sessionStorage` /
+  `document.cookie`, backend / web / target logs, and
+  `audit_events.payload` (2 public-metadata-only audit
+  rows in the window).
+
+**Promotion posture.** A single matrix run is one
+human-evaluator data point — **not** a Gate-1 pass and
+**not** a Gate-2 promotion. **wterm remains experimental
+and unpromoted; xterm remains the production
+compatibility baseline and the default renderer.** Gate 1
+/ Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged; wterm clearing the gate (2026-05-14g) plus
+this one graded matrix run are evaluation data points,
+not the deliberate Gate 1 promotion review. wterm is the
+**second experimental renderer (after ghostty-web) to
+complete a graded production-shell matrix smoke**, and
+the only DOM-rendered one; its adapter caveats (no
+xterm-style `fit()`, no cell-grid reflow on resize —
+resize/fit is a separate evaluation-matrix row, not a
+Core-correctness row) are recorded in
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Production-shell evaluation status and
+`focusTarget()` caveat" — the Gate 1 requirement that a
+candidate's Core-correctness caveats be recorded in the
+adapter spec is met for this row. Architectural posture
+unchanged: no backend protocol / session / orchestrator
+/ `terminal-core` / production-shell / renderer-adapter
+/ CI / deploy-template / CSP file was touched.
+
+**Deferred from this slice:** `ResttyRenderer.focusTarget()`
+and a restty matrix smoke once/if restty can render;
+desktop-Tauri / Android-Tauri renderer smokes;
+automated performance / benchmark harness; the
+production-side CSP decision; renderer
+production-default flip (Gate 2); persistent per-user /
+per-device renderer preference; `tmux` / `screen` and
+VT-snapshot persistence; a purpose-built mouse
+click-coordinate fixture and a larger-tooling target
+image for the full-screen-app alternate-screen row.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

@@ -8623,6 +8623,452 @@ passed and the redaction posture is intact.
 
 ---
 
+### 2026-05-14i · wterm production-shell renderer matrix smoke (first graded wterm matrix; renderer-fair input via focusTarget(); xterm recovery verified)
+
+**Date.** 2026-05-14 17:24 UTC – 17:52 UTC.
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Web + backend recreated from fresh
+`:main` registry images that include
+`bde039e feat(web): expose wterm focus target`:
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  index digest
+  `sha256:0d017b7fa910bbb497cef03074a511985ddc5370aecf15316eae94fc45368a40`,
+  amd64 manifest
+  `sha256:c3f5a06a5130d9f83f296776bcfd7cd0f4e5bcfd4bd4466cbcd773cebb4c1323`,
+  image config created `2026-05-14T17:12:39Z`.
+- backend
+  `git.js-node.cc/jsprague/relayterm-backend:main`,
+  index digest
+  `sha256:90573e96bcbca4dba962330ffa264365200ecf5af03390dac933ba6e2a23cb52`,
+  image config created `2026-05-14T17:12:01Z`.
+
+The staging stack was running the web image
+`sha256:751ac392…` — the **same digest the 2026-05-14g
+wterm gate smoke ran on**, built before
+`bde039e feat(web): expose wterm focus target` (committed
+`2026-05-14T17:07:36Z`). Confirmed stale by inspecting the
+fresh registry `:main` image in a throwaway container: its
+wterm lazy chunk `index-DFqyE158.js` (40,907 bytes)
+contains `focusTarget`, and the main chunk
+`index-D0aBjuMM.js` contains the
+`data-relayterm-terminal-input` marker — the running stale
+image's wterm chunk did not. With operator approval the
+web + backend services were recreated via
+`docker compose up -d --no-deps relayterm-backend
+relayterm-web`; Postgres was **not** recreated
+(`--no-deps`; `Up 5 days` before AND after). Recreated
+containers came up healthy at `2026-05-14T17:23:36Z`.
+**Branch.** `docs/wterm-production-matrix-smoke` off `main`
+(docs-only).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900 (resized to 1024 × 768 and 390 × 844 for
+specific rows, restored after). Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Run the first **graded** wterm
+renderer-evaluation matrix on the production shell, now
+that (a) the 2026-05-14g gate smoke proved wterm loads,
+mounts, and renders functionally on the staging surface,
+and (b) `bde039e feat(web): expose wterm focus target`
+implemented `WtermRenderer.focusTarget()`, so the
+production workspace can stamp the renderer-neutral
+`[data-relayterm-terminal-input]` marker on a wterm mount.
+The 2026-05-14g gate smoke **deferred every matrix row**
+because `data-renderer-input="none"` (no `focusTarget()`).
+This slice closes that gap. This is a smoke/docs slice —
+no code, no renderer adapters, no CSP, no backend /
+protocol changes.
+
+**Slice boundary (docs-only).** No repo source / CI /
+schema / migration / auth / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+nginx-template / deploy-template / CSP file was edited.
+The only host-side actions were the operator-approved
+web + backend recreate (above) and the throwaway SSH
+target lifecycle (below).
+
+**CSP posture (unchanged from 2026-05-14c).**
+`curl -sSI https://relayterm-staging.js-node.cc/`:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+```
+
+`'unsafe-eval'` NOT present; `data:` NOT present;
+`blob:` NOT present; `connect-src` not widened. This
+slice did not touch CSP.
+
+**Endpoint smoke (post-recreate).** `GET /` → `200`,
+`GET /healthz` → `200`, `GET /api/v1/auth/me` without
+cookie → `401`. Production SPA loads; Settings
+experimental-renderer gate card present, toggle initially
+OFF and the renderer radios hidden. Flipping the gate ON
+revealed the static warning and all four renderer radios;
+selecting `wterm` and `settings-apply` showed
+`settings-status-saved` and persisted `rendererId="wterm"`
+/ `experimentalRendererEvaluationEnabled=true` to
+`relayterm.terminal-settings.v1`.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-wterm-matrix-smoke-ssh`, attached only
+to `relayterm-staging_relayterm-staging-internal` with
+DNS alias `wterm-matrix-smoke-host` → `172.21.0.5`. **No
+host port published** (`docker port` empty; verified —
+only `2222/tcp` exposed internally). `USER_NAME=smoke`,
+`SUDO_ACCESS=false`, `PASSWORD_ACCESS=false`,
+`PUBLIC_KEY=<the RelayTerm-generated OpenSSH public-key
+line>`. The public-key line was fetched from the
+RelayTerm API into a local file via `browser_evaluate`'s
+`filename` option (never echoed into the conversation),
+validated with `ssh-keygen -lf` (fingerprint matched the
+generated identity), `scp`'d to the VPS, read into the
+`docker run -e PUBLIC_KEY=…` env, and the local + remote
+copies `shred`ded. No PEM / private-key bytes touched any
+tool-call payload, log, or the operator filesystem.
+
+**Identity / host / profile.**
+- Identity `wterm-matrix-smoke-identity` (generated
+  ed25519, id `0eeeaccc-932f-4822-a5ec-6d771ce316b3`,
+  fingerprint
+  `SHA256:kKohS78OQu0Xg7dIk8Ili0oPBXHgWnc7hsoIuWA5bhg`).
+  The `/api/v1/ssh-identities` list response carried **no**
+  `private_key` / `encrypted_private_key` field.
+- Host `Wterm-Matrix-Smoke-Host` (id
+  `86d1d7be-0bb2-45dd-9a5d-d15ad82ce6bb`, hostname
+  `wterm-matrix-smoke-host`, port `2222`, default user
+  `smoke`).
+- Profile `wterm-matrix-smoke-profile` (id
+  `62260d04-13a1-4e46-945b-b7f031acfb38`, tags
+  `renderer, wterm, matrix`).
+
+**Host-key preflight + trust.** Preflight captured
+`SHA256:wIr9TEqS0fWDMd4lfO34U1OLHIGIqT/ogudvB7RHkU4`,
+**byte-identical** to the target container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+Typed into the confirm input and trusted; the host-key
+status flipped to `Trusted`.
+
+**Auth-check.** Status flipped to `Authenticated` at
+`2026-05-14T17:36:30.823994551Z`.
+
+**Renderer mount (the load-bearing assertion).**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID
+`fdd16d4d-9bad-44bc-ba9c-c5f66da34c36`. The
+production-terminal workspace surfaced:
+- `data-phase="attached"` (`production-terminal-phase`
+  text `live`)
+- `data-renderer="wterm"`
+- `data-renderer-experimental="true"`
+- `data-renderer-fallback=""` (empty — **no
+  `adapter_mount_failed`**)
+- `data-renderer-gate="on"`
+- `data-renderer-input="marked"` — **the new state for
+  wterm**; the 2026-05-14g gate smoke had `"none"`.
+  `WtermRenderer.focusTarget()` now reports wterm's hidden
+  keyboard `<textarea>`, and the workspace stamped the
+  renderer-neutral `[data-relayterm-terminal-input]`
+  marker on it.
+- `production-terminal-renderer-diagnostic`:
+  `Renderer. wterm experimental · experimental`
+- `production-terminal-error` NOT rendered
+- exactly **one** `[data-relayterm-terminal-input]`
+  element — a `TEXTAREA` (wterm's `InputHandler.textarea`)
+- `browser_console_messages level=error all=true`:
+  **0 messages** during the wterm session.
+- wterm DOM grid sized correctly: `.wterm` host and
+  `production-terminal-viewport` both `894 × 432 px`, 24
+  `.term-row` divs, `.term-grid` present.
+- `session_events`: `created` → `attached` → `closed`
+  plus the detach/reconnect/resize rows below.
+
+**Renderer-fair input.** Per `apps/web/e2e/SMOKE.md`
+§ "D. Renderer evaluation smoke" → "Renderer-fair input":
+clicked `production-terminal-focus`, then verified
+`document.activeElement` ===
+`[data-relayterm-terminal-input]` (returned
+`{ hasTarget: true, focused: true }`, the marked
+`TEXTAREA`) before every Path A / Path C row. For the
+xterm recovery row the same selector resolved to xterm's
+`xterm-helper-textarea` — one selector, correct element
+per renderer.
+
+**Matrix results (browser surface, renderer wterm unless
+noted).**
+
+1. **Basic I/O — Path A — pass.** Typed through
+   `[data-relayterm-terminal-input]`: `echo
+   relayterm-wterm-matrix-baseline` echoed the sentinel;
+   `whoami` → `smoke`; `pwd` → `/config`; `uname -a` →
+   `Linux 72c4817e9e04 6.17.0-8-generic … x86_64
+   GNU/Linux`. No duplicate / missing lines; wterm's DOM
+   grid rendered the command echo + output cleanly.
+2. **Resize / fit — Path A + viewport handle — works
+   with caveats.** Initial `stty size` = `24 80`;
+   `printf 'cols-test:%*sEND\n' 80 ''` wrapped `END` at
+   the 80-column boundary. After resizing the browser to
+   1024 × 768 and clicking `production-terminal-fit`,
+   `stty size` was still `24 80` — the Fit control is a
+   clean no-op for wterm (`fit()` is an xterm-only
+   capability; `safeFit` probes for it at runtime and
+   wterm does not expose it). The `.wterm` DOM host
+   pixel-width tracked the container (894 → 735 px) but
+   the cell grid / PTY geometry did **not** reflow — the
+   adapter sets `autoResize` to `false` so the caller
+   drives sizing. Terminal stayed usable; no clipping /
+   overlay failure. Documented adapter behaviour, **not**
+   a `regression vs. baseline`.
+3. **Long output — Path A — pass.** `seq 1 300` rendered
+   all 300 lines — wterm keeps scrollback rows as DOM
+   nodes (the `.term-row` count grew to 320); the tail
+   showed `298` / `299` / `300` then `echo
+   relayterm-after-long-output` round-tripped. Terminal
+   responsive afterward.
+4. **Unicode / box / wide — Path D — works.** The
+   `printf` commands were typed as pure-ASCII `\xHH`
+   escapes (Path A keystrokes) so the **output** bytes
+   are what is under test (Path D). `caf` + U+00E9
+   (`é`) + U+03A9 (`Ω`) + U+03BB (`λ`) + U+1F680 (🚀)
+   all render with correct codepoints in the DOM grid;
+   the three box-drawing lines (`┌─┬─┐` / `│a│b│` /
+   `└─┴─┘`, codepoints U+250C…U+2518) align
+   column-for-column; `コンニチハ` katakana (U+30B3…
+   U+30CF) renders. wterm renders each `.term-row` as a
+   single text node (not per-cell spans), so codepoint
+   correctness in the DOM was confirmed but precise
+   per-glyph cell-width was **not** measured; typography
+   precision beyond "renders legibly" not measured.
+5. **Paste — Path C — pass.** `clipboard-write`
+   permission was `granted`. A 2-line payload (`echo
+   relayterm-paste-1` / `echo relayterm-paste-2`, 45
+   bytes) was written via `navigator.clipboard.writeText`
+   inside one `browser_evaluate` (the body never transited
+   a tool-call argument / return — the call returned only
+   "45 bytes, 2 lines"). A trusted Ctrl+V fired wterm's
+   DOM textarea `paste` handler →
+   `production-terminal-paste-confirm` panel with
+   `data-paste-reason="bracketed_paste_markers"`, meta
+   "2 lines, 57 bytes", **no paste body in the panel
+   HTML**. `production-terminal-paste-confirm-send`
+   completed the round-trip; both sentinels appeared in
+   the viewport and, after Enter, both executed and
+   round-tripped. wterm's own `paste` handler works
+   renderer-fairly.
+6. **Alternate screen — Path D — works.** The target
+   image has no `tput`/`ncurses`, so the probe used raw
+   escapes: `printf '\033[?1049h'; printf
+   'alt-screen-probe\n'` then `printf '\033[?1049l'`. On
+   `\033[?1049h` wterm switched to the alternate buffer
+   (`alt-screen-probe` rendered; the recent normal-buffer
+   content — box / wide / paste lines — was hidden). On
+   `\033[?1049l` the normal buffer was restored
+   (box / wide / paste lines back) and the standalone
+   `alt-screen-probe` line was correctly **absent** from
+   the restored buffer (the literal string survives only
+   in the typed command-echo line, as expected). wterm /
+   its WASM core handles the alternate-screen buffer
+   correctly.
+7. **Mouse — deferred — fixture absent.** No
+   purpose-built click-coordinate fixture exists and the
+   harness plan defers the mouse-input half; no obvious
+   safe method to fairly drive SGR mouse mode through
+   MCP. Recorded once per fixture per the
+   result-classification table.
+8. **Detach / reconnect / replay — Path A + production
+   buttons — pass.** `echo relayterm-before-detach`
+   round-tripped, then `production-terminal-detach` →
+   `data-phase="detached"` (renderer + marker
+   preserved). `production-terminal-reconnect` within
+   the 30 s TTL re-attached the **same** session UUID
+   `fdd16d4d-…` (`status=active`), `data-renderer`
+   returned to `wterm`, `data-renderer-input` re-stamped
+   `marked`, `data-renderer-fallback` empty. wterm
+   remounted **fresh** — the DOM grid was 24 empty rows;
+   prior output did **not** visually replay into the
+   remounted grid. This matches the documented baseline
+   behaviour ("renderer remounted; viewport empty until
+   new output" — the same property the 2026-05-13 xterm
+   baseline records and this runbook does not assert).
+   Wire-side replay is correct (same session row, still
+   active). Fresh `echo relayterm-after-reconnect`
+   round-tripped post-reattach.
+9. **Narrow / mobile viewport — Path A + viewport handle
+   — works with caveats.** Resized to 390 × 844:
+   workspace reachable, `production-terminal-focus`
+   visible, input usable, `data-renderer="wterm"` /
+   `data-renderer-input="marked"`, `echo
+   relayterm-mobile-width-wterm-matrix` round-tripped. The
+   `.wterm` DOM host pixel-width tracked the narrow
+   container (326 px) but the cell grid did **not**
+   reflow — same root cause and posture as row 2
+   (`autoResize` off; no xterm-style `fit()`). No crash /
+   MCP / renderer error. Viewport restored to 1440 × 900
+   afterward.
+
+**Xterm recovery row — pass.** Settings gate flipped OFF
+(the handler reset `rendererId="xterm"`), saved
+(`localStorage` confirmed `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`). A fresh
+launch on the same `wterm-matrix-smoke-profile` opened
+session UUID `0399a83c-72a1-4de9-96bd-cee834525a13` with
+`data-renderer="xterm"`,
+`data-renderer-experimental="false"`,
+`data-renderer-fallback=""`, `data-renderer-gate="off"`,
+`data-renderer-input="marked"`, diagnostic
+`Renderer. xterm baseline`. Per the renderer-fair
+procedure: clicked `production-terminal-focus`, verified
+`document.activeElement` === `[data-relayterm-terminal-input]`
+(which resolved to xterm's `xterm-helper-textarea`), then
+drove Path A keystrokes. `echo
+relayterm-wterm-matrix-xterm-recovery` round-tripped and
+`whoami` → `smoke`. **The xterm production default fully
+recovers after a wterm evaluation session.**
+
+**Pre-existing xterm `style-src` console errors (NOT a
+regression).** 6 `Applying inline style violates …
+'default-src 'self''` errors fired from
+`index-D0aBjuMM.js` during the **xterm** recovery attach
+— identical class to the 2026-05-14c / 2026-05-14e /
+2026-05-14f / 2026-05-14g findings. The **wterm** mount
+produced **0** console errors; these 6 are xterm's own
+pre-existing inline-style behaviour. xterm continues to
+mount and operate; no action this slice.
+
+**Session lifecycle rows.** `terminal_sessions`:
+`fdd16d4d-…` (wterm) and `0399a83c-…` (xterm recovery)
+both `closed`. `session_events`: wterm `fdd16d4d-…` →
+`created` ×1, `attached` ×2, `resized` ×2, `detached`
+×1, `reattached` ×1, `closed` ×1 (consistent with the
+detach/reconnect row and the two Fit-driven resizes);
+xterm recovery `0399a83c-…` → `created` / `attached` /
+`closed`.
+
+**Audit events in the smoke window.** 2 rows (Postgres
+timestamps, UTC), both `actor_id` non-null, both
+public-metadata-only:
+- `17:27:39 ssh_identity_created` — `{name, source:
+  generated, key_type: ed25519, created_at,
+  ssh_identity_id, fingerprint_sha256}`.
+- `17:34:59 server_profile_created` — `{name, host_id,
+  disabled_at: null, ssh_identity_id,
+  server_profile_id}`.
+
+Per-payload sentinel sweep over the smoke-window rows
+(`payload::text ~*` `{private_key,
+encrypted_private_key, BEGIN OPENSSH, openssh-key-v1,
+passphrase, session_token, token_hash, data_b64,
+relayterm-wterm-matrix, relayterm-paste,
+relayterm-before-detach, relayterm-after-reconnect,
+relayterm-mobile-width, alt-screen-probe}`): **0 hits**.
+
+**Backend / web / target log sweep.** Bounded
+`docker logs --since 35m` over the three containers:
+backend = 7 lines (RelayTerm does not log session
+lifecycle or terminal I/O to stdout; the only
+sentinel-pattern match was the documented
+`WARN missing session cookie` false positive), web/nginx
+= 69 request-log lines (status codes only, no payloads),
+target = 40 lines (s6 init banner + sshd-listening; the
+only sentinel-pattern match was the documented
+`User/password ssh access is disabled.` false positive).
+All secret / payload / smoke-sentinel strings: **0 hits**.
+
+**DOM + storage redaction.** Sweep over
+`document.documentElement.outerHTML`, `localStorage`,
+`sessionStorage`, `document.cookie` after the sessions
+closed: **0 hits** across the secrets + smoke-sentinel
+list. `document.cookie.length === 0` (HttpOnly).
+`localStorage` carried only
+`relayterm.terminal-settings.v1` with the post-cleanup
+values `{rendererId: "xterm",
+experimentalRendererEvaluationEnabled: false}`.
+`sessionStorage` empty.
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-wterm-matrix-smoke-ssh` is
+`docker stop`'d and auto-removed (`--rm`; `docker ps -a`
+confirmed gone). Profile `wterm-matrix-smoke-profile`
+**disabled** through the SPA (not deleted, per the
+inventory lifecycle policy) — `disabled_at` set
+`2026-05-14T18:46:47Z`, and a `server_profile_disabled`
+audit row was written (`actor_id` non-null,
+public-metadata-only payload `{name, host_id,
+disabled_at, ssh_identity_id, server_profile_id}`).
+Renderer Settings left at `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`. Left in
+place per the slice plan: the staging CSP (unchanged this
+slice), the staging Compose stack (running; Postgres
+`Up 5 days`; **not recreated** — web/backend recreate
+used `--no-deps`), the `wterm-matrix-smoke` identity /
+host / disabled profile / 1 trusted `known_host_entries`
+row / `terminal_sessions` / `session_events` /
+`audit_events` rows, and the staging smoke user. No
+durable row was deleted.
+
+**Intentionally deferred** (out of scope for this
+slice):
+- `ResttyRenderer.focusTarget()` and a restty matrix
+  smoke once/if restty can render.
+- Desktop Tauri / Android Tauri renderer smokes for any
+  candidate.
+- Automated performance / benchmark harness.
+- Renderer promotion / production-default switch
+  (Gate 2); persistent per-user / per-device renderer
+  preference beyond `relayterm.terminal-settings.v1`.
+- Production-side CSP decision (production deploy
+  templates remain strict).
+- `tmux` / `screen` host-side multiplexer persistence;
+  VT snapshot / durable persistence.
+- A purpose-built mouse click-coordinate fixture (matrix
+  row 7) and a larger-tooling target image for the
+  full-screen-app alternate-screen row.
+
+**Promotion decision.** **wterm remains experimental and
+unpromoted.** xterm remains the production compatibility
+baseline and the default renderer. A single matrix run is
+one human-evaluator data point — **not** a Gate-1 pass
+and **not** a Gate-2 promotion (see
+`docs/terminal-renderer-evaluation.md` § "Promotion
+criteria"). wterm clearing the gate (2026-05-14g) plus
+this one graded matrix run are evaluation data points;
+Gate 1 still requires the deliberate promotion review.
+No backend protocol / session /
+orchestrator / `terminal-core` / production-shell /
+renderer-adapter / CI / deploy-template / CSP file was
+touched.
+
+**Verdict.** The wterm Core-correctness matrix on the
+production shell is **pass / works** on every row that
+could be driven (basic I/O, long output, paste all
+`pass`; detach-reconnect-replay `pass` **wire-side**
+— same session row, renderer + marker re-stamped, fresh
+input round-trips — with renderer-side visual scrollback
+parity explicitly NOT claimed: wterm remounts fresh, the
+viewport is empty until new output, the same baseline
+behaviour the xterm 2026-05-13 entry records;
+unicode/box/wide and alternate-screen `works`; resize/fit
+and narrow-viewport `works with caveats` — the caveat is
+documented adapter
+behaviour: wterm exposes no xterm-style `fit()` and does
+not reflow its cell grid on container resize because the
+adapter defaults `autoResize` to `false`). Mouse is
+`deferred — fixture absent`. No row is a `regression
+vs. baseline`. The renderer-fair input seam
+(`[data-relayterm-terminal-input]` +
+`production-terminal-focus`), now available for wterm
+because `WtermRenderer.focusTarget()` landed in
+`bde039e`, drove input cleanly across every Path A /
+Path C row — closing the 2026-05-14g gate smoke's
+deferral. wterm is the **second experimental renderer
+(after ghostty-web) to complete a graded
+production-shell matrix smoke**, and the only DOM-rendered
+one. xterm recovery still works; the redaction posture is
+intact.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
