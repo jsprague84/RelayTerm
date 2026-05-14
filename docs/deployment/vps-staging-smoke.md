@@ -8273,6 +8273,356 @@ recovery passed and the redaction posture is intact.
 
 ---
 
+### 2026-05-14g · wterm production-shell renderer gate smoke (mounts cleanly AND renders functionally; matrix not graded — no focusTarget(); xterm recovery verified)
+
+**Date.** 2026-05-14 15:12 UTC – 15:40 UTC.
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Smoke ran against the **already-running**
+staging stack — web + backend images built
+`2026-05-14T05:40Z`, **identical digests to the
+2026-05-14f restty gate smoke**:
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  repo-digest
+  `sha256:751ac392c4892873355331991b7174edebc1588460baea562a25c68634ca6c2a`.
+- backend
+  `git.js-node.cc/jsprague/relayterm-backend:main`,
+  repo-digest
+  `sha256:d0b1debebceda4ae496220253cf34dc38d5fe967b17ee0fc78060c52fa44749b`.
+
+**Image-freshness note (operator-approved to proceed).**
+The running web bundle `index-CC8dESY2.js` was confirmed
+**content-current for every code-bearing commit**: it
+contains `data-relayterm-terminal-input` (commit
+`61cd7f1`, the last code commit), the `renderer-option`
+/ `experimental-renderer` selector strings. Registry
+`:main` HEAD has moved on since 2026-05-14f, but the
+three intervening `main` commits (`96d187a`, `040ffd0`,
+`24cfef2`) are **docs-only** — they bumped the image
+digest without changing app content. With operator
+approval the smoke proceeded on the running stack
+**without recreating web/backend**; Postgres untouched.
+**Branch.** `docs/wterm-production-renderer-gate` off
+`main` (docs-only).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900. Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Evaluate whether the existing **wterm**
+experimental renderer can load and mount on the
+production-shell staging surface through the gated
+renderer selector. If it mounts cleanly, run a focused
+matrix smoke; if it fails or is blocked, document the
+blocker and stop. This is a smoke/docs slice — no code,
+no renderer adapters, no CSP, no backend/protocol
+changes. wterm was the last experimental renderer not
+yet production-shell gate-tested.
+
+**Slice boundary (docs-only).** No repo source / CI /
+schema / migration / auth / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+nginx-template / deploy-template / CSP file was edited.
+The only host-side actions were the throwaway SSH
+target lifecycle (below) and the operator-approved
+*decision not to recreate* the stack.
+
+**CSP posture (unchanged from 2026-05-14c).**
+`curl -sSI https://relayterm-staging.js-node.cc/`:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+```
+
+`'unsafe-eval'` NOT present; `data:` NOT present;
+`blob:` NOT present; `connect-src` not widened. This
+slice did not touch CSP.
+
+**Endpoint smoke.** `GET /` → `200`, `GET /healthz` →
+`200`, `GET /api/v1/auth/me` without cookie → `401`.
+Production SPA loads; Settings experimental-renderer
+gate card is present with the toggle initially OFF and
+the `renderer-option-wterm` radio hidden. Flipping the
+gate ON revealed the static warning and all four
+renderer radios; selecting `wterm` and `settings-apply`
+showed `settings-status-saved` and persisted
+`rendererId="wterm"` /
+`experimentalRendererEvaluationEnabled=true` to
+`relayterm.terminal-settings.v1`. Selecting wterm in
+Settings produced **0** console errors/warnings (the
+wterm chunk is lazy — it loads on attach, not on
+selection).
+
+**wterm lazy chunk.** The production bundle's gated
+dynamic `import("@relayterm/terminal-wterm")` resolves
+to `assets/index-BKAYX4nB.js` (40,830 bytes — a small
+DOM-rendered adapter plus `@wterm/core`'s ~17 KB
+inlined base64 WASM module; no ghostty/restty markers).
+On terminal launch the chunk fetched at HTTP `200`.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-wterm-gate-smoke-ssh`, attached only
+to `relayterm-staging_relayterm-staging-internal` with
+DNS alias `wterm-gate-smoke-host` → `172.21.0.5`. **No
+host port published** (`HostConfig.PortBindings` empty;
+verified — only `2222/tcp` exposed internally).
+`USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`, `PUBLIC_KEY=<the
+RelayTerm-generated OpenSSH public-key line>`. The
+public-key line was fetched from the RelayTerm API into
+a local file via `browser_evaluate`'s `filename` option
+(never echoed into the conversation), validated with
+`ssh-keygen -lf` (fingerprint matched the generated
+identity), `scp`'d to the VPS, read into the
+`docker run -e PUBLIC_KEY=…` env, and the local +
+remote copies shredded. No PEM / private-key bytes
+touched any tool-call payload, log, or the operator
+filesystem.
+
+**Identity / host / profile.**
+- Identity `wterm-gate-smoke-identity` (generated
+  ed25519, fingerprint
+  `SHA256:ZgSSGw3Jc4R0oq/J6nc/QpDYzcySAiTkGsdlS3jvVgo`).
+- Host `Wterm-Gate-Smoke-Host` (hostname
+  `wterm-gate-smoke-host`, port `2222`, default user
+  `smoke`).
+- Profile `wterm-gate-smoke-profile` (tags
+  `renderer, wterm, gate`).
+
+**Host-key preflight + trust.** Preflight captured
+`SHA256:VxYsyH691CTDw3yk8KEeTuH9qWeNyh3WBNkjOEWaXOU`,
+**byte-identical** to the target container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+Typed into the confirm input and trusted; the host-key
+status flipped to `Trusted`.
+
+**Auth-check.** Status flipped to `Authenticated` at
+`2026-05-14T15:27:51Z`.
+
+**Renderer mount (the load-bearing assertion).**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID
+`7b51c168-36ac-497a-beb5-2e66f9fc11af`. wterm **loaded
+and mounted cleanly** — the production-terminal
+workspace surfaced:
+- `data-phase="attached"` (`production-terminal-phase`
+  text `live`)
+- `data-renderer="wterm"`
+- `data-renderer-experimental="true"`
+- `data-renderer-fallback=""` (empty — **no
+  `adapter_mount_failed`**; the dynamic `import()`
+  resolved, the constructor ran, `mount()` resolved,
+  the `@wterm/core` WASM compiled under
+  `'wasm-unsafe-eval'`)
+- `data-renderer-gate="on"`
+- `data-renderer-input="none"` — wterm's adapter does
+  **not** implement the optional `focusTarget()`
+  method, so the workspace could not stamp the
+  renderer-neutral `[data-relayterm-terminal-input]`
+  marker
+- `production-terminal-renderer-diagnostic`:
+  `Renderer. wterm experimental · experimental`
+- `production-terminal-error` NOT rendered
+- **0** console errors/warnings during the wterm mount
+- `session_events`: `created` → `attached` →
+  `resized` → `closed` — the **backend session
+  attached** and a PTY was live.
+
+**…and unlike restty, wterm is visually / functionally
+healthy.** The wterm DOM grid built and **sized
+correctly**: the `.wterm` host element and the
+`production-terminal-viewport` both measured
+`642 × 434 px` (not the 1 × 1 wedge restty hit on
+2026-05-14f), with 24 `.term-row` divs and a
+`.term-grid` present, computed `font-size: 14px`,
+monospace family. wterm is DOM-rendered (no canvas /
+WebGPU, no runtime font-CDN `fetch`), so none of
+restty's three compounding CSP failures applied.
+wterm's `.wterm` host stylesheet ships in the prod CSS
+bundle (static, not inline), and wterm produced **zero
+console errors** — fewer than xterm itself produces on
+this CSP (see the xterm-recovery note below).
+
+**Functional diagnostic input probe (NOT a graded
+renderer-fair matrix row).** Because
+`data-renderer-input="none"`, the SMOKE runbook's
+renderer-fair verification seam
+(`document.activeElement === [data-relayterm-terminal-input]`,
+per `apps/web/e2e/SMOKE.md` § "Renderer-fair input")
+was unavailable. A **diagnostic probe** — explicitly
+not a graded matrix row — was run to characterise the
+mount: clicking `production-terminal-focus` (which
+calls `renderer.focus()` → `WTerm.focus()`) moved
+browser focus onto wterm's textarea-backed
+`InputHandler` (verified `document.activeElement` is
+the `<textarea>` inside the `.wterm` host). A
+synthetic `fill()` did not drive wterm, but **real
+trusted `browser_press_key` keystrokes did** — typing
+`who` + Enter raised `last_seen_seq` `0 → 7` and wterm
+**rendered the `who` command echo and the shell prompt
+into its DOM grid**. The pre-input `last_seen_seq 0`
+was simply "no input driven yet," not a stall. This
+establishes wterm's input → wire → output → render
+path is **functional** on the production shell under
+the staging CSP — but it is a diagnostic observation,
+NOT a renderer-fair graded row (focus could not be
+verified through the renderer-neutral marker).
+
+**Matrix not graded.** Per `apps/web/e2e/SMOKE.md` §
+"Renderer-fair input", `data-renderer-input="none"`
+defers every Path A / Path C row
+(`deferred — renderer input target unavailable`).
+Because wterm exposes no `focusTarget()`, **no
+evaluation-matrix row was formally graded**; the slice
+stopped at the gate per its own "if it is blocked,
+document the blocker and stop" instruction. The gate
+question itself — does wterm load and mount cleanly,
+and is it functional — is answered **yes**.
+
+**Xterm recovery row — pass.** Settings gate flipped
+OFF (the handler reset `rendererId="xterm"`), saved
+(`localStorage` confirmed `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`). A fresh
+launch on the same `wterm-gate-smoke-profile` opened
+session UUID `dbf28a5b-8dd7-4a55-8ca2-2cfb4aefb113`
+with `data-renderer="xterm"`,
+`data-renderer-experimental="false"`,
+`data-renderer-fallback=""`, `data-renderer-gate="off"`,
+`data-renderer-input="marked"`. Per
+`apps/web/e2e/SMOKE.md` § "Renderer-fair input":
+clicked `production-terminal-focus`, verified
+`document.activeElement` === `[data-relayterm-terminal-input]`
+(`{hasTarget: true, focused: true}`), then drove Path A
+keystrokes (`pressSequentially` — trusted per-character
+key events; a `fill()` newline does not submit).
+`echo relayterm-wterm-gate-xterm-recovery` round-tripped
+(command echo + `echo` output) and `whoami` → `smoke`.
+`last_seen_seq` rose to `38`. **The xterm production
+default fully recovers after a wterm evaluation
+attempt.**
+
+**Pre-existing xterm `style-src` console errors (NOT a
+regression).** 6 `Applying inline style violates …
+'default-src 'self''` errors fired from
+`index-CC8dESY2.js` during the **xterm** recovery
+attach — identical class to the 2026-05-14c / 2026-05-14e
+/ 2026-05-14f findings. Notably the **wterm** mount
+produced **0** console errors; these 6 are xterm's own
+pre-existing inline-style behaviour. xterm continues to
+mount and operate; no action this slice.
+
+**Session lifecycle rows.** `terminal_sessions`:
+`7b51c168-…` (wterm) and `dbf28a5b-…` (xterm
+recovery) both `closed`. `session_events` for the two
+sessions: wterm `created` / `attached` / `resized` /
+`closed`; xterm recovery `created` / `attached` /
+`closed`.
+
+**Audit events in the smoke window.** 2 rows (Postgres
+timestamps, UTC), both `actor_id` non-null, both
+public-metadata-only:
+- `15:23:26 ssh_identity_created` — `{name, source:
+  generated, key_type: ed25519, created_at,
+  ssh_identity_id, fingerprint_sha256}`.
+- `15:26:24 server_profile_created` — `{name, host_id,
+  disabled_at: null, ssh_identity_id,
+  server_profile_id}`.
+
+Per-payload sentinel sweep over the smoke-window rows
+(`payload::text ~*` `{private_key,
+encrypted_private_key, BEGIN OPENSSH, openssh-key-v1,
+passphrase, session_token, token_hash, data_b64,
+relayterm-wterm-gate}`): **0 hits**.
+
+**Backend / web / target log sweep.** Bounded
+`docker logs --since 20m` over the three containers:
+backend = 0 lines (RelayTerm does not log session
+lifecycle or terminal I/O to stdout), web/nginx =
+28 request-log lines (status codes only, no payloads),
+target = 41 lines (s6 init banner + sshd-listening — no
+per-auth lines surface to `docker logs` for this
+image). Sentinel grep across all three streams
+(secrets + smoke sentinels, the documented
+`missing session cookie` / `User/password ssh access
+is disabled` false positives excluded): **0 hits**.
+
+**DOM + storage redaction.** Sweep over
+`document.documentElement.outerHTML`, `localStorage`,
+`sessionStorage`, `document.cookie` after the session
+closed: **0 hits** across the secrets + smoke-sentinel
+list. `document.cookie.length === 0` (HttpOnly).
+`localStorage` carried only
+`relayterm.terminal-settings.v1` with the post-cleanup
+values `{rendererId: "xterm",
+experimentalRendererEvaluationEnabled: false}`.
+`sessionStorage` empty.
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-wterm-gate-smoke-ssh` is
+`docker stop` + `docker rm`'d (`--rm` removes on stop;
+`docker ps -a` confirmed empty). Profile
+`wterm-gate-smoke-profile` **disabled** through the SPA
+(not deleted, per the inventory lifecycle policy) — it
+carries terminal session history. Renderer Settings
+left at `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`. Left in
+place per the slice plan: the staging CSP (unchanged
+this slice), the staging Compose stack (running;
+Postgres `Up 4 days`; **not recreated** this slice),
+the `wterm-gate-smoke` identity / host / disabled
+profile / 1 trusted `known_host_entries` row /
+`terminal_sessions` / `session_events` /
+`audit_events` rows, and the staging smoke user. No
+durable row was deleted.
+
+**Intentionally deferred** (out of scope for this
+slice):
+- A renderer-fair wterm evaluation-matrix smoke — its
+  precondition is a `focusTarget()` implementation in
+  `WtermRenderer` (a code slice; the xterm and
+  ghostty-web adapters already meet it).
+- Desktop Tauri / Android Tauri renderer smokes for
+  any candidate.
+- Automated performance / benchmark harness.
+- Renderer promotion / production-default switch
+  (Gate 2); persistent per-user / per-device renderer
+  preference beyond `relayterm.terminal-settings.v1`.
+- Production-side CSP decision (production deploy
+  templates remain strict).
+- `tmux` / `screen` host-side multiplexer persistence;
+  VT snapshot / durable persistence.
+
+**Promotion decision.** **wterm remains experimental
+and unpromoted.** xterm remains the production
+compatibility baseline and the default renderer. No
+backend protocol / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+CI / deploy-template / CSP file was touched.
+
+**Verdict.** wterm's production-shell gate is **PASS**
+(loader + mount + functional render only; the
+evaluation matrix was not graded). It is the **first
+experimental renderer to both mount cleanly AND render
+functionally** on the production shell: the gated dynamic `import()` resolves, the
+`WtermRenderer` constructor runs, `mount()` resolves,
+`@wterm/core`'s WASM compiles under the staging
+`'wasm-unsafe-eval'` CSP, the backend session attaches,
+the DOM grid sizes correctly (unlike restty's 1 × 1
+wedge), wterm produces zero console errors, and a
+diagnostic input probe confirmed the
+input → wire → output → render path works. However the
+**formal renderer-fair evaluation matrix was NOT
+graded** — `WtermRenderer` does not implement the
+optional `focusTarget()` method, so
+`data-renderer-input="none"` and the SMOKE runbook's
+renderer-neutral verification seam is unavailable. The
+prerequisite for a wterm matrix smoke is a
+`focusTarget()` implementation in the adapter — a code
+slice, explicitly out of scope here. xterm recovery
+passed and the redaction posture is intact.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

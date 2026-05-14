@@ -788,6 +788,101 @@ production-default flip (Gate 2); persistent per-user /
 per-device renderer preference; `tmux` / `screen` and
 VT-snapshot persistence.
 
+### 2026-05-14g · wterm production-shell renderer gate (mounts cleanly AND renders functionally; matrix deferred on the `focusTarget()` gap; not promoted)
+
+A docs-only smoke slice on 2026-05-14 carried the
+**wterm** experimental renderer through the
+production-shell gate on the staging surface — wterm
+was the last experimental renderer not yet
+production-shell gate-tested. Full smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14g · wterm production-shell renderer gate
+smoke".
+
+**What the gate found, on the production shell, with
+no source / CI / deploy / CSP changes:**
+
+- wterm's **loader and mount path is healthy** — the
+  gated dynamic `import()` of `@relayterm/terminal-wterm`
+  resolved (lazy chunk `assets/index-BKAYX4nB.js`,
+  40,830 bytes, fetched HTTP 200 on attach), the
+  `WtermRenderer` constructor ran, `mount()` resolved,
+  `@wterm/core`'s inlined WASM compiled under the
+  staging `'wasm-unsafe-eval'` CSP, and the backend
+  session attached (`session_events`:
+  created → attached → resized → closed). Diagnostics:
+  `data-renderer="wterm"`,
+  `data-renderer-experimental="true"`,
+  `data-renderer-fallback=""` (no `adapter_mount_failed`),
+  `data-renderer-gate="on"`, `data-phase="attached"`,
+  **0 console errors** during the wterm mount.
+- Unlike restty (2026-05-14f), wterm is **visually /
+  functionally healthy** on the staging surface. wterm
+  is DOM-rendered (no canvas / WebGPU, no runtime
+  font-CDN `fetch`), so none of restty's three
+  compounding CSP failures applied. The `.wterm` DOM
+  host sized correctly to `642 × 434 px` (not restty's
+  1 × 1 wedge), with 24 `.term-row` divs and the
+  `.term-grid` present. A **diagnostic input probe**
+  (not a graded renderer-fair row) confirmed the
+  input → wire → output → render path works: clicking
+  `production-terminal-focus` moved focus onto wterm's
+  textarea-backed `InputHandler`, and trusted
+  `browser_press_key` keystrokes (`who` + Enter)
+  raised `last_seen_seq` `0 → 7` and rendered the
+  command echo + shell prompt into wterm's DOM grid.
+- wterm's adapter does **not** implement the optional
+  `focusTarget()` method, so `data-renderer-input="none"`
+  and the renderer-fair Path A / Path C input seam
+  (`apps/web/e2e/SMOKE.md` § "Renderer-fair input") was
+  unavailable. **No evaluation-matrix row was formally
+  graded** — the slice stopped at the gate per "if it
+  is blocked, document the blocker and stop." The gate
+  question (does wterm load + mount cleanly, and is it
+  functional) is answered **yes**; the formal matrix
+  stays deferred on the `focusTarget()` gap, the same
+  precondition restty (2026-05-14f) also lacks.
+- **xterm recovery passed** end-to-end (gate OFF →
+  relaunch → `data-renderer="xterm"`,
+  `data-renderer-input="marked"`; renderer-fair focus
+  verified via `[data-relayterm-terminal-input]`;
+  `relayterm-wterm-gate-xterm-recovery` and `whoami`
+  round-tripped). The 6 xterm `style-src` inline-style
+  console errors are pre-existing (2026-05-14c/e/f),
+  not a regression, and did **not** fire during the
+  wterm session. Redaction sweep clean across DOM /
+  storage / cookies / backend-web-target logs /
+  `audit_events` payloads — 0 sentinel/secret hits.
+
+**Promotion posture.** **wterm remains experimental
+and unpromoted.** xterm remains the production
+compatibility baseline and the default renderer.
+Gate 1 / Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged — wterm's **Core-correctness** matrix rows
+cannot be graded until a renderer-fair input path
+exists for it, which needs `focusTarget()` implemented
+in `WtermRenderer`. wterm clearing the gate (clean
+mount + functional render) is one data point, **not**
+a Gate 1 pass. The `focusTarget()` precondition is
+documented in
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Production-shell evaluation status and
+`focusTarget()` caveat". No backend protocol /
+session / orchestrator / `terminal-core` /
+production-shell / renderer-adapter / CI /
+deploy-template / CSP file was touched.
+
+**Deferred from this slice:** a renderer-fair wterm
+matrix smoke once `WtermRenderer` implements
+`focusTarget()` (a code slice; the xterm and
+ghostty-web adapters already meet it); desktop-Tauri /
+Android-Tauri renderer smokes; automated performance /
+benchmark harness; renderer production-default flip
+(Gate 2); persistent per-user / per-device renderer
+preference; the production-side CSP decision; `tmux` /
+`screen` and VT-snapshot persistence.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
