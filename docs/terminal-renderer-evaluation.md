@@ -671,12 +671,18 @@ rows to hold on a target surface *with caveats
 documented in `docs/spec/terminal-adapters.md`*, plus
 the bundle-size sign-off and the SPEC updates; Gate 2
 still requires per-surface coverage and a soak window.
-Note the resize/fit and narrow-viewport caveats this
+The resize/fit and narrow-viewport caveats this
 smoke surfaced (ghostty-web exposes no xterm-style
-`fit()` and does not reflow its grid on container
-resize) are **not yet** written into
-`docs/spec/terminal-adapters.md` — capturing them there
-is part of the separate, future Gate 1 work, not this
+`fit()` and did not reflow its grid on container
+resize) are now documented in
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Production-shell evaluation status and resize/fit
+caveat" — the Gate 1 requirement that a candidate's
+Core-correctness caveats be recorded in the adapter
+spec is met for this row. The resize-behavior
+*decision* itself (implement renderer-neutral fit
+support vs. accept the limitation for experimental
+opt-in) remains future Gate 1 work, not this
 docs-smoke slice.
 Architectural posture unchanged: no backend protocol /
 session / orchestrator / `terminal-core` /

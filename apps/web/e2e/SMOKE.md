@@ -1556,6 +1556,18 @@ list below covers every smoke-run echo).
    per resize (operator-side DB check; **never** include row payload
    in the smoke entry).
 
+   Renderer-fairness note: `fit()` is an xterm-specific capability —
+   the production "Fit" control routes through `safeFit()`, which
+   probes for it at runtime and is a clean no-op on a renderer that
+   does not expose it (ghostty-web today — see
+   [`docs/spec/terminal-adapters.md`](../../docs/spec/terminal-adapters.md)
+   § "Production-shell evaluation status and resize/fit caveat"). On
+   such a renderer `stty size` staying unchanged after a viewport
+   resize + Fit click is **documented adapter behavior** — record it
+   as `works with caveats`, not `fail`, and capture the no-op plus any
+   non-reflow behavior in the smoke entry. A `fail` is reserved for a
+   renderer that *claims* fit/resize and gets it wrong.
+
 3. **Long output — Path A.**
 
    ```sh
@@ -1714,8 +1726,17 @@ list below covers every smoke-run echo).
     ```
 
     Sentinel: `relayterm-mobile-width-renderer`. Expected: the
-    renderer reflows the prior scrollback to the narrower width; the
-    echo round-trips; no MCP / renderer error.
+    workspace stays usable at the narrow width and the echo
+    round-trips with no MCP / renderer error. Reflow of the prior
+    scrollback to the narrower width is **renderer-dependent** — xterm
+    reflows via its `fit()` path; a renderer without an xterm-style
+    `fit()` (ghostty-web today) keeps its mounted column count and
+    clips long lines at the canvas edge rather than rewrapping. Record
+    the observed reflow / clip behavior honestly; for a renderer
+    without `fit()` the non-reflow is `works with caveats`, not a
+    `regression vs. baseline` — see
+    [`docs/spec/terminal-adapters.md`](../../docs/spec/terminal-adapters.md)
+    § "Production-shell evaluation status and resize/fit caveat".
 
 #### Clipboard permission deferral note
 
