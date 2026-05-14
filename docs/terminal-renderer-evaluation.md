@@ -363,18 +363,93 @@ ghostty-web promotion, no xterm-default flip. xterm remains the
 production compatibility baseline and the default renderer; the
 production-shell experimental-renderer gate continues to apply.
 
-**Staging verification posture.** The slice was validated
-locally only — `pnpm -r build` confirms `dist/assets/ghostty-vt-<hash>.wasm`
-emission and the renderer / adapter test suites pass. **A staging
-resmoke is still required** before any ghostty-web matrix row can
-be re-evaluated, and remains the next slice in the renderer-
-evaluation track (`docs/ghostty-web-wasm-asset-resmoke`). The
-staging resmoke also needs to either (i) report that
-`'wasm-unsafe-eval'` is independently required to actually mount
-the renderer, or (ii) come paired with a deploy-side CSP slice
-that adds it. Until that resmoke lands, every ghostty-web
-evaluation-matrix row stays deferred under the closed
-`apps/web/e2e/SMOKE.md` vocabulary.
+**Staging verification posture.** The adapter slice was
+validated locally first — `pnpm -r build` confirmed
+`dist/assets/ghostty-vt-<hash>.wasm` emission and the
+renderer / adapter test suites passed. The staging resmoke
+landed 2026-05-14 (see the next section below) and
+**confirmed option (i) — `'wasm-unsafe-eval'` is
+independently required to actually mount the renderer
+under the staging stack's current CSP**. The
+ghostty-web evaluation-matrix rows therefore stay deferred
+under the closed `apps/web/e2e/SMOKE.md` vocabulary
+until either (a) a deploy-side CSP slice adds
+`'wasm-unsafe-eval'` to `script-src`, or (b) an upstream
+`ghostty-web` patch removes the `WebAssembly.compile()`
+requirement from `Ghostty.loadFromPath`. Both are
+separate, deliberate slices that this docs entry does
+NOT authorise.
+
+### 2026-05-14 · ghostty-web WASM-as-asset staging resmoke (data: CSP block closed; `'wasm-unsafe-eval'` still blocks compile)
+
+A docs-only resmoke on 2026-05-14 against the staging
+stack — recreated from the `:main` images that include
+`aa6bf9f fix(web): load ghostty wasm as an asset` —
+verified the adapter-side fix on the live production
+shell. Full smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14b · Ghostty-web WASM-as-asset resmoke
+(data: CSP block closed; wasm-unsafe-eval still blocks
+compile; xterm recovery still works)".
+
+What the resmoke confirmed, on the production shell,
+without any source / CI / deploy / CSP changes:
+
+- The new same-origin asset emits and serves cleanly:
+  `https://relayterm-staging.js-node.cc/assets/ghostty-vt-<hash>.wasm`
+  returns HTTP 200 with `content-type: application/wasm`
+  and the standard `/assets/*` immutable cache. The
+  recreated web container's
+  `/usr/share/nginx/html/assets/` lists exactly one
+  fingerprinted `ghostty-vt-<hash>.wasm` file
+  (423,045 bytes); the pre-recreate listing had none.
+- The runtime fetches the asset via `Ghostty.load(wasmUrl)`:
+  `performance.getEntriesByType('resource')` showed
+  the asset URL with `initiatorType="fetch"`,
+  `responseStatus=200`, `decodedBodySize=423045`,
+  `duration≈82 ms`. The inlined
+  `data:application/wasm;base64,…` URL is no longer
+  the load path. The two `data:application/wasm` CSP
+  errors the 2026-05-14 mount-failure resmoke recorded
+  in the browser console **did not fire**.
+- `WebAssembly.compile()` inside upstream's
+  `Ghostty.loadFromPath` still rejects with the
+  `'unsafe-eval' is not an allowed source of script`
+  CompileError. A direct `await WebAssembly.compile(<8-byte
+  minimal WASM>)` issued from `browser_evaluate` rejected
+  identically — confirming the remaining gap is the
+  `WebAssembly.compile` call itself, not anything
+  specific to the ghostty-vt bytes.
+- ghostty-web therefore still fails to mount under the
+  staging CSP. `data-renderer-fallback="adapter_mount_failed"`
+  fires cleanly with the fixed operator-facing copy from
+  `feat(web): handle renderer mount failures`. xterm
+  recovery on the same profile still works end-to-end
+  (the smoke ran `echo relayterm-ghostty-asset-resmoke-xterm`
+  and `whoami → smoke` round-trips and closed the
+  session via `End session`).
+
+What this slice did **not** do (deferred):
+
+- Evaluation-matrix rows for ghostty-web — every row
+  stays `deferred — renderer not identified
+  (adapter_mount_failed)`.
+- A deploy-side CSP slice adding `'wasm-unsafe-eval'`
+  to `script-src` (the directive widens the execution
+  policy for ALL same-origin scripts, not just WASM
+  compile, and needs its own threat-model entry).
+- Any upstream ghostty-web patch.
+- restty / wterm / desktop-Tauri / Android-Tauri
+  smokes; benchmark harness; renderer promotion;
+  per-user / per-device renderer preference
+  persistence beyond the current
+  `relayterm.terminal-settings.v1` localStorage entry.
+
+Architectural posture unchanged: no backend protocol,
+session, orchestrator, `terminal-core`, production-shell-
+non-loader, CI, or deploy file was touched. xterm remains
+the production compatibility baseline and the default
+renderer.
 
 ## Purpose
 

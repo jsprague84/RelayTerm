@@ -6596,6 +6596,478 @@ recovers a working terminal on the same profile. The
 2026-05-13 ghostty-web smoke's wedged-`idle` failure
 mode is closed.
 
+### 2026-05-14b · Ghostty-web WASM-as-asset resmoke (data: CSP block closed; wasm-unsafe-eval still blocks compile; xterm recovery still works)
+
+**Date.** 2026-05-14 03:18 UTC – 03:32 UTC (≈14 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** `git.js-node.cc/jsprague/relayterm-web:main`
+(image config `sha256:0fed18d2…`, image built
+2026-05-14 02:43 UTC) +
+`git.js-node.cc/jsprague/relayterm-backend:main` (image
+config `sha256:747bede8…`, image built 2026-05-14 02:42 UTC).
+Pre-recreate state: the running web image config was
+`sha256:0250a9f9…` (built 2026-05-14 00:20 UTC, container
+started 2026-05-14 00:48 UTC — the same images the
+2026-05-14 mount-failure resmoke entry pinned). Both
+the `relayterm-web` and `relayterm-backend` services
+were pre-pulled (`docker pull git.js-node.cc/jsprague/relayterm-{web,backend}:main`)
+and then recreated at 2026-05-14 03:18 UTC
+(`docker compose up -d --no-deps --force-recreate
+--pull never relayterm-web relayterm-backend`) so the
+running web bundle includes
+`aa6bf9f fix(web): load ghostty wasm as an asset` —
+the adapter slice that swaps the inlined
+`data:application/wasm;base64,…` URL for a same-origin
+Vite-emitted `/assets/ghostty-vt-<hash>.wasm` asset.
+Postgres `postgres:17-alpine` left untouched
+(`Up 4 days` before AND `Up 4 days` after — the recreate
+explicitly used `--no-deps`). Asset assertion inside the
+recreated web container:
+`ls /usr/share/nginx/html/assets/ | grep ghostty-vt`
+returned `ghostty-vt-DOMeXDrv.wasm` (423,045 bytes,
+mtime 2026-05-14 02:43 UTC) — the new fingerprinted
+WASM asset the `?url` import emits. Pre-recreate the
+same listing returned nothing.
+**Branch.** `docs/ghostty-web-wasm-asset-resmoke`
+off `main` (docs-only slice; no source / CI / deploy /
+schema changes).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900. Auth: existing
+`staging+throwaway-20260509173230@example.com` cookie
+session, no re-login.
+
+**Goal.** Verify the adapter-side ghostty-web WASM-as-
+asset fix (`aa6bf9f`) on the live staging surface.
+Three load-bearing assertions:
+
+- The production web bundle now emits — and the
+  production CSP/SOP path actually fetches — a same-
+  origin `/assets/ghostty-vt-<hash>.wasm` asset; the
+  `data:application/wasm;base64,…` URL the 2026-05-13
+  and 2026-05-14 ghostty-web smokes were blocked on
+  is no longer the runtime load path.
+- ghostty-web still fails to mount under the staging
+  stack's current CSP because `WebAssembly.compile()`
+  / `compileStreaming()` independently require
+  `'wasm-unsafe-eval'` (no CSP changes in this slice).
+- `data-renderer-fallback="adapter_mount_failed"` plus
+  the fixed operator-facing copy from
+  `feat(web): handle renderer mount failures` continue
+  to fire cleanly; xterm fallback/manual recovery on
+  the same profile still works.
+
+Slice boundaries: no renderer-adapter changes, no CSP
+changes, no WASM/Vite bundling changes, no
+backend/session/orchestrator/protocol changes, no
+CI/deploy changes, no renderer promotion. This is a
+diagnostic resmoke — **no evaluation-matrix rows are
+graded for ghostty-web**.
+
+**CSP posture.** Unchanged.
+`curl -sSI https://relayterm-staging.js-node.cc/`
+returned
+`content-security-policy: default-src 'self'` (no
+`'wasm-unsafe-eval'`, no explicit `connect-src`, no
+`script-src` override). The recreated web image carries
+the same nginx `web.conf.template` posture as the prior
+images.
+`curl -sSI https://relayterm-staging.js-node.cc/assets/ghostty-vt-DOMeXDrv.wasm`
+returned `HTTP/2 200`, `content-type: application/wasm`,
+`cache-control: public, immutable, max-age=31536000` —
+same immutable-asset policy nginx applies to
+`/assets/*.js`. `/healthz` returned `200`,
+`/api/v1/auth/me` returned `401` (no session cookie),
+SPA at `/` returned `200`.
+
+**Renderer setup (gated, operator-opt-in).** Settings
+view pre-state: `data-renderer-gate="off"`, persisted
+`rendererId="xterm"`. Clicked
+`settings-experimental-renderer-toggle` (warning copy
+rendered), selected `renderer-option-ghostty-web`,
+clicked `settings-apply`. Post-state:
+- `localStorage["relayterm.terminal-settings.v1"]`
+  carries `rendererId="ghostty-web"` and
+  `experimentalRendererEvaluationEnabled=true`.
+- `settings-renderer-effective` reads "Effective
+  renderer on next session: ghostty-web experimental."
+- `settings-status-saved` reads "Saved locally. Applies
+  to the next terminal session."
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-ghostty-asset-resmoke-ssh`, attached
+only to the staging Compose network
+`relayterm-staging_relayterm-staging-internal` with
+DNS alias `ghostty-asset-resmoke-host` resolving to
+`172.21.0.5`. **No host port was published**
+(`docker port` returned empty; verified).
+`USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`,
+`PUBLIC_KEY=<the RelayTerm-generated OpenSSH line>`.
+The public-key line was extracted from the SPA's
+generate-success card via a single `browser_evaluate`,
+returned to the operator as base64, decoded inline
+inside one `ssh cloud-edge` shell session straight into
+`docker run -e PUBLIC_KEY=…`, and `unset PUBLIC_KEY`'d
+immediately. No PEM, no base64 sidecar, no private-key
+bytes touched the operator filesystem at any point.
+The container was `docker stop && docker rm`'d during
+cleanup.
+
+**Identity path.** Generated (backend-side keypair
+generation). One `POST /api/v1/ssh-identities` returned
+an `SshIdentityResponse` with `key_type=ed25519` and
+fingerprint
+`SHA256:xMUbJk4zetWOvgi+fzf1JgEJYzpdokSgkuEeL2w4O2k`
+(identity UUID `c8dadbdf-d171-411d-9211-23aee2c4246c`).
+
+**Host + profile create.** `Ghostty-Asset-Resmoke-Host`
+(display name) / `ghostty-asset-resmoke-host`
+(hostname) / `2222` / default user `smoke` (host UUID
+`c9d7690a-e039-4851-82bf-1dc148ffd6ab`).
+`ghostty-asset-resmoke-profile` binding that host to
+`ghostty-asset-resmoke-identity` with no username
+override and tags `renderer, ghostty-web, wasm-asset`
+(profile UUID `80188642-1afd-45f6-b5ce-27c1dbeaa738`).
+Success card carried the load-bearing copy "The host
+key is not yet trusted and SSH authentication has not
+been verified for this profile."
+
+**Host-key preflight + trust.** Preflight captured
+fingerprint
+`SHA256:nlm7GPqHBqQRbLHJ4BMT8cP4YWK2HVlUodQxm7+mK/k`,
+which is **byte-identical** to the locally-computed
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+value inside the target container. Typed the
+fingerprint into `host-key-confirm-input` →
+`host-key-trust-button`; `host-key-status-badge`
+flipped to `Trusted`.
+
+**Auth-check.** `auth-check-run-button` flipped
+`auth-check-status-badge` to `Authenticated` after a
+few seconds — public-key authentication succeeded with
+no PTY allocated.
+
+**Terminal launch — ghostty-web attempt
+(the load-bearing assertion).** `profile-launch-terminal`
+opened `/terminal` and created session UUID
+`461bb249-b07d-48bc-a509-9a8231cd0b97`. The workspace's
+attribute set after ≥3 s of waiting was:
+
+- `data-phase="idle"`
+- `data-renderer="unmounted"`
+- `data-renderer-experimental="false"`
+- **`data-renderer-fallback="adapter_mount_failed"`**
+- `data-renderer-gate="on"`
+- `production-terminal-error` panel rendered with
+  fixed text **`Renderer failed to mount. Switch back
+  to xterm in Settings and reopen the terminal.`** (the
+  `RENDERER_MOUNT_FAILED_MESSAGE` constant from
+  `apps/web/src/lib/app/terminal/terminalLaunch.ts`).
+- `production-terminal-renderer-diagnostic` rendered
+  "Renderer. unmounted · renderer failed to mount —
+  switch back to xterm in Settings and reopen the
+  terminal".
+- viewport empty (zero children).
+
+This is the same `adapter_mount_failed` surface the
+2026-05-14 mount-failure resmoke entry above pinned;
+the WASM-as-asset fix did NOT make ghostty-web mount.
+
+**What changed vs. the 2026-05-14 mount-failure
+resmoke (the differential this entry exists for).**
+The 2026-05-14 entry recorded **3 browser-console
+errors** captured during the mount attempt — two
+`data:application/wasm` CSP blocks (`connect-src`
+fallback to `default-src`, plus the matching
+`Fetch API cannot load data:application/wasm…`
+follow-up) and one `WebAssembly.compile(): … 'unsafe-eval'`
+`CompileError`. After the recreate:
+
+- `browser_console_messages level=error all=true`
+  returned **0 messages** during the ghostty-web mount
+  attempt itself. The two `data:application/wasm` CSP
+  errors **did not fire** — Vite emits the asset, the
+  adapter's `Ghostty.load(wasmUrl)` call points at the
+  same-origin URL, and CSP's `default-src 'self'`
+  permits the fetch. The `WebAssembly.compile` /
+  `'unsafe-eval'` CompileError still happens inside
+  upstream's `Ghostty.loadFromPath`, but it now lands
+  as a rejected promise that `mountRendererSafely`
+  catches into `adapter_mount_failed` — no CSP-violation
+  text reaches the JS console.
+- `performance.getEntriesByType('resource')` showed
+  exactly one ghostty-related entry:
+  `https://relayterm-staging.js-node.cc/assets/ghostty-vt-DOMeXDrv.wasm`
+  with `initiatorType="fetch"`, `responseStatus=200`,
+  `decodedBodySize=423045`, `duration≈82ms`. The
+  asset was served, fetched, and read into an
+  `ArrayBuffer` — the network-side half of the gap
+  the 2026-05-13 entry described is **closed**.
+- A manual `await WebAssembly.compile(<8-byte minimal
+  WASM>)` issued from `browser_evaluate` against the
+  page rejected with
+  `CompileError: WebAssembly.compile(): Compiling or
+   instantiating WebAssembly module violates the
+   following Content Security policy directive because
+   'unsafe-eval' is not an allowed source of script
+   in the following …` — confirming the remaining
+  gap is the upstream `WebAssembly.compile()` call
+  inside `Ghostty.loadFromPath`, not anything specific
+  to the ghostty-vt bytes (the same minimal valid
+  module also fails to compile). The same probe ran
+  against the real `/assets/ghostty-vt-DOMeXDrv.wasm`
+  bytes and against `WebAssembly.compileStreaming(fetch(...))`,
+  all three reject identically.
+
+The slice's claim "WASM-as-asset fix removes the
+`data:application/wasm` / `connect-src` half of the
+gap; the `'wasm-unsafe-eval'` half remains upstream-
+baked" (`wasmUrl.ts` header, `GhosttyWebRenderer.ts`
+header) is **directly verified on the production
+shell** by this resmoke.
+
+**Matrix rows (browser surface).** As with the
+2026-05-13 and 2026-05-14 ghostty-web entries above,
+**every evaluation-matrix row is deferred** under
+`deferred — renderer not identified
+(adapter_mount_failed)`. This is a deploy-side
+verification of the adapter slice, **not** a renderer-
+performance or matrix smoke. The renderer evaluation
+matrix itself is not advanced by this slice.
+
+**Xterm recovery verification (NOT a ghostty-web
+smoke pass).** After capturing the ghostty-web mount
+failure, the gate toggle was flipped OFF in Settings
+(which the `onExperimentalGateChange` handler
+explicitly resets to `rendererId="xterm"`), saved,
+and a new terminal launch opened on the same
+profile. Session UUID
+`c11cba6e-ba16-4903-8ca2-b6541a0ccdf0` attached in
+under a second with:
+- `data-renderer="xterm"`
+- `data-renderer-experimental="false"`
+- `data-renderer-fallback=""`
+- `data-renderer-gate="off"`
+- `data-phase="attached"` (live PTY)
+- `production-terminal-error` not rendered
+- `production-terminal-renderer-diagnostic` text
+  "Renderer. xterm baseline"
+
+After clicking `production-terminal-focus` and
+re-focusing the xterm helper textarea, the smoke
+sentinel `echo relayterm-ghostty-asset-resmoke-xterm`
+typed via Path A round-tripped cleanly (echo line
+rendered in viewport; status header showed
+`last_seen_seq=6`), followed by `whoami → smoke`
+(`last_seen_seq=11` after that round-trip). The
+workspace was closed via `production-terminal-close`
+(`End session`); the component unmounted, and the
+`/terminal` view fell back to its empty state.
+**xterm fallback remains fully usable after a gated
+experimental renderer mount-failure under this CSP.**
+
+**Session lifecycle rows.**
+- `terminal_sessions.461bb249-…` (ghostty-web
+  attempt): status `active`, closed_at NULL — created
+  server-side but no WS attach ever happened (mount
+  rejection short-circuited `attach()` before the
+  WebSocket handshake), so the backend orchestrator
+  has no russh channel for this id. Will be reaped by
+  the orphan-session janitor. `session_events`:
+  exactly 1 row (`created`, `{cols:80, rows:24,
+  stub:true}`). No `attached`, no `detached`, no
+  `closed` — consistent with the mount failure
+  happening before the WS attach handshake.
+- `terminal_sessions.c11cba6e-…` (xterm recovery):
+  status `closed`, closed_at 2026-05-14 03:31:41 UTC
+  (≈132 s lifetime). `session_events`: 3 rows in
+  order `created → attached → closed` (no `detached`
+  because the close was explicit via the `End
+  session` button). `attached` payload includes the
+  per-session-telemetry `client_info` user-agent
+  string (a known pre-existing field on
+  `session_events.payload`, NOT crossed into
+  `audit_events`).
+- Per the schema's per-session telemetry contract,
+  none of these crossed into `audit_events`.
+
+**Audit events in the smoke window.** Exactly 2 rows
+created during the slice (cleanup-disable row will
+add a 3rd, recorded under "Cleanup state" below):
+- `ssh_identity_created` at `03:21:55.550336Z`,
+  payload
+  `{name, source:"generated", key_type:"ed25519",
+   created_at, ssh_identity_id, fingerprint_sha256}` —
+  public-metadata only.
+- `server_profile_created` at `03:25:33.609876Z`,
+  payload `{name, host_id, disabled_at:null,
+   ssh_identity_id, server_profile_id}` —
+  public-metadata only.
+- **Zero** `audit_events` rows for the ghostty-web
+  mount failure itself — the failure path is browser-
+  side only (matches the 2026-05-13 and 2026-05-14
+  ghostty-web entries).
+
+**Backend / web / target log redaction.** Bounded
+`docker compose logs --since 30m` over the smoke
+window: backend = 7 lines (1 `WARN missing session
+cookie` pre-smoke line — same explanation as the
+2026-05-13 / 2026-05-14 entries, a literal WARN
+string, not a cookie value); web/nginx = 56 lines
+(request log only, no payloads); target sshd = 40
+lines (linuxserver entrypoint chatter only; no auth
+lines on stdout because the
+`linuxserver/openssh-server` image keeps `LogLevel
+INFO` events to `/var/log/auth.log` inside the
+container). Sentinel sweep against
+`{private_key_openssh, encrypted_private_key,
+BEGIN OPENSSH PRIVATE KEY, openssh-key-v1, passphrase,
+session_token, token_hash, data_b64, REDACT-MARKER,
+relayterm-ghostty-asset-resmoke, CompileError,
+unsafe-eval, WebAssembly, data:application/wasm}`
+returned **0 real hits** in every log. The `cookie`
+sentinel matched the backend's `WARN missing session
+cookie` text (same false-positive as prior smokes);
+the `password` sentinel matched the target sshd's
+linuxserver entrypoint message
+`User/password ssh access is disabled.` confirming
+`PASSWORD_ACCESS=false` was honored. Neither match
+represents a real secret-bytes leak; both are static
+diagnostic strings.
+
+**DOM + storage redaction.** Sweep over
+`document.documentElement.outerHTML` during the xterm
+recovery session AND against `localStorage`,
+`sessionStorage`, and `document.cookie`: zero hits
+across the secrets sentinel list above PLUS the
+renderer-mount-failure sentinels `{CompileError,
+WebAssembly, unsafe-eval, data:application/wasm}`
+(proving the raw `Error.message` / CSP directive
+text never reached the DOM despite the mount
+rejection earlier in the slice — exactly the
+posture `mountRendererSafely` is designed to enforce).
+`document.cookie.length === 0` (the `relayterm_session`
+cookie is HttpOnly — JS cannot read it).
+`localStorage` carried only
+`relayterm.terminal-settings.v1` (cosmetic + renderer
+fields with `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false` at the
+end of the slice) and `relayterm.active-terminal.v1`.
+The smoke sentinel
+`relayterm-ghostty-asset-resmoke-xterm` matched in
+the rendered DOM as expected — but **only inside
+`[data-testid="production-terminal-viewport"]`**,
+never outside it (`inHtmlOutsideViewport: false`),
+matching the redaction-rule contract for terminal-
+viewport content. `sessionStorage` empty.
+
+**Audit-payload sentinel sweep.** Against the
+smoke-window `audit_events`: `payload::text ~*`
+filter for
+`{private_key, encrypted_private_key, BEGIN OPENSSH,
+openssh-key-v1, passphrase, session_token,
+token_hash, data_b64, REDACT-MARKER,
+relayterm-ghostty-asset, CompileError, unsafe-eval,
+WebAssembly, data:application/wasm}` returned
+**zero rows**.
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-ghostty-asset-resmoke-ssh` is
+`docker stop` + `docker rm`'d (verified
+`docker ps -a --filter name=… --format {{.Names}}`
+returns empty). Profile
+`ghostty-asset-resmoke-profile` disabled through the
+SPA (preserved with `disabled_at` set, not deleted,
+per the inventory-lifecycle policy); the resulting
+`server_profile_disabled` audit row was recorded as
+the 3rd smoke-window `audit_events` entry, payload
+public-metadata only (`{name, host_id, disabled_at,
+ssh_identity_id, server_profile_id}`). Settings
+reset to `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false` so a
+future browser session against this staging surface
+starts on the production default. Left in place per
+the slice plan: staging Compose stack running,
+Postgres untouched (`Up 4 days` before AND after
+the slice — recreate used `--no-deps`),
+`ghostty-asset-resmoke-identity`
+(`c8dadbdf-…`), `Ghostty-Asset-Resmoke-Host`
+(`c9d7690a-…`), `ghostty-asset-resmoke-profile`
+(`80188642-…`, disabled), the 1 `active` (orphan) +
+1 `closed` `terminal_sessions` history rows, the 4
+total `session_events` rows, the 1 trusted
+`known_host_entries` row, the 3 `audit_events` rows
+emitted during the smoke (`ssh_identity_created`,
+`server_profile_created`,
+`server_profile_disabled`), the staging smoke user.
+
+**Intentionally deferred** (out of scope for this
+slice):
+- The remaining half of the CSP/WASM compatibility
+  gap (`'wasm-unsafe-eval'` in CSP `script-src`).
+  Two options for a future slice:
+  (a) a deploy-side CSP change adding
+      `'wasm-unsafe-eval'` to `script-src` (a
+      deliberate trade-off — the directive widens the
+      execution policy for ALL same-origin scripts,
+      not just WASM compile, and needs its own
+      threat-model entry); OR
+  (b) an upstream `ghostty-web` patch that swaps
+      `WebAssembly.compile` for a same-origin
+      streaming-instantiate path that does NOT
+      require `'wasm-unsafe-eval'` (if such a path
+      exists for the upstream parser's API). Neither
+      option is authorised by this slice.
+- ghostty-web evaluation-matrix / performance smoke
+  (gated on the above; no rows graded in this slice).
+- restty / wterm experimental renderer evaluation.
+- Desktop Tauri (path A bundled-shell handoff) and
+  Android Tauri renderer smokes for any candidate.
+  The Tauri WebView's CSP posture is separately
+  evaluated and is not unblocked by this slice.
+- Automated performance / benchmark harness.
+- Renderer production-default switch (Gate 2);
+  per-user / per-device renderer preference
+  persistence beyond the current
+  `relayterm.terminal-settings.v1` localStorage entry.
+
+**Promotion decision.** **ghostty-web remains
+experimental.** The production default remains
+xterm. Gate 1 and Gate 2 criteria are unchanged. No
+backend protocol, session, orchestrator,
+`terminal-core`, production-shell-non-loader, CI,
+or deploy file was touched by this slice. This
+smoke proves the WASM-as-asset adapter fix
+(`aa6bf9f`) lands cleanly on staging at the network
+layer; it does not grade or promote any renderer.
+
+**Verdict.** The WASM-as-asset adapter slice
+(`aa6bf9f`) closes the `data:application/wasm` /
+`connect-src` half of the CSP gap on the
+production-shell ghostty-web path: the asset emits,
+serves at HTTP 200 with `content-type:
+application/wasm` and the standard `/assets/*`
+immutable cache, and the runtime fetches it via a
+fingerprinted same-origin URL. The remaining
+upstream `WebAssembly.compile()` /
+`'wasm-unsafe-eval'` requirement still blocks the
+mount, surfacing via `adapter_mount_failed` plus the
+fixed operator-facing copy (with no
+`CompileError` / `unsafe-eval` / `WebAssembly` /
+`data:application/wasm` text reaching the DOM,
+audit log, or backend/web/target log streams). The
+2026-05-14 mount-failure-diagnostic surface lands
+identically; the underlying failure cause has
+narrowed from "two CSP gaps" to "one (upstream-
+baked) CSP gap." xterm recovery on the same profile
+still works end-to-end. ghostty-web stays
+experimental and unpromoted; the production default
+remains xterm. The next renderer-evaluation slice
+that wants to actually grade ghostty-web matrix
+rows must take one of the two deferred options
+above; neither is authorised here.
+
 ---
 
 ## See also
