@@ -451,6 +451,50 @@ non-loader, CI, or deploy file was touched. xterm remains
 the production compatibility baseline and the default
 renderer.
 
+### 2026-05-13 · ghostty-web WebAssembly CSP decision doc (proposed; no implementation)
+
+A docs-only design / threat-model slice on 2026-05-13 wrote up
+the next decision the renderer-evaluation track needs in order
+to collect ghostty-web Gate 1 evidence on the production shell:
+how (and whether) RelayTerm should permit
+`WebAssembly.compile` / `WebAssembly.instantiate` under the
+current strict CSP. Full doc:
+[`docs/ghostty-web-wasm-csp.md`](ghostty-web-wasm-csp.md).
+
+**Posture (load-bearing summary, NOT an authorisation to
+implement).**
+
+- Recommended next path is **Option D — staging only**: add
+  `'wasm-unsafe-eval'` (and only that) to `script-src` on the
+  staging surface's CSP; production deploy examples
+  (`deploy/docker-compose.example.yml`,
+  `deploy/docker-compose.images.example.yml`,
+  `deploy/docker-compose.traefik-staging.example.yml`) stay
+  strict.
+- The broader `'unsafe-eval'` source expression is **NOT** the
+  fix; the doc distinguishes the two and rules `'unsafe-eval'`
+  out.
+- `data:` is **NOT** re-added to any directive — the
+  `aa6bf9f fix(web): load ghostty wasm as an asset` slice
+  closed the data-URL surface; reintroducing it would regress.
+- `connect-src` is **NOT** changed; the same-origin asset fetch
+  already works under the current `default-src 'self'`.
+- CSP is page-level, not per-renderer-id — the operator gate
+  in Settings cannot scope a CSP relaxation per-user; the
+  staging-only scope is what contains the widening.
+- xterm remains the production compatibility baseline and the
+  default renderer. ghostty-web (and restty, wterm) stay
+  experimental and operator-gated at the workspace layer.
+  Gate 1 / Gate 2 promotion criteria are unchanged.
+
+The decision doc proposes the implementation slice boundary
+and the staging resmoke shape; the slice itself is a separate,
+later, deliberate slice and is **not** authorised by this
+entry. The CSP / WASM compatibility row in the per-candidate
+deferral list above remains deferred until that slice lands
+and a fresh staging resmoke records ghostty-web matrix
+evidence under the relaxed CSP.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
