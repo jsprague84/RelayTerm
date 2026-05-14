@@ -35,7 +35,10 @@
 > `data-renderer-fallback`. This access path is NOT a promotion of
 > ghostty-web / restty / wterm — see
 > [`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
-> § "Promotion criteria" for the Gate 1 / Gate 2 path.
+> § "Promotion criteria" for the Gate 1 / Gate 2 path, and
+> [`docs/renderer-comparison-scorecard.md`](../renderer-comparison-scorecard.md)
+> for a snapshot of current production-shell evidence across all
+> four adapters.
 >
 > The isolation test also pins that the experimental adapter package
 > names are referenced ONLY inside the renderer loader file AND only

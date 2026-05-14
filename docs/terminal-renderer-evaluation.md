@@ -42,6 +42,14 @@ implementation slice lands. **xterm is and remains the
 production compatibility baseline and the default renderer**
 until a candidate clears the Gate 2 promotion criteria below.
 
+A **renderer comparison scorecard** —
+[`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
+— summarises the current production-shell evidence for all four
+adapters in one place (status table, per-category qualitative
+labels, recommended next development lane). It is a snapshot of
+evidence, not a promotion, and is the recommended starting point
+for choosing the next renderer slice.
+
 ### 2026-05-13 · ghostty-web renderer-evaluation status (docs-only)
 
 A docs-only evaluation slice on 2026-05-13 attempted to carry the
@@ -1495,6 +1503,9 @@ will be its own slice if and when it ships:
 
 ## See also
 
+- [`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
+  — a snapshot scorecard of current production-shell evidence for
+  all four adapters, with a recommended next development lane.
 - [`SPEC.md`](../SPEC.md) — architectural invariants and surface
   index.
 - [`docs/spec/terminal.md`](spec/terminal.md) — terminal session
