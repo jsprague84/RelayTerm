@@ -27,13 +27,25 @@ const hoisted = vi.hoisted(() => {
     loadedAddons: unknown[] = [];
     dataListeners = new Set<FakeListener<string>>();
     resizeListeners = new Set<FakeListener<FakeOnResizeArg>>();
+    /**
+     * Mirrors xterm.js's public `Terminal.textarea` — the hidden helper
+     * `<textarea>` xterm wires keyboard input through. Real xterm sets
+     * it during `open()`; the fake does the same so `focusTarget()` can
+     * be exercised without a browser. A plain sentinel object is enough
+     * — the adapter only ever returns it by reference.
+     */
+    textarea: HTMLTextAreaElement | undefined;
 
     constructor(options: unknown) {
       this.options = options;
       FakeTerminal.instances.push(this);
     }
 
-    open(_el: HTMLElement) {}
+    open(_el: HTMLElement) {
+      this.textarea = {
+        __fakeXtermTextarea: true,
+      } as unknown as HTMLTextAreaElement;
+    }
     loadAddon(addon: unknown) {
       this.loadedAddons.push(addon);
     }
@@ -297,6 +309,21 @@ describe("XtermRenderer satisfies TerminalRenderer", () => {
     renderer.mount(stubElement);
     renderer.dispose();
     expect(() => renderer.focus()).not.toThrow();
+  });
+
+  it("focusTarget() returns the xterm helper textarea after mount, null otherwise", () => {
+    const renderer = new XtermRenderer();
+    // Pre-mount: no Terminal exists yet, so there is no input element.
+    expect(renderer.focusTarget()).toBeNull();
+    renderer.mount(stubElement);
+    const term = FakeTerminal.instances[0]!;
+    // After mount, focusTarget() is exactly xterm's `Terminal.textarea`
+    // — the element `focus()` targets and the one a real keystroke
+    // hits. Returned by reference; never read for content.
+    expect(renderer.focusTarget()).toBe(term.textarea);
+    renderer.dispose();
+    // After dispose the renderer is dead and exposes no input element.
+    expect(renderer.focusTarget()).toBeNull();
   });
 
   it("clear() invokes Terminal.clear and is safe before mount / after dispose", () => {

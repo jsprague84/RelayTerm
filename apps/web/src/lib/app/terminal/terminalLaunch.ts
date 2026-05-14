@@ -433,6 +433,116 @@ export function safeClearViewport(renderer: unknown): boolean {
 }
 
 /**
+ * Marker attribute stamped by {@link markRendererInputTarget} onto the
+ * DOM element that actually receives keyboard input for the mounted
+ * renderer. A renderer-evaluation smoke (or an operator) focuses and
+ * verifies `[data-relayterm-terminal-input]` instead of guessing
+ * between the viewport DIV and a per-renderer helper textarea — the
+ * xterm and ghostty-web adapters disagree on which element that is
+ * (xterm: a hidden child `<textarea>`; ghostty-web: the contenteditable
+ * host element). The marker is renderer-neutral: one selector targets
+ * the correct element regardless of which renderer mounted.
+ *
+ * Deliberately NOT `data-testid`: ghostty-web's focus target IS the
+ * viewport element, which already carries
+ * `data-testid="production-terminal-viewport"`; a second `data-testid`
+ * would clobber it. A dedicated attribute coexists with the existing
+ * testid and never collides.
+ */
+export const TERMINAL_INPUT_MARKER_ATTR = "data-relayterm-terminal-input";
+
+/**
+ * Resolve a renderer's keyboard-input element via the renderer-neutral
+ * optional `focusTarget()` method on {@link TerminalRenderer}.
+ *
+ * Returns the element typed as {@link Element} (the type that actually
+ * carries `setAttribute` / `removeAttribute` — the
+ * `TerminalRenderer.focusTarget` contract narrows it to `HTMLElement`
+ * for typed callers, but this helper takes `unknown` and duck-types).
+ * Returns `null` when the renderer does not implement `focusTarget()`
+ * (restty / wterm today), when it has no input element yet (pre-mount /
+ * post-dispose), when the call throws (a mid-dispose race), or when the
+ * returned value is not a settable DOM element. The `unknown` parameter
+ * type lets the production workspace pass its neutrally-typed renderer
+ * variable without a cast.
+ */
+function resolveRendererInputTarget(renderer: unknown): Element | null {
+  if (renderer === null || typeof renderer !== "object") return null;
+  const focusTarget = (renderer as { focusTarget?: unknown }).focusTarget;
+  if (typeof focusTarget !== "function") return null;
+  let element: unknown;
+  try {
+    element = (focusTarget as () => unknown).call(renderer);
+  } catch {
+    // A renderer mid-dispose could throw; treat exactly like "no input
+    // element exposed". Swallow without logging — an error message
+    // could surface renderer-internal state.
+    return null;
+  }
+  if (element === null || typeof element !== "object") return null;
+  const candidate = element as {
+    setAttribute?: unknown;
+    removeAttribute?: unknown;
+  };
+  if (
+    typeof candidate.setAttribute !== "function" ||
+    typeof candidate.removeAttribute !== "function"
+  ) {
+    return null;
+  }
+  return element as Element;
+}
+
+/**
+ * Stamp {@link TERMINAL_INPUT_MARKER_ATTR} on the renderer's keyboard-
+ * input element. Returns the marked element, or `null` when the
+ * renderer exposes no settable input element (see
+ * {@link resolveRendererInputTarget}).
+ *
+ * Pair every successful call with {@link unmarkRendererInputTarget}
+ * before the renderer is disposed — the attribute lives on the
+ * renderer-owned DOM node, and `focusTarget()` returns `null` once the
+ * renderer is torn down, so the marker can only be removed while the
+ * renderer is still live.
+ *
+ * Redaction posture: this helper only ever calls `setAttribute` with a
+ * fixed attribute name and the literal string `"true"`. It NEVER reads
+ * the element's value / textContent, never logs, never touches
+ * `localStorage` / `sessionStorage`, and never carries payload bytes —
+ * user input still flows exclusively through `renderer.onInput`.
+ */
+export function markRendererInputTarget(renderer: unknown): Element | null {
+  const element = resolveRendererInputTarget(renderer);
+  if (element === null) return null;
+  try {
+    element.setAttribute(TERMINAL_INPUT_MARKER_ATTR, "true");
+  } catch {
+    return null;
+  }
+  return element;
+}
+
+/**
+ * Remove the {@link TERMINAL_INPUT_MARKER_ATTR} marker from the
+ * renderer's keyboard-input element. Call this while the renderer is
+ * still live (before `dispose()`), so a future adapter whose
+ * `dispose()` nulls its internal terminal but leaves the host element
+ * in the DOM cannot strand a stale marker on a reusable node. A no-op
+ * when the renderer exposes no input element. Same redaction posture as
+ * {@link markRendererInputTarget} — only `removeAttribute` is called.
+ */
+export function unmarkRendererInputTarget(renderer: unknown): void {
+  const element = resolveRendererInputTarget(renderer);
+  if (element === null) return;
+  try {
+    element.removeAttribute(TERMINAL_INPUT_MARKER_ATTR);
+  } catch {
+    // Best-effort cleanup; a throw here means the element is already
+    // gone, which is the desired end state anyway.
+  }
+}
+
+/**
  * Stable UX-copy strings rendered by the production terminal workspace.
  * Centralised so the redaction sentinel test can pin them as wire-noise
  * free, and so a SPEC drift trips a unit test rather than a manual

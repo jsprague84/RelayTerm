@@ -205,6 +205,22 @@ export class GhosttyWebRenderer implements TerminalRenderer {
     this.#terminal?.focus();
   }
 
+  /**
+   * The element `focus()` targets — ghostty-web's contenteditable host
+   * element (`Terminal.element`, the element passed to `mount`).
+   * ghostty-web attaches its keydown listener to the host, NOT to the
+   * hidden helper `<textarea>` it also creates (that textarea is for
+   * IME / composition / paste only), so the host is the element a real
+   * keystroke hits. `null` before mount and after dispose.
+   *
+   * Per the `TerminalRenderer` contract this is used only for focus +
+   * a stable test selector — the element is never read for content and
+   * input bytes still flow exclusively through `onInput`.
+   */
+  focusTarget(): HTMLElement | null {
+    return this.#terminal?.element ?? null;
+  }
+
   resize(cols: number, rows: number): void {
     this.#terminal?.resize(cols, rows);
   }

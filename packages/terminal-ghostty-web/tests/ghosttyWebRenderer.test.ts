@@ -80,14 +80,23 @@ const hoisted = vi.hoisted(() => {
     opened = false;
     dataListeners = new Set<FakeListener<string>>();
     resizeListeners = new Set<FakeListener<FakeOnResizeArg>>();
+    /**
+     * Mirrors ghostty-web's public `Terminal.element` — the
+     * contenteditable host element ghostty-web wires its keydown
+     * listener to (NOT the hidden helper textarea). Real ghostty-web
+     * sets it to the element passed to `open()`; the fake does the same
+     * so `focusTarget()` can be exercised without a browser.
+     */
+    element: HTMLElement | undefined;
 
     constructor(options: unknown) {
       this.options = options;
       FakeTerminal.instances.push(this);
     }
 
-    open(_el: HTMLElement) {
+    open(el: HTMLElement) {
       this.opened = true;
+      this.element = el;
     }
     onData(cb: FakeListener<string>) {
       this.dataListeners.add(cb);
@@ -385,6 +394,24 @@ describe("GhosttyWebRenderer satisfies TerminalRenderer", () => {
     expect(term.focused).toBe(false);
     renderer.focus();
     expect(term.focused).toBe(true);
+  });
+
+  it("focusTarget() returns the ghostty-web host element after mount, null otherwise", async () => {
+    const renderer = new GhosttyWebRenderer();
+    // Pre-mount: no Terminal exists yet, so there is no input element.
+    expect(renderer.focusTarget()).toBeNull();
+    await renderer.mount(stubElement);
+    const term = FakeTerminal.instances[0]!;
+    // After mount, focusTarget() is exactly ghostty-web's
+    // `Terminal.element` — the contenteditable host the keydown
+    // listener is attached to, and the element `focus()` targets.
+    // ghostty-web sets `.element` to the element passed to `open()`,
+    // which is the element handed to `mount()`.
+    expect(renderer.focusTarget()).toBe(term.element);
+    expect(renderer.focusTarget()).toBe(stubElement);
+    renderer.dispose();
+    // After dispose the renderer is dead and exposes no input element.
+    expect(renderer.focusTarget()).toBeNull();
   });
 
   it("dispose is idempotent and tears down listeners", async () => {

@@ -120,6 +120,20 @@ export class XtermRenderer implements TerminalRenderer {
     this.#terminal?.focus();
   }
 
+  /**
+   * The element `focus()` targets — xterm's hidden helper `<textarea>`
+   * (`Terminal.textarea`), a child of the mount element. xterm attaches
+   * its keydown listener to this textarea, so it is the element a real
+   * keystroke hits. `null` before mount and after dispose.
+   *
+   * Per the `TerminalRenderer` contract this is used only for focus +
+   * a stable test selector — the textarea is never read for content
+   * and input bytes still flow exclusively through `onInput`.
+   */
+  focusTarget(): HTMLElement | null {
+    return this.#terminal?.textarea ?? null;
+  }
+
   resize(cols: number, rows: number): void {
     this.#terminal?.resize(cols, rows);
   }

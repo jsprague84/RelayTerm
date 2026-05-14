@@ -60,6 +60,7 @@
     computeWorkspaceEnablement,
     derivePhase,
     describeWorkspaceError,
+    markRendererInputTarget,
     mountRendererSafely,
     phaseLabel,
     phaseTone,
@@ -68,6 +69,7 @@
     safeFit,
     safeFocus,
     TERMINAL_UX_COPY,
+    unmarkRendererInputTarget,
     type WorkspacePhase,
   } from "./terminalLaunch.js";
   import {
@@ -215,6 +217,16 @@
   let activeRendererFallback = $state<RendererLoadFallback | null>(null);
   let experimentalRendererGate = $state(false);
   /**
+   * `true` once {@link markRendererInputTarget} has stamped the stable
+   * `data-relayterm-terminal-input` marker on the mounted renderer's
+   * keyboard-input element. Mirrored onto `data-renderer-input` so the
+   * renderer-evaluation smoke can assert "this renderer exposes a
+   * stable, renderer-neutral input target" without DOM-walking, then
+   * focus + verify `[data-relayterm-terminal-input]` directly. Never
+   * carries payload bytes — it is a boolean diagnostic only.
+   */
+  let rendererInputMarked = $state(false);
+  /**
    * Plaintext paste content held between `evaluatePaste` returning a
    * `confirm` decision and the operator confirming/cancelling. Lives at
    * script scope deliberately — never `$state`, never persisted, never
@@ -323,6 +335,7 @@
       r.dispose();
       activeRendererId = null;
       activeRendererFallback = mountOutcome.fallback;
+      rendererInputMarked = false;
       lastError = RENDERER_MOUNT_FAILED_MESSAGE;
       return;
     }
@@ -336,6 +349,18 @@
     activeRendererId = loadResult.rendererId;
     activeRendererFallback = loadResult.fallback ?? null;
     r.focus();
+    // Stamp a stable, renderer-neutral marker
+    // (`data-relayterm-terminal-input`) on the element that actually
+    // receives keyboard input — xterm's hidden helper textarea, or
+    // ghostty-web's contenteditable host element. The
+    // renderer-evaluation smoke focuses + verifies THIS element instead
+    // of guessing between the viewport DIV and a per-renderer helper
+    // textarea (the focus-target ambiguity that left the ghostty-web
+    // production-shell smoke unable to drive input past the first
+    // keystroke). `markRendererInputTarget` only sets one boolean
+    // attribute — no payload bytes cross this path; input still flows
+    // exclusively through `r.onInput` below.
+    rendererInputMarked = markRendererInputTarget(r) !== null;
     renderer = r;
 
     const transport = new WebSocketTerminalTransport();
@@ -488,8 +513,20 @@
     client?.dispose();
     client = null;
     if (!opts.keepRenderer) {
+      // Strip the `data-relayterm-terminal-input` marker BEFORE
+      // dispose: `focusTarget()` returns null once the renderer is torn
+      // down, so this is the last point the marker can be removed from
+      // the renderer-owned DOM node. xterm / ghostty-web destroy the
+      // element in their own dispose paths anyway, but a future adapter
+      // that keeps its host element around must not strand a stale
+      // marker on a reusable node.
+      unmarkRendererInputTarget(renderer);
       renderer?.dispose();
       renderer = null;
+      // The marked input element belonged to the disposed renderer's
+      // DOM subtree; clear the diagnostic so it cannot claim a stale
+      // input target survives the teardown.
+      rendererInputMarked = false;
     }
     // Drop any pending paste content along with the client — without
     // a live client there is nowhere to send it. Cleared regardless of
@@ -650,6 +687,7 @@
       : "false"}
   data-renderer-fallback={activeRendererFallback ?? ""}
   data-renderer-gate={experimentalRendererGate ? "on" : "off"}
+  data-renderer-input={rendererInputMarked ? "marked" : "none"}
 >
   <header class="flex flex-wrap items-baseline justify-between gap-3">
     <div class="flex flex-col gap-0.5">

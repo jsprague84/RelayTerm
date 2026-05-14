@@ -164,7 +164,9 @@ update this file in the same change.
 | `data-renderer-experimental` (attribute on `production-terminal`) | `"true"` when the mounted renderer is experimental, `"false"` otherwise (including `unmounted`). |
 | `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed` / `adapter_mount_failed`. The first three are produced by `rendererLoader.ts`'s synchronous paths (gate, unknown id, dynamic-import / constructor failure) AND fall back to xterm with `data-renderer="xterm"`. `adapter_mount_failed` is produced by `ProductionTerminal.svelte`'s `mountRendererSafely` call when the renderer's asynchronous `mount(target)` rejects (e.g., CSP-blocked WASM init); the workspace stays `data-renderer="unmounted"` and surfaces the operator-facing copy `Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.` in `production-terminal-error`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
 | `data-renderer-gate` (attribute on `production-terminal`) | `"on"` when the operator's experimental-renderer-evaluation gate is enabled in Settings, `"off"` otherwise. Independent of which renderer ended up mounted. |
-| `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer; enabled while live). |
+| `data-renderer-input` (attribute on `production-terminal`) | `"marked"` once the workspace has stamped the renderer-neutral input marker on the mounted renderer's keyboard-input element, `"none"` otherwise (renderer not mounted, mount failed, or the renderer does not implement the optional `focusTarget()` method — restty / wterm today). A renderer-evaluation smoke checks this is `"marked"` before relying on `[data-relayterm-terminal-input]` for Path A / Path C input. |
+| `[data-relayterm-terminal-input]` (attribute on a renderer-owned element) | Renderer-neutral marker on the element that actually receives keyboard input — xterm's hidden helper `<textarea>`, or ghostty-web's contenteditable host element (which is also `production-terminal-viewport`; the marker is a dedicated attribute so it coexists rather than clobbers the testid). This is the single stable selector a smoke focuses + verifies (`document.activeElement`) for renderer-fair Path A / Path C input — see section D "Renderer-fair input". Stamped only after a successful mount; absent on the mount-failure path. |
+| `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer via the renderer-neutral `focus()` method; enabled while live). Clicking it focuses `[data-relayterm-terminal-input]` for every renderer. |
 | `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). |
 | `[data-testid="production-terminal-clear"]`       | "Clear local viewport" button (renderer-only; never sends a wire frame, never mutates backend replay buffer, never asks the remote shell to run `clear`). |
 | `[data-testid="production-terminal-settings-note"]` | Inline workspace note: "Appearance settings apply to new terminal sessions." (sourced from `TERMINAL_UX_COPY`). |
@@ -1365,6 +1367,75 @@ visual cues alone (cursor shape, glyph appearance, scrollbar style) are
 If renderer identity cannot be proven for a given run, mark every row
 as `deferred — renderer not identified` and stop.
 
+#### Renderer-fair input (load-bearing)
+
+Before running any Path A / Path C row, focus the terminal through the
+renderer-neutral affordance and **verify** focus landed. This step
+exists because the renderers disagree on which DOM element receives
+keyboard input:
+
+- **xterm** routes keystrokes through a hidden helper `<textarea>` that
+  is a child of the viewport element.
+- **ghostty-web** makes the viewport element itself `contenteditable`
+  and attaches its keydown listener there — its hidden `<textarea>` is
+  for IME / composition / paste only.
+- **restty / wterm** are deferred (see "Explicit non-goals") and may
+  differ again.
+
+The 2026-05-14c ghostty-web production-shell smoke could not drive
+input past the first keystroke because the runbook had no
+renderer-neutral selector for "the element a real keystroke hits" — it
+was guessing between the viewport DIV and a per-renderer helper
+textarea. The workspace now resolves that: after a successful mount it
+stamps the marker attribute `[data-relayterm-terminal-input]` on
+whichever element the renderer's `focusTarget()` reports, and reflects
+`data-renderer-input="marked"` on `production-terminal`.
+
+**Renderer-fair focus procedure (run once per attach, and again after
+any detach / reconnect):**
+
+1. Confirm `production-terminal` carries `data-renderer-input="marked"`.
+   If it is `"none"`, the mounted renderer did not expose a stable
+   input target (restty / wterm today, or a mount failure) — mark every
+   Path A / Path C row `deferred — renderer input target unavailable`
+   and skip to the redaction sweep.
+2. Focus the terminal. Two renderer-neutral ways, both acceptable —
+   prefer the button (it routes through the renderer's own `focus()`,
+   which is the path a real operator hits):
+   - `browser_click [data-testid="production-terminal-focus"]` (the
+     "Focus terminal" button — calls `renderer.focus()`, which focuses
+     the same element `focusTarget()` reported), or
+   - focus `[data-relayterm-terminal-input]` directly via the MCP
+     focus / click primitive. This bypasses the renderer's `focus()`
+     side effects (e.g. scroll-to-cursor) — fine for driving input,
+     but the button is the truer operator path.
+   Do **not** click the bare `[data-testid="production-terminal-viewport"]`
+   element — for xterm that focuses the host DIV, not the helper
+   textarea, and the first keystroke will not reach the renderer.
+3. Verify focus landed on the renderer's input element:
+
+   ```js
+   () => {
+     const target = document.querySelector('[data-relayterm-terminal-input]');
+     return {
+       hasTarget: !!target,
+       focused: target !== null && document.activeElement === target,
+     };
+   }
+   ```
+
+   Expect `{ hasTarget: true, focused: true }`. If `focused` is
+   `false`, re-run step 2 once; if it still fails, mark the affected
+   rows `deferred — renderer focus could not be verified` rather than
+   recording an unreviewable input result.
+4. Only now drive Path A keystrokes (`browser_press_key` /
+   `browser_type`) or a Path C trusted Ctrl+V. They reach the renderer
+   because `document.activeElement` is the verified input element.
+5. The marker attribute carries **no payload bytes** — it is a fixed
+   boolean marker. Never read the input element's `value` /
+   `textContent`; input bytes are observed only as viewport output
+   round-trips, exactly as the command matrix specifies.
+
 #### Input-path rules (load-bearing)
 
 Each command-matrix row below labels the input path it requires. The
@@ -1455,7 +1526,10 @@ non-normative. The runbook's strings are chosen so each row's sentinel
 is a one-shot unique grep target (and so the redaction-sweep SENTINELS
 list below covers every smoke-run echo).
 
-1. **Basic ASCII I/O — Path A.** Type each, confirm round-trip:
+1. **Basic ASCII I/O — Path A.** Run the "Renderer-fair input"
+   procedure above first (focus + verify `document.activeElement` is
+   `[data-relayterm-terminal-input]`), then type each and confirm
+   round-trip:
 
    ```sh
    echo relayterm-renderer-baseline
@@ -1537,7 +1611,9 @@ list below covers every smoke-run echo).
    echo relayterm-paste-2
    ```
 
-   Focus the renderer viewport, dispatch a trusted `Control+V`. Expect
+   Run the "Renderer-fair input" procedure above to focus + verify
+   `[data-relayterm-terminal-input]`, then dispatch a trusted
+   `Control+V`. Expect
    the production paste-safety pipeline to fire: if the remote shell
    has bracketed paste on (fish / bash with readline / zsh do by
    default — see section B.1 "Bracketed-paste reality") the panel

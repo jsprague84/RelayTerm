@@ -564,6 +564,35 @@ What did **not** change:
   deploy examples — is its own deliberate later slice,
   not authorised by this entry.
 
+### 2026-05-14d · renderer-fair input affordance landed (precondition for grading the matrix; still not a matrix run)
+
+The renderer-fairness input strategy the 2026-05-14c entry
+named as a precondition landed in
+`feat/renderer-evaluation-input-fairness`. The
+`TerminalRenderer` interface gained an optional
+`focusTarget(): HTMLElement | null` (implemented for the
+xterm and ghostty-web adapters; restty / wterm deferred),
+and the production workspace stamps a renderer-neutral
+marker `data-relayterm-terminal-input` on the element a
+real keystroke hits — xterm's hidden helper textarea or
+ghostty-web's contenteditable host. `apps/web/e2e/SMOKE.md`
+§ "D. Renderer evaluation smoke" → "Renderer-fair input"
+now carries a concrete focus + verify procedure keyed on
+that selector. Detail:
+[`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md)
+§ "2026-05-14 · renderer-fair input affordance landed".
+
+Posture unchanged: no backend protocol / session /
+orchestrator change, no new wire surface, no
+WebSocket-injection input path (the harness plan's
+rejected Path I stays rejected). xterm remains the
+production compatibility baseline and the default
+renderer; ghostty-web / restty / wterm stay experimental
+and operator-gated. This slice is the **input
+precondition** — it does NOT itself run the ghostty-web
+evaluation matrix; that stays deferred to its own staging
+smoke slice.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

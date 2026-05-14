@@ -38,6 +38,25 @@ export interface TerminalRenderer {
   write(data: RendererOutput): void;
   /** Move browser focus into the renderer surface. */
   focus(): void;
+  /**
+   * Optional: the DOM element that `focus()` moves browser focus to —
+   * the element that actually receives keyboard input. For the
+   * xterm.js adapter this is xterm's hidden helper `<textarea>`; for
+   * the ghostty-web adapter it is the contenteditable host element
+   * (ghostty-web attaches its keydown listener to the host, not to a
+   * helper textarea). Returns `null` before mount, after dispose, or
+   * for a renderer that does not expose a single stable input element.
+   *
+   * This exists so a consumer can stamp a stable, renderer-neutral
+   * test-selector on the element a real keystroke hits — the four
+   * adapters disagree on whether that element is a child textarea or
+   * the viewport host itself, which made the production-shell
+   * renderer-evaluation smoke unable to target input fairly across
+   * renderers. The element is used ONLY for focus + selector purposes;
+   * it is NEVER read for content and never carries payload bytes —
+   * user input still flows exclusively through `onInput`.
+   */
+  focusTarget?(): HTMLElement | null;
   /** Update the visible cell grid. Caller still drives wire `resize`. */
   resize(cols: number, rows: number): void;
   /** Tear down. Must release all listeners and DOM/WebGL resources. */

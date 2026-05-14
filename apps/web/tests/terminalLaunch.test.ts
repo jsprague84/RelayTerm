@@ -12,6 +12,7 @@ import {
   derivePhase,
   describeLaunchError,
   describeWorkspaceError,
+  markRendererInputTarget,
   mountRendererSafely,
   phaseLabel,
   phaseTone,
@@ -21,7 +22,9 @@ import {
   safeClearViewport,
   safeFit,
   safeFocus,
+  TERMINAL_INPUT_MARKER_ATTR,
   TERMINAL_UX_COPY,
+  unmarkRendererInputTarget,
   type WorkspacePhase,
 } from "../src/lib/app/terminal/terminalLaunch.js";
 import { DEFAULT_DETACHED_LIVE_PTY_TTL_SECONDS } from "../src/lib/api/sessionPolicy.js";
@@ -595,6 +598,96 @@ describe("safeFocus", () => {
     });
     expect(safeFocus({ focus })).toBe(false);
     expect(focus).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("markRendererInputTarget", () => {
+  it("returns null for a null / non-object renderer", () => {
+    expect(markRendererInputTarget(null)).toBeNull();
+    expect(markRendererInputTarget(undefined)).toBeNull();
+    expect(markRendererInputTarget("xterm")).toBeNull();
+  });
+
+  it("returns null when the renderer does not implement focusTarget()", () => {
+    // restty / wterm today: the optional interface method is absent.
+    // The workspace must degrade cleanly — no throw, no marker.
+    const renderer = { focus: vi.fn() };
+    expect(markRendererInputTarget(renderer)).toBeNull();
+  });
+
+  it("returns null when focusTarget() yields no element (pre-mount / post-dispose)", () => {
+    expect(markRendererInputTarget({ focusTarget: () => null })).toBeNull();
+    expect(
+      markRendererInputTarget({ focusTarget: () => undefined }),
+    ).toBeNull();
+  });
+
+  it("returns null and swallows when focusTarget() throws (dispose race)", () => {
+    const focusTarget = vi.fn(() => {
+      throw new Error("renderer disposed");
+    });
+    expect(markRendererInputTarget({ focusTarget })).toBeNull();
+    expect(focusTarget).toHaveBeenCalledTimes(1);
+  });
+
+  it("stamps the renderer-neutral marker attribute and returns the element", () => {
+    // Minimal element stub: only `setAttribute` / `removeAttribute` are
+    // exercised — the helper never reads value / textContent / dataset.
+    const setAttribute = vi.fn();
+    const removeAttribute = vi.fn();
+    const element = { setAttribute, removeAttribute };
+    const result = markRendererInputTarget({ focusTarget: () => element });
+    expect(result).toBe(element);
+    expect(setAttribute).toHaveBeenCalledTimes(1);
+    expect(setAttribute).toHaveBeenCalledWith(TERMINAL_INPUT_MARKER_ATTR, "true");
+  });
+
+  it("uses a dedicated attribute that cannot collide with data-testid", () => {
+    // ghostty-web's focus target IS the viewport element, which already
+    // carries `data-testid="production-terminal-viewport"`. The marker
+    // must be a separate attribute so it coexists rather than clobbers.
+    expect(TERMINAL_INPUT_MARKER_ATTR).toBe("data-relayterm-terminal-input");
+    expect(TERMINAL_INPUT_MARKER_ATTR).not.toBe("data-testid");
+  });
+
+  it("returns null when the focus target is not a settable DOM element", () => {
+    // A renderer that returns something element-shaped but without
+    // `setAttribute` / `removeAttribute` must not throw.
+    expect(markRendererInputTarget({ focusTarget: () => ({}) })).toBeNull();
+    expect(
+      markRendererInputTarget({ focusTarget: () => ({ setAttribute: vi.fn() }) }),
+    ).toBeNull();
+  });
+});
+
+describe("unmarkRendererInputTarget", () => {
+  it("is a no-op for renderers with no resolvable input element", () => {
+    expect(() => unmarkRendererInputTarget(null)).not.toThrow();
+    expect(() => unmarkRendererInputTarget({ focus: vi.fn() })).not.toThrow();
+    expect(() =>
+      unmarkRendererInputTarget({ focusTarget: () => null }),
+    ).not.toThrow();
+  });
+
+  it("removes the marker attribute from the renderer's input element", () => {
+    const setAttribute = vi.fn();
+    const removeAttribute = vi.fn();
+    const element = { setAttribute, removeAttribute };
+    const renderer = { focusTarget: () => element };
+    markRendererInputTarget(renderer);
+    unmarkRendererInputTarget(renderer);
+    expect(removeAttribute).toHaveBeenCalledTimes(1);
+    expect(removeAttribute).toHaveBeenCalledWith(TERMINAL_INPUT_MARKER_ATTR);
+  });
+
+  it("swallows a throw from removeAttribute (element already gone)", () => {
+    const removeAttribute = vi.fn(() => {
+      throw new Error("element detached");
+    });
+    const renderer = {
+      focusTarget: () => ({ setAttribute: vi.fn(), removeAttribute }),
+    };
+    expect(() => unmarkRendererInputTarget(renderer)).not.toThrow();
   });
 });
 

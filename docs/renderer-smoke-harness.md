@@ -44,6 +44,44 @@ invariants the renderer track depends on. Until the harness is wired up
 experimental renderer evaluations (ghostty-web → restty → wterm) stay
 deferred behind it.
 
+### 2026-05-14 · renderer-fair input affordance landed
+
+The 2026-05-14c staging smoke mounted ghostty-web on the production
+shell but could not drive the evaluation matrix because Playwright MCP
+keyboard input did not consistently reach ghostty-web's xterm-compat
+shim past the first keystroke. Root cause was a real focus-target
+ambiguity, not a runbook wording gap: xterm routes keystrokes through a
+hidden helper `<textarea>` (a child of the viewport), while ghostty-web
+makes the viewport element itself `contenteditable` and attaches its
+keydown listener there. There was no renderer-neutral selector for
+"the element a real keystroke hits," so the runbook was guessing.
+
+`feat/renderer-evaluation-input-fairness` closed that gap with the
+smallest renderer-neutral change:
+
+- `@relayterm/terminal-core`'s `TerminalRenderer` interface gained an
+  optional `focusTarget(): HTMLElement | null` — the element `focus()`
+  moves browser focus to (xterm's helper textarea; ghostty-web's
+  contenteditable host). Implemented for the xterm and ghostty-web
+  adapters; restty / wterm are deferred and simply omit it (optional
+  method — builds are unaffected).
+- The production workspace stamps a dedicated marker attribute
+  `data-relayterm-terminal-input` on whatever `focusTarget()` reports,
+  and reflects `data-renderer-input="marked"` on `production-terminal`.
+  One stable selector now targets the correct input element across
+  renderers.
+- No backend / protocol / session / orchestrator change; no new wire
+  surface; xterm stays the default; ghostty-web stays experimental and
+  gated. The marker carries no payload bytes — it is a fixed boolean
+  attribute, and input still flows exclusively through `onInput`.
+
+The Path A and Path C entries below stay valid; what changed is that
+the runbook (`apps/web/e2e/SMOKE.md` § "D. Renderer evaluation smoke"
+→ "Renderer-fair input") now has a concrete focus + verify procedure
+keyed on `[data-relayterm-terminal-input]`. The ghostty-web evaluation
+matrix itself remains deferred until a smoke actually runs it under the
+relaxed staging CSP using this affordance.
+
 ## Findings from the xterm baseline smoke
 
 The 2026-05-13 entry is the load-bearing artifact for what the current
