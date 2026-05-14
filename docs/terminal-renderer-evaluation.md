@@ -273,6 +273,45 @@ loader-fallback taxonomy extension above, `tmux` / `screen` host-side
 multiplexer persistence, VT snapshot persistence, Gate-2 default
 flip, persistent per-user / per-device renderer preference.
 
+### 2026-05-14 · ghostty-web mount-failure diagnostic resmoke (adapter_mount_failed verified on staging)
+
+A docs-only resmoke on 2026-05-14 against the staging stack
+recreated from images carrying
+`239fe29 feat(web): handle renderer mount failures` exercised the
+same ghostty-web → production-shell launch path as the
+2026-05-13 ghostty-web entry above. The CSP/WASM
+`data:application/wasm` block still fires, but the workspace now
+exposes:
+
+- `data-renderer="unmounted"`,
+  `data-renderer-fallback="adapter_mount_failed"`,
+  `data-renderer-gate="on"`,
+- the operator-facing fixed copy `Renderer failed to mount. Switch
+  back to xterm in Settings and reopen the terminal.` in
+  `production-terminal-error`,
+- the matching diagnostic in
+  `production-terminal-renderer-diagnostic`,
+
+with the underlying `Error.message`, the CSP directive text, and
+the inlined-WASM `data:` URL still confined to the browser console
+(zero hits in DOM, `localStorage`, `audit_events.payload`, or any
+docker log). xterm recovery on the same profile (gate OFF →
+relaunch) attached cleanly and executed the smoke sentinels.
+
+The resmoke is **not** a ghostty-web matrix pass — every
+evaluation-matrix row stays `deferred — renderer not identified
+(adapter_mount_failed)` under the closed
+`apps/web/e2e/SMOKE.md` § "Renderer path confirmation" vocabulary.
+The 2026-05-13 wedged-`idle` failure mode is closed; the
+ghostty-web CSP/WASM compatibility fix, the renderer-evaluation
+matrix itself, restty/wterm smokes, desktop/Android renderer
+smokes, automated benchmark harness, and any renderer promotion
+remain deferred per the prior entry's deferral list. Full smoke
+entry: [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14 · Ghostty-web renderer mount-failure diagnostic
+resmoke (adapter_mount_failed verified; xterm recovery still
+works)".
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
