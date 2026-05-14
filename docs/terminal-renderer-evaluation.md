@@ -593,6 +593,106 @@ precondition** — it does NOT itself run the ghostty-web
 evaluation matrix; that stays deferred to its own staging
 smoke slice.
 
+### 2026-05-14e · ghostty-web production-shell renderer matrix smoke (first graded matrix; not a promotion)
+
+The staging smoke slice the 2026-05-14d entry named as
+deferred landed. The full smoke entry is in
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14e · Ghostty-web production-shell renderer
+matrix smoke (first graded matrix; xterm recovery
+verified)".
+
+This is the **first graded** ghostty-web run of the
+renderer-evaluation matrix on the production shell — the
+2026-05-13 and 2026-05-14/14b/14c ghostty-web entries
+either fell back to xterm (CSP/WASM blocked) or mounted
+but deferred every matrix row for lack of a
+renderer-fair input path. With the staging CSP relaxation
+(2026-05-14c) and the renderer-fair input affordance
+(2026-05-14d) both in place, the matrix could finally be
+driven.
+
+**What the matrix found, on the production shell, with
+no source / CI / deploy / CSP changes:**
+
+- ghostty-web mounted cleanly — `data-renderer="ghostty-web"`,
+  `data-renderer-experimental="true"`,
+  `data-renderer-fallback=""`, `data-renderer-gate="on"`,
+  `data-renderer-input="marked"`, zero console errors
+  during the session.
+- Input was driven renderer-fairly through the
+  `[data-relayterm-terminal-input]` marker + the
+  `production-terminal-focus` button, with
+  `document.activeElement` verified before every Path A /
+  Path C row. The same selector resolved to xterm's
+  helper textarea on the recovery row — one selector,
+  correct element per renderer.
+- **Core correctness** rows: basic I/O, long output
+  (300-line burst), copy-paste (trusted Ctrl+V →
+  production paste-safety pipeline →
+  `bracketed_paste_markers` confirm panel → send), and
+  detach / reconnect / replay (same session UUID,
+  renderer + marker re-stamped, prior output replayed)
+  all `pass`. Alternate-screen `works` (raw
+  `\033[?1049h`/`l` — the target image lacks `tput`).
+- **Text / typography** row: unicode / emoji / box
+  drawing / wide CJK all render legibly (`works`;
+  typography precision beyond "renders legibly" not
+  measured).
+- Resize / fit and narrow-viewport are `works with
+  caveats` — ghostty-web does not expose an xterm-style
+  `fit()` and does not reflow its grid on container
+  resize (the workspace's `safeFit` probes for the
+  capability and no-ops cleanly when it is absent). This
+  is documented adapter behaviour, **not** a `regression
+  vs. baseline`.
+- Mouse is `deferred — fixture absent` (no
+  click-coordinate fixture; harness plan defers the
+  mouse-input half).
+- xterm recovery verified end-to-end after the
+  ghostty-web session (gate OFF → fresh launch →
+  `data-renderer="xterm"` → commands round-trip). The
+  six xterm `style-src` inline-style console errors are
+  pre-existing (2026-05-14c), not a regression, and did
+  NOT fire during the ghostty-web session.
+- Redaction posture intact: 0 sentinel hits across DOM /
+  `localStorage` / `sessionStorage` / `document.cookie`,
+  backend / web / target logs, and `audit_events.payload`
+  (3 public-metadata-only audit rows in the window).
+
+**Promotion posture.** A single matrix run is one
+human-evaluator data point, **not** a Gate-2 promotion.
+**ghostty-web remains experimental and unpromoted; xterm
+remains the production compatibility baseline and the
+default renderer.** Gate 1 / Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged — Gate 1 still requires the Core-correctness
+rows to hold on a target surface *with caveats
+documented in `docs/spec/terminal-adapters.md`*, plus
+the bundle-size sign-off and the SPEC updates; Gate 2
+still requires per-surface coverage and a soak window.
+Note the resize/fit and narrow-viewport caveats this
+smoke surfaced (ghostty-web exposes no xterm-style
+`fit()` and does not reflow its grid on container
+resize) are **not yet** written into
+`docs/spec/terminal-adapters.md` — capturing them there
+is part of the separate, future Gate 1 work, not this
+docs-smoke slice.
+Architectural posture unchanged: no backend protocol /
+session / orchestrator / `terminal-core` /
+production-shell-non-loader / CI / deploy-template / CSP
+file was touched.
+
+**Deferred from this slice:** restty / wterm matrix
+smokes; desktop-Tauri / Android-Tauri renderer smokes;
+automated performance / benchmark harness; the
+production-side CSP decision; renderer production-default
+flip (Gate 2); persistent per-user / per-device renderer
+preference; `tmux` / `screen` and VT-snapshot
+persistence; a purpose-built mouse click-coordinate
+fixture and a larger-tooling target image for the
+full-screen-app alternate-screen row.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

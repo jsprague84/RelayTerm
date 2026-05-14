@@ -7532,6 +7532,402 @@ deferred slice.
 
 ---
 
+### 2026-05-14e · Ghostty-web production-shell renderer matrix smoke (first graded matrix; xterm recovery verified)
+
+**Date.** 2026-05-14 11:38 UTC – 13:37 UTC.
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Web + backend recreated from fresh
+`:main` registry images that include
+`61cd7f1 feat(web): add renderer-fair terminal focus
+path`:
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  index digest
+  `sha256:751ac392c4892873355331991b7174edebc1588460baea562a25c68634ca6c2a`,
+  amd64 manifest
+  `sha256:9e3f58105f11ad2246cc13737c00af2e85a2b9e61a8637429cf54e4eea3d453d`,
+  built `2026-05-14T05:40:36Z`.
+- backend
+  `git.js-node.cc/jsprague/relayterm-backend:main`,
+  index digest
+  `sha256:d0b1debebceda4ae496220253cf34dc38d5fe967b17ee0fc78060c52fa44749b`,
+  amd64 manifest
+  `sha256:fec61dd586de46723a35d4667e54ac0b14e3a02188a83bf10e777e34e2cfff1b`,
+  built `2026-05-14T05:39:52Z`.
+
+The staging stack was running images built
+`2026-05-14T02:42Z` — **before** the focus-path
+commit (committed `2026-05-14T05:35Z`). Confirmed
+stale by grepping the running web container's
+bundle: `data-relayterm-terminal-input` was **absent**
+from `/usr/share/nginx/html/assets/*.js`. With
+operator approval the web + backend services were
+recreated via `docker compose pull` +
+`docker compose up -d --no-deps relayterm-web
+relayterm-backend`; Postgres was **not** recreated
+(`--no-deps`; `Up 4 days` before AND after). The
+recreated bundle (`index-CC8dESY2.js`) carries the
+marker.
+**Branch.** `docs/ghostty-web-production-matrix-smoke`
+off `main` (docs-only; no host-side config edits this
+slice — the staging CSP middleware from 2026-05-14c
+was already in place).
+**Browser surface.** Playwright MCP (Chrome / Linux)
+at 1440 × 900 (resized to 1024 × 768 and 390 × 844 for
+specific rows, restored after). Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Run the first **graded** ghostty-web
+renderer-evaluation matrix on the production shell,
+now that (a) the staging CSP allows WASM execution
+(`'wasm-unsafe-eval'`, landed 2026-05-14c), (b)
+ghostty-web mounts on the production shell, and (c)
+`feat(web): add renderer-fair terminal focus path`
+gives a renderer-neutral input target. The
+2026-05-14c CSP smoke proved the mount but
+**deferred every matrix row** because MCP input could
+not fairly target ghostty-web's keyboard element.
+This slice closes that gap.
+
+**Slice boundary (docs-only).** No repo source / CI /
+schema / migration / auth / session / orchestrator /
+`terminal-core` / production-shell-non-loader /
+renderer-adapter / nginx-template / deploy-template /
+CSP file was edited. The only host-side actions were
+the operator-approved web+backend recreate (above)
+and the throwaway SSH target lifecycle (below).
+
+**CSP posture (unchanged from 2026-05-14c).**
+`curl -sSI https://relayterm-staging.js-node.cc/`:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+```
+
+`'unsafe-eval'` NOT present; `data:` NOT present;
+`blob:` NOT present; `connect-src` not widened. This
+slice did not touch CSP.
+
+**Endpoint smoke (post-recreate).** `GET /` → `200`,
+`GET /healthz` → `200`, `GET /api/v1/auth/me` without
+cookie → `401`. Production SPA loads; Settings
+experimental-renderer gate toggles on, reveals the
+warning + renderer radio group + effective-renderer
+diagnostic, and persists `rendererId="ghostty-web"`
+/ `experimentalRendererEvaluationEnabled=true` to
+`relayterm.terminal-settings.v1`.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-ghostty-matrix-smoke-ssh`, attached
+only to `relayterm-staging_relayterm-staging-internal`
+with DNS alias `ghostty-matrix-smoke-host` →
+`172.21.0.5`. **No host port published** (`docker
+port` empty; verified). `USER_NAME=smoke`,
+`SUDO_ACCESS=false`, `PASSWORD_ACCESS=false`,
+`PUBLIC_KEY=<the RelayTerm-generated OpenSSH line>`.
+The public-key line was extracted from the SPA's
+generate-success card via one `browser_evaluate`
+(returned base64-encoded), decoded inline inside a
+single `ssh cloud-edge` invocation straight into
+`docker run -e PUBLIC_KEY=…`, and unset immediately.
+No PEM / private-key bytes touched the operator
+filesystem.
+
+**Identity / host / profile.**
+- Identity `ghostty-matrix-smoke-identity` (generated
+  ed25519, fingerprint
+  `SHA256:hVT6KItaygPWfgr1orhU4fPa6gNKjwsd7IF/r2hobWs`).
+- Host `Ghostty-Matrix-Smoke-Host` (hostname
+  `ghostty-matrix-smoke-host`, port `2222`, default
+  user `smoke`).
+- Profile `ghostty-matrix-smoke-profile` (tags
+  `renderer, ghostty-web, matrix`).
+
+**Host-key preflight + trust.** Preflight captured
+`SHA256:DAADlhiO6h5Jqz0Wv3ic5/4iq3np8ZGOqQIJm632lyg`,
+**byte-identical** to the target container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+Typed into the confirm input and trusted;
+`host-key-status-badge` flipped to `Trusted`.
+
+**Auth-check.** `auth-check-status-badge` flipped to
+`Authenticated` at `2026-05-14T12:08:01Z`.
+
+**Renderer mount (the load-bearing assertion).**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID
+`54fee252-2ea0-4140-ae57-2f7b8d2bd700`. The
+production-terminal workspace surfaced:
+- `data-phase="attached"` (`production-terminal-phase`
+  text `live`)
+- `data-renderer="ghostty-web"`
+- `data-renderer-experimental="true"`
+- `data-renderer-fallback=""` (empty)
+- `data-renderer-gate="on"`
+- `data-renderer-input="marked"`
+- `production-terminal-renderer-diagnostic`:
+  `Renderer. ghostty-web experimental · experimental`
+- `production-terminal-error` NOT rendered
+- exactly one `[data-relayterm-terminal-input]`
+  element (the ghostty-web contenteditable viewport
+  host)
+- `browser_console_messages level=error all=true`:
+  **0 messages** during the ghostty-web session.
+
+**Renderer-fair input.** Per `apps/web/e2e/SMOKE.md`
+§ "D. Renderer evaluation smoke" → "Renderer-fair
+input": clicked `production-terminal-focus`, then
+verified `document.activeElement` ===
+`[data-relayterm-terminal-input]` (returned
+`{ hasTarget: true, focused: true }`) before every
+Path A / Path C row. For the xterm recovery row the
+same selector resolved to xterm's
+`xterm-helper-textarea` — one selector, correct
+element per renderer.
+
+**Matrix results (browser surface, renderer
+ghostty-web unless noted).**
+
+1. **Basic I/O — Path A — pass.** `echo
+   relayterm-ghostty-matrix-baseline` echoed the
+   sentinel; `whoami` → `smoke`; `pwd` → `/config`;
+   `uname -a` → `Linux ghostty-matrix-smoke-host
+   6.17.0-8-generic … x86_64`. No duplicate / missing
+   lines.
+2. **Resize / fit — Path A — works with caveats.**
+   Initial `stty size` = `24 80`. After resizing the
+   browser to 1024 × 768 and clicking
+   `production-terminal-fit`, `stty size` was still
+   `24 80` — the Fit control is a clean no-op for
+   ghostty-web (`fit()` is an xterm-only capability;
+   `safeFit` probes for it at runtime and ghostty-web
+   does not expose it). `printf 'cols-test:%*sEND\n'
+   80 ''` wrapped `END` at the 80-column boundary,
+   confirming the renderer honours its 80-col grid.
+   Terminal stayed usable; no clipping / overlay
+   failure. Not a renderer defect — documented
+   adapter behaviour.
+3. **Long output — Path A — pass.** `seq 1 300`
+   rendered all 300 lines (tail 280–300 visible, rest
+   in scrollback); `echo relayterm-after-long-output`
+   round-tripped; terminal responsive afterward.
+4. **Unicode / box / wide — Path D — works.** The
+   `printf` commands were typed as pure-ASCII hex
+   escapes (Path A keystrokes) so the **output** bytes
+   are what is under test (Path D). `café Ω λ 🚀`
+   render (emoji in colour); the three box-drawing
+   lines (`┌─┬─┐` / `│a│b│` / `└─┴─┘`) align
+   column-for-column into a coherent 2-cell table;
+   `コンニチハ` katakana renders as wide glyphs.
+   Typography precision beyond "renders legibly" was
+   not measured.
+5. **Paste block — Path C — pass.** `clipboard-write`
+   permission was `granted`. A 2-line payload
+   (`echo relayterm-paste-1` / `echo
+   relayterm-paste-2`) was written via
+   `navigator.clipboard.writeText` inside one
+   `browser_evaluate` (the body never transited a
+   tool-call argument / return). A trusted Ctrl+V
+   fired ghostty-web's `paste` handler →
+   `production-terminal-paste-confirm` panel with
+   `data-paste-reason="bracketed_paste_markers"`,
+   meta "3 lines, 58 bytes", **no paste body in the
+   panel HTML**. `production-terminal-paste-confirm-send`
+   completed the round-trip; both sentinels appeared
+   in the viewport.
+6. **Alternate screen — Path D — works.** The
+   target's Alpine image has no `tput`/`ncurses`, so
+   the probe used raw escapes:
+   `printf '\033[?1049h…'; sleep N; printf
+   '\033[?1049l'`. The alt-screen mid-state was
+   captured: a cleared alt buffer showing only
+   `alt-screen-probe`. On `\033[?1049l` the prior
+   normal-buffer content was restored and
+   `alt-screen-probe` was correctly **absent** from
+   the restored buffer. ghostty-web / libghostty-vt
+   handles the alternate-screen buffer correctly.
+7. **Mouse — deferred — fixture absent.** No
+   purpose-built click-coordinate fixture exists and
+   the harness plan defers the mouse-input half; no
+   obvious safe method to fairly drive SGR mouse mode
+   through MCP. Recorded once per fixture per the
+   result-classification table.
+8. **Detach / reconnect / replay — Path A + production
+   buttons — pass.** `echo relayterm-before-detach`,
+   then `production-terminal-detach` →
+   `data-phase="detached"` (renderer + marker
+   preserved). `production-terminal-reconnect` within
+   the 30 s TTL re-attached the **same** session UUID
+   `54fee252-…`, `data-renderer` returned to
+   `ghostty-web`, `data-renderer-input` re-stamped
+   `marked`. Orchestrator replay streamed prior
+   buffered output into the remounted ghostty-web
+   grid. Fresh `echo relayterm-after-reconnect`
+   round-tripped.
+9. **Narrow viewport — Path A — works with caveats.**
+   Resized to 390 × 844: workspace reachable,
+   `production-terminal-focus` visible, input usable,
+   `echo relayterm-mobile-width-ghostty-matrix`
+   round-tripped. ghostty-web does **not** reflow its
+   grid to the narrower canvas (stays 80 cols — same
+   root cause as row 2), so long lines clip at the
+   canvas edge rather than rewrap. No crash / MCP /
+   renderer error. Viewport restored to 1440 × 900
+   afterward.
+
+**Xterm recovery row — pass.** Settings gate flipped
+OFF (the handler reset `rendererId="xterm"`), saved
+(`localStorage` confirmed `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`). A
+fresh launch on the same `ghostty-matrix-smoke-profile`
+opened session UUID
+`a5f3c890-0d55-4a5a-ab0e-a049637de3a4` with
+`data-renderer="xterm"`,
+`data-renderer-experimental="false"`,
+`data-renderer-fallback=""`, `data-renderer-gate="off"`,
+diagnostic `Renderer. xterm baseline`. `echo
+relayterm-ghostty-matrix-xterm-recovery` and `whoami`
+(→ `smoke`) round-tripped via Path A. **The xterm
+production default fully recovers after a ghostty-web
+evaluation session.**
+
+**Pre-existing xterm `style-src` console errors (NOT a
+regression).** Six `Applying inline style violates …
+'default-src 'self''` errors fired from
+`index-CC8dESY2.js` during the **xterm** attach —
+identical class to the 2026-05-14c entry's finding.
+**Zero** console errors fired during the ghostty-web
+session. xterm continues to mount and operate; no
+action this slice.
+
+**Session lifecycle rows.** `terminal_sessions`:
+`54fee252-…` (ghostty-web) and `a5f3c890-…` (xterm
+recovery) both `closed`. `session_events` for the two
+sessions: `created` ×2, `attached` ×3, `detached` ×1,
+`reattached` ×1, `closed` ×2 — consistent with the
+detach/reconnect row and the two `End session`
+clicks.
+
+**Audit events in the smoke window.** 3 rows
+(Postgres timestamps, UTC), all `actor_id` non-null,
+all public-metadata-only:
+- `11:59:25 ssh_identity_created` — `{name, source:
+  generated, key_type: ed25519, created_at,
+  ssh_identity_id, fingerprint_sha256}`.
+- `12:07:04 server_profile_created` — `{name, host_id,
+  disabled_at: null, ssh_identity_id,
+  server_profile_id}`.
+- `13:36:42 server_profile_disabled` — `{name,
+  host_id, disabled_at, ssh_identity_id,
+  server_profile_id}` (cleanup row).
+
+Per-payload sentinel sweep over the smoke-window
+rows (`payload::text ~*` `{private_key,
+encrypted_private_key, BEGIN OPENSSH, openssh-key-v1,
+passphrase, session_token, token_hash, data_b64,
+REDACT-MARKER, relayterm-ghostty-matrix,
+relayterm-paste, relayterm-before-detach,
+relayterm-after-reconnect, relayterm-mobile-width,
+relayterm-after-long-output, alt-screen-probe}`):
+**0 hits**.
+
+**Backend / web / target log sweep.** Bounded
+`docker compose logs` over the smoke window: backend
+= 7 lines total (RelayTerm does not log session
+lifecycle or terminal I/O to stdout; only routine
+startup INFO + one pre-smoke
+`WARN missing session cookie` — known false
+positive); web/nginx = request log only, status
+codes, no payloads; target = s6 init banner + its own
+**host public keys** + `Public key from env variable
+added` (no private material, no smoke sentinels —
+this image's sshd does not surface per-auth lines to
+`docker logs`). Sentinel grep across all three
+streams: the only matches were the two documented
+literal false positives — backend's `missing session
+cookie` and the target's `User/password ssh access is
+disabled.` All secret / payload / smoke-sentinel
+strings: **0 hits**.
+
+**DOM + storage redaction.** Sweep over
+`document.documentElement.outerHTML`, `localStorage`,
+`sessionStorage`, `document.cookie` after the session
+closed: **0 hits** across the secrets + smoke-sentinel
+list. `document.cookie.length === 0` (HttpOnly).
+`localStorage` carried only
+`relayterm.terminal-settings.v1` with the
+post-cleanup values `{rendererId: "xterm",
+experimentalRendererEvaluationEnabled: false}`.
+`sessionStorage` empty. (ghostty-web renders to a
+canvas, so command output is never in the DOM;
+xterm's DOM viewport was unmounted on `End session`.)
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-ghostty-matrix-smoke-ssh` is
+`docker stop` + `docker rm`'d (`docker ps -a` empty).
+Profile `ghostty-matrix-smoke-profile` **disabled**
+through the SPA (not deleted, per the inventory
+lifecycle policy) — `disabled_at` set
+`2026-05-14T13:36:42Z`, the `server_profile_disabled`
+audit row above is the cleanup entry. Renderer
+Settings left at `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`. Left
+in place per the slice plan: the staging CSP change
+(unchanged this slice), the staging Compose stack
+(running; Postgres `Up 4 days` — recreate used
+`--no-deps`), the `ghostty-matrix-smoke` identity /
+host / disabled profile / 1 trusted
+`known_host_entries` row / `terminal_sessions` /
+`session_events` / `audit_events` rows, and the
+staging smoke user. No durable row was deleted.
+
+**Intentionally deferred** (out of scope for this
+slice):
+- restty / wterm experimental renderer matrix smokes.
+- Desktop Tauri / Android Tauri renderer smokes for
+  any candidate.
+- Automated performance / benchmark harness.
+- Renderer production-default switch (Gate 2);
+  persistent per-user / per-device renderer
+  preference beyond `relayterm.terminal-settings.v1`.
+- Production-side CSP decision (production deploy
+  templates remain strict).
+- `tmux` / `screen` host-side multiplexer
+  persistence; VT snapshot / durable persistence.
+- A purpose-built mouse click-coordinate fixture
+  (matrix row 7) and a larger-tooling target image
+  for the full-screen-app alternate-screen row.
+
+**Promotion decision.** **ghostty-web remains
+experimental and unpromoted.** xterm remains the
+production compatibility baseline and the default
+renderer. A single matrix run is one human-evaluator
+data point, **not** a Gate-2 promotion (see
+`docs/terminal-renderer-evaluation.md` § "Promotion
+criteria"). No backend protocol / session /
+orchestrator / `terminal-core` /
+production-shell-non-loader / CI / deploy-template /
+CSP file was touched.
+
+**Verdict.** The ghostty-web Core-correctness matrix
+on the production shell is **pass / works** on every
+row that could be driven (basic I/O, long output,
+paste, detach-reconnect-replay all `pass`; unicode and
+alternate-screen `works`; resize/fit and narrow
+viewport `works with caveats` — the caveat is the same
+documented adapter behaviour, ghostty-web not exposing
+an xterm-style `fit()` / container-resize reflow).
+Mouse is `deferred — fixture absent`. No row is a
+`regression vs. baseline`. The renderer-fair input
+seam (`[data-relayterm-terminal-input]` +
+`production-terminal-focus`) drove input cleanly past
+the first keystroke, closing the 2026-05-14c
+renderer-fairness gap. xterm recovery still works; the
+redaction posture is unaffected.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
