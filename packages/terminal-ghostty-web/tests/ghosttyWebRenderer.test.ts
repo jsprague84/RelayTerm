@@ -4,16 +4,25 @@ import type {
   RendererOutput,
   TerminalRenderer,
 } from "@relayterm/terminal-core";
+// Type-only reference to upstream `Ghostty`. `vi.mock("ghostty-web")`
+// rewrites the runtime module, but the `type` import keeps tsc looking
+// at the real declarations from `node_modules/ghostty-web` so the
+// `__setGhosttyLoaderForTesting` parameter type lines up at the type
+// level.
+import type { Ghostty as RealGhostty } from "ghostty-web";
 
 /**
  * `ghostty-web` is mocked so the adapter can be exercised outside a
- * browser. The mock tracks `init()` calls (one-shot WASM load), the
- * options the `Terminal` constructor saw, write payloads, focus/resize
- * dispositions, and the `onData`/`onResize` listener fans.
+ * browser. The mock tracks `Ghostty.load()` calls (one-shot WASM load),
+ * the options the `Terminal` constructor saw, write payloads,
+ * focus/resize dispositions, and the `onData`/`onResize` listener fans.
  *
  * The adapter is the only place in the repo that imports `ghostty-web`;
- * tests reach for `__resetGhosttyInitPromiseForTesting` (an internal
- * test seam) so each test starts with a fresh module-scope init cache.
+ * tests reach for `__resetGhosttyLoadPromiseForTesting` /
+ * `__setGhosttyLoaderForTesting` (internal test seams) so each test
+ * starts with a fresh module-scope load cache and can stall / replace
+ * the loader without depending on the fragile ESM-binding semantics of
+ * `vi.spyOn` against a static `Ghostty` import.
  */
 interface Deferred<T> {
   promise: Promise<T>;
@@ -35,16 +44,29 @@ const hoisted = vi.hoisted(() => {
   type FakeListener<T> = (arg: T) => void;
   type FakeOnResizeArg = { cols: number; rows: number };
 
-  const initCalls: {
+  const loadCalls: {
     count: number;
+    lastWasmUrl: string | undefined;
   } = {
     count: 0,
+    lastWasmUrl: undefined,
   };
 
-  /** Default `init` mock: resolves immediately, counts calls. */
-  function fakeInit(): Promise<void> {
-    initCalls.count += 1;
-    return Promise.resolve();
+  /**
+   * A throwaway stub the adapter and the FakeTerminal don't introspect.
+   * The real `Ghostty` instance exposes WASM-bound methods (`exports`,
+   * `createTerminal`, etc.); the adapter only ever passes the instance
+   * through `Terminal({ ghostty })` and never calls anything on it
+   * directly, so a sentinel object is sufficient.
+   */
+  const fakeGhosttyInstance = { __fakeGhostty: true } as const;
+
+  class FakeGhostty {
+    static load(wasmUrl?: string) {
+      loadCalls.count += 1;
+      loadCalls.lastWasmUrl = wasmUrl;
+      return Promise.resolve(fakeGhosttyInstance);
+    }
   }
 
   class FakeTerminal {
@@ -103,13 +125,32 @@ const hoisted = vi.hoisted(() => {
     }
   }
 
-  return { FakeTerminal, fakeInit, initCalls };
+  return { FakeGhostty, FakeTerminal, fakeGhosttyInstance, loadCalls };
 });
 
 vi.mock("ghostty-web", () => ({
+  Ghostty: hoisted.FakeGhostty,
   Terminal: hoisted.FakeTerminal,
-  init: hoisted.fakeInit,
 }));
+
+/**
+ * The adapter imports its WASM asset URL via Vite's `?url` suffix from
+ * `ghostty-web/ghostty-vt.wasm?url`. Vitest's Vite layer can resolve
+ * that in this repo without a mock (the real file exists in
+ * `node_modules`), but mocking the wrapper module keeps the unit test
+ * hermetic and lets the assertion below pin that the asset-URL string
+ * actually reaches the loader (vs. an `undefined` regression that would
+ * fall back to upstream's inlined data URL).
+ *
+ * The literal is duplicated between the mock factory and the
+ * `FAKE_WASM_URL` constant below because `vi.mock` is hoisted above
+ * top-level `const` declarations — the factory can't close over a
+ * symbol that hasn't been initialized at hoist time.
+ */
+vi.mock("../src/wasmUrl.js", () => ({
+  ghosttyWasmUrl: "/test-assets/ghostty-vt.wasm",
+}));
+const FAKE_WASM_URL = "/test-assets/ghostty-vt.wasm";
 
 import {
   GhosttyWebRenderer,
@@ -120,21 +161,22 @@ import {
 // seams below are deliberately NOT re-exported from the barrel; they
 // must remain unreachable from package consumers.
 import {
-  __resetGhosttyInitPromiseForTesting,
-  __setGhosttyInitForTesting,
+  __resetGhosttyLoadPromiseForTesting,
+  __setGhosttyLoaderForTesting,
 } from "../src/GhosttyWebRenderer.js";
 import { toGhosttyOptions, toGhosttyTheme } from "../src/options.js";
 
-const { FakeTerminal, initCalls } = hoisted;
+const { FakeTerminal, fakeGhosttyInstance, loadCalls } = hoisted;
 const stubElement = {} as unknown as HTMLElement;
 
 beforeEach(() => {
   FakeTerminal.instances.length = 0;
-  initCalls.count = 0;
-  // Restore both the cached init promise and the init function in
-  // case a test left the stalled-init seam in place.
-  __setGhosttyInitForTesting(null);
-  __resetGhosttyInitPromiseForTesting();
+  loadCalls.count = 0;
+  loadCalls.lastWasmUrl = undefined;
+  // Restore both the cached load promise and the loader function in
+  // case a test left the stalled-load seam in place.
+  __setGhosttyLoaderForTesting(null);
+  __resetGhosttyLoadPromiseForTesting();
 });
 
 /**
@@ -236,17 +278,32 @@ describe("GhosttyWebRenderer satisfies TerminalRenderer", () => {
   it("constructs without an element and defers DOM work to mount", () => {
     const renderer: TerminalRenderer = new GhosttyWebRenderer({ fontSize: 14 });
     expect(FakeTerminal.instances).toHaveLength(0);
-    expect(initCalls.count).toBe(0);
+    expect(loadCalls.count).toBe(0);
     void renderer.write("noop before mount");
   });
 
-  it("calls ghostty-web init exactly once across multiple mounts", async () => {
+  it("calls Ghostty.load exactly once across multiple mounts", async () => {
     const a = new GhosttyWebRenderer();
     const b = new GhosttyWebRenderer();
     await a.mount(stubElement);
     await b.mount(stubElement);
-    expect(initCalls.count).toBe(1);
+    expect(loadCalls.count).toBe(1);
     expect(FakeTerminal.instances).toHaveLength(2);
+  });
+
+  it("loads the WASM via the Vite-emitted same-origin asset URL", async () => {
+    const renderer = new GhosttyWebRenderer();
+    await renderer.mount(stubElement);
+    expect(loadCalls.count).toBe(1);
+    expect(loadCalls.lastWasmUrl).toBe(FAKE_WASM_URL);
+  });
+
+  it("passes the loaded Ghostty instance into Terminal via options.ghostty", async () => {
+    const renderer = new GhosttyWebRenderer();
+    await renderer.mount(stubElement);
+    expect(FakeTerminal.instances).toHaveLength(1);
+    const term = FakeTerminal.instances[0]!;
+    expect(term.options).toMatchObject({ ghostty: fakeGhosttyInstance });
   });
 
   it("forwards mapped options into the ghostty-web Terminal constructor", async () => {
@@ -260,13 +317,19 @@ describe("GhosttyWebRenderer satisfies TerminalRenderer", () => {
     await renderer.mount(stubElement);
     expect(FakeTerminal.instances).toHaveLength(1);
     const term = FakeTerminal.instances[0]!;
-    expect(term.options).toEqual({
-      fontFamily: "JetBrains Mono",
-      fontSize: 14,
-      cursorStyle: "underline",
-      cursorBlink: true,
-      scrollback: 1000,
-    });
+    // `ghostty` is asserted in a sibling test; here we pin the neutral
+    // option mapping using `objectContaining` so the assertion is
+    // forward-compatible with future options.* additions.
+    expect(term.options).toEqual(
+      expect.objectContaining({
+        fontFamily: "JetBrains Mono",
+        fontSize: 14,
+        cursorStyle: "underline",
+        cursorBlink: true,
+        scrollback: 1000,
+        ghostty: fakeGhosttyInstance,
+      }),
+    );
     expect(term.opened).toBe(true);
   });
 
@@ -368,25 +431,28 @@ describe("GhosttyWebRenderer satisfies TerminalRenderer", () => {
   });
 
   it("dispose during pending mount cancels the open and never constructs a Terminal", async () => {
-    // Stall the WASM init so we can fire dispose() in between. The
-    // adapter exposes `__setGhosttyInitForTesting` precisely so we
+    // Stall the WASM load so we can fire dispose() in between. The
+    // adapter exposes `__setGhosttyLoaderForTesting` precisely so we
     // don't have to reach for `vi.spyOn` against an ESM live binding —
     // that approach is fragile in strict-ESM transforms because the
-    // renderer module captured `ghosttyInit` by reference at import
-    // time. Swapping `initFn` instead is the documented seam.
-    const deferred = defer<void>();
-    let initSeen = 0;
-    __setGhosttyInitForTesting(() => {
-      initSeen++;
+    // renderer module captured `Ghostty` by reference at import time.
+    // Swapping `loaderFn` instead is the documented seam.
+    const deferred = defer<RealGhostty>();
+    let loadsSeen = 0;
+    let urlSeen: string | undefined;
+    __setGhosttyLoaderForTesting((url) => {
+      loadsSeen++;
+      urlSeen = url;
       return deferred.promise;
     });
     const renderer = new GhosttyWebRenderer();
     const mountPromise = renderer.mount(stubElement);
-    // dispose() runs before init resolves
+    // dispose() runs before load resolves
     renderer.dispose();
-    deferred.resolve();
+    deferred.resolve(fakeGhosttyInstance as unknown as RealGhostty);
     await mountPromise;
-    expect(initSeen).toBe(1);
+    expect(loadsSeen).toBe(1);
+    expect(urlSeen).toBe(FAKE_WASM_URL);
     expect(FakeTerminal.instances).toHaveLength(0);
   });
 

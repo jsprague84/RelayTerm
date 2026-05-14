@@ -6,11 +6,12 @@
  * means the adapter mirrors `@relayterm/terminal-xterm`'s `XtermRenderer`
  * almost line-for-line; the meaningful differences are:
  *
- *   1. `mount` is async because `init()` (one-time WASM load) must
- *      resolve before constructing a `Terminal`. The adapter caches the
- *      `init()` promise at module scope so multiple renderer instances
- *      share one WASM module load — re-initializing would be wasteful.
- *   2. `dispose()` may run during the awaited `init()`. The mount path
+ *   1. `mount` is async because the WASM module must be compiled and
+ *      instantiated before constructing a `Terminal`. The adapter caches
+ *      the loaded `Ghostty` instance promise at module scope so multiple
+ *      renderer instances share one WASM load — re-loading would tear
+ *      shared state out from under any live `Terminal`.
+ *   2. `dispose()` may run during the awaited load. The mount path
  *      re-checks the disposed flag after the await and refuses to open
  *      a `Terminal` into the user's DOM if disposal already happened.
  *   3. ghostty-web has no analogue for xterm's `lineHeight` option;
@@ -21,8 +22,11 @@
  * Lifecycle:
  *  - `new GhosttyWebRenderer(options)` — captures options. `write`
  *    before mount queues; the queue is flushed once mount resolves.
- *  - `await renderer.mount(element)` — ensures WASM init, constructs
- *    the ghostty-web `Terminal`, opens it, bridges `onData`/`onResize`.
+ *  - `await renderer.mount(element)` — ensures the shared `Ghostty`
+ *    instance is loaded, constructs the ghostty-web `Terminal` (passing
+ *    the loaded instance via `options.ghostty` so the no-arg `init()`
+ *    sugar — and its inlined `data:application/wasm;base64,…` URL — is
+ *    never reached), opens it, bridges `onData`/`onResize`.
  *  - `dispose()` — synchronous and idempotent. Safe to call before,
  *    during, or after `mount`. After dispose the renderer is dead;
  *    re-mount throws.
@@ -34,10 +38,22 @@
  * bytes in errors. `terminal-ghostty-web/tests/ghosttyWebRenderer.test.ts`
  * pins this with a sentinel string the same way the xterm adapter does.
  *
- * `init()` is global to ghostty-web's module: it loads a shared WASM
- * instance which every `Terminal` reuses. The shared promise lives at
- * module scope and is awaited on every mount so that subsequent
- * mounts pay only the cached resolve.
+ * CSP / WASM posture (load-bearing — slice 2026-05-13b):
+ *  - ghostty-web@0.4.0's no-arg `init()` loads its WASM from an inlined
+ *    `data:application/wasm;base64,…` URL, which is incompatible with
+ *    RelayTerm's production CSP (`default-src 'self'`, no `connect-src`
+ *    override). The adapter sidesteps that path entirely by:
+ *      (a) importing `ghostty-web/ghostty-vt.wasm?url` so Vite emits a
+ *          fingerprinted same-origin asset and substitutes its URL at
+ *          build time (see `./wasmUrl.ts`); and
+ *      (b) calling `Ghostty.load(wasmUrl)` directly, then handing the
+ *          loaded `Ghostty` instance into the `Terminal` constructor's
+ *          `options.ghostty`. Upstream's `getGhostty()` global cache is
+ *          never consulted, so the inline data URL is unreachable from
+ *          RelayTerm's production bundle.
+ *  - `WebAssembly.compile()` inside `Ghostty.loadFromPath` still
+ *    requires `'wasm-unsafe-eval'` in the deployment's CSP `script-src`.
+ *    That is upstream-baked and out of scope for this adapter slice.
  */
 import type {
   RendererInput,
@@ -45,12 +61,13 @@ import type {
   TerminalRenderer,
   Unsubscribe,
 } from "@relayterm/terminal-core";
-import { init as ghosttyInit, Terminal } from "ghostty-web";
+import { Ghostty, Terminal } from "ghostty-web";
 
 import {
   toGhosttyOptions,
   type GhosttyWebRendererOptions,
 } from "./options.js";
+import { ghosttyWasmUrl } from "./wasmUrl.js";
 
 interface RendererResize {
   cols: number;
@@ -61,54 +78,59 @@ type InputListener = (data: RendererInput) => void;
 type ResizeListener = (size: RendererResize) => void;
 
 /**
- * Module-scope cache of the `init()` promise. ghostty-web's `init()`
- * loads a shared WASM module the underlying `Terminal` instances reuse,
- * so each consumer should hit it at most once per page.
+ * Module-scope cache of the `Ghostty.load()` promise. The loaded WASM
+ * module backs every `Terminal` instance the page constructs, so each
+ * consumer should hit it at most once per page.
  *
  * Two indirections live here:
  *
- *  - `initFn` defaults to ghostty-web's exported `init`, but tests can
- *    replace it via `__setGhosttyInitForTesting`. This is more robust
- *    than relying on `vi.spyOn` against an ESM named export — a
- *    captured local binding (the `ghosttyInit` import above) is not
- *    affected by post-hoc property mutation on the module namespace
- *    object in strict-ESM consumers.
- *  - `initPromise` memoizes the awaited result so the second mount on
+ *  - `loaderFn` defaults to a thin wrapper around ghostty-web's
+ *    `Ghostty.load`, but tests can replace it via
+ *    `__setGhosttyLoaderForTesting`. This is more robust than relying
+ *    on `vi.spyOn` against an ESM named export — a captured local
+ *    binding (the `Ghostty` import above) is not affected by post-hoc
+ *    property mutation on the module namespace object in strict-ESM
+ *    consumers.
+ *  - `loadPromise` memoizes the awaited result so the second mount on
  *    a page pays only the cached resolve.
  *
  * Both seams are intentionally NOT re-exported from the package barrel
  * (`index.ts`) — they're reachable only via the relative path tests
  * use, so package consumers cannot reset shared WASM state at runtime.
  */
-type GhosttyInit = () => Promise<void>;
-let initFn: GhosttyInit = ghosttyInit;
-let initPromise: Promise<void> | null = null;
+type GhosttyLoader = (wasmUrl: string) => Promise<Ghostty>;
+const defaultLoader: GhosttyLoader = (url) => Ghostty.load(url);
+let loaderFn: GhosttyLoader = defaultLoader;
+let loadPromise: Promise<Ghostty> | null = null;
 
-function ensureGhosttyInit(): Promise<void> {
-  if (initPromise === null) {
-    initPromise = initFn();
+function ensureGhostty(): Promise<Ghostty> {
+  if (loadPromise === null) {
+    loadPromise = loaderFn(ghosttyWasmUrl);
   }
-  return initPromise;
+  return loadPromise;
 }
 
 /**
- * Reset the cached `init()` promise. Test-only seam — the production
- * surface intentionally has no way to force a re-init, because doing so
- * would tear the shared WASM module out from under any live Terminal.
+ * Reset the cached `Ghostty.load()` promise. Test-only seam — the
+ * production surface intentionally has no way to force a re-load,
+ * because doing so would tear the shared WASM module out from under
+ * any live Terminal.
  */
-export function __resetGhosttyInitPromiseForTesting(): void {
-  initPromise = null;
+export function __resetGhosttyLoadPromiseForTesting(): void {
+  loadPromise = null;
 }
 
 /**
  * Replace the function used to load ghostty-web's WASM. Test-only seam
- * for exercising init-failure or stall paths without depending on the
+ * for exercising load-failure or stall paths without depending on the
  * fragile ESM-binding semantics of `vi.spyOn` against a static import.
- * Pass `null` to restore the default (ghostty-web's exported `init`).
+ * Pass `null` to restore the default (a wrapper over `Ghostty.load`).
  */
-export function __setGhosttyInitForTesting(fn: GhosttyInit | null): void {
-  initFn = fn ?? ghosttyInit;
-  initPromise = null;
+export function __setGhosttyLoaderForTesting(
+  fn: GhosttyLoader | null,
+): void {
+  loaderFn = fn ?? defaultLoader;
+  loadPromise = null;
 }
 
 export class GhosttyWebRenderer implements TerminalRenderer {
@@ -135,14 +157,21 @@ export class GhosttyWebRenderer implements TerminalRenderer {
     }
     this.#mountStarted = true;
 
-    await ensureGhosttyInit();
+    const ghostty = await ensureGhostty();
 
     // Re-check after the await: a synchronous `dispose()` during the
     // WASM load must NOT result in an open Terminal. Bail silently —
     // the caller's `dispose()` already returned.
     if (this.#disposed) return;
 
-    const term = new Terminal(toGhosttyOptions(this.#options));
+    // Pass the pre-loaded `Ghostty` instance through `options.ghostty`
+    // so the `Terminal` constructor bypasses upstream's `getGhostty()`
+    // global cache (and the no-arg `init()` path that fills it from the
+    // inlined data URL). See file header for CSP rationale.
+    const term = new Terminal({
+      ...toGhosttyOptions(this.#options),
+      ghostty,
+    });
     term.open(element);
 
     this.#onDataDispose = term.onData((data: string) => {
@@ -188,7 +217,7 @@ export class GhosttyWebRenderer implements TerminalRenderer {
     this.#onDataDispose = null;
     this.#onResizeDispose = null;
     // ghostty-web's `Terminal.dispose()` releases the WASM-backed
-    // viewport buffer and renderer. The shared `init()` module stays
+    // viewport buffer and renderer. The shared `Ghostty` module stays
     // loaded; that's intentional — see file header.
     this.#terminal?.dispose();
     this.#terminal = null;

@@ -13,11 +13,22 @@
  * this package is renderer-neutral at the interface level, even though
  * the implementation is ghostty-web-shaped.
  *
- * ghostty-web inlines its WASM payload as a base64 data URL inside the
- * shipped JS bundle, so the package is self-contained — no separate
- * asset wiring is required to consume it from a Vite app. This is why
- * a `styles` side-effect entrypoint is intentionally absent here (the
- * xterm adapter needs one for xterm's CSS; ghostty-web ships none).
+ * ghostty-web ships its WASM payload TWO ways in `ghostty-web@0.4.0`:
+ *   1. inlined as a `data:application/wasm;base64,…` URL inside the
+ *      shipped JS bundle (the no-arg `init()` sugar uses this);
+ *   2. as a sibling `./ghostty-vt.wasm` file the package's `exports`
+ *      map exposes at the subpath `ghostty-web/ghostty-vt.wasm`.
+ *
+ * The adapter takes path 2: `./wasmUrl.ts` imports the upstream subpath
+ * with Vite's `?url` suffix so the production build emits a
+ * fingerprinted same-origin asset, and `GhosttyWebRenderer.mount`
+ * passes the loaded `Ghostty` instance through `Terminal({ ghostty })`
+ * so the inlined data URL — incompatible with RelayTerm's
+ * `default-src 'self'` CSP — is never reached. See the file header on
+ * `GhosttyWebRenderer.ts` for the full posture and the
+ * `wasm-unsafe-eval` caveat. A `styles` side-effect entrypoint is
+ * intentionally absent here (the xterm adapter needs one for xterm's
+ * CSS; ghostty-web ships none).
  */
 
 export { GhosttyWebRenderer } from "./GhosttyWebRenderer.js";
@@ -37,11 +48,14 @@ export {
 // The following are intentionally NOT re-exported through the public
 // barrel:
 //
-//  - `__resetGhosttyInitPromiseForTesting` and
-//    `__setGhosttyInitForTesting` from `GhosttyWebRenderer.ts`. They
-//    are test seams for swapping the shared WASM init out from under
+//  - `__resetGhosttyLoadPromiseForTesting` and
+//    `__setGhosttyLoaderForTesting` from `GhosttyWebRenderer.ts`. They
+//    are test seams for swapping the shared WASM load out from under
 //    the cached promise; production callers must not be able to reach
 //    them. Tests import them via the relative module path.
+//  - `ghosttyWasmUrl` from `wasmUrl.ts`. The same-origin asset URL is
+//    an internal implementation detail of how the adapter loads its
+//    WASM; package consumers must not depend on it.
 //  - `toGhosttyOptions` / `toGhosttyTheme` from `options.ts`. They
 //    return ghostty-web-shaped types (`ITerminalOptions`, `ITheme`)
 //    which would re-introduce ghostty-web shapes into the consumer

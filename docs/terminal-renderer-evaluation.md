@@ -312,6 +312,70 @@ entry: [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
 resmoke (adapter_mount_failed verified; xterm recovery still
 works)".
 
+### 2026-05-13b · ghostty-web WASM-as-asset adapter fix (data URL removed; staging resmoke pending)
+
+The adapter-side half of the CSP/WASM compatibility gap called
+out in the 2026-05-13 ghostty-web entry above ("Promotion
+posture") landed in `feat/ghostty-web-wasm-asset-loading`. The
+`@relayterm/terminal-ghostty-web` adapter now loads its WASM via
+a same-origin Vite-emitted asset URL instead of upstream's
+inlined `data:application/wasm;base64,…` URL:
+
+- `packages/terminal-ghostty-web/src/wasmUrl.ts` imports
+  `ghostty-web/ghostty-vt.wasm?url`. Vite copies the upstream
+  package's sibling `.wasm` (exposed via ghostty-web's
+  `exports` map at `./ghostty-vt.wasm`) into the production
+  build's `dist/assets/` directory with a fingerprinted
+  filename (e.g. `dist/assets/ghostty-vt-DOMeXDrv.wasm`).
+- `GhosttyWebRenderer.mount` calls `Ghostty.load(wasmUrl)`
+  directly and passes the resulting instance into
+  `new Terminal({ ghostty })`, so upstream's no-arg `init()`
+  sugar — the only call site that consumes the inlined data URL
+  — is never reached.
+- A static-source pin
+  (`packages/terminal-ghostty-web/tests/wasmAssetSource.test.ts`)
+  asserts the adapter neither imports `init` nor embeds an
+  executable `data:application/wasm` literal, and that
+  `wasmUrl.ts` imports the upstream subpath with Vite's `?url`
+  suffix.
+
+What this fix removes from the production CSP gap: the
+`connect-src` rejection of the inlined `data:application/wasm`
+URL. What it does NOT remove: `WebAssembly.compile()` /
+`WebAssembly.instantiate()` inside upstream's
+`Ghostty.loadFromPath` still require `'wasm-unsafe-eval'` in the
+deployment's CSP `script-src`. That is upstream-baked and
+explicitly out of scope for this slice; closing it is a separate
+deploy-side or upstream-patch decision.
+
+The upstream `ghostty-web@0.4.0` bundle continues to embed the
+inlined data URL as text inside `dist/ghostty-web.js` because
+Rollup cannot prove the no-arg branch of `Ghostty.load(A)` is
+unreachable; the literal therefore survives into the lazy
+ghostty-web chunk as dead code. The runtime never `fetch`es it.
+The main entry chunk (default xterm path) does not reference
+either the data URL or the emitted `.wasm` asset.
+
+This is **adapter-side only**: no backend protocol change, no
+session / orchestrator change, no `terminal-core` change, no
+schema or migration change, no deployment CSP change, no
+ghostty-web promotion, no xterm-default flip. xterm remains the
+production compatibility baseline and the default renderer; the
+production-shell experimental-renderer gate continues to apply.
+
+**Staging verification posture.** The slice was validated
+locally only — `pnpm -r build` confirms `dist/assets/ghostty-vt-<hash>.wasm`
+emission and the renderer / adapter test suites pass. **A staging
+resmoke is still required** before any ghostty-web matrix row can
+be re-evaluated, and remains the next slice in the renderer-
+evaluation track (`docs/ghostty-web-wasm-asset-resmoke`). The
+staging resmoke also needs to either (i) report that
+`'wasm-unsafe-eval'` is independently required to actually mount
+the renderer, or (ii) come paired with a deploy-side CSP slice
+that adds it. Until that resmoke lands, every ghostty-web
+evaluation-matrix row stays deferred under the closed
+`apps/web/e2e/SMOKE.md` vocabulary.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
