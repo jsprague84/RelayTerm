@@ -609,8 +609,8 @@ describe("markRendererInputTarget", () => {
   });
 
   it("returns null when the renderer does not implement focusTarget()", () => {
-    // restty / wterm today: the optional interface method is absent.
-    // The workspace must degrade cleanly — no throw, no marker.
+    // restty today: the optional interface method is absent. The
+    // workspace must degrade cleanly — no throw, no marker.
     const renderer = { focus: vi.fn() };
     expect(markRendererInputTarget(renderer)).toBeNull();
   });

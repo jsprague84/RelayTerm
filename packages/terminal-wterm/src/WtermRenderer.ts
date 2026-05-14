@@ -107,6 +107,23 @@ interface RendererResize {
   rows: number;
 }
 
+/**
+ * Structural view of the wterm internals `focusTarget()` reaches for.
+ *
+ * `WTerm` keeps its `InputHandler` on a `private input` field, and the
+ * `InputHandler` keeps the hidden keyboard `<textarea>` on a `private
+ * textarea` field — neither is on `@wterm/dom`'s public `.d.ts`
+ * surface, but both exist at runtime. That textarea is the element
+ * wterm appends to the host, attaches its `keydown`/`paste`/IME
+ * listeners to, and the one `WTerm.focus()` ultimately focuses (via
+ * `InputHandler.focus()`). This adapter is the single place in the
+ * repo that knows wterm internals (see the file header), so the narrow
+ * structural cast is contained here rather than leaking upward.
+ */
+interface WtermInputInternals {
+  input: { textarea: HTMLTextAreaElement } | null;
+}
+
 type InputListener = (data: RendererInput) => void;
 type ResizeListener = (size: RendererResize) => void;
 
@@ -229,6 +246,25 @@ export class WtermRenderer implements TerminalRenderer {
     // Pre-mount is a silent no-op: there is no DOM element to focus
     // until `mount` resolves and the WTerm is owned.
     this.#wterm?.focus();
+  }
+
+  /**
+   * The element `focus()` ultimately targets — wterm's hidden keyboard
+   * `<textarea>` (`InputHandler.textarea`), a child of the mount
+   * element. wterm attaches its `keydown` listener to this textarea and
+   * `WTerm.focus()` delegates to `InputHandler.focus()` which focuses
+   * it, so it is the element a real keystroke hits. `null` before mount
+   * (no WTerm yet), after dispose, and after a dispose that raced a
+   * pending `init()` (the WTerm was destroyed and never adopted).
+   *
+   * Per the `TerminalRenderer` contract this is used only for focus +
+   * a stable test selector — the textarea is never read for content
+   * and input bytes still flow exclusively through `onInput`.
+   */
+  focusTarget(): HTMLElement | null {
+    if (this.#wterm === null) return null;
+    const input = (this.#wterm as unknown as WtermInputInternals).input;
+    return input?.textarea ?? null;
   }
 
   resize(cols: number, rows: number): void {

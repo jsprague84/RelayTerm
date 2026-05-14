@@ -883,6 +883,45 @@ benchmark harness; renderer production-default flip
 preference; the production-side CSP decision; `tmux` /
 `screen` and VT-snapshot persistence.
 
+### 2026-05-14h · `WtermRenderer.focusTarget()` implemented (unblocks the deferred wterm matrix smoke; still not a matrix run)
+
+The `focusTarget()` code slice the 2026-05-14g gate
+entry named as the precondition for grading wterm's
+**Core-correctness** matrix landed in
+`feat/wterm-renderer-focus-target`. `WtermRenderer` now
+implements the optional `focusTarget(): HTMLElement |
+null` — it returns wterm's hidden keyboard `<textarea>`
+(the `InputHandler.textarea` element wterm appends to
+the host and `WTerm.focus()` ultimately focuses), and
+`null` before mount / after dispose / after a
+dispose-vs-pending-`init()` race. With this, the
+production workspace can stamp the renderer-neutral
+`[data-relayterm-terminal-input]` marker on a wterm
+mount (`data-renderer-input="marked"`) and the
+renderer-fair Path A / Path C input seam is available
+for wterm. This **unblocks** — but does **not perform**
+— the deferred renderer-fair wterm matrix smoke; that
+remains a separate, deliberate slice. wterm remains
+experimental and unpromoted; xterm remains the
+production compatibility baseline and the default
+renderer. `ResttyRenderer` still lacks `focusTarget()`.
+Scope: adapter package + its tests + docs only — no
+backend protocol / session / orchestrator /
+`terminal-core` / production-shell / CI / deploy /
+CSP file was touched. Detail in
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Production-shell evaluation status and
+`focusTarget()` caveat".
+
+**Deferred from this slice:** the renderer-fair wterm
+production-shell matrix smoke; `ResttyRenderer.focusTarget()`;
+desktop-Tauri / Android-Tauri renderer smokes;
+automated performance / benchmark harness; renderer
+production-default flip (Gate 2); persistent per-user /
+per-device renderer preference; the production-side
+CSP decision; `tmux` / `screen` and VT-snapshot
+persistence.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

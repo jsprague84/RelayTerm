@@ -164,8 +164,8 @@ update this file in the same change.
 | `data-renderer-experimental` (attribute on `production-terminal`) | `"true"` when the mounted renderer is experimental, `"false"` otherwise (including `unmounted`). |
 | `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed` / `adapter_mount_failed`. The first three are produced by `rendererLoader.ts`'s synchronous paths (gate, unknown id, dynamic-import / constructor failure) AND fall back to xterm with `data-renderer="xterm"`. `adapter_mount_failed` is produced by `ProductionTerminal.svelte`'s `mountRendererSafely` call when the renderer's asynchronous `mount(target)` rejects (e.g., CSP-blocked WASM init); the workspace stays `data-renderer="unmounted"` and surfaces the operator-facing copy `Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.` in `production-terminal-error`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
 | `data-renderer-gate` (attribute on `production-terminal`) | `"on"` when the operator's experimental-renderer-evaluation gate is enabled in Settings, `"off"` otherwise. Independent of which renderer ended up mounted. |
-| `data-renderer-input` (attribute on `production-terminal`) | `"marked"` once the workspace has stamped the renderer-neutral input marker on the mounted renderer's keyboard-input element, `"none"` otherwise (renderer not mounted, mount failed, or the renderer does not implement the optional `focusTarget()` method — restty / wterm today). A renderer-evaluation smoke checks this is `"marked"` before relying on `[data-relayterm-terminal-input]` for Path A / Path C input. |
-| `[data-relayterm-terminal-input]` (attribute on a renderer-owned element) | Renderer-neutral marker on the element that actually receives keyboard input — xterm's hidden helper `<textarea>`, or ghostty-web's contenteditable host element (which is also `production-terminal-viewport`; the marker is a dedicated attribute so it coexists rather than clobbers the testid). This is the single stable selector a smoke focuses + verifies (`document.activeElement`) for renderer-fair Path A / Path C input — see section D "Renderer-fair input". Stamped only after a successful mount; absent on the mount-failure path. |
+| `data-renderer-input` (attribute on `production-terminal`) | `"marked"` once the workspace has stamped the renderer-neutral input marker on the mounted renderer's keyboard-input element, `"none"` otherwise (renderer not mounted, mount failed, or the renderer does not implement the optional `focusTarget()` method — restty today). A renderer-evaluation smoke checks this is `"marked"` before relying on `[data-relayterm-terminal-input]` for Path A / Path C input. |
+| `[data-relayterm-terminal-input]` (attribute on a renderer-owned element) | Renderer-neutral marker on the element that actually receives keyboard input — xterm's hidden helper `<textarea>`, ghostty-web's contenteditable host element (which is also `production-terminal-viewport`; the marker is a dedicated attribute so it coexists rather than clobbers the testid), or wterm's hidden keyboard `<textarea>`. This is the single stable selector a smoke focuses + verifies (`document.activeElement`) for renderer-fair Path A / Path C input — see section D "Renderer-fair input". Stamped only after a successful mount; absent on the mount-failure path. |
 | `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer via the renderer-neutral `focus()` method; enabled while live). Clicking it focuses `[data-relayterm-terminal-input]` for every renderer. |
 | `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). |
 | `[data-testid="production-terminal-clear"]`       | "Clear local viewport" button (renderer-only; never sends a wire frame, never mutates backend replay buffer, never asks the remote shell to run `clear`). |
@@ -1379,8 +1379,11 @@ keyboard input:
 - **ghostty-web** makes the viewport element itself `contenteditable`
   and attaches its keydown listener there — its hidden `<textarea>` is
   for IME / composition / paste only.
-- **restty / wterm** are deferred (see "Explicit non-goals") and may
-  differ again.
+- **wterm** appends a hidden keyboard `<textarea>` to the host element
+  and attaches its keydown listener there; `focusTarget()` reports that
+  textarea.
+- **restty** is deferred (see "Explicit non-goals") and may differ
+  again — its adapter does not implement `focusTarget()` yet.
 
 The 2026-05-14c ghostty-web production-shell smoke could not drive
 input past the first keystroke because the runbook had no
@@ -1396,7 +1399,7 @@ any detach / reconnect):**
 
 1. Confirm `production-terminal` carries `data-renderer-input="marked"`.
    If it is `"none"`, the mounted renderer did not expose a stable
-   input target (restty / wterm today, or a mount failure) — mark every
+   input target (restty today, or a mount failure) — mark every
    Path A / Path C row `deferred — renderer input target unavailable`
    and skip to the redaction sweep.
 2. Focus the terminal. Two renderer-neutral ways, both acceptable —

@@ -59,6 +59,24 @@ const hoisted = vi.hoisted(() => {
     rows: number;
     writes: Array<string | Uint8Array> = [];
     focused = false;
+    /**
+     * The element the most recent `focus()` call targeted. Real wterm's
+     * `WTerm.focus()` delegates to `InputHandler.focus()`, which focuses
+     * the hidden keyboard `<textarea>`; before `init()` builds the
+     * `InputHandler` it falls back to the host element. The fake mirrors
+     * that branch so a test can pin that `focus()` and `focusTarget()`
+     * agree on one input surface.
+     */
+    focusedElement: HTMLElement | null = null;
+    /**
+     * Mirrors `WTerm.input` — the (type-level-private) `InputHandler`
+     * wterm constructs at the end of `init()`. The adapter's
+     * `focusTarget()` reaches `input.textarea`, the hidden keyboard
+     * `<textarea>` wterm appends to the host and wires its `keydown`
+     * listener to. A plain sentinel object is enough — the adapter only
+     * ever returns it by reference and never reads it for content.
+     */
+    input: { textarea: HTMLTextAreaElement } | null = null;
     destroyed = false;
     initStarted = false;
     initSettled = false;
@@ -85,6 +103,14 @@ const hoisted = vi.hoisted(() => {
         this.initRejected = true;
         throw new Error("wterm: failed to initialize: simulated WASM failure");
       }
+      // Real wterm builds the `InputHandler` (and its hidden keyboard
+      // `<textarea>`) at the end of a successful `init()`. Mirror that
+      // so `focusTarget()` has something to return post-mount.
+      this.input = {
+        textarea: {
+          __fakeWtermTextarea: true,
+        } as unknown as HTMLTextAreaElement,
+      };
       this.initSettled = true;
       return this;
     }
@@ -103,6 +129,9 @@ const hoisted = vi.hoisted(() => {
 
     focus(): void {
       this.focused = true;
+      // `WTerm.focus()` focuses the InputHandler's textarea once `init()`
+      // built it, and falls back to the host element otherwise.
+      this.focusedElement = this.input ? this.input.textarea : this.element;
     }
 
     destroy(): void {
@@ -305,6 +334,59 @@ describe("WtermRenderer satisfies TerminalRenderer", () => {
     expect(wterm.focused).toBe(false);
     renderer.focus();
     expect(wterm.focused).toBe(true);
+  });
+
+  it("focusTarget() returns the wterm keyboard textarea after mount, null otherwise", async () => {
+    const renderer = new WtermRenderer();
+    // Pre-mount: no WTerm exists yet, so there is no input element.
+    expect(renderer.focusTarget()).toBeNull();
+    await renderer.mount(stubElement);
+    const wterm = FakeWTerm.instances[0]!;
+    // After mount, focusTarget() is exactly wterm's hidden helper
+    // `<textarea>` (`WTerm.input.textarea`) — the element wterm appends
+    // to the host, wires its `keydown` listener to, and `focus()`
+    // targets. Returned by reference; never read for content.
+    expect(renderer.focusTarget()).toBe(wterm.input!.textarea);
+    renderer.dispose();
+    // After dispose the renderer is dead and exposes no input element.
+    expect(renderer.focusTarget()).toBeNull();
+  });
+
+  it("focus() and focusTarget() resolve to the same keyboard input surface", async () => {
+    const renderer = new WtermRenderer();
+    await renderer.mount(stubElement);
+    const wterm = FakeWTerm.instances[0]!;
+    renderer.focus();
+    // `focus()` delegates to `WTerm.focus()` -> `InputHandler.focus()`,
+    // which focuses the hidden `<textarea>`; `focusTarget()` reports
+    // that same element. A renderer-fair smoke can therefore focus via
+    // the workspace button and verify `document.activeElement` against
+    // the renderer-neutral `[data-relayterm-terminal-input]` marker.
+    expect(wterm.focusedElement).toBe(renderer.focusTarget());
+  });
+
+  it("focusTarget() returns null after a dispose during pending init", async () => {
+    FakeWTerm.__deferInit = true;
+    const renderer = new WtermRenderer();
+    const mountPromise = renderer.mount(stubElement);
+    renderer.dispose();
+    FakeWTerm.__resolveInits();
+    await mountPromise;
+    // The just-constructed WTerm was destroyed and never adopted by the
+    // adapter, so there is no input element to expose.
+    expect(renderer.focusTarget()).toBeNull();
+  });
+
+  it("focusTarget() returns null after a failed init()", async () => {
+    FakeWTerm.__nextInitFails = true;
+    const renderer = new WtermRenderer();
+    await expect(renderer.mount(stubElement)).rejects.toThrow(
+      /failed to initialize/,
+    );
+    // `mount` nulls `#wterm` on the init-failure path before rethrowing,
+    // so the renderer exposes no input element — it must not surface the
+    // half-initialized InputHandler that wterm's own catch tore down.
+    expect(renderer.focusTarget()).toBeNull();
   });
 
   it("dispose is idempotent and tears down listeners and the wterm", async () => {
