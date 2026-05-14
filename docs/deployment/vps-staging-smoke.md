@@ -7926,6 +7926,351 @@ the first keystroke, closing the 2026-05-14c
 renderer-fairness gap. xterm recovery still works; the
 redaction posture is unaffected.
 
+### 2026-05-14f · restty production-shell renderer gate smoke (mounts but non-functional under staging CSP; matrix not graded; xterm recovery verified)
+
+**Date.** 2026-05-14 14:20 UTC – 14:46 UTC.
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Smoke ran against the **already-running**
+staging stack — web + backend images built
+`2026-05-14T05:40Z`:
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  repo-digest
+  `sha256:751ac392c4892873355331991b7174edebc1588460baea562a25c68634ca6c2a`.
+- backend
+  `git.js-node.cc/jsprague/relayterm-backend:main`,
+  repo-digest
+  `sha256:d0b1debebceda4ae496220253cf34dc38d5fe967b17ee0fc78060c52fa44749b`.
+
+**Image-freshness note (operator-approved to proceed).**
+At smoke start the registry `:main` HEAD had moved on
+to index digests
+`sha256:03824ecf80cd09e0ce07265816e8f6fdb47b45ce64faf6b347acce6d79330efa`
+(web) /
+`sha256:949661c005a8b29b40ac81addcbe9f5d1706d2a1a8f60d853503848197ae6ea1`
+(backend) — **newer than the running stack**. Cause:
+CI rebuilds `:main` on every push to `main` with no
+path filter, and the two most recent `main` commits
+(`24cfef2 docs(deployment)`, `040ffd0 docs(spec)`) are
+**docs-only** — they bumped the image digest without
+changing app content. The running web bundle was
+confirmed **content-current for every code-bearing
+commit**: `index-CC8dESY2.js` contains
+`data-relayterm-terminal-input` (commit `61cd7f1`, the
+last code commit), the `renderer-option` /
+`experimental-renderer` selector strings, and a
+2.69 MB restty lazy chunk (`index-B1iThG__.js`). With
+operator approval the smoke proceeded on the running
+stack **without recreating web/backend** — the digest
+drift was docs-only and added no functional coverage;
+Postgres untouched.
+**Branch.** `docs/restty-production-renderer-gate` off
+`main` (docs-only).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900. Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Evaluate whether the existing **restty**
+experimental renderer can load and mount on the
+production-shell staging surface through the gated
+renderer selector. If it mounts cleanly, run a focused
+matrix smoke; if it fails, document the blocker and
+stop. This is a smoke/docs slice — no code, no renderer
+adapters, no CSP, no backend/protocol changes.
+
+**Slice boundary (docs-only).** No repo source / CI /
+schema / migration / auth / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+nginx-template / deploy-template / CSP file was edited.
+The only host-side actions were the throwaway SSH
+target lifecycle (below) and the operator-approved
+*decision not to recreate* the stack.
+
+**CSP posture (unchanged from 2026-05-14c).**
+`curl -sSI https://relayterm-staging.js-node.cc/`:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+```
+
+`'unsafe-eval'` NOT present; `data:` NOT present;
+`blob:` NOT present; `connect-src` not widened. This
+slice did not touch CSP.
+
+**Endpoint smoke.** `GET /` → `200`, `GET /healthz` →
+`200`, `GET /api/v1/auth/me` without cookie → `401`.
+Production SPA loads; Settings experimental-renderer
+gate toggles on, reveals the warning + renderer radio
+group, and persists `rendererId="restty"` /
+`experimentalRendererEvaluationEnabled=true` to
+`relayterm.terminal-settings.v1`. Selecting restty in
+Settings produced **0** console errors/warnings (the
+2.69 MB restty chunk is lazy — it loads on attach, not
+on selection).
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-restty-gate-smoke-ssh`, attached
+only to `relayterm-staging_relayterm-staging-internal`
+with DNS alias `restty-gate-smoke-host` →
+`172.21.0.5`. **No host port published**
+(`HostConfig.PortBindings` empty; verified — only
+`2222/tcp` exposed internally). `USER_NAME=smoke`,
+`SUDO_ACCESS=false`, `PASSWORD_ACCESS=false`,
+`PUBLIC_KEY=<the RelayTerm-generated OpenSSH line>`.
+The public-key line was fetched from the RelayTerm API
+into a local file via `browser_evaluate`'s `filename`
+option (never echoed into the conversation), validated
+with `ssh-keygen -lf` (fingerprint matched the
+generated identity), `scp`'d to the VPS, read into the
+`docker run -e PUBLIC_KEY=…` env, and the local +
+remote copies shredded. No PEM / private-key bytes
+touched any tool-call payload, log, or the operator
+filesystem.
+
+**Identity / host / profile.**
+- Identity `restty-gate-smoke-identity` (generated
+  ed25519, fingerprint
+  `SHA256:Z3BYP9qJpP217JX/7rxvB8ksXqFwKA2sC01kjkHuMsQ`).
+- Host `Restty-Gate-Smoke-Host` (hostname
+  `restty-gate-smoke-host`, port `2222`, default user
+  `smoke`).
+- Profile `restty-gate-smoke-profile` (tags
+  `renderer, restty, gate`).
+
+**Host-key preflight + trust.** Preflight captured
+`SHA256:zI49Z0uM3sovYLdFWjKHAqCkgn1zHxpb0ThI/eYU5SI`,
+**byte-identical** to the target container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+Typed into the confirm input and trusted; the host-key
+status flipped to `Trusted`.
+
+**Auth-check.** Status flipped to `Authenticated` at
+`2026-05-14T14:30:35Z`.
+
+**Renderer mount (the load-bearing assertion).**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID
+`730248b6-a33a-4bb7-af3a-68c9b1c88bef`. restty
+**loaded and mounted in the loader-taxonomy sense** —
+the production-terminal workspace surfaced:
+- `data-phase="attached"` (`production-terminal-phase`
+  text `live`)
+- `data-renderer="restty"`
+- `data-renderer-experimental="true"`
+- `data-renderer-fallback=""` (empty — **no
+  `adapter_mount_failed`**; the dynamic `import()`
+  resolved, the constructor ran, `mount()` resolved,
+  the WASM compiled under `'wasm-unsafe-eval'`)
+- `data-renderer-gate="on"`
+- `data-renderer-input="none"` — restty's adapter does
+  **not** implement the optional `focusTarget()`
+  method, so the workspace could not stamp the
+  renderer-neutral `[data-relayterm-terminal-input]`
+  marker
+- `production-terminal-renderer-diagnostic`:
+  `Renderer. restty experimental · experimental`
+- `production-terminal-error` NOT rendered
+- `session_events`: `created` → `attached` →
+  `resized` → `closed` — the **backend session
+  attached** and a PTY was live.
+
+**…but the renderer was visually / functionally
+non-functional.** Despite the clean mount diagnostics,
+restty rendered nothing usable:
+- The restty `<canvas class="pane-canvas">` was stuck
+  at **1 × 1 px** (`getBoundingClientRect()` and the
+  canvas `width`/`height` attributes both `1`).
+- `last_seen_seq` stayed `0` for the whole session —
+  no PTY output ever rendered into the workspace.
+- The viewport showed only restty's own
+  find-in-scrollback chrome over a black 1×1 canvas.
+
+**Three compounding causes (from the browser console,
+error classes summarised — no payload bytes):**
+1. **Inline-style CSP block (3 errors).** restty
+   applies inline styles to size/position its DOM;
+   `style-src` was not set so it falls back to
+   `default-src 'self'` (no `'unsafe-inline'`), and
+   every inline-style application from the restty
+   chunk (`index-B1iThG__.js`) is blocked → the canvas
+   never gets sized, so it stays 1 × 1.
+2. **`connect-src` CSP block (~22 errors).** restty's
+   runtime text-shaper `fetch()`es a font stack
+   (~11 fonts: Nerd Fonts, Noto Sans Symbols/CJK, emoji,
+   Symbola) from `https://cdn.jsdelivr.net`;
+   `connect-src` was not set so it falls back to
+   `default-src 'self'`, and every cross-origin font
+   fetch is refused. Plus 7
+   `[font] optional local font missing` warnings.
+3. **WebGPU `No available adapters` warning.** The
+   headless Playwright/Chromium environment exposes no
+   WebGPU adapter; restty's WebGPU/WebGL2 renderer has
+   no GPU adapter to bind.
+
+This is a **distinct failure stage from ghostty-web's**
+(2026-05-13 / 2026-05-14): ghostty-web's `mount()`
+*rejected* → `adapter_mount_failed`. restty's
+`mount()` *resolves cleanly* — the loader's closed
+fallback taxonomy (`experimental_gate_off` /
+`unknown_renderer_id` / `adapter_load_failed` /
+`adapter_mount_failed`) **cannot describe**
+"mounted-but-non-functional," so the workspace shows
+**no operator-visible error panel** even though the
+renderer is unusable. Worth noting as a taxonomy gap;
+no fix attempted this slice (out of scope).
+
+**Matrix not graded.** Because restty did not exist as
+a usable renderer surface (1 × 1 canvas, no fonts, no
+rendered output) **and** restty does not implement
+`focusTarget()` so the renderer-fair Path A / Path C
+input seam was unavailable (`data-renderer-input="none"`
+— per `apps/web/e2e/SMOKE.md` § "Renderer-fair input",
+this defers every Path A/C row), **no
+evaluation-matrix row was run or graded**. The slice
+stopped at the gate per its own "if it fails, document
+the blocker and stop" instruction.
+
+**Xterm recovery row — pass.** Settings gate flipped
+OFF (the handler reset `rendererId="xterm"`), saved
+(`localStorage` confirmed `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`). A fresh
+launch on the same `restty-gate-smoke-profile` opened
+session UUID `89c5f5e7-1a4a-4303-921c-d42f0c0f707f`
+with `data-renderer="xterm"`,
+`data-renderer-experimental="false"`,
+`data-renderer-fallback=""`, `data-renderer-gate="off"`,
+`data-renderer-input="marked"`. Per
+`apps/web/e2e/SMOKE.md` § "Renderer-fair input":
+clicked `production-terminal-focus`, verified
+`document.activeElement` === `[data-relayterm-terminal-input]`
+(`{hasTarget: true, focused: true}`), then drove Path A
+keystrokes. `echo relayterm-restty-gate-xterm-recovery`
+round-tripped (command echo + `echo` output — 2 viewport
+occurrences) and `whoami` → `smoke`. Full-size viewport,
+prompt visible — the stark contrast to restty's 1 × 1
+wedge. **The xterm production default fully recovers
+after a restty evaluation attempt.**
+
+**Pre-existing xterm `style-src` console errors (NOT a
+regression).** 6 `Applying inline style violates …
+'default-src 'self''` errors fired from
+`index-CC8dESY2.js` during the **xterm** recovery
+attach — identical class to the 2026-05-14c /
+2026-05-14e findings. xterm continues to mount and
+operate; no action this slice.
+
+**Session lifecycle rows.** `terminal_sessions`:
+`730248b6-…` (restty) and `89c5f5e7-…` (xterm
+recovery) both `closed`. `session_events` for the two
+sessions: restty `created` / `attached` / `resized` /
+`closed`; xterm recovery `created` / `attached` /
+`closed`.
+
+**Audit events in the smoke window.** 3 rows (Postgres
+timestamps, UTC), all `actor_id` non-null, all
+public-metadata-only:
+- `14:24:49 ssh_identity_created` — `{name, source:
+  generated, key_type: ed25519, created_at,
+  ssh_identity_id, fingerprint_sha256}`.
+- `14:28:49 server_profile_created` — `{name, host_id,
+  disabled_at: null, ssh_identity_id,
+  server_profile_id}`.
+- `14:45:35 server_profile_disabled` — `{name, host_id,
+  disabled_at, ssh_identity_id, server_profile_id}`
+  (cleanup row).
+
+Per-payload sentinel sweep over the smoke-window rows
+(`payload::text ~*` `{private_key,
+encrypted_private_key, BEGIN OPENSSH, openssh-key-v1,
+passphrase, session_token, token_hash, data_b64,
+relayterm-restty-gate}`): **0 hits**.
+
+**Backend / web / target log sweep.** Bounded
+`docker logs --since 40m` over the three containers:
+backend = 2 lines (one routine retention-sweep INFO +
+one pre-smoke `WARN missing session cookie` — known
+false positive; RelayTerm does not log session
+lifecycle or terminal I/O to stdout), web/nginx =
+48 request-log lines (status codes only, no payloads),
+target = 40 lines (s6 init banner + sshd-listening — no
+per-auth lines surface to `docker logs` for this
+image). Sentinel grep across all three streams
+(secrets + smoke sentinels, the documented
+`missing session cookie` / `User/password ssh access
+is disabled` false positives excluded): **0 hits**.
+
+**DOM + storage redaction.** Sweep over
+`document.documentElement.outerHTML`, `localStorage`,
+`sessionStorage`, `document.cookie` after the session
+closed: **0 hits** across the secrets + smoke-sentinel
+list. `document.cookie.length === 0` (HttpOnly).
+`localStorage` carried only
+`relayterm.terminal-settings.v1` with the post-cleanup
+values `{rendererId: "xterm",
+experimentalRendererEvaluationEnabled: false}`.
+`sessionStorage` empty.
+
+**Cleanup state.** Throwaway SSH container
+`relayterm-staging-restty-gate-smoke-ssh` is
+`docker stop` + `docker rm`'d (`docker ps -a` empty).
+Profile `restty-gate-smoke-profile` **disabled**
+through the SPA (not deleted, per the inventory
+lifecycle policy) — `disabled_at` set
+`2026-05-14T14:45:35Z`, the `server_profile_disabled`
+audit row above is the cleanup entry. Renderer
+Settings left at `rendererId="xterm"` /
+`experimentalRendererEvaluationEnabled=false`. Left in
+place per the slice plan: the staging CSP (unchanged
+this slice), the staging Compose stack (running;
+Postgres `Up 4 days`; **not recreated** this slice),
+the `restty-gate-smoke` identity / host / disabled
+profile / 1 trusted `known_host_entries` row /
+`terminal_sessions` / `session_events` /
+`audit_events` rows, and the staging smoke user. No
+durable row was deleted.
+
+**Intentionally deferred** (out of scope for this
+slice):
+- wterm experimental renderer matrix smoke.
+- Desktop Tauri / Android Tauri renderer smokes for
+  any candidate.
+- Automated performance / benchmark harness.
+- Renderer promotion / production-default switch
+  (Gate 2); persistent per-user / per-device renderer
+  preference beyond `relayterm.terminal-settings.v1`.
+- Production-side CSP decision (production deploy
+  templates remain strict). Whether a future restty
+  evaluation slice should widen the staging CSP
+  (`style-src 'unsafe-inline'` for the inline-style
+  block, a `connect-src` allowance or a self-hosted
+  font bundle for the jsdelivr block) is its own
+  deliberate later decision — NOT authorised here.
+- `tmux` / `screen` host-side multiplexer persistence;
+  VT snapshot / durable persistence.
+
+**Promotion decision.** **restty remains experimental
+and unpromoted.** xterm remains the production
+compatibility baseline and the default renderer. No
+backend protocol / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+CI / deploy-template / CSP file was touched.
+
+**Verdict.** restty's loader path is healthy on the
+production shell — dynamic import, constructor, and
+`mount()` all resolve, the WASM compiles under the
+staging `'wasm-unsafe-eval'` CSP, and the backend
+session attaches. But restty is **not usable** on the
+current staging surface: its inline-style-driven
+layout is blocked by `default-src 'self'` (canvas
+stuck at 1 × 1 px) and its runtime font stack is
+blocked by the same directive (`connect-src` →
+jsdelivr CDN), with WebGPU additionally unavailable in
+the headless browser. The restty gate is recorded as
+**failed — mounts but non-functional under the staging
+CSP**; the evaluation matrix was not graded. xterm
+recovery passed and the redaction posture is intact.
+
 ---
 
 ## See also

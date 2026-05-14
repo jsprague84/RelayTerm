@@ -699,6 +699,95 @@ persistence; a purpose-built mouse click-coordinate
 fixture and a larger-tooling target image for the
 full-screen-app alternate-screen row.
 
+### 2026-05-14f · restty production-shell renderer gate (mounts but non-functional under staging CSP; not promoted)
+
+A docs-only smoke slice on 2026-05-14 carried the
+**restty** experimental renderer through the
+production-shell gate on the staging surface, to
+decide whether restty could be matrix-evaluated like
+ghostty-web (2026-05-14e). Full smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-14f · restty production-shell renderer gate
+smoke".
+
+**What the gate found, on the production shell, with
+no source / CI / deploy / CSP changes:**
+
+- restty's **loader path is healthy** — the gated
+  dynamic `import()` of `@relayterm/terminal-restty`
+  resolved, the `ResttyRenderer` constructor ran,
+  `mount()` resolved, the WASM compiled under the
+  staging `'wasm-unsafe-eval'` CSP, and the backend
+  session attached (`session_events`:
+  created → attached → resized → closed). Diagnostics:
+  `data-renderer="restty"`,
+  `data-renderer-experimental="true"`,
+  `data-renderer-fallback=""` (no `adapter_mount_failed`),
+  `data-renderer-gate="on"`, `data-phase="attached"`.
+- restty is nonetheless **visually / functionally
+  non-functional** on the staging surface. The restty
+  `<canvas>` stayed at **1 × 1 px** and `last_seen_seq`
+  stayed `0` — nothing rendered. Three compounding
+  causes: (1) restty applies **inline styles** for
+  layout, blocked by `default-src 'self'` (the
+  `style-src` fallback, no `'unsafe-inline'`) → canvas
+  never sized; (2) restty's runtime text-shaper
+  `fetch()`es a **font stack from `cdn.jsdelivr.net`**,
+  blocked by the same directive (the `connect-src`
+  fallback); (3) **WebGPU `No available adapters`** in
+  the headless browser environment.
+- This is a **distinct failure stage from
+  ghostty-web's**: ghostty-web's `mount()` *rejected*
+  (`adapter_mount_failed`). restty's `mount()`
+  *resolves cleanly* — so the loader's closed fallback
+  taxonomy cannot describe "mounted-but-non-functional"
+  and the workspace shows **no operator-visible error
+  panel**. Recorded as a taxonomy gap; no fix this
+  slice.
+- restty's adapter does **not** implement the optional
+  `focusTarget()` method, so `data-renderer-input="none"`
+  and the renderer-fair Path A / Path C input seam was
+  unavailable. Combined with the 1 × 1 canvas, **no
+  evaluation-matrix row was run or graded** — the
+  slice stopped at the gate per "if it fails, document
+  the blocker and stop."
+- **xterm recovery passed** end-to-end (gate OFF →
+  relaunch → `data-renderer="xterm"` →
+  `relayterm-restty-gate-xterm-recovery` and `whoami`
+  round-tripped). Redaction sweep clean across DOM /
+  storage / cookies / backend-web-target logs /
+  `audit_events` payloads — 0 sentinel/secret hits.
+
+**Promotion posture.** **restty remains experimental
+and unpromoted.** xterm remains the production
+compatibility baseline and the default renderer.
+Gate 1 / Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged — restty cannot clear Gate 1's Core-correctness
+rows because it is not a usable renderer surface on
+the evaluated staging CSP. The CSP blockers that
+prevent Gate 1, and the `focusTarget()` precondition a
+future restty production-shell smoke needs, are
+documented in
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Production-shell evaluation status and CSP caveat".
+No backend protocol / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+CI / deploy-template / CSP file was touched.
+
+**Deferred from this slice:** the staging-CSP decision
+that would let restty render at all (`style-src
+'unsafe-inline'` for the inline-style block, plus a
+`connect-src` allowance or a self-hosted font bundle
+for the jsdelivr block — its own deliberate later
+decision, not authorised here); a restty matrix smoke
+once/if restty can render; wterm matrix smoke;
+desktop-Tauri / Android-Tauri renderer smokes;
+automated performance / benchmark harness; renderer
+production-default flip (Gate 2); persistent per-user /
+per-device renderer preference; `tmux` / `screen` and
+VT-snapshot persistence.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
