@@ -39,11 +39,11 @@
 | **Staging smoke status** | Production-baseline smoke 2026-05-13; exercised as recovery renderer through 2026-05-14i | First **graded** matrix smoke 2026-05-14e | Gate smoke 2026-05-14g; **graded** matrix smoke 2026-05-14i | Gate smoke 2026-05-14f; **no matrix row graded** |
 | **Input-path status** | Renderer-fair input works (`focusTarget()` → helper textarea) | Renderer-fair input works (`focusTarget()` → contenteditable host) | Renderer-fair input works (`focusTarget()` landed `bde039e` → hidden keyboard textarea) | `focusTarget()` **missing** → `data-renderer-input="none"`; renderer-fair seam unavailable |
 | **CSP / runtime requirements** | Runs under strict `default-src 'self'`. Pre-existing `style-src` inline-style console noise (see §3) | Needs `script-src 'self' 'wasm-unsafe-eval'`; same-origin WASM asset after adapter fix `aa6bf9f` | Needs `'wasm-unsafe-eval'` (inlined WASM in `@wterm/core`); DOM-rendered — no canvas / WebGPU / font-CDN deps | Needs `'wasm-unsafe-eval'` **plus** `style-src 'unsafe-inline'` **plus** a `connect-src` / font allowance; WebGPU adapter unavailable headless |
-| **Resize / fit status** | Full `fit()` via `@xterm/addon-fit`; production "Fit" control is xterm-specific and works | `works with caveats` — no `fit()`, no grid reflow on resize | `works with caveats` — no `fit()`, `autoResize` defaults `false`, no grid reflow | Unknown — never rendered |
+| **Resize / fit status** | Full `fit()` via `@xterm/addon-fit`; production "Fit" control is xterm-specific and works | `works with caveats` — no `fit()`, no grid reflow on resize | `works with caveats` — no `fit()`, `autoResize` defaults `false`; the 2026-05-14j investigation found the non-reflow is a RelayTerm-side abstraction gap, **not** a wterm limitation (`renderer.resize()` reflows; `autoResize` self-fits — neither is wired to a container-fit path in production) | Unknown — never rendered |
 | **Mobile / browser-native UX potential** | Baseline; canvas-rendered, mobile behaviour noted as potentially rougher | Unknown; canvas-style, no mobile smoke | **Strongest candidate** — DOM-rendered grid → native selection / copy / paste / IME / soft keyboard. *Potential, unverified* (no mobile / Tauri smoke) | Unknown |
 | **Correctness / VT potential** | Mature baseline; not the differentiating engine on its own | **Strong** — libghostty-vt parser via WASM | Promising — Zig + WASM core; alt-screen verified | Unknown — highest text-shaping ambition, never measured |
 | **Known blockers** | None | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision; no mobile / Tauri smoke | Inline-style CSP; external font fetch; WebGPU unavailable headless; `focusTarget()` missing |
-| **Next recommended action** | Optional baseline-hardening lane | Correctness / modern-VT lane (resize/reflow, advanced VT) | Product / mobile UX lane (fit/reflow investigation, mobile smoke) | Separate viability decision — not promotion work |
+| **Next recommended action** | Optional baseline-hardening lane | Correctness / modern-VT lane (resize/reflow, advanced VT) | Product / mobile UX lane — fit/reflow investigation landed (2026-05-14j, docs-only); next is the renderer-neutral autofit **design** slice, then a mobile smoke | Separate viability decision — not promotion work |
 
 ## 3. Evidence summary per renderer
 
@@ -127,6 +127,22 @@
   (no `fit()`, `autoResize` defaults `false`, no grid reflow);
   needs the `'wasm-unsafe-eval'` relaxation to mount; no
   mobile / Tauri smoke yet.
+- **Resize/reflow root cause established (2026-05-14j,
+  docs-only investigation).** wterm is *not* the blocker —
+  `WTerm.resize(cols, rows)` genuinely reflows the grid,
+  and wterm's `autoResize` `ResizeObserver` self-fits. The
+  production non-reflow is a RelayTerm-side abstraction
+  gap: the adapter defaults `autoResize` to `false`, the
+  `wtermOnly.autoResize` opt-in is structurally
+  unreachable from the production shell, and `safeFit()`
+  duck-types for an xterm-`FitAddon`-shaped synchronous
+  `fit()` that wterm cannot satisfy. The fix is a
+  deliberate renderer-neutral, **observer-shaped** autofit
+  design slice — see
+  [`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+  § "Resize / fit / reflow — investigation findings" and
+  [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)
+  § "2026-05-14j".
 
 ### restty
 
@@ -245,13 +261,16 @@ Qualitative labels (the repo has no numeric scoring convention):
   needs to get right and that xterm's canvas model handles less
   naturally.
 - The renderer-fair production-shell matrix smoke has **already
-  landed** (2026-05-14i), so the next slice is **not** another
-  matrix smoke. The next slice should be
-  **`feat/wterm-fit-reflow-investigation`** — investigate and
-  decide the renderer-neutral resize / fit / reflow story that the
-  matrix smoke flagged as an open Gate-1 decision (the same caveat
-  ghostty-web carries). A mobile / Android-WebView smoke is the
-  natural follow-on once resize behaviour is settled.
+  landed** (2026-05-14i), and the **`feat/wterm-fit-reflow-investigation`**
+  slice has now landed too (2026-05-14j, docs-only): it established
+  that the wterm non-reflow is a RelayTerm-side abstraction gap, not
+  a wterm limitation, and that the fix wants an **observer-shaped**
+  renderer-neutral autofit capability rather than xterm's synchronous
+  `fit()`. The next slice is therefore the renderer-neutral autofit
+  **design + implementation** slice (transferable to ghostty-web),
+  which resolves the open Gate-1 resize/fit decision. A mobile /
+  Android-WebView smoke is the natural follow-on once that behaviour
+  is settled and resmoked.
 
 **Secondary (backup): ghostty-web correctness lane.**
 
@@ -267,11 +286,17 @@ slice on restty until that decision is made.
 
 ## 7. Next slice proposals (ranked)
 
-1. **`feat/wterm-fit-reflow-investigation`** — investigate the
-   renderer-neutral resize / fit / reflow story for wterm (and,
-   transferably, ghostty-web); resolve the open Gate-1 decision.
-   *Primary lane, highest leverage — the wterm matrix is already
-   graded so this is the real next step.*
+1. **Renderer-neutral autofit design + implementation** — the
+   follow-on to the now-landed `feat/wterm-fit-reflow-investigation`
+   (2026-05-14j). Design an **observer-shaped** optional fit
+   capability on the neutral `TerminalRenderer` surface (xterm's
+   `FitAddon` wraps to it; wterm's `autoResize` `ResizeObserver`
+   already is it; ghostty-web no-ops until it grows one), decide
+   whether the production shell / Settings expose an "auto-fit"
+   toggle, and resolve the open Gate-1 resize/fit decision. A
+   `docs/wterm-fit-reflow-resmoke` staging resmoke follows once
+   behaviour changes. *Primary lane, highest leverage — the
+   investigation is done; this is the real next step.*
 2. **`docs/wterm-mobile-smoke-plan`** — plan the Android-WebView /
    Tauri mobile smoke that would *verify* wterm's native-UX
    potential instead of asserting it.

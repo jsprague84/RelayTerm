@@ -1065,6 +1065,105 @@ VT-snapshot persistence; a purpose-built mouse
 click-coordinate fixture and a larger-tooling target
 image for the full-screen-app alternate-screen row.
 
+### 2026-05-14j · wterm fit/reflow investigation (docs-only; root cause identified; renderer-neutral autofit deferred to its own slice)
+
+The `feat/wterm-fit-reflow-investigation` slice the
+2026-05-14i matrix entry and the renderer comparison
+scorecard both named as the wterm product/mobile UX
+lane's first step. It is an **investigation slice** —
+a code-reading study of `@wterm/dom@0.2.1` (`WTerm`),
+`WtermRenderer`, `rendererLoader.ts`, and
+`settingsToRendererOptions`, not a smoke and not a
+renderer change.
+
+**Conclusion: the wterm non-reflow is a RelayTerm-side
+abstraction gap, not a wterm/upstream limitation.**
+wterm *can* reflow:
+
+- `WTerm.resize(cols, rows)` (public; wired by the
+  adapter) calls `bridge.resize()` **and**
+  `renderer.setup()` — a genuine cell-grid + PTY-geometry
+  reflow. Anything that recomputes `(cols, rows)` and
+  calls `renderer.resize()` already reflows wterm.
+- wterm ships a native fit-to-container path: with
+  `autoResize: true` (wterm's own default), `init()`
+  attaches a `ResizeObserver` that measures char size
+  and calls `resize()` on every container change. With
+  `autoResize: false` it runs `_lockHeight()` instead
+  and never observes the container.
+
+The production-shell non-reflow is the sum of three
+RelayTerm-side facts: (1) `WtermRenderer` defaults
+`autoResize` to `false` for cross-adapter parity; (2)
+the `wtermOnly.autoResize` opt-in is **structurally
+unreachable** from the production shell —
+`settingsToRendererOptions()` returns
+`Required<BaseTerminalRendererOptions>`, and `wtermOnly`
+is on `WtermRendererOptions`, not the base type, so the
+loader never forwards it; (3) the production "Fit"
+affordance and `safeFit()` are xterm-`FitAddon`-shaped —
+they duck-type for a synchronous `fit(): { cols, rows }`
+that wterm has no public method to satisfy
+(`_measureCharSize` / `_container` are private).
+
+`safeFit()` *is* too xterm-shaped: a synchronous
+one-shot `fit(): { cols, rows }` is the `FitAddon`
+contract; wterm's honest fit model is observer-driven,
+not a synchronous one-shot (the `ResizeObserver`
+callback fires asynchronously — the measurement inside
+it is synchronous, but there is no inline method that
+returns post-fit dims). A single neutral `fit()` cannot
+unify the two without leaking one renderer's model onto
+the other.
+
+**Outcome: docs-only (Outcome A).** No safe in-boundary
+code change was found. Implementing a synchronous
+`fit()` on the wterm adapter would require
+reimplementing wterm's private char-measurement against
+its private DOM — a fragile internals leak. Adding an
+optional `fit?()` to `terminal-core` would formalize
+xterm's shape without giving wterm a way to honor it.
+Flipping the adapter `autoResize` default, or routing
+`wtermOnly` through the production shell, are
+behavior / production-surface changes outside an
+investigation slice's boundary. The precise root cause,
+the rejected options, and the recommendation are now
+recorded in
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Resize / fit / reflow — investigation findings".
+
+**Recommendation for the follow-on slice.** Design the
+renderer-neutral resize/fit capability **observer-shaped**
+("observe my container and self-fit, emitting
+`onResize`") rather than as xterm's synchronous one-shot
+`fit()`: xterm's `FitAddon` can be wrapped to that
+shape, wterm's `autoResize` `ResizeObserver` already *is*
+that shape, ghostty-web can no-op until it grows one.
+That design — plus the product decision of whether the
+production shell / Settings expose an "auto-fit" toggle —
+is its own deliberate slice, with a follow-on staging
+resmoke (`docs/wterm-fit-reflow-resmoke`) once behavior
+actually changes.
+
+**Promotion posture unchanged.** wterm remains
+experimental and unpromoted; xterm remains the
+production compatibility baseline and the default
+renderer. Gate 1 / Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged. This slice touched no backend protocol /
+session / orchestrator / `terminal-core` /
+production-shell / renderer-adapter / CI / deploy /
+CSP file — it is docs-only.
+
+**Deferred from this slice:** the renderer-neutral
+autofit design + implementation; any production-shell /
+Settings auto-fit toggle; the `docs/wterm-fit-reflow-resmoke`
+staging resmoke (only meaningful once behavior changes);
+renderer promotion; the xterm-default flip; restty
+`focusTarget()` / restty matrix; desktop-Tauri /
+Android-Tauri renderer smokes; the performance /
+benchmark harness.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
