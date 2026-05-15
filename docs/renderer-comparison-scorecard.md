@@ -43,7 +43,7 @@
 | **Mobile / browser-native UX potential** | Baseline; canvas-rendered, mobile behaviour noted as potentially rougher | Unknown; canvas-style, no mobile smoke | **Strongest candidate** — DOM-rendered grid → native selection / copy / paste / IME / soft keyboard. *Potential, unverified* (no mobile / Tauri smoke) | Unknown |
 | **Correctness / VT potential** | Mature baseline; not the differentiating engine on its own | **Strong** — libghostty-vt parser via WASM | Promising — Zig + WASM core; alt-screen verified | Unknown — highest text-shaping ambition, never measured |
 | **Known blockers** | None | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision; no mobile / Tauri smoke | Inline-style CSP; external font fetch; WebGPU unavailable headless; `focusTarget()` missing |
-| **Next recommended action** | Optional baseline-hardening lane | Correctness / modern-VT lane (resize/reflow, advanced VT) | Product / mobile UX lane — fit/reflow investigation landed (2026-05-14j, docs-only); next is the renderer-neutral autofit **design** slice, then a mobile smoke | Separate viability decision — not promotion work |
+| **Next recommended action** | Optional baseline-hardening lane | Correctness / modern-VT lane (resize/reflow, advanced VT) | Product / mobile UX lane — fit/reflow investigation landed (2026-05-14j, docs-only); renderer-neutral autofit **design** landed ([`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md)); next is the `feat/renderer-neutral-autofit` implementation, then a mobile smoke | Separate viability decision — not promotion work |
 
 ## 3. Evidence summary per renderer
 
@@ -138,7 +138,11 @@
   duck-types for an xterm-`FitAddon`-shaped synchronous
   `fit()` that wterm cannot satisfy. The fix is a
   deliberate renderer-neutral, **observer-shaped** autofit
-  design slice — see
+  capability — **now designed** in
+  [`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md)
+  (mount-time `autofit` option + `autofitActive()` query;
+  implementation is the named `feat/renderer-neutral-autofit`
+  slice). See also
   [`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
   § "Resize / fit / reflow — investigation findings" and
   [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)
@@ -266,11 +270,14 @@ Qualitative labels (the repo has no numeric scoring convention):
   that the wterm non-reflow is a RelayTerm-side abstraction gap, not
   a wterm limitation, and that the fix wants an **observer-shaped**
   renderer-neutral autofit capability rather than xterm's synchronous
-  `fit()`. The next slice is therefore the renderer-neutral autofit
-  **design + implementation** slice (transferable to ghostty-web),
-  which resolves the open Gate-1 resize/fit decision. A mobile /
-  Android-WebView smoke is the natural follow-on once that behaviour
-  is settled and resmoked.
+  `fit()`. That **design slice has now landed**
+  ([`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md),
+  docs-only): a mount-time renderer-neutral `autofit` option plus an
+  optional `autofitActive()` query, transferable to ghostty-web. The
+  next slice is therefore the `feat/renderer-neutral-autofit`
+  **implementation**, which resolves the open Gate-1 resize/fit
+  decision. A mobile / Android-WebView smoke is the natural follow-on
+  once that behaviour is settled and resmoked.
 
 **Secondary (backup): ghostty-web correctness lane.**
 
@@ -286,17 +293,21 @@ slice on restty until that decision is made.
 
 ## 7. Next slice proposals (ranked)
 
-1. **Renderer-neutral autofit design + implementation** — the
+1. **`feat/renderer-neutral-autofit` implementation** — the
    follow-on to the now-landed `feat/wterm-fit-reflow-investigation`
-   (2026-05-14j). Design an **observer-shaped** optional fit
-   capability on the neutral `TerminalRenderer` surface (xterm's
-   `FitAddon` wraps to it; wterm's `autoResize` `ResizeObserver`
-   already is it; ghostty-web no-ops until it grows one), decide
-   whether the production shell / Settings expose an "auto-fit"
-   toggle, and resolve the open Gate-1 resize/fit decision. A
+   (2026-05-14j) and the `docs/renderer-neutral-autofit-design`
+   design slice. The **design is done**
+   ([`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md)):
+   an **observer-shaped** mount-time `autofit` option on
+   `BaseTerminalRendererOptions` plus an optional `autofitActive()`
+   query on `TerminalRenderer` (xterm wires `ResizeObserver` +
+   `FitAddon`; wterm maps it to `WTerm.autoResize`; ghostty-web /
+   restty accept-and-no-op it), a local-only Settings toggle, and a
+   `data-renderer-autofit` diagnostic. The implementation slice builds
+   that and resolves the open Gate-1 resize/fit decision; a
    `docs/wterm-fit-reflow-resmoke` staging resmoke follows once
-   behaviour changes. *Primary lane, highest leverage — the
-   investigation is done; this is the real next step.*
+   behaviour changes. *Primary lane, highest leverage — the design is
+   done; this is the real next step.*
 2. **`docs/wterm-mobile-smoke-plan`** — plan the Android-WebView /
    Tauri mobile smoke that would *verify* wterm's native-UX
    potential instead of asserting it.
@@ -337,6 +348,9 @@ slice on restty until that decision is made.
 - [`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md) —
   the four renderer-adapter contracts and the per-adapter
   "Production-shell evaluation status" caveats.
+- [`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md)
+  — the observer-shaped renderer-neutral autofit design (the
+  ranked next slice in § 7).
 - [`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md) —
   the input-path taxonomy and command matrix the smokes inherit.
 - [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)

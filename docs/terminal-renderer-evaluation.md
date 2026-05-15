@@ -1145,6 +1145,16 @@ is its own deliberate slice, with a follow-on staging
 resmoke (`docs/wterm-fit-reflow-resmoke`) once behavior
 actually changes.
 
+**Design slice landed (2026-05-14, `docs/renderer-neutral-autofit-design`).**
+That observer-shaped design is now recorded, docs-only, in
+[`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md):
+a mount-time renderer-neutral `autofit` option on
+`BaseTerminalRendererOptions` plus an optional
+`autofitActive()` query on `TerminalRenderer`, with a
+local-only Settings toggle and a `data-renderer-autofit`
+diagnostic. Implementation is the named follow-on slice
+`feat/renderer-neutral-autofit`.
+
 **Promotion posture unchanged.** wterm remains
 experimental and unpromoted; xterm remains the
 production compatibility baseline and the default
