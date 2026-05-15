@@ -1228,3 +1228,89 @@ describe("ProductionTerminal.svelte — mount-failure wiring", () => {
     );
   });
 });
+
+/**
+ * Reactivity wiring for the mounted-renderer reference.
+ *
+ * The production workspace exposes `data-renderer-autofit` and the Fit
+ * button copy through two `$derived` blocks that read the locally-held
+ * renderer reference (the `renderer` variable inside the component
+ * `<script>`). The first slice of the renderer-neutral autofit work
+ * declared it as a plain `let renderer: TerminalRenderer | null = null;`
+ * — Svelte 5 does NOT track mutations on a plain `let`, so the
+ * `$derived`s captured `renderer = null` at module init and never
+ * re-ran when `attach()` assigned the mounted renderer. The workspace
+ * shipped a stale `data-renderer-autofit="unsupported"` for renderers
+ * (xterm, wterm) whose `autofitActive()` returned `true` post-mount.
+ *
+ * The fix wraps the reference in `$state.raw(...)`: the reassignment
+ * IS reactive (so the derivations re-run), but the underlying renderer
+ * instance is not deeply proxied (xterm / wterm / ghostty-web / restty
+ * adapter classes use `#`-prefixed private fields which Svelte's default
+ * deep proxy cannot intercept).
+ *
+ * The pin below is a raw-text scan against `ProductionTerminal.svelte`.
+ * Like the other ProductionTerminal structural assertions in this file,
+ * it stays cheap and survives formatting drift while making a future
+ * "let's collapse it back to plain let" regression a test failure
+ * instead of a staging-smoke surprise.
+ */
+describe("ProductionTerminal.svelte — renderer reference reactivity", () => {
+  const TERMINAL_PATH = new URL(
+    "../src/lib/app/terminal/ProductionTerminal.svelte",
+    import.meta.url,
+  ).pathname;
+  const text = readFileSync(TERMINAL_PATH, "utf8");
+
+  it("declares `renderer` via $state.raw so $derived re-runs on reassignment", () => {
+    // `$state.raw(...)` is required (not plain `$state(...)`): the
+    // renderer adapter classes (XtermRenderer, WtermRenderer, …) use
+    // `#`-prefixed private fields, which TypeScript-compiles to real
+    // private fields that JavaScript Proxies cannot forward. A default
+    // `$state` would wrap the instance in a deep proxy and the very
+    // first private-field access (e.g. `this.#terminal` inside
+    // `XtermRenderer.write`) would throw a TypeError. `$state.raw`
+    // makes the reference reactive without proxying the underlying
+    // value.
+    expect(text).toMatch(
+      /\blet\s+renderer\s*=\s*\$state\.raw\s*<\s*TerminalRenderer\s*\|\s*null\s*>\s*\(\s*null\s*\)/,
+    );
+  });
+
+  it("does NOT declare `renderer` as a plain non-reactive `let`", () => {
+    // Defence-in-depth against the original bug shape: a plain
+    // `let renderer: TerminalRenderer | null = null;` is not tracked by
+    // Svelte 5, so the `$derived` blocks below would capture the initial
+    // `null` and never re-run when `attach()` assigns the mounted
+    // renderer. Pin the exact form that shipped the bug so a future
+    // refactor that re-introduces it trips here, not in staging.
+    expect(text).not.toMatch(
+      /\blet\s+renderer\s*:\s*TerminalRenderer\s*\|\s*null\s*=\s*null\s*;/,
+    );
+  });
+
+  it("feeds the reactive renderer into both autofit derivations", () => {
+    // Both `autofitStatus` (drives `data-renderer-autofit`) and
+    // `fitButton` (drives the Fit-button enablement + tooltip) read the
+    // SAME `renderer` reference. Pinning both call sites keeps a
+    // partial refactor that only updates one derivation from drifting
+    // their reactivity contracts apart.
+    expect(text).toMatch(
+      /computeRendererAutofitStatus\s*\(\s*\{[^}]*\brenderer\b[^}]*\}\s*\)/,
+    );
+    expect(text).toMatch(
+      /computeFitButtonState\s*\(\s*\{[\s\S]*?\brenderer,?[\s\S]*?\}\s*\)/,
+    );
+  });
+
+  it("clears `renderer` to null inside teardownLocal so the derivations collapse to 'unsupported' on dispose", () => {
+    // The teardown path MUST null the reactive reference (not just call
+    // `dispose()`), so the next `$derived` re-run resolves
+    // `computeRendererAutofitStatus({ ..., renderer: null }) === "unsupported"`
+    // and `computeFitButtonState({ ..., renderer: null })` disables the
+    // Fit button cleanly. The renderer-input marker stripping and the
+    // dispose itself are preserved.
+    expect(text).toMatch(/renderer\?\.dispose\(\)/);
+    expect(text).toMatch(/renderer\s*=\s*null\s*;/);
+  });
+});

@@ -201,14 +201,34 @@
    */
   let blockedPasteDecision = $state<PasteDecision | null>(null);
 
+  // Deliberately a plain `let`, not `$state.raw`: no `$derived` reads
+  // `client`, so its mutations need not be tracked by Svelte. The
+  // asymmetry with `renderer` below is intentional — only `renderer`
+  // feeds reactive derivations (`autofitStatus`, `fitButton`).
   let client: TerminalSessionClient | null = null;
   /**
    * Active renderer for the current attach. Typed against the neutral
    * {@link TerminalRenderer} surface so xterm / ghostty-web / restty /
    * wterm all sit behind one variable. `null` between mounts AND while
    * an attach is in flight.
+   *
+   * Reactive via `$state.raw(...)` (NOT plain `$state(...)`): the
+   * downstream `$derived` blocks for `autofitStatus` and `fitButton`
+   * read this reference, and a plain `let` would leave them frozen at
+   * the initial `null` value (the bug the 2026-05-14 wterm autofit
+   * resmoke surfaced — `data-renderer-autofit="unsupported"` even when
+   * the mounted renderer's `autofitActive()` returned `true`).
+   * `$state.raw` is the right rune here because the renderer adapter
+   * classes (XtermRenderer, WtermRenderer, …) use `#`-prefixed private
+   * fields; the deep proxy a default `$state` would install cannot
+   * forward those field accesses, so any subsequent method call on the
+   * adapter would throw a TypeError. `$state.raw` tracks the reference
+   * reactively without proxying the underlying instance — reassignments
+   * trigger the derivations, mutations on the renderer's internal state
+   * are invisible (which is correct: a renderer that resizes its grid
+   * or refits should not cascade a `$derived` re-run).
    */
-  let renderer: TerminalRenderer | null = null;
+  let renderer = $state.raw<TerminalRenderer | null>(null);
   /**
    * Diagnostic state surfaced via `data-renderer-*` attributes so the
    * staging smoke can prove which renderer was actually mounted, without
