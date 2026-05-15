@@ -1203,6 +1203,118 @@ renderer promotion; the xterm-default flip; restty
 Android-Tauri renderer smokes; the performance /
 benchmark harness.
 
+### 2026-05-15 · `docs/wterm-fit-reflow-resmoke` staging resmoke (real PTY reflow verified for wterm AND xterm under operator-opt-in autofit; `data-renderer-autofit` workspace diagnostic bug discovered)
+
+**Status:** docs-only resmoke recording the runtime
+behaviour of the now-landed
+`feat(web): add renderer-neutral autofit` slice on
+the production shell. **No** renderer / `terminal-core`
+/ production-shell-non-doc / protocol / backend /
+session / orchestrator / CSP / CI / deploy file was
+edited.
+
+**Surface.** `https://relayterm-staging.js-node.cc`,
+Playwright MCP browser. Operator-approved web-only
+recreate from fresh `:main` registry image
+`sha256:7fc53fc7aba0…` (image config) /
+`sha256:7197d33160d2…` (multi-arch index manifest).
+Backend + Postgres untouched.
+
+**What changed at runtime.** With the operator opting
+in via Settings → "Fit terminal to its container"
+(`autofitEnabled: true`), wterm's PTY now actually
+reflows on a container resize:
+
+- Initial `stty size` at 896-px container: `24 80`
+  (constructor cols=80 hint).
+- After narrowing the browser to 390 × 844 (the
+  AppShell collapses to mobile and `.wterm` shrinks
+  to 327 × 448 px): `stty size` reflowed to **`24
+  35`**. The 2026-05-14i baseline (autofit not yet
+  shipped) stayed at `24 80` for the same step.
+- After restoring to 1440 × 900 (`.wterm` back to
+  896 × 448): `stty size` settled at `24 103`
+  (wterm's own `floor(width / charWidth)` measurement
+  via the upstream `ResizeObserver` — wterm re-measures
+  character width on each observer fire rather than
+  restoring the constructor's `cols=80` seed, so the
+  post-cycle column count is whatever wterm's
+  current measurement reports, not the initial value).
+- xterm with autofit on, exercised as the H control:
+  `24 80` → `26 40` after the same narrow resize.
+  xterm's adapter-owned `ResizeObserver` + `FitAddon`
+  reflowed end-to-end.
+
+The **resize / fit / reflow** Gate-1 caveat the 14j
+investigation opened is therefore **substantively
+closed for wterm** under the operator-opt-in autofit
+path — the underlying capability does what the
+design said it would.
+
+**Workspace diagnostic bug (newly discovered).** The
+`data-renderer-autofit` attribute stayed at
+`"unsupported"` for the entire matrix run on BOTH
+wterm and xterm, even with autofit enabled and the
+underlying renderer reflow working. The Fit-button
+autofit-active tooltip ("Autofit is keeping the
+terminal sized to its container.") never appeared.
+Cause traced to
+`apps/web/src/lib/app/terminal/ProductionTerminal.svelte`:
+`let renderer: TerminalRenderer | null = null;` is a
+plain `let`, not `$state`, so the
+`autofitStatus = $derived(computeRendererAutofitStatus({
+autofitEnabled, renderer }))` derivation does not
+re-run when `renderer = r` is later assigned. The
+derivation runs once during attach with `renderer =
+null` (because `autofitEnabled = true` is set
+synchronously *before* `renderer = r`) and then
+stays at `"unsupported"`. This affects ONLY the
+workspace diagnostic surface — the actual autofit
+capability works fine. The follow-on bug-fix slice
+is named **`fix(web): make renderer reactive for
+data-renderer-autofit`**: make `renderer` a `$state`
+(or mirror it to a `$state` shadow), extend
+`apps/web/tests/` to pin the
+`data-renderer-autofit="active"` post-mount
+transition for both wterm and xterm under
+`autofitEnabled = true`. SMOKE.md's autofit
+precondition (`data-renderer-autofit="active"`)
+remains structurally unverifiable from the
+production shell until that ships — runbook step
+ordering is correct, the assertion just cannot be
+made truthfully today.
+
+**Promotion posture unchanged.** wterm remains
+experimental and unpromoted; xterm remains the
+production compatibility baseline and the production
+default renderer. Gate 1 / Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged. The renderer-neutral autofit
+implementation does what the design said it would
+and removes the resize/fit reason a Gate 1 reviewer
+might cite for wterm, but neither this resmoke nor
+the autofit slice itself is a Gate 1 review or a
+promotion mechanism.
+
+**Cleanup posture.** Throwaway SSH target, host
+record, server profile, and SSH identity created by
+this slice are still in place — cleanup is deferred
+pending operator approval (see the smoke entry's
+Cleanup section for the full resource list and the
+exact cleanup commands).
+
+**Cross-links.** Smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-15 · wterm production-shell renderer-neutral
+autofit resmoke". Design:
+[`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md).
+Implementation: `a2c806b feat(web): add renderer-neutral
+autofit`. Adapter contracts:
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Implementation status (since 2026-05-15…)". Scorecard:
+[`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
+§ "Resize / fit status".
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

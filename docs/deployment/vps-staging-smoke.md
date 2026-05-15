@@ -9069,6 +9069,531 @@ intact.
 
 ---
 
+### 2026-05-15 · wterm production-shell renderer-neutral autofit resmoke (PTY reflow verified end-to-end; data-renderer-autofit diagnostic bug discovered; xterm autofit verified)
+
+**Date.** 2026-05-15 20:53 UTC – 21:24 UTC (≈31 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Web force-recreated from fresh `:main`
+registry image that includes
+`a2c806b feat(web): add renderer-neutral autofit`:
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  index manifest digest
+  `sha256:7197d33160d2e3edd1b8fc3110315cbb8cce24d4bf440532bd8a5642b5c17ed1`,
+  amd64 image config digest
+  `sha256:7fc53fc7aba06e3602d41cb2197ba7404897d4f8e8fc0d8c2f997d2fe7b8d83f`,
+  container created `2026-05-15T20:58:51Z`. Pre-recreate
+  the running web image was `sha256:0d017b7fa910…` —
+  the **same digest the 2026-05-14i wterm matrix smoke
+  ran on**, built before this slice's autofit work.
+  `Last-Modified` on `/` confirmed: pre-recreate
+  `Thu, 14 May 2026 17:12:38 GMT`, post-recreate
+  `Fri, 15 May 2026 19:53:43 GMT`.
+- backend
+  `git.js-node.cc/jsprague/relayterm-backend:main`,
+  digest `sha256:90573e96bcbca4dba962330ffa264365200ecf5af03390dac933ba6e2a23cb52`,
+  **untouched** (the autofit slice is web-only — no
+  `apps/backend/` or `crates/` files in the diff).
+- postgres `postgres:17-alpine`, **untouched** (`Up 6 days`
+  before AND after).
+
+Operator approval was requested and granted before
+recreating the web service. Postgres / backend were
+explicitly held. Recreate command:
+`docker compose up -d --no-deps --force-recreate
+--pull never relayterm-web` (executed on cloud-edge
+under `/home/ubuntu/docker-compose/relayterm-staging`).
+
+Pre-flight bundle verification: pulled the fresh
+`:main` web image into a throwaway container and
+grep'd `/usr/share/nginx/html/assets/index-*.js`
+for `settings-autofit-enabled`, `data-renderer-autofit`,
+`autofitEnabled`, `computeRendererAutofitStatus` —
+all four present in `index-4Fc6yR-p.js` (main chunk).
+Lazy wterm chunk `index-CTfxJBJf.js` (41,024 bytes)
+contained `WtermRenderer` plus 9 occurrences of
+`autoResize` (the wterm `WTermOptions` field name) and
+1 occurrence of `autofitActive`. After recreate,
+`docker exec relayterm-staging-relayterm-web-1` against
+the same paths confirmed identical strings in the
+running container, and `performance.getEntriesByType('resource')`
+inside Playwright confirmed the browser actually
+loaded `index-4Fc6yR-p.js` + `index-CTfxJBJf.js` for
+the wterm session.
+
+**Branch.** `docs/wterm-fit-reflow-resmoke` off `main`
+(docs-only).
+**Browser surface.** Playwright MCP (Chrome / Linux) at
+1440 × 900 (resized to 1920 × 1080 and 390 × 844 for
+specific rows, restored after). Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Verify whether the newly landed
+`feat(web): add renderer-neutral autofit` slice
+actually changes wterm's resize / fit / reflow
+behaviour on the production shell, the open Gate-1
+question the 2026-05-14j investigation and the
+`docs/renderer-neutral-autofit.md` design / implementation
+fed into. Smoke / docs slice — no source / renderer-adapter /
+backend / protocol / CSP / CI / deploy edits.
+
+**Slice boundary (docs-only).** No repo source / CI /
+schema / migration / auth / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+nginx-template / deploy-template / CSP file was edited.
+The only host-side actions were the operator-approved
+web recreate (above) and the throwaway SSH target
+lifecycle (below).
+
+**CSP posture (unchanged from 2026-05-14c).**
+`curl -sSI https://relayterm-staging.js-node.cc/`:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+```
+
+`'unsafe-eval'` NOT present; `data:` NOT present;
+`blob:` NOT present; `connect-src` not widened. This
+slice did not touch CSP.
+
+**Endpoint smoke (post-recreate).** `GET /` → `200`,
+`GET /healthz` → `200`, `GET /api/v1/auth/me` without
+cookie → `401`. Production SPA loads; Settings card
+exposes the new "Fit terminal to its container"
+checkbox (`[data-testid="settings-autofit-enabled"]`)
+and the experimental-renderer gate toggle. Flipping
+the gate ON revealed the four renderer radios; selecting
+`wterm`, ticking the autofit checkbox, and pressing
+"Save changes" wrote
+`relayterm.terminal-settings.v2 = {…, "rendererId":"wterm",
+"experimentalRendererEvaluationEnabled":true,
+"autofitEnabled":true}` to the storage. The legacy v1
+entry is also still present (intentional non-destructive
+v1→v2 migration per `terminalSettings.ts`
+`LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS`). The
+"Saved locally. Applies to the next terminal session."
+toast rendered.
+
+**Throwaway SSH target.** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-wterm-autofit-smoke-ssh`, attached
+only to `relayterm-staging_relayterm-staging-internal`
+with DNS alias `wterm-autofit-smoke-host` →
+`172.21.0.5`. **No host port published** (`docker port`
+empty; only `2222/tcp` exposed internally).
+`USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`, `PUBLIC_KEY=<the
+RelayTerm-generated OpenSSH public-key line>`. The
+public-key line was fetched from `/api/v1/ssh-identities/<id>`
+into a local file via `browser_evaluate`'s
+`filename` option (never echoed into the conversation),
+validated with `ssh-keygen -lf` (fingerprint
+`SHA256:3VwSZ/Z0OJ/kz7M711FLEn1aIfS86aEfn6f1HMajcak`),
+`scp`'d to the VPS, read into the
+`docker run -e PUBLIC_KEY=…` env, and the local +
+remote copies `shred`ded. No PEM / private-key bytes
+touched any tool-call payload, log, or the operator
+filesystem.
+
+**Identity / host / profile.**
+- Identity `wterm-autofit-smoke-identity` (generated
+  ed25519, id `cd2a619b-7c5a-4672-b9da-7865a9f8e761`,
+  fingerprint
+  `SHA256:3VwSZ/Z0OJ/kz7M711FLEn1aIfS86aEfn6f1HMajcak`).
+  The `/api/v1/ssh-identities` list response carried **no**
+  `private_key` / `encrypted_private_key` field.
+- Host `Wterm-Autofit-Smoke-Host` (id
+  `1ae1004e-f7d8-4d9e-8b63-27442517476d`, hostname
+  `wterm-autofit-smoke-host`, port `2222`, default user
+  `smoke`).
+- Profile `wterm-autofit-smoke-profile` (id
+  `19b1bf65-b69e-41f2-8c5b-a8d5bdfb8384`). Tags were
+  intended as `renderer, wterm, autofit` but did not
+  persist on the create (cosmetic — does not block any
+  matrix row; noted for a future smoke-form polish slice).
+
+**Host-key preflight + trust.** Preflight captured
+`SHA256:JwTBTV4FovUz7PP5fmCRZtVa1XxBrwY9H9rN/a0YjFw`,
+**byte-identical** to the target container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+Typed into the confirm input and trusted; the host-key
+status flipped to `Trusted ed25519`.
+
+**Auth-check.** Status flipped to `Authenticated`
+within ≈3 s of clicking "Run auth-check".
+
+**Renderer mount diagnostics (load-bearing).**
+`profile-launch-terminal` opened `/terminal` and
+created session UUID `1cb58c71-74de-4b17-8d5b-2e74d264505a`
+(the second of two wterm sessions in this slice; the
+first detached during diagnostic investigation past
+the default 30 s TTL). The production-terminal
+workspace surfaced:
+- `data-phase="attached"` (`production-terminal-phase`
+  text `live`)
+- `data-renderer="wterm"`
+- `data-renderer-experimental="true"`
+- `data-renderer-fallback=""` (empty — **no
+  `adapter_mount_failed`**)
+- `data-renderer-gate="on"`
+- `data-renderer-input="marked"` — marker stamped on
+  wterm's hidden keyboard `<textarea>` (one
+  `[data-relayterm-terminal-input]` element)
+- `data-renderer-autofit="unsupported"` ← **unexpected
+  for an autofit-on wterm mount**; see "Workspace
+  diagnostic bug" below
+- Fit button: `disabled`, title
+  `"Fit is not supported by the current renderer."` ←
+  **also unexpected when autofit is genuinely active**
+- `production-terminal-error` NOT rendered
+- `browser_console_messages level=error` returned the
+  pre-existing `style-src` inline-style baseline noise
+  only — no autofit / wterm errors. (Count grew from
+  the 2026-05-14i ≈6 to ≈10–24 across the slice; same
+  *kind* — see 2026-05-14c entry — not new failure
+  modes.)
+- wterm DOM evidence: `.wterm` host carries
+  `style="--term-row-height: 17px;"` (CSS variable
+  written by wterm's `_doRender` after measuring) and
+  carries **no** inline `height` lock; an inline pixel
+  `height` would be the signature of wterm's
+  `_lockHeight()` branch which only runs when
+  `autoResize` is `false` upstream. Combined with the
+  observed PTY reflow below, this proves wterm's
+  upstream `ResizeObserver` IS attached — i.e. the
+  adapter DID pass `autoResize: true` to the
+  `WTerm` constructor.
+
+**Renderer-fair input.** Per `apps/web/e2e/SMOKE.md`
+§ "D. Renderer evaluation smoke" → "Renderer-fair input":
+clicked `production-terminal-focus`, then verified
+`document.activeElement === [data-relayterm-terminal-input]`
+(the marked `TEXTAREA`) before typing. For the xterm
+recovery row the same selector resolved to xterm's
+`xterm-helper-textarea` — one selector, correct
+element per renderer.
+
+**Workspace diagnostic bug discovered (the central
+finding of this slice).** `data-renderer-autofit`
+stayed at `"unsupported"` for the **entire matrix
+run** — for both wterm AND xterm, with autofit
+enabled. The Fit-button autofit-active tooltip
+(`"Autofit is keeping the terminal sized to its
+container."`) **never appeared** on any session in
+this slice. Cause traced to
+`apps/web/src/lib/app/terminal/ProductionTerminal.svelte`:
+`let renderer: TerminalRenderer | null = null;` is a
+plain `let`, not `$state`. The
+`autofitStatus = $derived(computeRendererAutofitStatus({
+autofitEnabled, renderer }))` derivation re-runs only
+when its tracked reactive dependencies change.
+`autofitEnabled` IS `$state` and updates once per
+attach (synchronously, before `renderer = r` is
+assigned), so the derivation runs at that moment with
+`renderer === null`, yielding `"unsupported"`. The
+later `renderer = r;` assignment does NOT re-trigger
+the derivation because plain `let` is not reactive in
+Svelte 5 runes. `autofitStatus` therefore remains
+stuck at `"unsupported"` for the lifetime of the
+session, regardless of which renderer mounted or
+whether `autofitActive()` would in fact return `true`.
+This **only affects the workspace diagnostic surface**
+(`data-renderer-autofit` attribute, the
+`computeFitButtonState` autofit-active tooltip path,
+and any test selector that pivots on
+`data-renderer-autofit="active"`); it does **not**
+affect the underlying autofit capability — see the
+matrix observations below. Recommended fix is a
+follow-on slice that makes `renderer` a `$state` (or
+mirrors it onto a `$state` shadow) so the derivation
+re-runs when the renderer assigns; the slice should
+also extend a Svelte test (a new
+`apps/web/tests/productionTerminal.autofit.test.ts`
+spec is the cleanest landing site, modeled on the
+existing `apps/web/tests/terminalLaunch.test.ts`
+helpers) that pins the `data-renderer-autofit`
+attribute transitions: `"off"` when `autofitEnabled`
+is `false`, `"active"` post-mount when `autofitEnabled`
+is `true` AND the renderer's `autofitActive()`
+returns `true`, `"unsupported"` when `autofitEnabled`
+is `true` AND the renderer's `autofitActive()`
+returns `false` or the method is omitted. Naming
+proposal: **`fix(web): make renderer reactive for
+data-renderer-autofit`** as the next slice.
+
+**Matrix results (browser surface, renderer wterm
+unless noted, autofit enabled).** All Path A rows
+input via `[data-relayterm-terminal-input]` after the
+renderer-fair focus step. Container box dimensions
+captured via `Element.getBoundingClientRect()`.
+
+A. **Baseline — Path A — pass.** At browser viewport
+   1440 × 900, container `.wterm` was 896 × 448 px.
+   `stty size` → `24 80` (the cols=80 hint passed
+   into the constructor; wterm's `ResizeObserver`
+   fired immediately after this and re-measured to a
+   different value once the host stabilised — see D
+   below). `printf '%*sEND\n' 80 ''` produced
+   `END` at column 80 (PTY width 80). `whoami` →
+   `smoke`; `pwd` → `/config`. `data-renderer-autofit`
+   = `"unsupported"` (workspace bug above).
+
+B. **Wider browser viewport — Path A + viewport handle —
+   pass; container did not grow.** Resized the
+   browser window to 1920 × 1080 and waited 2 s for
+   any observer to settle. The AppShell layout caps the
+   terminal area: `.wterm` stayed at 896 × 448 px even
+   though the window grew. `stty size` → `24 80`
+   unchanged. This is **not a wterm autofit failure**:
+   the container the renderer observes never resized,
+   so there is nothing for wterm's `ResizeObserver` to
+   honour. A future surface-level test of "browser
+   viewport grew → terminal grew with it" would need
+   the AppShell to expand its content slot. Recorded
+   as a layout observation, not a renderer regression.
+
+C. **Narrow / mobile viewport — Path A + viewport
+   handle — *real* PTY reflow verified.** Resized the
+   browser window to 390 × 844 and waited 2 s. The
+   AppShell collapsed to its mobile layout, shrinking
+   `.wterm` to 327 × 448 px. Re-focused the renderer
+   via the workspace's "Focus terminal" button (which
+   moved `document.activeElement` back to the marked
+   wterm `TEXTAREA`) and typed `stty size; printf
+   '%*sEND\n' 80 ''; echo relayterm-wterm-autofit-narrow`.
+   `stty size` → **`24 35`** ← the PTY columns
+   shrank from 80 to 35 to match the narrower
+   container. The 80-space `printf` wrapped onto
+   multiple lines at the new 35-column boundary.
+   Sentinel `relayterm-wterm-autofit-narrow` echoed.
+   Workspace stayed usable; no clipping, no
+   adapter_mount_failed, no console error. This is
+   the **load-bearing improvement vs the 2026-05-14i
+   matrix baseline** (which observed `stty size`
+   stayed `24 80` and the cell grid / PTY geometry
+   did not reflow).
+
+D. **Return to desktop — Path A + viewport handle — PTY
+   reflowed back wider.** Resized the browser back to
+   1440 × 900 (`.wterm` returned to 896 × 448 px),
+   re-focused, typed `stty size`. Result:
+   **`24 103`** — wider than the initial
+   `24 80` baseline at the same container width. The
+   `24 80` value at A came from the constructor's
+   `cols=80, rows=24` initial-grid hint passed by the
+   renderer loader; wterm's first
+   `ResizeObserver` callback after stabilising would
+   have measured a slightly different
+   `floor(width/charWidth)` value, and the round-trip
+   through narrow → wide settled at 103. This is
+   wterm's own char-width measurement, not a
+   RelayTerm-side decision; the load-bearing fact is
+   that the PTY cols **track the container** under
+   autofit, not their exact integer. Sentinel
+   `relayterm-wterm-autofit-return` echoed.
+
+E. **Basic I/O sanity — Path A — pass.** `whoami` →
+   `smoke`; `pwd` → `/config`; `uname -a` → `Linux
+   b7489299f1eb 6.17.0-8-generic … x86_64 GNU/Linux`;
+   sentinel `relayterm-wterm-autofit-baseline-e`
+   echoed. Commands round-tripped cleanly; no
+   duplicate / missing lines.
+
+F. **Long output sanity — Path A — pass.** `seq 1 150
+   | tail -8` rendered 143–150; sentinel
+   `relayterm-wterm-autofit-after-long-output` echoed
+   on the next line. The `.term-row` count grew from
+   24 → 42 (wterm keeps scrollback as DOM nodes — same
+   as the 2026-05-14i observation). No terminal
+   stalls.
+
+G. **Fit button behaviour — works with caveats.** Fit
+   button stayed `disabled` for the whole wterm
+   session with title
+   `"Fit is not supported by the current renderer."`.
+   With the workspace diagnostic bug above, this is
+   the wrong tooltip *path* — when autofit is active
+   the spec wording (per
+   [`docs/renderer-neutral-autofit.md`](../renderer-neutral-autofit.md)
+   § 9 and the `apps/web/e2e/SMOKE.md` § "Resize / fit"
+   row) calls for
+   `"Autofit is keeping the terminal sized to its
+   container."`. The button correctly stayed disabled
+   either way (one-shot xterm-`FitAddon`-shaped fit
+   does not apply to a renderer that has no `fit()`).
+   Did **not** click the disabled button (per the
+   SMOKE runbook). Recorded as `works with caveats`,
+   not `fail` — the safer wrong-tooltip path
+   (renderer-unsupported) is *also* technically true
+   for wterm in isolation, just not the most
+   informative copy when autofit is doing the fitting.
+
+H. **xterm autofit recovery / control — works; same
+   diagnostic bug.** Reset Settings: `rendererId =
+   xterm`, `experimentalRendererEvaluationEnabled =
+   false`, **kept `autofitEnabled = true` deliberately**
+   so the H row could verify whether xterm's autofit
+   path also reflows. The `wterm-autofit-smoke-profile`
+   stayed enabled (the prior session-close ends the
+   session row, not the profile). Launched a fresh
+   xterm session (`551e6fe3-1199-44e1-b430-b5cf4eff11ac`).
+   Workspace: `data-renderer="xterm"`,
+   `data-renderer-input="marked"`,
+   `data-renderer-fallback=""`,
+   `data-renderer-autofit="unsupported"` ← **same
+   workspace diagnostic bug**, NOT an xterm autofit
+   limitation. Fit button: `enabled`, default tooltip
+   (no autofit-active override). Typed `stty size`
+   via Playwright `keyboard.press` (xterm's helper
+   textarea is offscreen-positioned via CSS and the
+   Playwright `.fill` visibility check refuses it; the
+   focus button + page-level keystrokes is the
+   renderer-fair fallback): result `24 80` at desktop
+   width. Resized to 390 × 844 (`.xterm` shrank to
+   325 × 442 px), refocused, typed `stty size` again:
+   result **`26 40`** — xterm's adapter-owned
+   `ResizeObserver` + `FitAddon` reflowed the PTY end
+   to end (rows 24 → 26 because portrait window is
+   taller; cols 80 → 40 because narrower window). The
+   underlying autofit capability works on xterm; only
+   the workspace diagnostic / Fit-button copy is
+   bugged. Sentinel
+   `relayterm-wterm-autofit-xterm-recovery` was
+   intended for this row but Playwright `.fill` was
+   not usable on the offscreen helper textarea — the
+   page-level `keyboard.press` confirmation through
+   the screenshot showed `stty size` returning the
+   reflowed values directly.
+
+**Comparison vs the 2026-05-14i wterm matrix baseline.**
+
+| Property | 2026-05-14i (autofit OFF; not shipped) | 2026-05-15 (autofit ON; this slice) |
+|---|---|---|
+| Initial `stty size` at 896-px container | `24 80` (constructor seed) | `24 80` (constructor seed; same) |
+| Container `.wterm` pixel width tracks container resize | yes (DOM host shrank; cell grid did not) | yes (DOM host shrank; **cell grid + PTY DID also reflow**) |
+| `stty size` after browser narrow to 390 × 844 | `24 80` (no reflow) | **`24 35`** (wterm reflowed via its own `ResizeObserver`) |
+| `stty size` after restore to 1440 × 900 | `24 80` | **`24 103`** (wterm re-measured at the wider container) |
+| Fit button on wterm | `disabled` (no `fit()` method) | `disabled` (same) |
+| Workspace `data-renderer-autofit` | `"off"` (no autofit setting) | `"unsupported"` (incorrect — should be `"active"`; workspace reactivity bug) |
+| Console errors | pre-existing CSP `style-src` baseline noise | same baseline noise (no new errors) |
+| Redaction sweep | clean | clean |
+
+**Result.** The renderer-neutral autofit implementation
+DOES make wterm reflow on a real container resize —
+the Gate-1 resize/fit caveat the 14j investigation
+opened is **substantively closed for wterm**, in the
+sense that an operator who opts into autofit gets
+genuine PTY reflow on container changes. The
+companion workspace diagnostic surface
+(`data-renderer-autofit` attribute, autofit-active
+Fit-button copy) has a separate Svelte 5 reactivity
+bug that needs its own fix slice; until that ships,
+the `autofit="active"` precondition the SMOKE.md
+"Resize / fit" autofit row pins is **structurally
+unverifiable** from the production shell, even though
+the underlying autofit IS working.
+
+**Promotion impact.** None. Same posture as
+2026-05-14i: wterm clearing the gate (clean mount +
+functional render) and now clearing the autofit-on
+resize/fit row are human-evaluator data points, NOT a
+Gate 1 pass. Gate 1 still requires the Gate-1
+reviewer to either accept the outstanding caveats or
+close them; autofit on wterm now belongs in the
+"closed" column for resize/fit, but the workspace
+diagnostic bug is a fresh `works with caveats` line
+to weigh. xterm remains the production compatibility
+baseline and the production default renderer; the
+experimental gate posture is unchanged. The
+implementation slice ships off by default — fresh
+users observe zero behaviour change.
+
+**Renderer-fair input + selector vocabulary.** No
+changes vs the 2026-05-14i runbook for wterm; the
+xterm helper textarea offscreen-positioning is a
+known xterm CSS posture (recorded under "Encountered
+Lessons" 2026-05-14), and the page-level
+`keyboard.press` workaround used here for xterm is
+documented in `apps/web/e2e/SMOKE.md` § "D" as the
+fallback for renderers whose helper textarea fails
+Playwright's visibility check.
+
+**Backend / web / target log redaction.** Bounded
+`docker logs --since 30m` over the smoke window:
+backend = 2 lines (1 known-FP `WARN missing session
+cookie` pre-smoke line); web/nginx = 77 lines
+(request log only, no payloads); target sshd = 41
+lines (linuxserver entrypoint chatter only; no auth
+lines on stdout). Sentinel sweep against
+`{private_key_openssh, encrypted_private_key,
+"BEGIN OPENSSH PRIVATE KEY", openssh-key-v1,
+passphrase, session_token, token_hash, data_b64,
+REDACT-MARKER, relayterm-wterm-autofit-baseline,
+relayterm-wterm-autofit-narrow,
+relayterm-wterm-autofit-return,
+relayterm-wterm-autofit-after-long-output,
+relayterm-wterm-autofit-xterm-recovery}` — **zero
+matches** across all three log streams.
+
+**Browser-side redaction sweep.** `document.cookie.length
+= 0` (auth cookie HttpOnly ✓). `localStorage` keys:
+exactly `relayterm.terminal-settings.v1` and
+`relayterm.terminal-settings.v2` (the v1 entry is
+preserved per the documented non-destructive
+migration). `sessionStorage` empty. Sentinel sweep
+of `document.documentElement.outerHTML` (excluding
+the production terminal viewport — the viewport
+legitimately contains command output during a live
+session) for the same 14-string list returned **zero
+matches**. The pre-existing `style-src` CSP
+inline-style console errors recorded in the
+2026-05-14c entry are still present (count grew from
+~6 to ~24 over the multi-session slice; same kind,
+documented baseline artifact, not autofit-specific).
+
+**Backend / DB.** No bounded SQL queries needed for
+this slice; every load-bearing observation is on the
+browser surface or the wire-level `stty size`
+output. The smoke produced two `terminal_sessions`
+rows (wterm IDs `a393697a-…` + `1cb58c71-…`) plus
+two more for the H xterm recovery (`7889e75a-…` +
+`551e6fe3-…`); each got the standard
+`created → attached → closed` event sequence from the
+`session_events` per-session telemetry contract.
+Per the schema's per-session-telemetry rule, none
+crossed into `audit_events`. Audit events created in
+the slice window: identity create (1), host create
+(1), profile create (1), host-key trust (1), profile
+operations (auth-check etc.); no audit-side payload
+leak per the 1 known-FP backend-log line.
+
+**Cleanup posture (deferred — pending operator
+approval).** See the matching cleanup section at
+slice-end. No cleanup has run yet.
+
+**Promotion decision.** wterm remains experimental
+and unpromoted; xterm remains the production
+compatibility baseline and the production default.
+Gate 1 / Gate 2 criteria under
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+§ "Promotion criteria" are unchanged. The renderer
+default flip is NOT recommended by this slice. The
+follow-on workspace-reactivity bug-fix slice
+(naming proposal **`fix(web): make renderer
+reactive for data-renderer-autofit`**) is the
+**only** code change called for by this resmoke.
+
+**Intentionally deferred (this slice owns none of
+these).** ghostty-web / restty real autofit
+implementations; restty `focusTarget()` and CSP /
+WebGPU viability; desktop-Tauri / Android-Tauri
+renderer smokes; performance / benchmark automation;
+renderer promotion or xterm-default flip; production
+CSP decisions; tmux/screen persistence; durable
+VT-snapshot persistence.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
