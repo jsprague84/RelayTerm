@@ -57,6 +57,8 @@
   import {
     buildAttachWsUrl,
     classifyReconnectAttempt,
+    computeFitButtonState,
+    computeRendererAutofitStatus,
     computeWorkspaceEnablement,
     derivePhase,
     describeWorkspaceError,
@@ -70,6 +72,7 @@
     safeFocus,
     TERMINAL_UX_COPY,
     unmarkRendererInputTarget,
+    type RendererAutofitStatus,
     type WorkspacePhase,
   } from "./terminalLaunch.js";
   import {
@@ -217,6 +220,15 @@
   let activeRendererFallback = $state<RendererLoadFallback | null>(null);
   let experimentalRendererGate = $state(false);
   /**
+   * Operator preference for renderer-neutral autofit (the
+   * {@link BaseTerminalRendererOptions.autofit} option). Read once per
+   * attach from {@link TerminalSettings.autofitEnabled} so a Settings
+   * change takes effect on the NEXT attach, same per-attach model as
+   * renderer selection. Drives the `data-renderer-autofit` taxonomy
+   * AND the Fit-button copy.
+   */
+  let autofitEnabled = $state(false);
+  /**
    * `true` once {@link markRendererInputTarget} has stamped the stable
    * `data-relayterm-terminal-input` marker on the mounted renderer's
    * keyboard-input element. Mirrored onto `data-renderer-input` so the
@@ -265,6 +277,34 @@
     computeWorkspaceEnablement({ phase, lastSeenSeq }),
   );
 
+  /**
+   * Renderer-neutral autofit status mirrored onto
+   * `data-renderer-autofit`. `off` when the operator did not enable
+   * autofit; `active` when enabled AND the mounted renderer wired it;
+   * `unsupported` when enabled but the mounted renderer no-ops it. The
+   * derivation re-runs on every relevant state edge (renderer mount /
+   * dispose, mount failure, Settings reload) because the underlying
+   * `autofitActive()` call is cheap and pure-boolean — the helper
+   * never reads payload bytes.
+   */
+  const autofitStatus = $derived<RendererAutofitStatus>(
+    computeRendererAutofitStatus({ autofitEnabled, renderer }),
+  );
+
+  /**
+   * Fit-button enablement + tooltip. Disabled when the workspace is not
+   * live, when autofit is keeping the grid sized (the one-shot button is
+   * redundant), or when the mounted renderer has no `fit()` method. The
+   * helper centralises the precedence; the component just consumes it.
+   */
+  const fitButton = $derived(
+    computeFitButtonState({
+      liveRenderer: enablement.fit,
+      renderer,
+      autofitActive: autofitStatus === "active",
+    }),
+  );
+
   function showsTtlHint(p: WorkspacePhase): boolean {
     return p === "detached" && !closedExplicitly;
   }
@@ -293,6 +333,7 @@
     // typed reason that surfaces on `data-renderer-fallback`.
     const settings = loadTerminalSettings();
     experimentalRendererGate = settings.experimentalRendererEvaluationEnabled;
+    autofitEnabled = settings.autofitEnabled;
     const requestedRenderer = effectiveRendererId(settings);
     const loadResult = await loadRenderer({
       id: requestedRenderer,
@@ -688,6 +729,7 @@
   data-renderer-fallback={activeRendererFallback ?? ""}
   data-renderer-gate={experimentalRendererGate ? "on" : "off"}
   data-renderer-input={rendererInputMarked ? "marked" : "none"}
+  data-renderer-autofit={autofitStatus}
 >
   <header class="flex flex-wrap items-baseline justify-between gap-3">
     <div class="flex flex-col gap-0.5">
@@ -732,9 +774,10 @@
       type="button"
       class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
       onclick={fitClicked}
-      disabled={!enablement.fit}
+      disabled={!fitButton.enabled}
       data-testid="production-terminal-fit"
-      title="Refit the terminal to the container; backend PTY resizes via the renderer's onResize signal"
+      title={fitButton.tooltip ??
+        "Refit the terminal to the container; backend PTY resizes via the renderer's onResize signal"}
     >
       Fit
     </button>

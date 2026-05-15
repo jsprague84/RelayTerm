@@ -65,6 +65,21 @@ export class XtermRenderer implements TerminalRenderer {
   #onResizeDispose: { dispose(): void } | null = null;
   #pendingWrites: RendererOutput[] = [];
   #disposed = false;
+  /**
+   * Live `ResizeObserver` when the neutral `autofit` option is true and
+   * the renderer is mounted. `null` otherwise (pre-mount, autofit-off,
+   * post-dispose, or when the environment has no `ResizeObserver`).
+   * Owned exclusively by this adapter — `terminal-core` and the
+   * production shell stay renderer-neutral and never reach for it.
+   */
+  #autofitObserver: ResizeObserver | null = null;
+  /**
+   * Active rAF token used to coalesce a burst of `ResizeObserver`
+   * callbacks into a single `FitAddon.fit()` call. `null` when no rAF
+   * is queued. Cleared on dispose so a late callback that survives
+   * `disconnect()` does not call into a torn-down `FitAddon`.
+   */
+  #pendingFitFrame: number | null = null;
 
   constructor(options: XtermRendererOptions = {}) {
     this.#options = options;
@@ -105,6 +120,20 @@ export class XtermRenderer implements TerminalRenderer {
         term.write(chunk);
       }
     }
+
+    // Renderer-neutral autofit (`BaseTerminalRendererOptions.autofit`).
+    // When enabled, install a `ResizeObserver` on the mount element and
+    // re-run `FitAddon.fit()` on each container change. The fit fans
+    // out through xterm's `onResize` synchronously, which the existing
+    // single subscriber translates into the wire `resize` frame — no
+    // new event channel. Coalesce with `requestAnimationFrame` so a
+    // burst of observer callbacks during a drag does not thrash the
+    // atlas. When the browser/runtime has no `ResizeObserver`
+    // (test harness without the shim, ancient browser), the option
+    // silently no-ops; `autofitActive()` reports the truth.
+    if (this.#options.autofit === true) {
+      this.#installAutofitObserver(element);
+    }
   }
 
   write(data: RendererOutput): void {
@@ -141,6 +170,20 @@ export class XtermRenderer implements TerminalRenderer {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    // Tear down the autofit observer FIRST. A late observer callback
+    // that survives `disconnect()` would otherwise race the FitAddon
+    // teardown a few lines below; clearing both the observer and the
+    // pending rAF token here guarantees no fit fires post-dispose.
+    if (this.#autofitObserver !== null) {
+      this.#autofitObserver.disconnect();
+      this.#autofitObserver = null;
+    }
+    if (this.#pendingFitFrame !== null) {
+      const cancel = (globalThis as { cancelAnimationFrame?: (id: number) => void })
+        .cancelAnimationFrame;
+      if (typeof cancel === "function") cancel(this.#pendingFitFrame);
+      this.#pendingFitFrame = null;
+    }
     this.#onDataDispose?.dispose();
     this.#onResizeDispose?.dispose();
     this.#onDataDispose = null;
@@ -191,6 +234,67 @@ export class XtermRenderer implements TerminalRenderer {
    */
   clear(): void {
     this.#terminal?.clear();
+  }
+
+  /**
+   * Report whether the renderer-neutral
+   * `BaseTerminalRendererOptions.autofit` capability is genuinely wired
+   * right now. `true` only while a live `ResizeObserver` + `FitAddon`
+   * pair is observing the mount container. `false` pre-mount, after
+   * dispose, when autofit was not requested, or in an environment
+   * without `ResizeObserver`. Diagnostic-only — never reads or carries
+   * payload bytes; fitting changes still flow through `onResize`.
+   */
+  autofitActive(): boolean {
+    return this.#autofitObserver !== null;
+  }
+
+  #installAutofitObserver(element: HTMLElement): void {
+    const Ctor = (
+      globalThis as { ResizeObserver?: typeof ResizeObserver }
+    ).ResizeObserver;
+    if (typeof Ctor !== "function") {
+      // No-op silently: the option is renderer-neutral intent; an
+      // environment that cannot honour it is the same shape as a
+      // renderer that no-ops autofit (ghostty-web / restty today).
+      return;
+    }
+    const observer = new Ctor(() => {
+      // The renderer was disposed between an observer queue-up and the
+      // callback firing — bail without touching the addon.
+      if (this.#disposed) return;
+      this.#scheduleFit();
+    });
+    observer.observe(element);
+    this.#autofitObserver = observer;
+  }
+
+  #scheduleFit(): void {
+    if (this.#pendingFitFrame !== null) return;
+    const raf = (globalThis as { requestAnimationFrame?: (cb: () => void) => number })
+      .requestAnimationFrame;
+    const runFit = () => {
+      this.#pendingFitFrame = null;
+      if (this.#disposed) return;
+      const fit = this.#fitAddon;
+      if (fit === null) return;
+      try {
+        fit.fit();
+      } catch {
+        // FitAddon.fit() can throw if the host element was detached
+        // mid-resize — swallow to keep the redaction posture (no
+        // payload bytes can surface) and to avoid escalating a
+        // best-effort fit into a workspace error.
+      }
+    };
+    if (typeof raf === "function") {
+      this.#pendingFitFrame = raf(runFit);
+    } else {
+      // Fallback for environments without rAF: defer one microtask so
+      // a burst of observer callbacks still coalesces.
+      this.#pendingFitFrame = 0;
+      queueMicrotask(runFit);
+    }
   }
 
   #fanoutInput(data: RendererInput): void {

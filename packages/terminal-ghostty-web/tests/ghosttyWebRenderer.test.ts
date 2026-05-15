@@ -227,6 +227,15 @@ describe("toGhosttyOptions / toGhosttyTheme", () => {
     expect(toGhosttyOptions({ lineHeight: 1.4 })).toEqual({});
   });
 
+  it("silently drops the renderer-neutral autofit option (no analogue today)", () => {
+    // ghostty-web has no container-fit / ResizeObserver path; the
+    // renderer-neutral `autofit` option is accepted on the public
+    // surface for cross-renderer parity and dropped here so it does
+    // not leak into the underlying `ITerminalOptions` blob.
+    expect(toGhosttyOptions({ autofit: true })).toEqual({});
+    expect(toGhosttyOptions({ autofit: false })).toEqual({});
+  });
+
   it("forwards a full ANSI palette via toGhosttyTheme", () => {
     const theme = toGhosttyTheme({
       background: "#000",
@@ -547,6 +556,32 @@ describe("GhosttyWebRenderer redaction rule", () => {
     if (captured instanceof Error) {
       expect(captured.message).not.toContain(SECRET_INPUT);
     }
+  });
+});
+
+describe("GhosttyWebRenderer autofit (accept-and-drop)", () => {
+  it("accepts autofit:true without failure", async () => {
+    const renderer = new GhosttyWebRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    // Pre-mount/post-mount construction succeeds; the option does NOT
+    // throw and does NOT reach the underlying constructor blob.
+    const term = FakeTerminal.instances[0]!;
+    expect(JSON.stringify(term.options)).not.toContain("autofit");
+  });
+
+  it("autofitActive() reports false honestly (unsupported)", async () => {
+    const renderer = new GhosttyWebRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    // ghostty-web has no real container-fit path; the workspace mirrors
+    // this onto `data-renderer-autofit="unsupported"` so an operator sees
+    // honest copy in Settings.
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofitActive() is false when autofit:false (consistent with unsupported)", async () => {
+    const renderer = new GhosttyWebRenderer({ autofit: false });
+    await renderer.mount(stubElement);
+    expect(renderer.autofitActive?.()).toBe(false);
   });
 });
 

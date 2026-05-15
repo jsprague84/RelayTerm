@@ -89,4 +89,22 @@ export interface BaseTerminalRendererOptions {
   /** Visible scrollback in lines. */
   scrollbackLines?: number;
   theme?: RendererTheme;
+  /**
+   * Keep the cell grid fitted to the mount container: observe the
+   * container and re-fit on resize, emitting `onResize` on each change.
+   * Renderer-NEUTRAL intent, not a mechanism — each adapter honours it
+   * with its own container-observation path (xterm: ResizeObserver +
+   * FitAddon; wterm: WTerm.autoResize). A renderer with no container-fit
+   * path accepts the field and silently drops it, exactly like the
+   * cosmetic knobs it cannot honour. Default `false`: the caller drives
+   * sizing explicitly via `resize()`.
+   *
+   * Honoured at mount/construct time per adapter — not a post-mount
+   * runtime toggle. A renderer-id or autofit change takes effect on the
+   * next attach, the same per-attach model the production shell already
+   * uses for renderer selection and cosmetic settings. Fitting changes
+   * still flow through the existing `onResize` seam — no new event
+   * channel.
+   */
+  autofit?: boolean;
 }

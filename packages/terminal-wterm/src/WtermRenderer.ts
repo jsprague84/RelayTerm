@@ -150,6 +150,15 @@ export class WtermRenderer implements TerminalRenderer {
   #pendingResize: RendererResize | null = null;
   #disposed = false;
   #mountStarted = false;
+  /**
+   * Resolved value of `WTermOptions.autoResize` for the live mount, set
+   * AFTER `init()` resolved and the adapter adopted the `WTerm`
+   * instance. `false` pre-mount, `false` after dispose / failed init /
+   * dispose-during-init. Drives `autofitActive()`. Captured at
+   * construction time rather than re-read from the WTerm because the
+   * underlying instance does not expose it on its public surface.
+   */
+  #resolvedAutoResize = false;
 
   constructor(options: WtermRendererCtorOptions = {}) {
     const { cols, rows, ...rest } = options;
@@ -215,6 +224,7 @@ export class WtermRenderer implements TerminalRenderer {
     }
 
     this.#wterm = wterm;
+    this.#resolvedAutoResize = mapped.autoResize;
 
     if (this.#pendingResize !== null) {
       const { cols, rows } = this.#pendingResize;
@@ -289,6 +299,7 @@ export class WtermRenderer implements TerminalRenderer {
     // makes our own `dispose()` idempotent independently of wterm.
     this.#wterm?.destroy();
     this.#wterm = null;
+    this.#resolvedAutoResize = false;
     this.#pendingWrites.length = 0;
     this.#pendingResize = null;
     this.#inputListeners.clear();
@@ -307,6 +318,20 @@ export class WtermRenderer implements TerminalRenderer {
     return () => {
       this.#resizeListeners.delete(cb);
     };
+  }
+
+  /**
+   * Report whether the renderer-neutral
+   * `BaseTerminalRendererOptions.autofit` capability is genuinely wired
+   * right now. wterm's autofit IS its `autoResize` `ResizeObserver`
+   * (set up in `WTerm.init()` from the resolved `autoResize` flag).
+   * `true` post-mount when the resolved value was true; `false`
+   * pre-mount, after dispose, on a failed init, and when autofit was
+   * not requested. Diagnostic-only — never reads or carries payload
+   * bytes; fitting changes still flow through `onResize`.
+   */
+  autofitActive(): boolean {
+    return this.#wterm !== null && this.#resolvedAutoResize;
   }
 
   #fanoutInput(data: RendererInput): void {

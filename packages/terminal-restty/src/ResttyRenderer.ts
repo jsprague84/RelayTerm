@@ -190,6 +190,19 @@ export class ResttyRenderer implements TerminalRenderer {
     this.#terminal?.resize(cols, rows);
   }
 
+  /**
+   * Report whether the renderer-neutral
+   * `BaseTerminalRendererOptions.autofit` capability is genuinely wired.
+   * restty's xterm-compat shim has no public container-fit /
+   * `ResizeObserver` path today, so this adapter accepts the option
+   * (for cross-renderer parity) and returns `false` honestly. Combined
+   * with restty's independent CSP / WebGPU viability gating, autofit is
+   * moot here until that viability decision lands.
+   */
+  autofitActive(): boolean {
+    return false;
+  }
+
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;

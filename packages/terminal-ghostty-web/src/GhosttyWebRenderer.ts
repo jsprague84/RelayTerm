@@ -225,6 +225,25 @@ export class GhosttyWebRenderer implements TerminalRenderer {
     this.#terminal?.resize(cols, rows);
   }
 
+  /**
+   * Report whether the renderer-neutral
+   * `BaseTerminalRendererOptions.autofit` capability is genuinely wired.
+   * ghostty-web has no container-fit / `ResizeObserver` path on its
+   * public surface today, so this adapter accepts the option (for
+   * cross-renderer parity at the call site) and returns `false`
+   * honestly. The workspace mirrors the value onto
+   * `data-renderer-autofit="unsupported"` when the operator enabled
+   * autofit and `"off"` otherwise — operator-facing taxonomy only;
+   * never carries payload bytes.
+   *
+   * Revisited when / if ghostty-web grows a container-observation path
+   * upstream; until then the unsupported-but-accepted shape matches the
+   * cosmetic-knob drop pattern this adapter already follows.
+   */
+  autofitActive(): boolean {
+    return false;
+  }
+
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;

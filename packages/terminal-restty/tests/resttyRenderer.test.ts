@@ -129,6 +129,15 @@ describe("toResttyOptions", () => {
     ).toEqual({});
   });
 
+  it("silently drops the renderer-neutral autofit option (no analogue today)", () => {
+    // restty's xterm-compat shim has no public container-fit /
+    // ResizeObserver path. The renderer-neutral `autofit` option is
+    // accepted on the public surface for cross-renderer parity and
+    // dropped here so it does not leak into the underlying options blob.
+    expect(toResttyOptions({ autofit: true })).toEqual({});
+    expect(toResttyOptions({ autofit: false })).toEqual({});
+  });
+
   it("`resttyOnly` escape hatch overrides initial grid keys", () => {
     expect(
       toResttyOptions(
@@ -355,6 +364,31 @@ describe("ResttyRenderer redaction rule", () => {
     await renderer.mount(stubElement);
     const term = FakeTerminal.instances[0]!;
     expect(JSON.stringify(term.options)).not.toContain(SECRET_INPUT);
+  });
+});
+
+describe("ResttyRenderer autofit (accept-and-drop)", () => {
+  it("accepts autofit:true without failure", async () => {
+    const renderer = new ResttyRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    // The option does NOT throw and does NOT reach the underlying
+    // options blob.
+    const term = FakeTerminal.instances[0]!;
+    expect(JSON.stringify(term.options)).not.toContain("autofit");
+  });
+
+  it("autofitActive() reports false honestly (unsupported under restty today)", async () => {
+    const renderer = new ResttyRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    // restty has no public container-fit path on its xterm-compat shim;
+    // the workspace mirrors this onto `data-renderer-autofit="unsupported"`.
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofitActive() is false when autofit:false (consistent with unsupported)", async () => {
+    const renderer = new ResttyRenderer({ autofit: false });
+    await renderer.mount(stubElement);
+    expect(renderer.autofitActive?.()).toBe(false);
   });
 });
 

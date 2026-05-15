@@ -13,9 +13,13 @@
 
 ## 1. Status / decision summary
 
-- **Status:** design only — no code in this slice. The implementation
-  is the named follow-on slice `feat/renderer-neutral-autofit`
-  (§ 14).
+- **Status:** design landed 2026-05-14 (`d5ceb55 docs(design): define
+  renderer-neutral autofit`). Implementation landed 2026-05-15 in
+  `feat/renderer-neutral-autofit` (§ 14). This document remains the
+  design source of truth; the per-adapter implemented contract is also
+  mirrored into [`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+  § "Implementation status (since 2026-05-15…)" and the matching ghostty-web
+  / restty sections.
 - **Not a renderer promotion.** No adapter is promoted by this doc.
   Gate 1 / Gate 2 in
   [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)

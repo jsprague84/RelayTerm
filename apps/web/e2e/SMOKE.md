@@ -165,9 +165,10 @@ update this file in the same change.
 | `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed` / `adapter_mount_failed`. The first three are produced by `rendererLoader.ts`'s synchronous paths (gate, unknown id, dynamic-import / constructor failure) AND fall back to xterm with `data-renderer="xterm"`. `adapter_mount_failed` is produced by `ProductionTerminal.svelte`'s `mountRendererSafely` call when the renderer's asynchronous `mount(target)` rejects (e.g., CSP-blocked WASM init); the workspace stays `data-renderer="unmounted"` and surfaces the operator-facing copy `Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.` in `production-terminal-error`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
 | `data-renderer-gate` (attribute on `production-terminal`) | `"on"` when the operator's experimental-renderer-evaluation gate is enabled in Settings, `"off"` otherwise. Independent of which renderer ended up mounted. |
 | `data-renderer-input` (attribute on `production-terminal`) | `"marked"` once the workspace has stamped the renderer-neutral input marker on the mounted renderer's keyboard-input element, `"none"` otherwise (renderer not mounted, mount failed, or the renderer does not implement the optional `focusTarget()` method — restty today). A renderer-evaluation smoke checks this is `"marked"` before relying on `[data-relayterm-terminal-input]` for Path A / Path C input. |
+| `data-renderer-autofit` (attribute on `production-terminal`) | Closed-vocabulary diagnostic for the renderer-neutral autofit capability ([`docs/renderer-neutral-autofit.md`](../../docs/renderer-neutral-autofit.md)): `"off"` when the operator did not enable autofit in Settings (default for fresh users); `"active"` when autofit is enabled AND the mounted renderer wired it (`TerminalRenderer.autofitActive() === true` — xterm with its `ResizeObserver` + `FitAddon`, or wterm with its `WTerm.autoResize`); `"unsupported"` when autofit is enabled but the renderer no-ops it (`autofitActive()` is `false` / throws / the method is omitted, OR no renderer is mounted — ghostty-web / restty today). A renderer-evaluation matrix row that tests resize/fit MUST quote this attribute as proof of the autofit posture; a `"unsupported"` value is documented adapter behaviour for the experimental renderers without a container-fit path, not a regression. The companion staging resmoke (`docs/wterm-fit-reflow-resmoke`) precondition is `data-renderer-autofit="active"` for the wterm matrix row. |
 | `[data-relayterm-terminal-input]` (attribute on a renderer-owned element) | Renderer-neutral marker on the element that actually receives keyboard input — xterm's hidden helper `<textarea>`, ghostty-web's contenteditable host element (which is also `production-terminal-viewport`; the marker is a dedicated attribute so it coexists rather than clobbers the testid), or wterm's hidden keyboard `<textarea>`. This is the single stable selector a smoke focuses + verifies (`document.activeElement`) for renderer-fair Path A / Path C input — see section D "Renderer-fair input". Stamped only after a successful mount; absent on the mount-failure path. |
 | `[data-testid="production-terminal-focus"]`       | "Focus terminal" button (moves keyboard focus into the renderer via the renderer-neutral `focus()` method; enabled while live). Clicking it focuses `[data-relayterm-terminal-input]` for every renderer. |
-| `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). |
+| `[data-testid="production-terminal-fit"]`         | "Fit" button (refits the renderer to its container; the renderer's `onResize` listener drives the wire `resize` frame — the button does NOT call `client.sendResize`). Two new disabled states as of 2026-05-15 (`feat/renderer-neutral-autofit`): disabled with `title="Autofit is keeping the terminal sized to its container."` when `data-renderer-autofit="active"` (the one-shot button is redundant); disabled with `title="Fit is not supported by the current renderer."` when the mounted renderer exposes no `fit()` method (ghostty-web, restty, wterm today). The closed-vocabulary tooltips are pinned by `apps/web/tests/terminalLaunch.test.ts`. |
 | `[data-testid="production-terminal-clear"]`       | "Clear local viewport" button (renderer-only; never sends a wire frame, never mutates backend replay buffer, never asks the remote shell to run `clear`). |
 | `[data-testid="production-terminal-settings-note"]` | Inline workspace note: "Appearance settings apply to new terminal sessions." (sourced from `TERMINAL_UX_COPY`). |
 | `[data-testid="production-terminal-copy-paste-note"]` | Inline workspace note: browser-shortcut copy/paste guidance with bracketed-paste / OSC 52 flagged as future work (sourced from `TERMINAL_UX_COPY`). |
@@ -1561,15 +1562,37 @@ list below covers every smoke-run echo).
 
    Renderer-fairness note: `fit()` is an xterm-specific capability —
    the production "Fit" control routes through `safeFit()`, which
-   probes for it at runtime and is a clean no-op on a renderer that
-   does not expose it (ghostty-web today — see
+   probes for it at runtime. As of 2026-05-15
+   (`feat/renderer-neutral-autofit`) the workspace's
+   `computeFitButtonState` helper **disables** the Fit button with the
+   closed copy `"Fit is not supported by the current renderer."` when
+   the mounted renderer exposes no `fit()` method (ghostty-web, restty,
+   wterm today). Do **not** click the disabled button; note the
+   disabled state + tooltip text as **documented adapter behavior** —
+   record it as `works with caveats`, not `fail`. A `fail` is reserved
+   for a renderer that *claims* fit/resize and gets it wrong. See
    [`docs/spec/terminal-adapters.md`](../../docs/spec/terminal-adapters.md)
-   § "Production-shell evaluation status and resize/fit caveat"). On
-   such a renderer `stty size` staying unchanged after a viewport
-   resize + Fit click is **documented adapter behavior** — record it
-   as `works with caveats`, not `fail`, and capture the no-op plus any
-   non-reflow behavior in the smoke entry. A `fail` is reserved for a
-   renderer that *claims* fit/resize and gets it wrong.
+   § "Production-shell evaluation status and resize/fit caveat" and
+   [`docs/renderer-neutral-autofit.md`](../../docs/renderer-neutral-autofit.md)
+   § 9 for the precedence rules.
+
+   **Autofit precondition (added 2026-05-15,
+   `feat/renderer-neutral-autofit`).** The renderer-neutral autofit
+   capability ships **off by default**, so a default-Settings smoke
+   continues to observe the xterm-only Fit semantics above. For a
+   resmoke that wants to prove a renderer reflows under a narrowed
+   container (the deferred `docs/wterm-fit-reflow-resmoke` slice in
+   particular), the operator must first enable
+   `[data-testid="settings-autofit-enabled"]` in Settings, reopen the
+   session, AND verify the workspace carries
+   `data-renderer-autofit="active"` before doing the
+   resize-and-stty-size check. A `data-renderer-autofit="unsupported"`
+   value records that the mounted renderer no-ops autofit honestly
+   (ghostty-web, restty today) — record as `works with caveats`, not
+   `fail`. The Fit button is intentionally disabled with the closed
+   copy "Autofit is keeping the terminal sized to its container." when
+   `autofitActive()` is true; an enabled Fit button on
+   `data-renderer-autofit="active"` would be a regression.
 
 3. **Long output — Path A.**
 

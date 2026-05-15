@@ -543,6 +543,161 @@ export function unmarkRendererInputTarget(renderer: unknown): void {
 }
 
 /**
+ * Closed taxonomy mirrored onto `data-renderer-autofit` on the
+ * production terminal section. Reflects the operator's preference AND
+ * the mounted renderer's honest capability — see § 9 of
+ * `docs/renderer-neutral-autofit.md`.
+ *
+ *  - `off`         — operator did not enable autofit; the renderer is
+ *                    not being container-fit. The default for fresh
+ *                    users.
+ *  - `active`      — autofit enabled AND the mounted renderer wired it
+ *                    (`autofitActive() === true`).
+ *  - `unsupported` — autofit enabled BUT the mounted renderer no-ops
+ *                    it (`autofitActive()` is `false`, throws, the
+ *                    method is omitted, or no renderer is mounted).
+ *
+ * Diagnostic taxonomy only — never carries payload bytes. The workspace
+ * exposes the value so a renderer-evaluation smoke can prove autofit is
+ * actually wired for a given renderer without visual guessing.
+ */
+export type RendererAutofitStatus = "off" | "active" | "unsupported";
+
+export interface RendererAutofitStatusInput {
+  /** Operator preference from `TerminalSettings.autofitEnabled`. */
+  autofitEnabled: boolean;
+  /**
+   * Mounted renderer (or `null` pre-mount / post-mount-failure). Typed
+   * as `unknown` so the helper duck-types the optional `autofitActive()`
+   * method on the renderer-neutral interface — a renderer that omits
+   * the method maps to `unsupported`.
+   */
+  renderer: unknown;
+}
+
+/**
+ * Compute the closed `data-renderer-autofit` value for a workspace.
+ *
+ * Redaction posture: this helper inspects exactly one boolean
+ * (`autofitEnabled`) and one optional method (`autofitActive()`) on the
+ * renderer. It NEVER reads renderer DOM, NEVER touches input/output
+ * bytes, and NEVER logs. A throwing `autofitActive()` (a renderer mid-
+ * dispose) is swallowed to `unsupported` — the right diagnostic shape
+ * for a renderer the workspace cannot honestly call "active".
+ */
+export function computeRendererAutofitStatus(
+  input: RendererAutofitStatusInput,
+): RendererAutofitStatus {
+  if (!input.autofitEnabled) return "off";
+  const renderer = input.renderer;
+  if (renderer === null || typeof renderer !== "object") return "unsupported";
+  const probe = (renderer as { autofitActive?: unknown }).autofitActive;
+  if (typeof probe !== "function") return "unsupported";
+  try {
+    return (probe as () => boolean).call(renderer) === true
+      ? "active"
+      : "unsupported";
+  } catch {
+    return "unsupported";
+  }
+}
+
+/**
+ * Operator-facing copy rendered as the title attribute on the
+ * disabled-because-autofit-is-active Fit button. The string is closed
+ * vocabulary — no session ids, no error messages, no renderer-internal
+ * state. § 9 of `docs/renderer-neutral-autofit.md` pins the wording.
+ */
+export const FIT_BUTTON_AUTOFIT_ACTIVE_TOOLTIP =
+  "Autofit is keeping the terminal sized to its container.";
+
+/**
+ * Operator-facing copy rendered as the title attribute on the
+ * disabled-because-renderer-does-not-support-fit Fit button. Closed
+ * vocabulary; pins the "honest about what the button does" rule from
+ * § 9 of `docs/renderer-neutral-autofit.md`.
+ */
+export const FIT_BUTTON_RENDERER_UNSUPPORTED_TOOLTIP =
+  "Fit is not supported by the current renderer.";
+
+export interface FitButtonStateInput {
+  /**
+   * `true` when the workspace is in a live phase (attached / replaying)
+   * AND the renderer is mounted. The production component derives this
+   * from {@link computeWorkspaceEnablement}'s `fit` predicate.
+   */
+  liveRenderer: boolean;
+  /**
+   * Mounted renderer (or `null`). Typed `unknown` so the helper
+   * duck-types the optional `fit()` method (xterm exposes it; the
+   * experimental adapters do not). Used only to probe the method's
+   * presence — never invoked here.
+   */
+  renderer: unknown;
+  /**
+   * `true` when the renderer has reported live autofit
+   * (`autofitActive() === true`).
+   */
+  autofitActive: boolean;
+}
+
+export interface FitButtonState {
+  /** `true` exactly when the operator can usefully click Fit. */
+  enabled: boolean;
+  /**
+   * Closed-vocabulary tooltip explaining a disabled state. `undefined`
+   * for the enabled path AND for the "not-live" path — the disabled-
+   * because-not-live case relies on the same generic disable affordance
+   * the other workspace buttons use; only the autofit-active and
+   * renderer-unsupported cases get a dedicated explanation string.
+   */
+  tooltip: string | undefined;
+}
+
+/**
+ * Compute Fit-button enablement and copy. The button stays a best-
+ * effort one-shot refit via the existing `safeFit()` (the xterm-only
+ * `fit()`); this helper makes it HONEST about what it does — informed
+ * by `autofitActive()` and the renderer's capability surface.
+ *
+ * Precedence (deliberate):
+ *  1. Workspace not live → disabled, no special tooltip (the generic
+ *     "fit is only meaningful while attached" affordance covers this).
+ *  2. Autofit is active → disabled with the autofit-active tooltip. A
+ *     renderer that is continuously fitting its container makes the
+ *     one-shot button redundant; surfacing the autofit reason is more
+ *     helpful than the missing-`fit()` one even when both predicates
+ *     fire (some future renderer might be in this exact shape).
+ *  3. Renderer has no `fit()` → disabled with the renderer-unsupported
+ *     tooltip. The dev lab already exposes adapter-specific affordances
+ *     for the experimental renderers; the production button is honest
+ *     about its xterm-shaped one-shot nature.
+ *  4. Otherwise → enabled, no tooltip.
+ */
+export function computeFitButtonState(
+  input: FitButtonStateInput,
+): FitButtonState {
+  if (!input.liveRenderer) {
+    return { enabled: false, tooltip: undefined };
+  }
+  if (input.autofitActive) {
+    return { enabled: false, tooltip: FIT_BUTTON_AUTOFIT_ACTIVE_TOOLTIP };
+  }
+  const renderer = input.renderer;
+  const hasFit =
+    renderer !== null &&
+    typeof renderer === "object" &&
+    typeof (renderer as { fit?: unknown }).fit === "function";
+  if (!hasFit) {
+    return {
+      enabled: false,
+      tooltip: FIT_BUTTON_RENDERER_UNSUPPORTED_TOOLTIP,
+    };
+  }
+  return { enabled: true, tooltip: undefined };
+}
+
+/**
  * Stable UX-copy strings rendered by the production terminal workspace.
  * Centralised so the redaction sentinel test can pin them as wire-noise
  * free, and so a SPEC drift trips a unit test rather than a manual

@@ -136,6 +136,14 @@
     markDirty();
   }
 
+  function onAutofitChange(event: Event) {
+    draft = {
+      ...draft,
+      autofitEnabled: (event.target as HTMLInputElement).checked,
+    };
+    markDirty();
+  }
+
   function onThemeChange(event: Event) {
     const value = (event.target as HTMLSelectElement).value;
     draft = {
@@ -316,6 +324,30 @@
           />
           <span class="text-xs text-zinc-400">
             Blink the cursor when the terminal has focus.
+          </span>
+        </span>
+      </label>
+
+      <label class="flex flex-col gap-1 text-sm text-zinc-200 md:col-span-2">
+        <span class="text-xs uppercase tracking-wide text-zinc-400">
+          Fit terminal to its container
+        </span>
+        <span class="flex items-center gap-2 pt-1">
+          <input
+            type="checkbox"
+            class="size-4 accent-emerald-600"
+            checked={draft.autofitEnabled}
+            onchange={onAutofitChange}
+            data-testid="settings-autofit-enabled"
+          />
+          <span class="text-xs text-zinc-400">
+            Supported renderers keep the terminal sized to the workspace
+            container as it resizes. Unsupported experimental renderers
+            (ghostty-web, restty today) may ignore this setting; the
+            terminal workspace surfaces an honest <code class="font-mono"
+              >data-renderer-autofit</code
+            >
+            diagnostic when this happens.
           </span>
         </span>
       </label>

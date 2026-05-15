@@ -69,4 +69,17 @@ export interface TerminalRenderer {
    * missing implementation as "the caller drives resize."
    */
   onResize?(cb: (size: { cols: number; rows: number }) => void): Unsubscribe;
+  /**
+   * Optional: report whether autofit
+   * (`BaseTerminalRendererOptions.autofit`) is genuinely wired for this
+   * mounted renderer. `true` only when a real container-observing fit is
+   * active; `false` before mount, after dispose, when autofit was not
+   * requested, or for a renderer that accepts the option but no-ops it.
+   * A renderer that omits this method is treated as "autofit
+   * unsupported".
+   *
+   * Diagnostic-only — like `focusTarget()`, it never reads or carries
+   * payload bytes. Fitting changes still flow through `onResize`.
+   */
+  autofitActive?(): boolean;
 }

@@ -127,12 +127,25 @@ export function toWtermOptions(
   initialGrid: WtermInitialGrid = {},
 ): MappedWtermOptions {
   const wtermOnly = opts.wtermOnly ?? {};
-  const mapped: MappedWtermOptions = {
-    // Default `autoResize` to false — see file header. Caller can
-    // explicitly opt into wterm's ResizeObserver-driven autofit via
-    // `wtermOnly.autoResize: true`.
-    autoResize: wtermOnly.autoResize ?? false,
-  };
+  // Resolve `autoResize` with three layers of precedence (mount-time,
+  // not runtime — wterm's autoResize is decided in `init()`):
+  //
+  //   1. `wtermOnly.autoResize` — explicit non-portable escape hatch;
+  //      wins when set so a caller who reaches for the raw knob is not
+  //      silently overridden by the portable setting.
+  //   2. `opts.autofit` — the renderer-neutral
+  //      `BaseTerminalRendererOptions.autofit` (mount-time, declarative
+  //      "keep me fitted to my container"). Honoured when the explicit
+  //      hatch is absent.
+  //   3. Adapter default `false` — matches the
+  //      `XtermRenderer` / `GhosttyWebRenderer` / `ResttyRenderer`
+  //      "caller drives sizing" parity, so a renderer-id switch from
+  //      one of those to wterm does not silently change behaviour.
+  const autoResize =
+    wtermOnly.autoResize !== undefined
+      ? wtermOnly.autoResize
+      : (opts.autofit ?? false);
+  const mapped: MappedWtermOptions = { autoResize };
   if (initialGrid.cols !== undefined) mapped.cols = initialGrid.cols;
   if (initialGrid.rows !== undefined) mapped.rows = initialGrid.rows;
   if (opts.cursorBlink !== undefined) mapped.cursorBlink = opts.cursorBlink;

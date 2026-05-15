@@ -1155,6 +1155,35 @@ local-only Settings toggle and a `data-renderer-autofit`
 diagnostic. Implementation is the named follow-on slice
 `feat/renderer-neutral-autofit`.
 
+**Implementation slice landed (2026-05-15,
+`feat/renderer-neutral-autofit`).** The capability now
+exists in code. `BaseTerminalRendererOptions.autofit?:
+boolean` and `TerminalRenderer.autofitActive?(): boolean`
+ship on `@relayterm/terminal-core`; `XtermRenderer`
+wires its own `ResizeObserver` + `FitAddon` behind
+`autofit`; `WtermRenderer` maps `autofit` →
+`WTerm.autoResize` (with `wtermOnly.autoResize`
+precedence preserved); `GhosttyWebRenderer` /
+`ResttyRenderer` accept-and-no-op the option, returning
+`autofitActive()` as `false` honestly. `TerminalSettings`
+gains `autofitEnabled` (default `false`, v1→v2 storage
+migration), `SettingsView` exposes a "Fit terminal to its
+container" checkbox with honest copy, and
+`ProductionTerminal.svelte` mirrors the resolved state
+onto `data-renderer-autofit ∈ {off, active, unsupported}`.
+The production "Fit" button stays a best-effort one-shot
+refit, but reads `autofitActive()` for its enablement /
+copy via `computeFitButtonState`. The implementation
+ships **off by default** so fresh users see zero
+behaviour change; xterm's fixed-grid + manual-Fit
+posture is untouched on the default path. **No** renderer
+promotion, **no** xterm-default flip, **no** backend /
+protocol / session / orchestrator change, **no** CSP /
+CI / deploy change. The staging resmoke
+(`docs/wterm-fit-reflow-resmoke`) — re-running the wterm
+production-shell matrix with autofit enabled — is a
+separate deliberate slice and has not yet run.
+
 **Promotion posture unchanged.** wterm remains
 experimental and unpromoted; xterm remains the
 production compatibility baseline and the default

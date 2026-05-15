@@ -130,15 +130,25 @@ export const DEFAULT_CURSOR_STYLE: RendererCursorStyle = "block";
 export const DEFAULT_CURSOR_BLINK = true;
 
 /**
- * Persisted shape (v1). Adding a field is a breaking change relative to
- * existing localStorage entries — bump the storage key (e.g.
- * `relayterm.terminal-settings.v2`) and migrate from the v1 read path.
+ * Persisted shape (v2). Adding a field is a breaking change relative to
+ * existing localStorage entries — the storage key is bumped on schema
+ * additions and the legacy key is migrated through
+ * {@link LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS}.
  *
  * The struct intentionally stores the theme PRESET ID rather than the
  * full {@link RendererTheme}. This keeps presets editable in code (a
  * preset tweak is picked up by every saved entry) and makes the saved
  * footprint small. Custom palettes (per-color overrides) are explicit
  * future work; landing them safely will need a new schema version.
+ *
+ * Schema history:
+ *  - v1 (`relayterm.terminal-settings.v1`) — initial nine fields.
+ *  - v2 (`relayterm.terminal-settings.v2`) — adds {@link autofitEnabled}
+ *    so the renderer-neutral `BaseTerminalRendererOptions.autofit`
+ *    capability can be toggled per-browser. Migration is non-destructive:
+ *    a v1 entry is read on first load when no v2 entry exists, the
+ *    missing `autofitEnabled` defaults to `false` (renderer-neutral
+ *    autofit ships OFF by default), and the next save writes v2.
  */
 export interface TerminalSettings {
   fontFamily: string;
@@ -164,9 +174,38 @@ export interface TerminalSettings {
    * unlocks the experimental adapters.
    */
   experimentalRendererEvaluationEnabled: boolean;
+  /**
+   * Operator opt-in for the renderer-neutral
+   * {@link BaseTerminalRendererOptions.autofit} capability — "keep the
+   * cell grid fitted to the workspace container". Off by default so
+   * fresh users see zero behaviour change. xterm and wterm honour it
+   * with their own container-observation paths; ghostty-web and restty
+   * accept the option and report `autofitActive()` as `false` honestly.
+   * Local-only browser preference; never sent to or stored by the
+   * backend.
+   */
+  autofitEnabled: boolean;
 }
 
-export const TERMINAL_SETTINGS_STORAGE_KEY = "relayterm.terminal-settings.v1";
+export const TERMINAL_SETTINGS_STORAGE_KEY = "relayterm.terminal-settings.v2";
+
+/**
+ * Legacy storage keys the loader migrates from when the current
+ * {@link TERMINAL_SETTINGS_STORAGE_KEY} is missing. Ordered most-recent
+ * first so a future v3 bump that adds `v2` here keeps reading the most
+ * recent migrate path first. Exposed so tests can pin the migration
+ * source and a future operator-facing data-export feature can find it.
+ *
+ * Reading from a legacy key is non-destructive: the legacy entry stays
+ * on the storage host until a subsequent {@link saveTerminalSettings}
+ * call writes the current key. The legacy entry is then ignored on
+ * future loads (the current-key branch wins). This is deliberate —
+ * silently deleting a legacy entry would surprise an operator who
+ * downgraded the app for an unrelated reason.
+ */
+export const LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS: readonly string[] = [
+  "relayterm.terminal-settings.v1",
+] as const;
 
 /**
  * Returns a fresh defaults object. The function is preferred over a
@@ -185,6 +224,7 @@ export function defaultTerminalSettings(): TerminalSettings {
     themePresetId: DEFAULT_THEME_PRESET_ID,
     rendererId: DEFAULT_RENDERER_ID,
     experimentalRendererEvaluationEnabled: false,
+    autofitEnabled: false,
   };
 }
 
@@ -319,6 +359,13 @@ export function parseTerminalSettings(input: unknown): TerminalSettings {
   const experimentalRaw = raw["experimentalRendererEvaluationEnabled"];
   const experimentalRendererEvaluationEnabled = experimentalRaw === true;
 
+  // Same strict-boolean contract for renderer-neutral autofit: a
+  // truthy string ("yes") or a number (1) must NOT coerce. Default
+  // false matches the design ("ships zero behaviour change until an
+  // operator opts in").
+  const autofitRaw = raw["autofitEnabled"];
+  const autofitEnabled = autofitRaw === true;
+
   return {
     fontFamily,
     fontSize,
@@ -329,6 +376,7 @@ export function parseTerminalSettings(input: unknown): TerminalSettings {
     themePresetId,
     rendererId,
     experimentalRendererEvaluationEnabled,
+    autofitEnabled,
   };
 }
 
@@ -384,20 +432,42 @@ function storage(): StorageLike | null {
 export function loadTerminalSettings(): TerminalSettings {
   const store = storage();
   if (!store) return defaultTerminalSettings();
-  let raw: string | null;
+  // Try the current storage key first. If it exists (even if malformed),
+  // we treat its outcome as authoritative — we do NOT fall back to a
+  // legacy key on a malformed current entry, because that would mask a
+  // corrupted user setting with stale data.
+  let currentRaw: string | null;
   try {
-    raw = store.getItem(TERMINAL_SETTINGS_STORAGE_KEY);
+    currentRaw = store.getItem(TERMINAL_SETTINGS_STORAGE_KEY);
   } catch {
     return defaultTerminalSettings();
   }
-  if (raw === null) return defaultTerminalSettings();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return defaultTerminalSettings();
+  if (currentRaw !== null) {
+    try {
+      return parseTerminalSettings(JSON.parse(currentRaw));
+    } catch {
+      return defaultTerminalSettings();
+    }
   }
-  return parseTerminalSettings(parsed);
+  // Current key is missing. Walk legacy keys (most-recent first) for a
+  // migration source. A malformed legacy entry also collapses to
+  // defaults — we do NOT skip to the next legacy key because the keys
+  // form a single migration chain, not a fallback chain.
+  for (const legacyKey of LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS) {
+    let legacyRaw: string | null;
+    try {
+      legacyRaw = store.getItem(legacyKey);
+    } catch {
+      return defaultTerminalSettings();
+    }
+    if (legacyRaw === null) continue;
+    try {
+      return parseTerminalSettings(JSON.parse(legacyRaw));
+    } catch {
+      return defaultTerminalSettings();
+    }
+  }
+  return defaultTerminalSettings();
 }
 
 /**
@@ -463,6 +533,7 @@ export function settingsToRendererOptions(
     cursorBlink: settings.cursorBlink,
     scrollbackLines: settings.scrollbackLines,
     theme: resolveTheme(settings),
+    autofit: settings.autofitEnabled,
   };
 }
 

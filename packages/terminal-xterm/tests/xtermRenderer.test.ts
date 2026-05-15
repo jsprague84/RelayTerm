@@ -11,6 +11,37 @@ import type {
  * and dispose calls so tests can assert on the boundary without ever
  * inspecting input bytes themselves.
  */
+/**
+ * `ResizeObserver` is not part of the JSDOM-free vitest environment. The
+ * hoisted fake captures observe/disconnect calls and lets each test
+ * trigger the registered callback synchronously so the autofit wiring
+ * can be exercised without a browser.
+ */
+interface FakeResizeObserverEntry {
+  observed: Element | null;
+  disconnected: boolean;
+  trigger: () => void;
+}
+
+const observerHoisted = vi.hoisted(() => {
+  const instances: FakeResizeObserverEntry[] = [];
+  class FakeResizeObserver {
+    #entry: FakeResizeObserverEntry;
+    constructor(cb: () => void) {
+      this.#entry = { observed: null, disconnected: false, trigger: cb };
+      instances.push(this.#entry);
+    }
+    observe(el: Element) {
+      this.#entry.observed = el;
+    }
+    disconnect() {
+      this.#entry.disconnected = true;
+    }
+    unobserve() {}
+  }
+  return { FakeResizeObserver, instances };
+});
+
 const hoisted = vi.hoisted(() => {
   type FakeListener<T> = (arg: T) => void;
   type FakeOnResizeArg = { cols: number; rows: number };
@@ -90,7 +121,11 @@ const hoisted = vi.hoisted(() => {
   }
 
   class FakeFitAddon {
+    static instances: FakeFitAddon[] = [];
     fitCalls = 0;
+    constructor() {
+      FakeFitAddon.instances.push(this);
+    }
     fit() {
       this.fitCalls++;
     }
@@ -110,6 +145,39 @@ vi.mock("@xterm/addon-web-links", () => ({
   WebLinksAddon: hoisted.FakeWebLinksAddon,
 }));
 
+// Install a ResizeObserver shim on globalThis so the xterm autofit
+// path can attach an observer when the option is enabled. The shim is
+// scoped per-test via `beforeEach` resetting the captured instances list.
+Object.defineProperty(globalThis, "ResizeObserver", {
+  value: observerHoisted.FakeResizeObserver,
+  configurable: true,
+  writable: true,
+});
+
+// requestAnimationFrame may be undefined in vitest's Node env; the
+// adapter falls back to a microtask, but providing a stable fake makes
+// rAF-coalesced fit calls assertable.
+const rafCallbacks: Array<() => void> = [];
+Object.defineProperty(globalThis, "requestAnimationFrame", {
+  value: (cb: () => void) => {
+    rafCallbacks.push(cb);
+    return rafCallbacks.length;
+  },
+  configurable: true,
+  writable: true,
+});
+Object.defineProperty(globalThis, "cancelAnimationFrame", {
+  value: (_id: number) => {},
+  configurable: true,
+  writable: true,
+});
+
+function flushRaf(): void {
+  const queue = rafCallbacks.slice();
+  rafCallbacks.length = 0;
+  for (const cb of queue) cb();
+}
+
 import { XtermRenderer, type XtermRendererOptions } from "../src/index.js";
 // The conversion helpers are adapter-internal — see comment in index.ts.
 // Tests reach into the relative module so the public API stays neutral.
@@ -121,6 +189,9 @@ const stubElement = {} as unknown as HTMLElement;
 
 beforeEach(() => {
   FakeTerminal.instances.length = 0;
+  FakeFitAddon.instances.length = 0;
+  observerHoisted.instances.length = 0;
+  rafCallbacks.length = 0;
 });
 
 /**
@@ -471,6 +542,95 @@ describe("XtermRenderer redaction rule (step 6)", () => {
     if (captured instanceof Error) {
       expect(captured.message).not.toContain(SECRET_INPUT);
     }
+  });
+});
+
+describe("XtermRenderer autofit", () => {
+  it("autofit defaults off: no ResizeObserver is constructed", () => {
+    const renderer = new XtermRenderer();
+    renderer.mount(stubElement);
+    expect(observerHoisted.instances).toHaveLength(0);
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofit:false explicit also leaves no observer", () => {
+    const renderer = new XtermRenderer({ autofit: false });
+    renderer.mount(stubElement);
+    expect(observerHoisted.instances).toHaveLength(0);
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofit:true installs a ResizeObserver on the mount element", () => {
+    const renderer = new XtermRenderer({ autofit: true });
+    renderer.mount(stubElement);
+    expect(observerHoisted.instances).toHaveLength(1);
+    expect(observerHoisted.instances[0]!.observed).toBe(stubElement);
+    expect(renderer.autofitActive?.()).toBe(true);
+  });
+
+  it("autofitActive() is false before mount and after dispose", () => {
+    const renderer = new XtermRenderer({ autofit: true });
+    expect(renderer.autofitActive?.()).toBe(false);
+    renderer.mount(stubElement);
+    expect(renderer.autofitActive?.()).toBe(true);
+    renderer.dispose();
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("observer callback fans through FitAddon.fit() (rAF-coalesced)", () => {
+    const renderer = new XtermRenderer({ autofit: true });
+    renderer.mount(stubElement);
+    const fit = FakeFitAddon.instances[0]!;
+    const before = fit.fitCalls;
+    // Trigger the observer twice synchronously; rAF coalesces into one
+    observerHoisted.instances[0]!.trigger();
+    observerHoisted.instances[0]!.trigger();
+    flushRaf();
+    expect(fit.fitCalls - before).toBe(1);
+  });
+
+  it("observer fires propagate through the existing onResize seam", () => {
+    const renderer = new XtermRenderer({ autofit: true });
+    const sizes: Array<{ cols: number; rows: number }> = [];
+    renderer.onResize?.((s) => sizes.push(s));
+    renderer.mount(stubElement);
+    const term = FakeTerminal.instances[0]!;
+    // Simulate the FitAddon driving a new grid (real FitAddon calls
+    // term.resize which fans onResize listeners synchronously).
+    observerHoisted.instances[0]!.trigger();
+    flushRaf();
+    // Drive the fake terminal resize the same way real FitAddon does
+    term.resize(120, 40);
+    expect(sizes.some((s) => s.cols === 120 && s.rows === 40)).toBe(true);
+  });
+
+  it("dispose disconnects the observer", () => {
+    const renderer = new XtermRenderer({ autofit: true });
+    renderer.mount(stubElement);
+    expect(observerHoisted.instances[0]!.disconnected).toBe(false);
+    renderer.dispose();
+    expect(observerHoisted.instances[0]!.disconnected).toBe(true);
+  });
+
+  it("late observer callbacks after dispose do not call FitAddon.fit", () => {
+    const renderer = new XtermRenderer({ autofit: true });
+    renderer.mount(stubElement);
+    const fit = FakeFitAddon.instances[0]!;
+    const before = fit.fitCalls;
+    renderer.dispose();
+    // Real ResizeObservers don't fire after disconnect; defence-in-depth
+    // assertion against a future change that ignores #disposed in the
+    // coalesced rAF callback.
+    observerHoisted.instances[0]!.trigger();
+    flushRaf();
+    expect(fit.fitCalls).toBe(before);
+  });
+
+  it("autofit option is not echoed onto the xterm options blob", () => {
+    const renderer = new XtermRenderer({ autofit: true, fontSize: 14 });
+    renderer.mount(stubElement);
+    const term = FakeTerminal.instances[0]!;
+    expect(JSON.stringify(term.options)).not.toContain("autofit");
   });
 });
 

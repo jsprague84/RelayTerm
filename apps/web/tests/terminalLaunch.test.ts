@@ -8,10 +8,14 @@ import type {
 import {
   buildAttachWsUrl,
   classifyReconnectAttempt,
+  computeFitButtonState,
+  computeRendererAutofitStatus,
   computeWorkspaceEnablement,
   derivePhase,
   describeLaunchError,
   describeWorkspaceError,
+  FIT_BUTTON_AUTOFIT_ACTIVE_TOOLTIP,
+  FIT_BUTTON_RENDERER_UNSUPPORTED_TOOLTIP,
   markRendererInputTarget,
   mountRendererSafely,
   phaseLabel,
@@ -745,6 +749,141 @@ describe("safeClearViewport", () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+describe("computeRendererAutofitStatus", () => {
+  it("returns 'off' when autofit is not enabled in settings", () => {
+    expect(
+      computeRendererAutofitStatus({ autofitEnabled: false, renderer: null }),
+    ).toBe("off");
+    // Even with a renderer that DOES support autofit, the closed
+    // 'off' value wins when the operator has not enabled autofit.
+    expect(
+      computeRendererAutofitStatus({
+        autofitEnabled: false,
+        renderer: { autofitActive: () => true },
+      }),
+    ).toBe("off");
+  });
+
+  it("returns 'active' when autofit is enabled and the renderer reports active", () => {
+    expect(
+      computeRendererAutofitStatus({
+        autofitEnabled: true,
+        renderer: { autofitActive: () => true },
+      }),
+    ).toBe("active");
+  });
+
+  it("returns 'unsupported' when autofit is enabled but the renderer reports false", () => {
+    expect(
+      computeRendererAutofitStatus({
+        autofitEnabled: true,
+        renderer: { autofitActive: () => false },
+      }),
+    ).toBe("unsupported");
+  });
+
+  it("returns 'unsupported' when the renderer omits autofitActive()", () => {
+    // Per the TerminalRenderer contract, a renderer that omits the
+    // method is treated as "autofit unsupported" — the workspace must
+    // not pretend autofit is wired.
+    expect(
+      computeRendererAutofitStatus({ autofitEnabled: true, renderer: {} }),
+    ).toBe("unsupported");
+  });
+
+  it("returns 'unsupported' when the renderer is null (pre-mount / mount failure)", () => {
+    expect(
+      computeRendererAutofitStatus({ autofitEnabled: true, renderer: null }),
+    ).toBe("unsupported");
+  });
+
+  it("returns 'unsupported' when autofitActive() throws (mid-dispose race)", () => {
+    expect(
+      computeRendererAutofitStatus({
+        autofitEnabled: true,
+        renderer: {
+          autofitActive: () => {
+            throw new Error("disposed");
+          },
+        },
+      }),
+    ).toBe("unsupported");
+  });
+});
+
+describe("computeFitButtonState", () => {
+  it("disabled when the workspace is not live (phase ≠ attached/replaying)", () => {
+    expect(
+      computeFitButtonState({
+        liveRenderer: false,
+        renderer: { fit: () => ({ cols: 80, rows: 24 }) },
+        autofitActive: false,
+      }),
+    ).toEqual({ enabled: false, tooltip: undefined });
+  });
+
+  it("disabled with autofit-active tooltip when autofit is keeping the grid sized", () => {
+    const state = computeFitButtonState({
+      liveRenderer: true,
+      renderer: { fit: () => ({ cols: 80, rows: 24 }) },
+      autofitActive: true,
+    });
+    expect(state.enabled).toBe(false);
+    expect(state.tooltip).toBe(FIT_BUTTON_AUTOFIT_ACTIVE_TOOLTIP);
+  });
+
+  it("disabled with renderer-unsupported tooltip when renderer has no fit()", () => {
+    const state = computeFitButtonState({
+      liveRenderer: true,
+      renderer: {},
+      autofitActive: false,
+    });
+    expect(state.enabled).toBe(false);
+    expect(state.tooltip).toBe(FIT_BUTTON_RENDERER_UNSUPPORTED_TOOLTIP);
+  });
+
+  it("autofit-active tooltip wins over renderer-unsupported when both apply", () => {
+    // A renderer that reports autofit-active is by definition fitting
+    // its container — surface the autofit reason rather than the
+    // missing-fit-method one even if both predicates fire.
+    const state = computeFitButtonState({
+      liveRenderer: true,
+      renderer: {},
+      autofitActive: true,
+    });
+    expect(state.tooltip).toBe(FIT_BUTTON_AUTOFIT_ACTIVE_TOOLTIP);
+  });
+
+  it("does not expose any payload-shaped data on the helper surface", () => {
+    // Defence-in-depth: the helper's inputs are a boolean + a duck-typed
+    // renderer + a boolean; its return is a boolean + a string from a
+    // closed set. Pin the tooltips as closed-vocabulary strings so a
+    // future change that includes session ids or error messages trips
+    // here.
+    expect(FIT_BUTTON_AUTOFIT_ACTIVE_TOOLTIP).toBe(
+      "Autofit is keeping the terminal sized to its container.",
+    );
+    expect(FIT_BUTTON_RENDERER_UNSUPPORTED_TOOLTIP).toBe(
+      "Fit is not supported by the current renderer.",
+    );
+  });
+});
+
+// Track the positive enabled-state assertion separately so the diff stays
+// readable: the helper returns `enabled:true` only on the live-renderer
+// + has-fit + autofit-inactive intersection.
+describe("computeFitButtonState (positive enablement)", () => {
+  it("enabled === true exactly when live AND fit() present AND autofit inactive", () => {
+    expect(
+      computeFitButtonState({
+        liveRenderer: true,
+        renderer: { fit: () => null },
+        autofitActive: false,
+      }),
+    ).toEqual({ enabled: true, tooltip: undefined });
   });
 });
 

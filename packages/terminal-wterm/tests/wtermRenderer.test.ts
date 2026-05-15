@@ -184,6 +184,26 @@ describe("toWtermOptions", () => {
     expect(toWtermOptions({})).toEqual({ autoResize: false });
   });
 
+  it("base `autofit: true` maps to autoResize: true", () => {
+    expect(toWtermOptions({ autofit: true })).toEqual({ autoResize: true });
+  });
+
+  it("base `autofit: false` keeps autoResize false (no surprise opt-in)", () => {
+    expect(toWtermOptions({ autofit: false })).toEqual({ autoResize: false });
+  });
+
+  it("`wtermOnly.autoResize` wins over base autofit (explicit escape hatch)", () => {
+    // The non-portable knob is the deliberate "I know what I'm doing"
+    // override. It MUST take precedence whether it forces auto-resize
+    // ON or OFF, regardless of the portable `autofit` value.
+    expect(
+      toWtermOptions({ autofit: true, wtermOnly: { autoResize: false } }),
+    ).toEqual({ autoResize: false });
+    expect(
+      toWtermOptions({ autofit: false, wtermOnly: { autoResize: true } }),
+    ).toEqual({ autoResize: true });
+  });
+
   it("forwards the initial cell grid as cols/rows", () => {
     expect(toWtermOptions({}, { cols: 80, rows: 24 })).toEqual({
       autoResize: false,
@@ -601,6 +621,73 @@ describe("WtermRenderer redaction rule", () => {
     // The mock retains the entire options bag; serialise it and pin
     // that the sentinel never appears.
     expect(JSON.stringify(wterm.options)).not.toContain(SECRET_INPUT);
+  });
+});
+
+describe("WtermRenderer autofit", () => {
+  it("autofitActive() is false before mount", () => {
+    const renderer = new WtermRenderer({ autofit: true });
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofit defaults off: autoResize is false post-mount and autofitActive false", async () => {
+    const renderer = new WtermRenderer();
+    await renderer.mount(stubElement);
+    expect(FakeWTerm.instances[0]!.options.autoResize).toBe(false);
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("base autofit:true maps to WTermOptions.autoResize:true and autofitActive true", async () => {
+    const renderer = new WtermRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    expect(FakeWTerm.instances[0]!.options.autoResize).toBe(true);
+    expect(renderer.autofitActive?.()).toBe(true);
+  });
+
+  it("wtermOnly.autoResize precedence: wtermOnly:false wins over base autofit:true", async () => {
+    const renderer = new WtermRenderer({
+      autofit: true,
+      wtermOnly: { autoResize: false },
+    });
+    await renderer.mount(stubElement);
+    expect(FakeWTerm.instances[0]!.options.autoResize).toBe(false);
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("wtermOnly.autoResize precedence: wtermOnly:true wins over base autofit:false", async () => {
+    const renderer = new WtermRenderer({
+      autofit: false,
+      wtermOnly: { autoResize: true },
+    });
+    await renderer.mount(stubElement);
+    expect(FakeWTerm.instances[0]!.options.autoResize).toBe(true);
+    expect(renderer.autofitActive?.()).toBe(true);
+  });
+
+  it("autofitActive() is false after dispose", async () => {
+    const renderer = new WtermRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    expect(renderer.autofitActive?.()).toBe(true);
+    renderer.dispose();
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofitActive() is false after a failed init()", async () => {
+    FakeWTerm.__nextInitFails = true;
+    const renderer = new WtermRenderer({ autofit: true });
+    await expect(renderer.mount(stubElement)).rejects.toThrow(
+      /failed to initialize/,
+    );
+    expect(renderer.autofitActive?.()).toBe(false);
+  });
+
+  it("autofit option is not echoed onto the WTerm options blob", async () => {
+    const renderer = new WtermRenderer({ autofit: true });
+    await renderer.mount(stubElement);
+    // The mapped blob has `autoResize`, not `autofit`; the neutral
+    // option name must not leak into the underlying constructor bag.
+    const blob = FakeWTerm.instances[0]!.options;
+    expect(Object.prototype.hasOwnProperty.call(blob, "autofit")).toBe(false);
   });
 });
 

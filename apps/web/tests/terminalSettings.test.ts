@@ -10,6 +10,7 @@ import {
   FONT_FAMILY_MAX_LEN,
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
+  LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS,
   LINE_HEIGHT_MAX,
   LINE_HEIGHT_MIN,
   RENDERER_IDS,
@@ -98,6 +99,9 @@ describe("defaults", () => {
     expect(d.rendererId).toBe(DEFAULT_RENDERER_ID);
     expect(d.rendererId).toBe("xterm");
     expect(d.experimentalRendererEvaluationEnabled).toBe(false);
+    // Renderer-neutral autofit defaults OFF. Fresh users see zero
+    // behaviour change until they opt in via Settings.
+    expect(d.autofitEnabled).toBe(false);
   });
 
   it("returns a fresh object so callers can mutate without aliasing", () => {
@@ -262,8 +266,102 @@ describe("parseTerminalSettings", () => {
       themePresetId: TERMINAL_THEME_PRESETS[1]?.id ?? DEFAULT_THEME_PRESET_ID,
       rendererId: "ghostty-web",
       experimentalRendererEvaluationEnabled: true,
+      autofitEnabled: true,
     };
     expect(parseTerminalSettings(input)).toEqual(input);
+  });
+});
+
+describe("autofitEnabled parsing", () => {
+  it("defaults to false when the field is missing", () => {
+    expect(parseTerminalSettings({}).autofitEnabled).toBe(false);
+    expect(parseTerminalSettings({ fontSize: 14 }).autofitEnabled).toBe(false);
+  });
+
+  it("only accepts literal booleans true/false", () => {
+    // Truthy strings, numbers, objects, arrays must NOT coerce. The
+    // renderer-neutral autofit option is binary by contract; any
+    // non-boolean lands as the default `false`.
+    expect(parseTerminalSettings({ autofitEnabled: "true" }).autofitEnabled).toBe(false);
+    expect(parseTerminalSettings({ autofitEnabled: 1 }).autofitEnabled).toBe(false);
+    expect(parseTerminalSettings({ autofitEnabled: {} }).autofitEnabled).toBe(false);
+    expect(parseTerminalSettings({ autofitEnabled: null }).autofitEnabled).toBe(false);
+    expect(parseTerminalSettings({ autofitEnabled: true }).autofitEnabled).toBe(true);
+    expect(parseTerminalSettings({ autofitEnabled: false }).autofitEnabled).toBe(false);
+  });
+
+  it("round-trips through save/load", () => {
+    saveTerminalSettings({
+      ...defaultTerminalSettings(),
+      autofitEnabled: true,
+    });
+    expect(loadTerminalSettings().autofitEnabled).toBe(true);
+  });
+
+  it("hostile non-boolean stored entry collapses to false (no crash)", () => {
+    storage.setItem(
+      TERMINAL_SETTINGS_STORAGE_KEY,
+      JSON.stringify({
+        autofitEnabled: "yes",
+      }),
+    );
+    const loaded = loadTerminalSettings();
+    expect(loaded.autofitEnabled).toBe(false);
+  });
+});
+
+describe("v1 → v2 storage migration", () => {
+  it("LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS exposes the legacy v1 key explicitly", () => {
+    // The migration path needs to be visible to test code AND to a
+    // future operator-facing data-export feature. Pinning the legacy
+    // key as a constant prevents a refactor from silently dropping the
+    // migration source.
+    expect(LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS).toContain(
+      "relayterm.terminal-settings.v1",
+    );
+    // The current key MUST not be in the legacy list.
+    expect(LEGACY_TERMINAL_SETTINGS_STORAGE_KEYS).not.toContain(
+      TERMINAL_SETTINGS_STORAGE_KEY,
+    );
+  });
+
+  it("loads from a v1 entry when no v2 entry exists", () => {
+    const v1 = {
+      fontFamily: '"Iosevka", monospace',
+      fontSize: 14,
+      lineHeight: 1.2,
+      cursorStyle: "underline" as const,
+      cursorBlink: false,
+      scrollbackLines: 5_000,
+      themePresetId: DEFAULT_THEME_PRESET_ID,
+      rendererId: "xterm" as const,
+      experimentalRendererEvaluationEnabled: false,
+    };
+    storage.setItem("relayterm.terminal-settings.v1", JSON.stringify(v1));
+    const loaded = loadTerminalSettings();
+    // Every v1 field survives verbatim; autofitEnabled defaults false
+    // because v1 entries pre-date the field.
+    expect(loaded.fontSize).toBe(14);
+    expect(loaded.fontFamily).toBe('"Iosevka", monospace');
+    expect(loaded.cursorStyle).toBe("underline");
+    expect(loaded.autofitEnabled).toBe(false);
+  });
+
+  it("prefers a v2 entry over a v1 entry when both exist", () => {
+    storage.setItem(
+      "relayterm.terminal-settings.v1",
+      JSON.stringify({ fontSize: 22 }),
+    );
+    storage.setItem(
+      TERMINAL_SETTINGS_STORAGE_KEY,
+      JSON.stringify({ fontSize: 11 }),
+    );
+    expect(loadTerminalSettings().fontSize).toBe(11);
+  });
+
+  it("malformed v1 entry collapses to defaults (no v2 fallback chain back to v1)", () => {
+    storage.setItem("relayterm.terminal-settings.v1", "{not-json");
+    expect(loadTerminalSettings()).toEqual(defaultTerminalSettings());
   });
 });
 
@@ -320,6 +418,7 @@ describe("loadTerminalSettings (localStorage)", () => {
         "themePresetId",
         "rendererId",
         "experimentalRendererEvaluationEnabled",
+        "autofitEnabled",
       ].sort(),
     );
     expect(keys).not.toContain("private_key");
@@ -528,6 +627,16 @@ describe("settingsToRendererOptions", () => {
     expect(options.cursorBlink).toBe(true);
     expect(options.scrollbackLines).toBe(DEFAULT_SCROLLBACK_LINES);
     expect(options.theme).toBe(TERMINAL_THEME_PRESETS[0]?.theme);
+    // Renderer-neutral autofit defaults OFF in the mapped options too.
+    expect(options.autofit).toBe(false);
+  });
+
+  it("maps autofitEnabled:true onto autofit:true", () => {
+    const options = settingsToRendererOptions({
+      ...defaultTerminalSettings(),
+      autofitEnabled: true,
+    });
+    expect(options.autofit).toBe(true);
   });
 
   it("does not leak any xterm-specific key", () => {
@@ -542,6 +651,7 @@ describe("settingsToRendererOptions", () => {
         "cursorBlink",
         "scrollbackLines",
         "theme",
+        "autofit",
       ].sort(),
     );
     expect((options as Record<string, unknown>).xtermOnly).toBeUndefined();
