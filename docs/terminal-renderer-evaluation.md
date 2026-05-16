@@ -1601,6 +1601,101 @@ does NOT promote any renderer, does NOT flip the xterm
 default, and does NOT alter the Phase 1 / Phase 2 promotion
 gates.
 
+### 2026-05-16b · `docs/mobile-first-launch-ws-investigation` — Playwright mobile-emulation does NOT reproduce the 2026-05-15c / 2026-05-16 first-launch detach pattern; "POST→WS gap" measurement methodology needs re-validation
+
+**Status:** docs-only Playwright-first investigation against the
+deployed staging stack with the renderer set to **xterm**
+production baseline. **No** renderer / `terminal-core` /
+production-shell-non-doc / protocol / backend / session /
+orchestrator / CSP / CI / deploy file was edited. **wterm was
+not re-tested** — 2026-05-16 already exonerated wterm as the
+cause, so a wterm re-run would add only noise.
+
+**Surfaces.** Workstation Playwright Chromium at desktop
+(1440 × 900) for Phase A baseline, and at mobile-emulation
+(1080 × 2340, viewport-only — UA not overridden) for Phase B
+and Phase C. Real-phone work explicitly out of scope (handled
+by the 2026-05-15c / 2026-05-16 entries).
+
+**Stack pin (unchanged from 2026-05-15c / 2026-05-16).** web
+`sha256:cb9620986ddf…`, backend `sha256:90573e96bcbc…`, CSP
+`default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+
+**Renderer setting.** Settings → gate **OFF**, renderer
+**xterm**, `autofitEnabled = false`. Gate never flipped on.
+
+**What landed.** Three xterm Launch attempts against a fresh
+hermetic throwaway (`relayterm-staging-mobile-ws-investigation-ssh`,
+on the staging internal bridge with alias
+`mobile-ws-investigation-host`):
+
+- **Phase A** (`83ec9433`, desktop) — POST 16:10:16 → 201
+  (180–195 ms), SSH `ESTABLISHED` inside throwaway 16:10:17,
+  workspace `data-phase="attached"` by 16:10:23, `whoami →
+  smoke` round-tripped to the prompt `91d5c5dea39d:~$`, closed
+  cleanly.
+- **Phase B** (`475b8ffa`, mobile-emulation, first launch) —
+  POST 16:11:52 → 201 (180 ms), SSH `ESTABLISHED` 16:11:52,
+  `attached` by 16:11:56.809 (~4.7 s after click), closed
+  cleanly.
+- **Phase C** (`252c4878`, mobile-emulation, second launch) —
+  POST 16:12:22 → 201 (172 ms), SSH `ESTABLISHED` 16:12:23,
+  `attached` by 16:12:28.033 (~7.4 s after click), closed
+  cleanly.
+
+**Headline.** **The 60–68 s first-launch detach pattern was NOT
+reproduced** under Playwright mobile-emulation across two
+consecutive launches on this stack. The investigation **narrows
+the hypothesis space**: the gap is NOT mobile-viewport-bound,
+NOT workspace-state-machine-bound under desktop Chromium, NOT
+Cloudflare-tail-bound from this workstation network at this
+hour, and NOT orchestrator-attach-timeout-bound for any
+mobile-shape workload. It remains attributable to the
+real-Android-Chrome execution environment OR an intermittent
+russh-dial first-attempt stall — neither of which Playwright
+emulation can exhibit.
+
+**Methodology correction surfaced by this slice.** The nginx
+`access_log` line for `GET /api/v1/terminal-sessions/<id>/ws`
+records the **close timestamp**, not the open timestamp. Phase
+A demonstrated this cleanly: POST 16:10:16, workspace
+`attached` 16:10:23 (≤ 7 s after POST), SSH `ESTABLISHED`
+16:10:17 (≤ 1 s after POST), operator-driven close at
+~16:11:32, **nginx ws log line at 16:11:32** — i.e. 76 s after
+POST, exactly matching the workspace-controlled session
+lifespan. The 2026-05-15c / 2026-05-16 "60–68 s POST→WS gap"
+measurements should be read as "session lifespan from POST to
+detach", not "POST→WS-open delay". This does **not** change the
+2026-05-16 classification (still workspace-bound + transient,
+wterm exonerated); it changes the mechanism the gap is
+attributable to.
+
+**Posture.** Do NOT promote wterm. Do NOT flip the xterm
+production baseline. xterm's surface-2 status is **"works with
+intermittent first-launch detach pattern shared with every
+renderer, mechanism still under investigation"** — unchanged
+from the 2026-05-16 grading.
+
+**Cross-links.** Smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-16b · `docs/mobile-first-launch-ws-investigation`".
+Plan update:
+[`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+§ 11 "Update after the 2026-05-16b Playwright-first
+investigation". Scorecard update:
+[`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
+§ "wterm" Known concerns footnote.
+
+**Next slice.** **`feat/web-terminal-launch-timing-diagnostics`**
++ optional **`feat/api-session-attach-timing-events`**, with a
+**mandatory `lifetime_X_then_close` verification sub-step**
+before any downstream code change relies on the nginx WS
+close-time interpretation: open a session, hold it open with
+no Output for a known X seconds, close from the client,
+confirm nginx's `GET .../ws 101` log timestamp equals the
+close timestamp. See the 2026-05-16b smoke entry's "Next slice
+proposed" subsection for the full scope.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

@@ -129,10 +129,32 @@
   GPU-accelerated.
 - **Known concerns:** needs the `'wasm-unsafe-eval'` relaxation to
   mount; the **first surface-2 (Android Chrome) execution of the
-  mobile smoke plan landed 2026-05-15c**
+  mobile smoke plan landed 2026-05-15c**, was reclassified by
+  the 2026-05-16 xterm-control resmoke as workspace-bound +
+  transient (not wterm-specific), and was further narrowed by
+  the 2026-05-16b Playwright-first investigation
   ([`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+  § "2026-05-16b") to **NOT a property of mobile viewport
+  shape, NOT workspace-state-machine-bound under desktop
+  Chromium, NOT Cloudflare-tail-bound** — the gap remains
+  attributable to the real-Android-Chrome execution stack
+  and/or an intermittent russh-dial first-attempt stall, both
+  of which Playwright cannot exhibit. The 2026-05-16b slice
+  also surfaced a **methodology issue worth carrying forward
+  here**: the nginx `access_log` line for `GET .../ws` records
+  the **close timestamp**, not the open timestamp, so the
+  earlier "60-68 s POST→WS gap" measurements should be re-read
+  as "session lifespan from POST to detach". This does NOT
+  change the wterm-exonerated reading; it changes the mechanism
+  the gap is attributable to and sharpens the next workspace
+  instrumentation slice.
+
+  *Original 2026-05-15c entry (historical context for the
+  concern above).* The first surface-2 execution lives at
+  [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
   § "2026-05-15c · wterm Android Chrome (surface 2) browser
-  smoke") and produced a mixed signal: the wterm renderer *mounts*
+  smoke" and produced a mixed signal at the time: the wterm
+  renderer *mounts*
   cleanly on Android Chrome and survives rotation, but the
   workspace session lifecycle did not reach a live PTY in two
   consecutive attempts (`detached (TTL window) seq=0`; backend
@@ -146,9 +168,13 @@
   POST on launches 2 and 3 against the same throwaway. The
   detach pattern is therefore **workspace-bound + transient**,
   not wterm-specific — wterm is exonerated as the cause. The
-  next executable slice is workspace-side
-  (`docs/mobile-first-launch-ws-investigation`, working title),
-  not another wterm surface-2 / surface-3 attempt. The
+  next executable slice was the Playwright-first
+  `docs/mobile-first-launch-ws-investigation` docs slice
+  (landed 2026-05-16b — see above for the mechanism-narrowing
+  + methodology-correction findings); the slice after that is
+  the coded `feat/web-terminal-launch-timing-diagnostics` +
+  optional `feat/api-session-attach-timing-events`, NOT
+  another wterm surface-2 / surface-3 attempt. The
   2026-05-15c read of "russh never dialed the SSH target" is
   also corrected: it was based on `docker logs` of the
   linuxserver/openssh-server throwaway, which only writes
@@ -333,27 +359,41 @@ slice on restty until that decision is made.
 
 ## 7. Next slice proposals (ranked)
 
-1. **`docs/mobile-first-launch-ws-investigation`** (working
-   title) — workspace-side instrumentation of the mobile-Chrome
-   WS-open path so the 60-68 s first-launch POST→WS gap surfaced
-   by the 2026-05-15c surface-2 wterm smoke and reproduced under
-   the xterm production baseline in the 2026-05-16 resmoke can be
-   attributed to (a) the mobile-Chrome side, (b) the
-   Cloudflare → origin tail, or (c) the workspace's own client
-   state machine, plus a workspace-visible diagnostic the
-   operator can see *during* the gap. *Primary lane.* Until this
-   lands, every mobile renderer smoke (wterm OR xterm OR
-   ghostty-web) re-collects the same intermittent first-launch
-   detach pattern as evidence of the wrong question; running a
-   surface-3 Tauri smoke first would only double the redaction
-   surface for no incremental signal. The mobile smoke methodology
-   that re-tests will sit on top of (Playwright mobile emulation +
-   server-side inspection + narrow real-phone scope, per
-   [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
-   § 5 "2026-05-16 methodology update" and
+1. **`feat/web-terminal-launch-timing-diagnostics`** +
+   optional **`feat/api-session-attach-timing-events`** —
+   workspace-side + backend-side timing instrumentation so the
+   60-68 s first-launch POST→WS gap surfaced by the 2026-05-15c
+   surface-2 wterm smoke and reproduced under the xterm
+   production baseline in the 2026-05-16 resmoke can be
+   attributed when it next appears on a real phone. The
+   Playwright-first **`docs/mobile-first-launch-ws-investigation`**
+   slice that ran on 2026-05-16b (see
+   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+   § "2026-05-16b") did NOT reproduce the gap under desktop
+   Chromium at mobile viewport across two consecutive launches,
+   narrowing the hypothesis space to (a) real-Android-Chrome
+   WS-handshake on a freshly opened tab, (b) an intermittent
+   russh dial / `attach_session` first-attempt stall, or (c)
+   both. That slice also surfaced a **methodology issue**: the
+   nginx `access_log` line for `GET .../ws` records the close
+   timestamp, not the open timestamp, so the prior "60-68 s
+   POST→WS gap" measurements should be re-read as "session
+   lifespan from POST to detach". *Primary lane.* The first
+   sub-step of the instrumentation slice MUST verify the
+   "nginx logs WS upgrades at close" interpretation with a
+   controlled `lifetime_X_then_close` test before any code
+   change downstream relies on it. Until the instrumentation +
+   verification land, every mobile renderer smoke (wterm OR
+   xterm OR ghostty-web) re-collects the same intermittent
+   first-launch detach pattern as evidence of the wrong
+   question; running a surface-3 Tauri smoke first would only
+   double the redaction surface for no incremental signal. The
+   Playwright-first / real-phone-narrow methodology
+   ([`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+   § 5 "2026-05-16 methodology update" +
    [`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § D →
-   "Mobile smoke methodology") is in place; the workspace slice
-   is the missing prerequisite, not the methodology.
+   "Mobile smoke methodology") sits on top of this slice when
+   the next real-phone reproduction runs.
 2. **`docs/wterm-android-tauri-smoke`** — surface-3 Tauri
    Android WebView smoke. **Deferred** until the workspace
    slice above lands; the same workspace-bound first-launch

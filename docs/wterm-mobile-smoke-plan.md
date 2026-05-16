@@ -936,6 +936,37 @@ re-test before the workspace-side fix lands would re-collect
 the same intermittent first-launch detach pattern across every
 renderer and is not useful evidence.
 
+**Update after the 2026-05-16b Playwright-first investigation.**
+The Playwright-first execution of
+`docs/mobile-first-launch-ws-investigation` against the same
+stack ran 3 launches (1 × desktop, 2 × mobile-emulation
+1080 × 2340) and **did NOT reproduce** the 60–68 s pattern —
+all three reached `data-phase="attached"` within ≤ 7.4 s of the
+launch click, with SSH `ESTABLISHED` inside the throwaway on
+the same wall-clock second as POST (see
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-16b · `docs/mobile-first-launch-ws-investigation`").
+The investigation also surfaced a **methodology issue worth
+flagging here**: the nginx `access_log` line for the WebSocket
+upgrade route records the **close timestamp**, not the open
+timestamp, so the 2026-05-15c / 2026-05-16 "60–68 s POST→WS
+gap" measurements should be read as "session lifespan from POST
+to detach" rather than "POST→WS-open delay". This does NOT
+change the 2026-05-16 outcome classification (still
+workspace-bound + transient, wterm exonerated); it changes the
+mechanism the gap is attributable to, narrowing the leading
+hypothesis to a russh-dial / `attach_session` first-attempt
+stall or a real-Android-Chrome WS-handshake quirk that
+Playwright cannot exhibit. The next slice is now a coded
+workspace + backend timing-instrumentation slice
+(`feat/web-terminal-launch-timing-diagnostics`), and its FIRST
+sub-step is a controlled `lifetime_X_then_close` verification
+of the nginx WS-close-time interpretation. Until that lands,
+the row-channel mapping below remains valid (real-phone rows
+stay real-phone), but a wterm or ghostty-web surface-2 re-run
+adds no signal — the same intermittent pattern would surface
+across every renderer.
+
 **Methodology update (2026-05-16).** Any subsequent surface-2
 or surface-3 row sweep — whether under the workspace-fix slice
 above or after it lands — runs under the **"Playwright-first,

@@ -2041,9 +2041,18 @@ image; `ss` / `ip` are not.
 Each row that needs a server-side observation pulls from this
 fixed set:
 
-- **Backend nginx access log** — POST 201 / WS 101 timing and
-  the POST→WS gap (the 2026-05-15c / 2026-05-16 headline
-  measurement).
+- **Backend nginx access log** — POST 201 timing is the
+  authoritative POST timestamp. The `GET …/ws HTTP/1.1 101`
+  line records the WebSocket-upgrade **close** timestamp, not
+  the open timestamp — confirmed by the 2026-05-16b
+  Playwright-first investigation (Phase A: POST 16:10:16,
+  workspace-driven close at 16:11:32, nginx ws log line at
+  16:11:32 = matches close, not open). Treat the 2026-05-15c
+  / 2026-05-16 "60–68 s POST→WS gap" measurements as
+  "session lifespan from POST to detach", not "POST→WS-open
+  delay", until the workspace + backend timing-diagnostics
+  slice (`feat/web-terminal-launch-timing-diagnostics`) lands
+  an open-time-explicit signal.
 - **Postgres `session_events`** — `attached` / `detached` /
   `closed` rows for the session UUID; `payload->>'last_seen_seq'`,
   `payload->>'reason'`. Public metadata only.

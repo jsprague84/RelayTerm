@@ -10656,6 +10656,450 @@ open question.
 
 ---
 
+### 2026-05-16b · `docs/mobile-first-launch-ws-investigation` (Playwright-first workspace-side investigation) — Playwright mobile-emulation did NOT reproduce the 2026-05-15c / 2026-05-16 first-launch detach pattern; the "60–68 s POST→WS gap" reading needs re-validation because nginx's WS-upgrade access-log line records the close time, not the open time
+
+Playwright-first follow-on to the 2026-05-16 xterm-control resmoke,
+driven from the workstation against the same staging stack (web
+image `sha256:cb9620986ddf…`, backend image
+`sha256:90573e96bcbc…`, CSP `default-src 'self'; script-src 'self'
+'wasm-unsafe-eval'` — all byte-identical to 2026-05-15c / 2026-05-16
+per `etag "6a07a599-1ab"` + `Last-Modified Fri, 15 May 2026
+23:00:41 GMT`). Goal of this slice: narrow the hypothesis space
+for the 2026-05-15c / 2026-05-16 Launch-1 detach-at-seq-0 finding
+by running three Playwright-driven launches (desktop baseline +
+two mobile-emulation) under the
+[Playwright-first methodology](../wterm-mobile-smoke-plan.md#section-5--proposed-smoke-rows)
+landed in `docs(testing): update mobile smoke methodology`
+(2026-05-16 / commit `3c1f96d`). Outcome: **the 60–68 s pattern
+was NOT reproduced under desktop Chromium at mobile viewport
+(1080 × 2340) across two consecutive launches against a fresh
+throwaway on the staging internal network** — both launches went
+live within seconds of POST, with SSH `ESTABLISHED` inside the
+throwaway visible on the same wall-clock second as the POST.
+**Workspace question narrows**: the gap is NOT a property of
+mobile viewport shape, NOT a property of the workspace's
+client-side state machine under desktop Chromium, NOT a property
+of the Cloudflare → origin path from this network at this hour,
+and NOT a property of the orchestrator's attach-timeout being
+tight enough to trip any mobile-shape workload. The gap remains
+attributable to the real-Android-Chrome execution environment OR
+to an intermittent first-attempt russh-dial path that this slice's
+sample size cannot reproduce; either way the right next slice is
+workspace + backend timing instrumentation, not another
+surface-2 or surface-3 row sweep.
+
+**Date.** 2026-05-16 16:07 – 16:13 UTC (≈ 6 min, end-to-end
+including inventory create, three launches, log triage, and
+cleanup).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+
+**Stack pin (unchanged from 2026-05-15c / 2026-05-16).**
+
+- web `git.js-node.cc/jsprague/relayterm-web:main`, container
+  image `sha256:cb9620986ddfcb69ac44a80cc8709d3b46a1fbd7fac5ace092012f6f312d3198`,
+  served `ETag "6a07a599-1ab"`, `Last-Modified Fri, 15 May 2026
+  23:00:41 GMT`.
+- backend `git.js-node.cc/jsprague/relayterm-backend:main`,
+  container image
+  `sha256:90573e96bcbca4dba962330ffa264365200ecf5af03390dac933ba6e2a23cb52`.
+- CSP unchanged:
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+
+**Methodology surface.** Per
+[`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) § D →
+"Mobile smoke methodology (Playwright-first; real-phone narrow)"
+and `docs/wterm-mobile-smoke-plan.md` § 5 ("2026-05-16
+methodology update"). Real-phone work was **not** in scope for
+this slice — 2026-05-15c / 2026-05-16 already established the
+real-phone Launch-1 reproduction, and the right next step is
+adding code-side timing diagnostics before doing another
+hardware smoke. Evidence-class labels per the methodology:
+**server-side inspected** (nginx, Postgres, `docker exec`
+inside the throwaway), **playwright-emulated** (browser-side
+fetch + WebSocket + `data-*` reads), **inferred** (cross-row
+comparison), or **deferred — &lt;reason&gt;** (when a row was
+intentionally not exercised). No **real-phone operator** rows.
+
+**Smoke target setup (corrected network plumbing from 2026-05-15c
+onward).** Throwaway SSH target
+`relayterm-staging-mobile-ws-investigation-ssh`, image
+`lscr.io/linuxserver/openssh-server:latest`
+(`10.2_p1-r0-ls225`), user `smoke`, pubkey-only,
+`SUDO_ACCESS=false`, `PASSWORD_ACCESS=false`. Container created
+with **no host port** published (the 2026-05-15c
+`-p 127.0.0.1:2226:2222` idiom was structurally broken — the
+backend container has no path to the cloud-edge host loopback —
+and was corrected on the 2026-05-16 resmoke). After `docker run`
+the throwaway was `docker network connect`ed to
+`relayterm-staging_relayterm-staging-internal` with
+`--alias mobile-ws-investigation-host`, then disconnected from
+the default `bridge`. Backend reaches the throwaway via container
+DNS on the internal bridge (alias resolves to `172.21.0.5`).
+Vault-managed ed25519 keypair generated via the staging
+Identities SPA (`mobile-ws-investigation-identity`, fingerprint
+`SHA256:ArqyWaJKqhfFQ3zWbIJDTRzXbWiCITz/nZboBAdcDcc`); public
+key passed to the throwaway as `-e PUBLIC_KEY=...` at run time.
+Private half never leaves the backend vault.
+
+**Inventory rows from the workstation (all via SPA / API).**
+SSH identity `mobile-ws-investigation-identity`
+(`edeaae23-80ee-4508-9d4f-fb0554d814c5`). Host
+`mobile-ws-investigation-host` → `mobile-ws-investigation-host:2222`
+(`bf5f6045-4a87-4340-ab7c-5df648e3ec67`). Server profile
+`mobile-ws-investigation-xterm-profile`
+(`12e86818-4067-40c4-9087-4477173baff0`). Preflight + trust-host-key
++ auth-check all returned 200 (preflight `host_key_fingerprint
+SHA256:53DXdtHvIC//rJ3FFaLv0/QUzDcMym7EvChdoKRqrRM`, auth-check
+`status: authentication_succeeded`) **before** any Launch
+attempt — russh dial path proven reachable for this throwaway
+with these credentials, same posture as 2026-05-15c / 2026-05-16
+preflight checks.
+
+**Renderer setting.** Settings → renderer evaluation gate
+**OFF**, renderer **xterm**. `autofitEnabled = false`. Same
+posture as 2026-05-16. wterm was **not** flipped on in this
+slice — the 2026-05-16 xterm-control already exonerated wterm
+as the cause of the 2026-05-15c finding, so a wterm re-run here
+would add only noise.
+
+**Driver surface.** Workstation Playwright MCP (Chromium
+`148.0.0.0`, Linux x86_64 UA — **not** a real Android UA;
+mobile-emulation is viewport-only here, no UA override). Browser
+side timings captured via:
+
+- `performance.getEntriesByType('resource')` for POST + GET
+  `/terminal-sessions[/<id>]` (`startTime` + `duration`);
+- `data-phase` / `data-renderer` / `data-renderer-input` /
+  `data-renderer-fallback` / `data-renderer-gate` /
+  `data-renderer-autofit` / `data-session-id` /
+  `data-last-seen-seq` on `[data-testid="production-terminal"]`;
+- `[data-relayterm-terminal-input]` + `document.activeElement`
+  for renderer-fair input focus (Phase A only).
+
+Server-side timings captured via `ssh cloud-edge docker logs
+relayterm-staging-relayterm-web-1` (nginx access log, source of
+truth for HTTP timing), `ssh cloud-edge docker exec
+relayterm-staging-mobile-ws-investigation-ssh netstat -tn` (SSH
+inbound truth per the 2026-05-16 lesson — `docker logs` of
+linuxserver/openssh-server is NOT a valid SSH-inbound probe),
+and `/api/v1/terminal-sessions/<id>` (`status`, `created_at`,
+`closed_at`).
+
+#### Three launches against the same throwaway
+
+| Phase | Surface | Session UUID | Wall t=0 (click) | POST `/terminal-sessions` (nginx) | SSH ESTABLISHED (netstat) | Workspace `data-phase` reached | Session lifecycle outcome |
+|---|---|---|---|---|---|---|---|
+| **A** | desktop Playwright (1440 × 900) | `83ec9433-5072-4b2f-9a11-ec76527e19c9` | 16:10:17 | 16:10:16 → 201 (180–195 ms) | 16:10:17 (first poll sample = 1; sample interval 1 s, so dial completed within ≤ 1 s of POST) | `attached` by 16:10:23 | live; operator typed `whoami`, prompt `91d5c5dea39d:~$` visible in viewport; closed cleanly at 16:11:32 |
+| **B** | mobile-emulated Playwright (1080 × 2340) | `475b8ffa-87c3-4e52-8831-0967f06d08c9` | 16:11:52.126 | 16:11:52 → 201 (180 ms; `startTime` 10 445 ms after page nav origin) | 16:11:52 (first sample after the click already at 1) | `attached` by 16:11:56.809 (~4.7 s after click) | live; closed cleanly at 16:12:12 |
+| **C** | mobile-emulated Playwright (1080 × 2340), same UUID-fresh nav | `252c4878-4f14-4e4d-8786-2d46525be04d` | 16:12:20.597 | 16:12:22 → 201 (172 ms) | 16:12:23 (3-second gap between Phase-B close at 16:12:12 and Phase-C dial — visible in the per-second poll log) | `attached` by 16:12:28.033 (~7.4 s after click) | live; closed cleanly at 16:12:54 |
+
+**Headline.** **The 60–68 s first-launch detach pattern flagged
+by 2026-05-15c / 2026-05-16 Launch 1 did NOT reproduce under
+Playwright mobile-emulation across two consecutive launches** on
+this stack at the same staging endpoint with the xterm
+production-baseline renderer. All three sessions transitioned to
+`attached` (workspace `data-phase`) within ≤ 7.4 s of the launch
+click, the backend dialed russh within ≤ 1 – 3 s of POST in
+every case, and SSH was visibly `ESTABLISHED` inside the
+throwaway on the same wall-clock second as the POST or the next.
+
+#### Methodology correction — nginx access log records WS upgrade at CLOSE time, not OPEN time
+
+A second finding emerged from cross-referencing the captured
+data, and it changes how the 2026-05-15c and 2026-05-16
+"60–68 s POST→WS gap" measurements should be read.
+
+The nginx `access_log` line for the WebSocket upgrade route
+`GET /api/v1/terminal-sessions/<id>/ws → 101` is written **when
+the WebSocket connection closes**, not when it opens. This is a
+well-documented nginx behaviour for WebSocket upstreams (the
+proxied connection only "completes" from nginx's POV at close),
+but it has not been explicit in the staging-smoke methodology
+until this slice. The Phase A evidence here is the clearest
+demonstration on the RelayTerm stack:
+
+- Phase A POST: nginx logs `POST /terminal-sessions → 201` at
+  16:10:16.
+- Phase A workspace: `data-phase="attached"` observed at
+  16:10:23 (≈ 7 s after POST).
+- Phase A SSH on the throwaway: `ESTABLISHED` at 16:10:17
+  (≤ 1 s after POST; the round-trip `whoami → prompt` succeeded
+  with the visible prompt `91d5c5dea39d:~$` in the xterm
+  viewport).
+- Phase A operator-driven close: workspace close-button clicked
+  at ~16:11:32; session `closed_at` row in DB at 16:11:32.967.
+- Phase A nginx logs `GET .../ws HTTP/1.1 101` at **16:11:32**
+  — **76 s after the POST**, which exactly matches the
+  workspace-controlled session lifespan, not any open-time delay.
+
+The same shape held for Phase B (POST 16:11:52, attached
+≤ 16:11:56.809, nginx ws log 16:12:12 — at close) and Phase C
+(POST 16:12:22, attached ≤ 16:12:28, nginx ws log 16:12:54 —
+at close). In every case the nginx WS log timestamp is the
+close timestamp, not the open timestamp.
+
+What this means for the 2026-05-15c / 2026-05-16 evidence
+(re-reading those entries with this correction in hand):
+
+- 2026-05-16 Launch 1: POST 14:30:42, nginx ws log 14:31:50,
+  `session_events.detached` 14:31:50 (`last_seen_seq: null`),
+  auto-close 14:32:20 (`client_requested`). Under the corrected
+  reading, 14:31:50 is when the WS upgrade **closed**, not when
+  it opened. The WS most plausibly opened sometime between
+  14:30:42 (POST) and 14:31:50 (close), and the 68-second figure
+  is **the session's full lifespan in a never-live state**, not
+  the time between POST completion and WS handshake. The
+  `last_seen_seq: null` confirms zero Output frames flowed
+  before the WS closed.
+- 2026-05-15c: same shape, same likely correction. The
+  60-second figure quoted there is the session lifespan, not a
+  POST→WS-open delay.
+
+What this does NOT change: the 2026-05-15c / 2026-05-16
+**outcome classification is still "workspace-bound + transient,
+not renderer-specific"**, and **wterm remains exonerated** as
+the cause. The change is to the **mechanism** the gap is
+attributable to. The currently-best mechanism set narrows to:
+
+1. The WS opened fast (consistent with my Playwright runs), the
+   workspace sent `Attach`, but the backend's russh dial /
+   `attach_session` flow failed or stalled on first attempt
+   against a fresh state on the real-phone path — so the
+   workspace sat at `connecting` / `attached-stub` and detached
+   when no Output arrived inside the orchestrator's
+   first-message window. **This is the new leading hypothesis.**
+2. The WS open itself was slow (Android-Chrome-specific
+   handshake on a freshly-opened tab) by some-fraction of 60 s,
+   followed by a normal `Attach` → no Output → detach cycle.
+3. Some combination of (1) and (2).
+
+All three are testable with workspace-side + backend-side
+timing instrumentation (see "Next slice proposed" below). None
+of them are testable just by re-running the smoke under
+Playwright emulation — Playwright cannot exhibit the real
+Android-Chrome WS handshake nor the intermittent russh-dial
+first-attempt failure mode.
+
+**Per operator request (this slice).** The first follow-on
+workspace-instrumentation slice MUST deliberately verify the
+"nginx logs WebSocket upgrades at close time" interpretation
+with a controlled `lifetime_X_then_close` test pattern (open a
+session, hold it open for a known X seconds with no Output, then
+close from the client; confirm nginx ws log timestamp = close
+time). The methodology-verification step pins the interpretation
+before any code change downstream relies on it.
+
+#### Per-row evidence (mapped against the investigation questions in the slice spec)
+
+Question numbering follows the slice's "Questions to answer" list.
+
+1. **Does Playwright mobile emulation reproduce the 60–68 s
+   POST→WS gap?** **No.** Two consecutive mobile-emulation
+   launches (Phase B + Phase C) both reached `data-phase="attached"`
+   within ≤ 7.4 s of the launch click on this stack. **Evidence
+   class:** playwright-emulated + server-side inspected.
+2. **Does desktop viewport avoid the gap?** **Yes (consistent
+   with prior baselines).** Phase A desktop reached `attached`
+   in ~ 7 s with POST→201 in 195 ms; identical posture to the
+   2026-05-13 desktop baseline. **Evidence class:** playwright-emulated.
+3. **Is the gap before POST completion, between POST and WS
+   open, or after WS open?** **Not measurable from this slice
+   alone** because the gap did not reproduce. The methodology
+   correction above (nginx WS log = close time) is a precondition
+   for answering this from the 2026-05-15c / 2026-05-16 evidence.
+   **Evidence class:** inferred from the prior entries + this
+   slice's per-second netstat timing.
+4. **Does target netstat show SSH inbound before/after WS
+   attach?** **All three launches:** SSH `ESTABLISHED` inside
+   throwaway visible on the same wall-clock second as the POST
+   (Phase A 16:10:17 vs POST 16:10:16; Phase B 16:11:52 vs POST
+   16:11:52; Phase C 16:12:23 vs POST 16:12:22). The russh dial
+   reliably happened immediately on the WS-attach path in this
+   sample. **Evidence class:** server-side inspected (corrected
+   `netstat -tn` probe per the 2026-05-16 lesson).
+5. **Does the backend create/start SSH before WS attach, or
+   only after attach?** **Only after WS attach.** The POST
+   `/terminal-sessions` creates the session row + pre-marks the
+   orchestrator state; the SSH dial fires from the WS-upgrade
+   handler's `attach_session` call. The per-second poll shows
+   `established_to_2222=0` until the WS-upgrade window, then
+   `=1` from the same wall-clock second. **Evidence class:**
+   inferred from `crates/relayterm-api/src/routes/v1/terminal_sessions.rs`
+   (`ws_attach` calls `manager.attach_session()` on upgrade)
+   plus the per-second netstat poll.
+6. **Does a seq=0 detached session have any target inbound
+   connection?** **Not reproduced in this slice.** Worth
+   re-asking under the workspace-instrumentation slice with a
+   real-phone reproduction.
+7. **Is this first-launch only, mobile-width only, or
+   transient?** **Transient** per the 2026-05-16 evidence (xterm
+   launches 2 + 3 went live cleanly; xterm launch 1 reproduced).
+   This slice adds: **not** mobile-width only (mobile-width
+   reproduces neither the gap nor the detach under Playwright);
+   **not** workspace-state-machine-bound under desktop Chromium.
+8. **Is it renderer-independent under xterm?** **Yes** — already
+   established by the 2026-05-16 xterm-control resmoke. This
+   slice does not re-test wterm.
+9. **Does reconnect within TTL recover?** **Deferred — not
+   reached.** No session detached in this slice for reconnect to
+   apply against. The 2026-05-15c real-phone Reconnect attempt
+   inside the 30 s TTL window did NOT recover; the 2026-05-16
+   Launch 1 + manual Reconnect at 14:33:25 was past the auto-close
+   at 14:32:20 and got HTTP 409. The recover-within-TTL question
+   for the seq=0 case stays open.
+10. **What exact next implementation/debug slice should follow?**
+    **`feat/web-terminal-launch-timing-diagnostics` + optional
+    `feat/api-session-attach-timing-events`.** See "Next slice
+    proposed" below.
+
+#### Classification
+
+The 2026-05-16 classification stands: **workspace-bound +
+transient**, not wterm-specific. This slice **narrows the
+hypothesis space** and **flags a methodology issue**:
+
+- **NOT a property of mobile viewport shape.** Playwright
+  Chromium at 1080 × 2340 reaches `attached` in seconds, twice
+  in a row.
+- **NOT a property of the workspace SPA's client-side state
+  machine under desktop Chromium.** Same engine, same DOM,
+  same JS — fast attaches.
+- **NOT a property of the Cloudflare → origin tail from this
+  workstation network at this hour.** Same Cloudflare-fronted
+  endpoint, fast attaches across the desktop + mobile-emulation
+  rows.
+- **NOT a property of the orchestrator's attach-timeout being
+  tight enough to trip any mobile-shape workload.** The
+  workload would have to be specifically real-Android-Chrome-
+  shaped (or intermittently russh-dial-stalled) to trip it.
+- **PLAUSIBLY a property of (a) real-Android-Chrome WS-handshake
+  on a freshly-opened tab, (b) an intermittent russh dial /
+  first-attempt-after-fresh-state stall, or (c) both** —
+  testable with workspace + backend timing instrumentation.
+- **METHODOLOGY: the prior "POST→WS gap" measurements may have
+  been reading nginx's WS-close timestamp as a WS-open
+  timestamp.** The methodology-verification step proposed under
+  the next slice will pin this.
+
+#### What this slice does NOT promise / does NOT change
+
+- xterm remains the production default. No renderer promotion.
+- No CSP change. No backend / orchestrator / russh change. No
+  workspace SPA change. No protocol change. No CI / deploy
+  change.
+- No Tauri Android build. No real-phone smoke (2026-05-16
+  already established the real-phone Launch-1 reproduction; a
+  second hardware reproduction adds no signal until the
+  instrumentation lands).
+- The 2026-05-15c and 2026-05-16 dated entries are NOT rewritten
+  in place. This entry flags the interpretation correction for
+  future readers; the historical entries stay as records of
+  what was concluded at the time.
+
+#### Redaction sweep — clean
+
+15-minute log window covering all three launches across backend
++ web/nginx + SSH-target containers (105 lines total) plus the
+two per-second netstat poll captures (226 lines) plus today's
+Playwright console caches. Substring grep for
+`encrypted_private_key`, `private_key_openssh`, `BEGIN OPENSSH
+PRIVATE KEY`, `openssh-key-v1`, `passphrase`, `session_token`,
+`token_hash`, `data_b64`, `REDACT-MARKER`, `password=`,
+`passwd=`, `Authorization:`, `Cookie:`, the smoke sentinels
+`relayterm-mobile-ws-*` → **zero hits** outside the known false
+positives (`User/password ssh access is disabled.` on the
+linuxserver/openssh-server boot banner; `missing session cookie`
+on routine 401 metadata). The vault-generated ed25519 keypair's
+public half (`ssh-ed25519 AAAA…GoBRvarm…`) is the only key
+material that crossed the wire, and only in its OpenSSH
+public-key form — never in PEM, never with private-key
+delimiters. The two terminal-session UUIDs that detached
+without a live PTY in 2026-05-15c / 2026-05-16 are not in this
+slice's evidence; this slice's three session UUIDs all closed
+cleanly via the operator-driven close button.
+
+#### Cleanup
+
+After operator approval (operator selected: "Stop+remove SSH
+target container only" + "add the lifetime_X_then_close
+verification note to this dated entry" — see § "Methodology
+correction" above), the throwaway target was removed:
+
+```
+ssh cloud-edge 'docker rm -f relayterm-staging-mobile-ws-investigation-ssh'
+```
+
+→ container removed; `docker ps -a | grep -E
+"mobile-ws-investigation|wterm-android|xterm-android|resmoke"`
+returns nothing on cloud-edge. The
+`mobile-ws-investigation-xterm-profile` server profile, the
+`mobile-ws-investigation-host` host row, the
+`mobile-ws-investigation-identity` SSH identity, the single
+`known_host_entries` row, and the three `terminal_sessions`
+rows (`83ec9433`, `475b8ffa`, `252c4878`, all `status=closed`)
+are **left in place in staging DB** for reuse by the next
+workspace-instrumentation slice if it wants a pre-staged
+throwaway profile. Per inventory lifecycle policy default,
+server profiles are **disabled, not deleted**, when retired;
+this slice's operator explicitly scoped cleanup to the
+container only. Browser Settings stay xterm / gate off / autofit
+off (unchanged from start). The staging stack, staging CSP, and
+Postgres were not touched.
+
+#### Next slice proposed (not run by this slice)
+
+**`feat/web-terminal-launch-timing-diagnostics`** — add
+workspace-side timing instrumentation to the WS-open path so
+the (still-unrepro'd) 60–68 s first-launch gap can be
+attributed when it next appears on a real phone:
+
+- record `WebSocket` constructor call timestamp, `open`
+  event timestamp, first `Attach` JSON sent timestamp,
+  first `ServerMsg::SessionAttached` received timestamp,
+  first `Output` received timestamp on a per-session basis
+  inside `TerminalSessionClient`;
+- expose those as closed-vocabulary `data-*` attributes on
+  `[data-testid="production-terminal"]` (e.g.
+  `data-launch-ws-open-ms`, `data-launch-first-output-ms`,
+  `data-launch-attach-sent-ms`) and as a workspace operator
+  panel so the operator can see *during* the 60-second wait
+  whether the WS is even open;
+- mirror the same milestone set into `session_events` on the
+  backend side via `feat/api-session-attach-timing-events`
+  (lightweight: just `created → ws_upgraded → first_attach_seen
+  → first_output_emitted` with absolute timestamps; no payload
+  bytes, public metadata only per
+  `docs/agent/redaction-rules.md` § 1);
+- **methodology verification (per operator request, in this
+  slice's approval).** The FIRST sub-step of the instrumentation
+  slice must explicitly verify the "nginx logs WS upgrades at
+  close time" interpretation by running a controlled
+  `lifetime_X_then_close` test (open a session, hold it open
+  with no Output for a known X seconds, close from the client,
+  read the nginx ws log timestamp and confirm it equals the
+  close timestamp). Pin the interpretation in the runbook
+  before downstream code-side changes rely on it.
+
+**`docs/android-phone-session-debug-runbook`** (optional
+follow-on) — if the instrumentation slice lands and the next
+real-phone reproduction's `data-*` values + `session_events`
+rows do NOT explain the 60-second gap, write a short focused
+runbook for the operator-side diagnostics needed on a real
+Samsung phone (Chrome DevTools USB attach steps,
+`chrome://net-internals` capture, `adb logcat` filters for
+the Chrome WebView process), so a third investigation slice
+does not have to re-derive them. Defer unless instrumentation
+proves insufficient.
+
+**Surface-3 (Tauri Android WebView) smoke (`docs/wterm-android-
+tauri-smoke`) stays deferred** until the workspace + backend
+instrumentation lands AND the real-phone reproduction is
+re-classified. Running the Tauri smoke now would only
+re-collect the same intermittent first-launch detach pattern
+across a more expensive surface.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
