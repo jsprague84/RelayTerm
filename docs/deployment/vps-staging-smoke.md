@@ -9948,6 +9948,448 @@ renderer promotion or xterm-default flip; production
 CSP decisions; tmux/screen persistence; durable
 VT-snapshot persistence.
 
+### 2026-05-15c · wterm Android Chrome (surface 2) browser smoke — mount + rotation pass; live PTY attach NOT reached (open question)
+
+First execution of the
+[`docs/wterm-mobile-smoke-plan.md`](../wterm-mobile-smoke-plan.md)
+runbook against **surface 2** (Android Chrome on a physical
+device), driven via adb keyboard/touch automation from the
+workstation. Goal of this slice: capture a *first* honest data
+point on whether the wterm renderer is viable on Android Chrome
+against the deployed staging stack, *without* building or
+installing any Tauri Android APK. Outcome: **wterm renderer
+mounts cleanly on Android Chrome and survives rotation, but the
+session never reached a live PTY in two consecutive attempts** —
+both sessions stayed in `detached (TTL window) last_seen_seq 0`
+even though the backend's WS upgrade succeeded. Backend SSH dial
+never fired (SSH-target container shows zero inbound connections
+for the smoke window). Recording this as an open mobile-WS-attach
+question; the slice does NOT promote wterm and does NOT flip the
+xterm default.
+
+**Date.** 2026-05-16 03:55 UTC – 04:10 UTC (≈ 15 min on-device,
+plus log triage and cleanup; workstation clock 2026-05-15 evening
+CDT).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+
+**Stack pin.** Same web image as the 2026-05-15b autofit
+diagnostic resmoke (entry above) — web force-recreate from that
+slice carries into this one with no further deploy:
+
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  container image
+  `sha256:cb9620986ddfcb69ac44a80cc8709d3b46a1fbd7fac5ace092012f6f312d3198`,
+  container created `2026-05-15T23:16:27Z`,
+  served `Last-Modified: Fri, 15 May 2026 23:00:41 GMT`,
+  ETag `"6a07a599-1ab"`.
+- backend `git.js-node.cc/jsprague/relayterm-backend:main`,
+  container image
+  `sha256:90573e96bcbca4dba962330ffa264365200ecf5af03390dac933ba6e2a23cb52`,
+  container created `2026-05-14T17:23:36Z`. Backend version
+  unchanged from the 2026-05-14g / 2026-05-15a/b entries above —
+  this slice does not touch backend code.
+- Served bundle: `index-9Ss46Hol.js` (663 KB), with auxiliary
+  chunks `index-BCIfX0j-.js` (2.6 MB, which carries the wterm
+  Zig+WASM core inlined per the `@wterm/dom` 0.2.x packaging),
+  `index-CTfxJBJf.js` (40 KB), `index-DMQTeLDC.js` (639 KB),
+  `index-DmaIwISy.css` (53 KB). Plus ghostty-web's
+  `ghostty-vt-DOMeXDrv.wasm` (not loaded by this smoke).
+- CSP unchanged from prior entries:
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+  No `connect-src`/`worker-src` overrides; wterm needs neither
+  per the renderer-comparison-scorecard wterm row.
+
+**Smoke target setup.** Throwaway SSH target on cloud-edge:
+
+```
+ssh cloud-edge 'docker run -d --name relayterm-staging-wterm-android-browser-smoke-ssh \
+  --restart unless-stopped -p 127.0.0.1:2226:2222 \
+  -e PUID=1000 -e PGID=1000 -e TZ=UTC \
+  -e USER_NAME=smoke -e PASSWORD_ACCESS=false \
+  -e PUBLIC_KEY="<vault-managed ed25519 pubkey>" \
+  lscr.io/linuxserver/openssh-server:latest'
+```
+
+linuxserver/openssh-server `10.2_p1-r0-ls225`, pubkey-only,
+listening on 2222 inside the container. The vault-managed
+ed25519 keypair was created via the staging Identities UI from
+the phone; the private half stays in the backend vault and never
+leaves the server (CSP-pinned).
+
+**Inventory rows created from the phone (all via SPA, none via
+shell).** SSH identity `wterm-android-browser-smoke-key`
+(ed25519, vault-generated). Host `wterm-android-browser-smoke`
+(staging-internal address pointing at the throwaway SSH target's
+2226 port). Server profile
+`wterm-android-browser-smoke-profile` (UUID
+`8372dc8e-087e-4928-8918-60cd7b10f76f`), bound to the host and
+identity above. Preflight + trust-host-key + auth-check
+*all returned 200* before any Launch terminal attempt:
+
+```
+POST /api/v1/server-profiles/8372dc8e-.../host-key-preflight  200
+POST /api/v1/server-profiles/8372dc8e-.../trust-host-key       200
+POST /api/v1/server-profiles/8372dc8e-.../auth-check           200
+POST /api/v1/server-profiles/8372dc8e-.../auth-check           200  (re-check after Settings nav)
+```
+
+So the russh dial path is provably *reachable* from the staging
+backend to the throwaway target with these credentials — the SSH
+target *did* accept inbound connections during the preflight /
+auth-check phase. The detach finding below is specific to the
+post-Launch attach cycle.
+
+**Device + browser.** Samsung phone, model id `R38N500TY3E`
+(adb-visible), Android Chrome `148.0.0.0` (user-agent reports
+`Linux; Android 10; K` — Chrome's reduced UA), screen 1080 × 2340,
+samsung-keyboard IME. Driven via the workstation's
+`/home/jsprague/Android/Sdk/platform-tools/adb` over USB
+(`adb devices` returns the device authorised; no scrcpy /
+remote-display tooling in this slice).
+
+**Network path.** Phone is on the workstation's home wifi
+(no operator VPN); requests reach staging via the public
+`relayterm-staging.js-node.cc` Cloudflare-fronted endpoint.
+The operator-side source IP is not relevant to this entry's
+findings and is omitted from the public record (same posture
+as prior surface-2 / surface-3 dated entries on this stack).
+
+**Renderer setting.** Settings → Renderer evaluation gate
+**ON** + selected renderer **wterm**. State carried from a
+prior workstation session via the auto-login cookie; this slice
+did not re-flip the gate from the phone. Confirmed in the
+workspace banner copy ("LIVE SSH TERMINAL WORKSPACE" with the
+wterm renderer mounted into the production-terminal element).
+
+#### Rows attempted
+
+This slice attempted rows **A**, **B**, **C**, **I**, **J**, **K**
+(per the 17-row plan in `docs/wterm-mobile-smoke-plan.md` §5,
+mapped against the surface-2 first-pass scope). Rows
+**D–H** (ASCII input, modifier keys, paste, copy/select, long
+output) and rows **L–M** (browser back/forward, xterm control
+comparison) were **NOT exercised** in this slice — see "What was
+NOT done" below — because the session never reached a live PTY
+and renderer-fair input testing requires SSH to be live.
+
+- **Row A — wterm renderer mount diagnostic.** PASS. A small
+  blinking block cursor was visible at the top-left of the
+  `production-terminal` viewport in *both* session attempts
+  (screenshot evidence kept local-only per slice privacy
+  posture; not committed). The wterm host element is the
+  `.wterm` class root with the renderer's own CSS-variable
+  theming — visually distinct from xterm's hidden-textarea +
+  canvas pair, matching `docs/spec/terminal-adapters.md` §
+  "wterm experimental renderer adapter". Mount survived the
+  workspace nav cycle (Servers → Launch terminal → workspace)
+  and was reproducible on the second Launch.
+
+- **Row B — tap-to-focus / Row C — soft-keyboard reveal.**
+  PARTIAL. Tapping the workspace controls' "Focus terminal"
+  button reliably called the renderer-neutral `focusTarget()`
+  path; the soft keyboard (samsung IME) revealed on focus and
+  occupied roughly the lower half of the viewport. The wterm
+  cursor remained visible in the upper viewport region while
+  the IME was open. The workspace viewport reflowed when the
+  IME opened, but the wterm grid itself did NOT visibly resize
+  during the IME open/close cycle (autofit is mount-time only
+  for wterm in the current adapter; this matches the
+  scorecard's wterm autofit note). Tracked as a separate
+  open observation, not a regression.
+
+- **Row I — autofit / rotation.** PARTIAL PASS. Forcing landscape
+  via `content insert --uri content://settings/system
+  --bind name:s:user_rotation --bind value:i:1` rotated the
+  WebView cleanly: the production-shell nav rail (RelayTerm
+  brand → Dashboard → Terminal → Sessions → Server profiles)
+  reflowed to the left, the workspace status block reflowed to
+  the right, and the "Status / Focus terminal / Fit / Clear /
+  Detach / End session / Reconnect / Disconnect / Back to
+  servers" control row wrapped onto two lines without
+  truncation. The detach-state banner remained legible.
+  Rotating back to portrait restored the prior layout. The
+  wterm grid renderer did NOT re-fit on rotation in this slice
+  (consistent with autofit being mount-time only for the
+  current `@wterm/dom` 0.2.x adapter); a renderer-driven Fit
+  on a live PTY was not exercised because the PTY never went
+  live (see Row J).
+
+- **Row J — detach / reconnect.** This was where the slice's
+  primary finding emerged. **Both Launch terminal attempts
+  produced a session that immediately reported
+  `Status: detached (TTL window)` with `last_seen_seq 0`** in
+  the workspace banner, even though backend nginx confirmed
+  both the session POST (HTTP 201) and the WS upgrade (HTTP
+  101) completed successfully:
+
+  ```
+  Session 1 (45e2f261-c96c-45d2-8301-06b63d105b65):
+    03:57:45 POST /api/v1/terminal-sessions                 201
+    03:58:46 GET  /api/v1/terminal-sessions/.../ws          101
+    (~61s gap between POST and WS dial)
+  Session 2 (033c48ac-3838-4214-8fe6-5e5ee5cbf768):
+    04:04:08 POST /api/v1/terminal-sessions                 201
+    04:05:08 GET  /api/v1/terminal-sessions/.../ws          101
+    (~60s gap between POST and WS dial)
+  ```
+
+  Tapping **Reconnect** while inside the 30s detached-TTL
+  window (the
+  `RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS`
+  knob's value, set in this stack to the documented 30s default)
+  did NOT visibly transition the workspace to a live state;
+  status persisted at `detached (TTL window)`. A
+  workspace-rendered red banner "Send attempted after session
+  ended" appeared at one point during the first session,
+  indicating the workspace client believed the session was
+  closed even though the WS upgrade had completed at the HTTP
+  layer.
+
+  The SSH-target container's logs were checked end-to-end for
+  the smoke window:
+
+  ```
+  ssh cloud-edge 'docker logs --since 30m \
+    relayterm-staging-wterm-android-browser-smoke-ssh 2>&1'
+  ```
+
+  → **zero inbound connections** beyond the linuxserver
+  boot banner. So russh on the backend never dialed the SSH
+  target for either of these two Launch attempts, even though
+  the auth-check route (which DOES dial russh) had succeeded
+  twice for the same profile + identity moments earlier (~ 75s
+  before the first Launch).
+
+- **Row K — navigation usability.** PARTIAL PASS. The
+  workspace controls row (Focus terminal / Fit / Clear local
+  viewport / Detach / End session / Reconnect / Disconnect /
+  Back to servers) was tap-reachable on a 1080-px phone,
+  though the buttons sit at uncomfortably tight spacing for
+  thumb input — tap-coordinate drift on the workstation-side
+  adb-driven tap led to several accidental "Back to servers"
+  navigations away from the workspace (recovered each time by
+  re-navigating Servers → expand profile → Launch terminal).
+  Tracked as a usability observation, not a renderer fault.
+  The Profiles list itself was *very* long (28 hosts, 26
+  profiles in this staging slot from prior smokes) — the
+  SEARCH PROFILES filter at the top of `/servers` was the
+  only practical way to locate the wterm profile on a phone.
+
+#### What was NOT done (deferred / blocked)
+
+- **Rows D – H (ASCII input, modifier keys, paste, copy /
+  select, long output `seq 1 150`)** — *blocked* by the
+  Row J detach finding. Renderer-fair input testing requires
+  the SSH PTY to be live so that input bytes can be
+  round-tripped to a visible prompt; with the session detached
+  at `seq 0` no PTY byte ever arrived, and forcing input into
+  a detached workspace would only have exercised the
+  workspace's "Send attempted after session ended" error path
+  (which the smoke already observed visually). These rows are
+  carried forward into the next mobile slice.
+- **Rows L (browser back / forward in Chrome's history stack)
+  and M (xterm control comparison on the same phone)** —
+  *deferred for scope*. L would have exercised the SPA
+  router's deep-link reconnect, but without a live PTY the
+  reconnect target itself is the open question, so re-rolling
+  the dice on it via browser navigation adds no new
+  information. M (xterm control comparison) would need a
+  fresh profile + a Settings flip back to `xterm` from the
+  phone — given the 60-second POST→WS delay observed on this
+  network, the smoke owner chose to land the primary wterm
+  finding rather than burn another 30 min on a same-network
+  xterm rerun. M is carried forward into the next slice and
+  should be the *first* row exercised when this finding is
+  re-investigated, because if xterm shows the same detach-at-
+  seq-0 pattern on the same network the cause is the
+  mobile-Chrome-↔-staging WS path, not the wterm renderer.
+- **Surface 3 (Tauri Android WebView)** — *intentionally
+  deferred*. The smoke plan explicitly orders surface 2 →
+  surface 3, and running surface 3 against a finding that
+  surface 2 has flagged would conflate "is wterm OK on
+  Android?" with "is the Tauri Android WebView OK on Android
+  for wterm?". The Tauri rebuild + signing dance is also
+  expensive (~ 5-10 min per APK). Surface 3 is the next
+  slice's first row, *after* the Row J open question has a
+  hypothesis.
+- **Performance / frame-time / scroll-jank measurement** —
+  *deferred*. No DOM-content paint tracing, no
+  `requestAnimationFrame` timing, no `PerformanceObserver`
+  trace from the device side in this slice; the slice is a
+  go / no-go viability gate, not a perf characterisation.
+- **Touch-keyboard modifier bar** — *not in scope for this
+  slice* (no slice yet exists to add one); confirmed as a
+  known gap (no Ctrl / Esc / Tab / arrows on the samsung
+  IME), but exercising the workaround (long-press, swipe
+  gestures, alternate IMEs) was *not* part of this slice's
+  surface-2 scope.
+- **Tauri APK build + install** — *explicitly out of scope*
+  per the slice non-goals.
+
+#### Honest open question (the headline finding)
+
+**On Android Chrome against this staging stack, with the wterm
+renderer selected, the session lifecycle reproducibly stalls at
+"workspace mounted, WS upgraded at HTTP layer, status =
+detached (TTL window), `last_seen_seq` = 0, no SSH dial fired"
+across two consecutive Launch attempts.** The renderer
+itself mounts; the inventory plumbing works (preflight + trust
++ auth-check are all green for the same profile moments
+earlier); the WS handshake completes at HTTP 101. But the
+client-side workspace either never sends the attach message
+or sends one the backend ignores, and the SSH dial never
+happens.
+
+The slice does NOT root-cause this. Plausible hypotheses worth
+investigating in a follow-up:
+
+1. **Renderer-mount → WS-dial ordering on touch devices.**
+   The ~60s consistent gap between session POST and WS dial
+   suggests the workspace is waiting on something between
+   POST-returns-201 and WS-open-fires. Could be (a) wterm
+   WASM-init being slower on this Android Chrome than the
+   workspace's WS-open timeout assumes, (b) a click /
+   render-cycle stall that defers WS open until the next
+   touch-frame, or (c) an unrelated mobile-Chrome WS
+   handshake delay. Distinguishable by re-running the same
+   sequence with renderer set to `xterm` (Row M) on the same
+   phone on the same network.
+2. **WS attach message lost between phone-Chrome and backend.**
+   The WS upgrade completes at HTTP 101 but the first
+   protocol message (the client-side `attach` JSON) may never
+   reach the backend, may reach the backend after a server-
+   side attach-timeout, or may reach the backend but encode
+   in a way the surface-2 path mishandles. Backend tracing
+   for the session UUIDs at INFO level was silent — the
+   backend's INFO logger does not emit on session create /
+   WS upgrade routinely, so this is *not* evidence that the
+   backend never received the attach; it's just absence of
+   evidence. A focused trace-level rerun would be
+   informative.
+3. **Cloudflare WS proxy + cellular-class link.** Phone is
+   on home wifi (not LTE), so cellular path-MTU /
+   keepalive issues are unlikely, but Cloudflare → origin
+   WS-upgrade latency on the staging tunnel could be the
+   ~60s tail; the workstation desktop browser smokes do not
+   reproducibly see that delay.
+
+**Posture for the next slice owner:** do NOT promote wterm
+to default. Do NOT flip the xterm production baseline.
+The mobile-WS-attach question is a *workspace* question, not
+a *renderer* question — solving it for wterm solves it for
+every adapter, and the right next slice is "xterm on Android
+Chrome against staging" (i.e. Row M of this plan, run as its
+own slice).
+
+#### Cleanup
+
+After operator approval (operator selected: "Stop+remove SSH
+target container" and "Full finding + open question"), the
+throwaway target was removed:
+
+```
+ssh cloud-edge 'docker rm -f \
+  relayterm-staging-wterm-android-browser-smoke-ssh'
+```
+
+→ container removed; no residual containers matching
+`wterm-android` on cloud-edge. The
+`wterm-android-browser-smoke-profile` server profile + its
+host + the vault-managed `wterm-android-browser-smoke-key`
+SSH identity were **left in place in staging DB** for reuse by
+the follow-on Row M / surface-3 slice (per inventory lifecycle
+policy default for server_profiles: disable, not delete; the
+operator-explicit cleanup scope in this slice was the SSH
+target container only). The two terminal-session rows
+(45e2f261, 033c48ac) are *never* user-deletable per the
+inventory lifecycle policy and remain in the
+`terminal_sessions` table in the detached state they ended in;
+they are evidence for the open question above.
+
+#### Redaction sweep
+
+```
+ssh cloud-edge 'docker logs --since 1h relayterm-staging-relayterm-backend-1; \
+  echo "===WEB==="; docker logs --since 1h relayterm-staging-relayterm-web-1; \
+  echo "===SSH==="; docker logs --since 1h \
+  relayterm-staging-wterm-android-browser-smoke-ssh' \
+  > /tmp/wterm-smoke-staging-logs.txt
+```
+
+Grep for `encrypted_private_key | private_key | password |
+passphrase | token= | cookie= | x-csrf | session-token |
+BEGIN OPENSSH | PEM | argon2id | hash:\$argon | argon2\$ |
+staging\+throwaway | throwaway-20260509` returned **only one
+line**: `User/password ssh access is disabled.` from the
+linuxserver/openssh-server boot banner — that is the container
+*advertising its pubkey-only configuration*, not a credential
+value. No `encrypted_private_key` /  `private_key` field, no
+session-cookie value, no `Authorization` header, no PEM
+delimiters, no argon2 hash strings, no plaintext throwaway
+email address. Sentinel-clean.
+
+Screenshots (61 PNGs at `/tmp/wterm-android-*.png` on the
+workstation) are **kept local only and NOT committed** — two
+of them inadvertently captured Chrome's tab switcher with an
+operator-personal "passwords" tab visible (workstation-side,
+unrelated to RelayTerm credentials), and per the slice's
+"Mobile screenshots stay local unless sanitised" posture all
+mobile screenshots from this slice remain on the workstation
+disk only. None of the renderer-mount / detach-state / nginx-
+log evidence above depends on a published screenshot.
+
+#### Doc updates landed by this slice
+
+- This dated entry.
+- [`docs/wterm-mobile-smoke-plan.md`](../wterm-mobile-smoke-plan.md)
+  § 5 (Proposed smoke rows) — row-by-row status column added,
+  marking A / B / C / I / K as PARTIAL+ pass and D – H / L / M
+  as deferred-to-next-slice with the Row J finding as the
+  blocker.
+- [`docs/renderer-comparison-scorecard.md`](../renderer-comparison-scorecard.md)
+  — wterm Mobile UX row footnote points at this entry; the
+  scorecard's overall recommendation (xterm production
+  baseline; wterm experimental, evaluated on a per-surface
+  basis) is unchanged.
+- [`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+  — wterm renderer's "Surfaces evaluated" subsection links
+  this entry as the first Android Chrome (surface 2)
+  data point.
+- AGENTS.md Encountered Lessons — appended a single dated
+  entry capturing the renderer-mount-vs-WS-attach distinction
+  and the surface-2 ordering rule (surface 2 must answer
+  "renderer mounts and survives" before surface 3 is worth
+  spinning up).
+
+#### Intentionally deferred (this slice owns none of these)
+
+Renderer promotion or xterm-default flip; backend / russh
+attach-flow tracing; CSP changes; the
+`detached_live_pty_ttl_seconds` knob being widened (it is
+deliberately 30s and should stay there for staging); any
+fix to the workspace-mount → WS-dial ordering; any
+touch-keyboard modifier bar work; any Tauri Android APK
+build; any xterm-default flip; any client-side
+performance / scroll-jank measurement; any rerun of
+Rows D – H / L / M (those graduate into the follow-on slice
+proposed in the closing paragraph below).
+
+#### Next slice proposed (not run by this slice)
+
+`docs/wterm-android-browser-resmoke` — exercise **Row M
+first** (xterm on the same Samsung phone on the same network
+against the same staging stack) to prove whether the
+detach-at-seq-0 / 60s POST→WS gap pattern is renderer-bound
+(wterm-specific) or workspace-bound (every renderer
+including the production-baseline xterm). If xterm
+reproduces the same detach pattern, the bug lives in
+the workspace's WS-attach handshake (and the right next
+fix slice is *workspace*, not *wterm*). If xterm
+attaches cleanly, the bug is wterm-specific and the next
+fix slice should look at wterm's mount-completion → WS-dial
+ordering. Only after Row M lands a clear signal should
+Rows D – H / L / surface-3-Tauri attempts resume.
+
 ---
 
 ## See also

@@ -186,6 +186,41 @@ Rows 3–6 + 9 are the load-bearing wterm-on-mobile rows; rows 11–12
 gate viability; rows 16–17 prevent the smoke from being interpreted
 without controls.
 
+### Status after the 2026-05-15c surface-2 first execution
+
+The first execution of this runbook against surface 2
+(Android Chrome) landed as the
+[`2026-05-15c · wterm Android Chrome (surface 2) browser smoke`](deployment/vps-staging-smoke.md#2026-05-15c-wterm-android-chrome-surface-2-browser-smoke-mount-rotation-pass-live-pty-attach-not-reached-open-question)
+dated entry in the staging-smoke log. Per-row status from that
+first execution (surface 2 only; surfaces 3 and 4 not yet
+attempted):
+
+| # | Row | Surface 2 status (2026-05-15c) | Why |
+|---|---|---|---|
+| 1 | Renderer mount diagnostic | **PASS** | wterm grid + visible block cursor mounted on the production-terminal element on both Launch attempts. |
+| 2 | Autofit posture | NOT GRADED on phone | Carried forward; surface-1 autofit already covered by 2026-05-15 / 2026-05-15b dated entries. |
+| 3 | Tap-to-focus | PARTIAL PASS | `production-terminal-focus` button worked; soft keyboard rose. Selector-side verification skipped because Chrome's WebView is opaque to uiautomator. |
+| 4 | Soft-keyboard open / layout | PARTIAL PASS | wterm cursor stayed visible above the IME; grid did not reflow on IME open / close (autofit is mount-time only in the current `@wterm/dom` 0.2.x adapter). |
+| 5 | Viewport-height drives autofit | **DEFERRED** | Blocked by Row 12 detach finding — no live PTY to round-trip `stty size` against. |
+| 6 | ASCII input (Path A) | **DEFERRED** | Blocked by Row 12; no live PTY. |
+| 7 | Modifier-key affordance scoping | DEFERRED | Confirmed by inspection (no in-workspace modifier bar on the samsung IME); full scope deferred to its own slice. |
+| 8 | Paste flow | **DEFERRED** | Blocked by Row 12; the paste-safety panel could not be exercised against a live remote prompt. |
+| 9 | Copy / select | **DEFERRED** | The wterm DOM is mountable, but the copy/select flow's "bytes survive paste into another app" check needs visible payload to copy. With no PTY output, no payload existed. |
+| 10 | Long output / scroll | **DEFERRED** | Blocked by Row 12; no PTY. |
+| 11 | Narrow-viewport reflow on rotation | **PARTIAL PASS** | Rotating portrait↔landscape reflowed the workspace nav rail and control row cleanly; the wterm grid itself did not re-fit (autofit is mount-time only — see Row 4). No broken paint. |
+| 12 | **Detach / reconnect (the headline)** | **OPEN QUESTION** | Two consecutive sessions reached `detached (TTL window) seq=0`; backend nginx confirmed POST→201 + GET ws→101 for both with a consistent ~60s POST→WS dial gap; SSH-target container shows zero inbound connections (russh never dialed). Reconnect within the 30s TTL window did not flip to live. Not yet root-caused. See the 2026-05-15c dated entry for the full evidence trail. |
+| 13 | Profile / session nav usability | PARTIAL PASS | Every nav button reachable on 1080-wide screen; control-row buttons sit at tight thumb spacing. |
+| 14 | Orientation change on active session | **DEFERRED** | Blocked by Row 12; no active session to rotate against. |
+| 15 | Browser back / forward | **DEFERRED** | Skipped — see "What was NOT done" in the dated entry. |
+| 16 | Redaction / storage / log sweep | **PASS** | Sentinel-clean grep across backend + nginx + SSH-target logs; no `private_key`, `encrypted_private_key`, session-token, cookie, PEM, argon2, or throwaway-email substring. |
+| 17 | xterm control comparison | **DEFERRED → first row of next slice** | The next slice (`docs/wterm-android-browser-resmoke`) MUST run this row first; the Row 12 question is workspace-vs-renderer and the xterm control is what distinguishes them. |
+
+The pass / partial / deferred markings are *as of 2026-05-15c
+only* and are not a renderer judgement; they are an honest
+record of what the first surface-2 execution could and could
+not reach. Promotion / xterm-default decisions are NOT on the
+table from this row set alone.
+
 ## 6. Test prerequisites
 
 - **Staging URL.** `https://relayterm-staging.js-node.cc` (the
@@ -475,6 +510,17 @@ against the production-shell bundle that contains wterm. The Tauri
 shell smoke piggy-backs on Galaxy S10e + the existing bundled-shell
 handoff infrastructure the 2026-05-09 entries established, so the
 incremental cost from the Chrome smoke is small.
+
+**Update after the 2026-05-15c surface-2 execution.** The Chrome
+smoke is **not** green — see the per-row table in §5 above and
+the dated entry it references. The follow-on Tauri smoke
+(`docs/wterm-android-tauri-smoke`) therefore stays deferred
+until the Row 12 detach question has at least one re-investigation
+slice behind it. The next executable slice is
+`docs/wterm-android-browser-resmoke` (xterm-first control rerun on
+the same phone, same network, same staging stack), not the Tauri
+shell. See the "Next slice proposed" subsection in the 2026-05-15c
+dated entry for the exact scope.
 
 If the Chrome smoke (surface 2) reveals that wterm is **not yet**
 mobile-ready as built — likely the modifier-bar gap or a

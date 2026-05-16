@@ -1390,6 +1390,102 @@ Adapter contracts unchanged:
 [`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
 § "Implementation status (since 2026-05-15…)".
 
+### 2026-05-15c · `docs/wterm-android-browser-smoke` (surface 2) — first Android Chrome execution; mount + rotation pass, WS-attach detach-at-seq-0 is the headline open question
+
+**Status:** docs-only smoke execution against the deployed
+staging stack. **No** renderer / `terminal-core` /
+production-shell-non-doc / protocol / backend / session /
+orchestrator / CSP / CI / deploy file was edited. The slice's
+sole new artefacts are the dated entry in
+`docs/deployment/vps-staging-smoke.md` (§ "2026-05-15c"), the
+per-row status block in `docs/wterm-mobile-smoke-plan.md` § 5,
+the "Known concerns" update in
+`docs/renderer-comparison-scorecard.md` § "wterm", this entry,
+and a single AGENTS.md Encountered-Lessons line.
+
+**Surface.** `https://relayterm-staging.js-node.cc` against a
+physical Samsung Android phone (adb-visible `R38N500TY3E`),
+Chrome `148.0.0.0` on Android 10 (Chrome's reduced UA strings
+"K"), driven via the workstation's adb. Web container =
+`sha256:cb9620986ddf…` (the 2026-05-15b digest);
+backend = `sha256:90573e96bcbc…` (unchanged from 2026-05-14g
+onward). Bundle `index-9Ss46Hol.js`. CSP unchanged:
+`default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+
+**Renderer setting.** Settings → Renderer evaluation gate ON +
+renderer = `wterm`, carried via auto-login cookie from a
+prior workstation session.
+
+**What landed.**
+
+- Row 1 (renderer mount): **PASS** — visible block cursor in
+  the `production-terminal` viewport on both Launch attempts.
+- Rows 3 / 4 (tap-to-focus + soft keyboard): partial pass —
+  `production-terminal-focus` button worked, samsung IME rose
+  on focus, wterm cursor stayed visible above the IME.
+- Row 11 (rotation): partial pass — nav rail + control row
+  reflowed cleanly in landscape. wterm grid did not re-fit on
+  rotation (autofit is mount-time only for the current
+  `@wterm/dom` 0.2.x adapter; consistent with the
+  2026-05-14j / 2026-05-15 scorecard row, not a regression).
+- Row 13 (workspace nav usability): partial pass — every
+  control reachable on a 1080-wide screen, though button
+  spacing is tight for thumb input.
+- Row 16 (redaction): **PASS** — sentinel-clean grep across
+  backend + nginx + SSH-target logs for the smoke window.
+
+**What did NOT land — the headline open question.** Both
+fresh sessions (`45e2f261-c96c-45d2-8301-06b63d105b65`,
+`033c48ac-3838-4214-8fe6-5e5ee5cbf768`) immediately reached
+`Status: detached (TTL window)` with `last_seen_seq 0`.
+Backend nginx access log confirms POST `/api/v1/terminal-sessions`
+→ 201, then GET `/ws` → 101 for both — but with a **consistent
+~60-second gap between POST and WS dial** for both sessions.
+SSH-target container log shows **zero inbound connections** for
+the smoke window, so russh on the backend never even dialed
+the throwaway SSH target for either session, even though the
+preflight + trust-host-key + auth-check routes (which DO dial
+russh) had all returned 200 for the same profile +
+identity less than 90s before the first Launch. Reconnect
+within the 30-second TTL window did not flip the workspace
+state to live. Without a live PTY, the renderer-fair input
+rows (6 ASCII input, 7 modifier-key affordances, 8 paste, 9
+copy/select, 10 long output) could not be exercised and are
+all carried into the next slice as `deferred — blocked by
+Row 12`. Per-row status table is in
+`docs/wterm-mobile-smoke-plan.md` § 5.
+
+**Why this is NOT a renderer judgement.** The renderer
+mounts; the renderer's grid is visible; the renderer's
+rotation behaviour is acceptable. The detach-at-seq-0 pattern
+is a *workspace* observation that this slice cannot
+distinguish from a *renderer* observation without an xterm
+control on the same phone / network / staging stack. The
+next slice (`docs/wterm-android-browser-resmoke`) runs Row
+17 (xterm control comparison) **first** specifically to make
+that distinction; if xterm reproduces the same detach
+pattern, the bug is workspace-side and wterm is exonerated;
+if xterm attaches cleanly, the bug is wterm-specific and
+the next fix slice should look at wterm's mount-completion
+→ WS-dial ordering on touch devices.
+
+**Posture.** Do NOT promote wterm. Do NOT flip the xterm
+production baseline. wterm's experimental status is
+unchanged. The 2026-05-14g production-shell mount gate and
+the 2026-05-14i matrix smoke remain the last graded data
+points for wterm on the desktop surface; this entry is the
+first surface-2 data point and is honestly mixed.
+
+**Cross-links.** Smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-15c · wterm Android Chrome (surface 2) browser
+smoke". Plan: [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+§ 5 (per-row status table) and § 11 (next slice proposal).
+Scorecard updates:
+[`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
+§ "wterm" Known concerns, § "Mobile / browser-native UX
+potential" footnote.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —
