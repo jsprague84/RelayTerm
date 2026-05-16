@@ -1577,6 +1577,30 @@ resmoke"). Scorecard update:
 § "wterm" Known concerns (the 2026-05-15c mobile detach
 finding is now reclassified as workspace-bound).
 
+**2026-05-16 · `docs/mobile-smoke-methodology-update`
+(methodology follow-up, docs-only).** A separate docs slice
+has refactored the mobile smoke execution model in
+[`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+§ 5 ("2026-05-16 methodology update — Playwright-first
+execution model, real-phone narrow scope") and added the
+operator-runbook surface in
+[`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § D →
+"Mobile smoke methodology (Playwright-first; real-phone
+narrow)". Every future surface-2 / surface-3 row sweep — under
+the workspace-side investigation slice above or after it lands
+— defaults to Playwright mobile emulation + server-side log /
+DB inspection, with real-phone operator work reserved for the
+closed list of rows whose evidence depends on hardware (soft
+keyboard, selection handles, OS paste menu, Android back
+gesture, touch ergonomics, real orientation event chain,
+tab / session lifecycle). Operator prompts are short and
+row-based; the SSH-inbound probe is `netstat -tn` inside the
+throwaway target (not `docker logs`); every evidence row is
+tagged with an evidence-class label. The methodology change
+does NOT promote any renderer, does NOT flip the xterm
+default, and does NOT alter the Phase 1 / Phase 2 promotion
+gates.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

@@ -1902,6 +1902,215 @@ without a class is an unreviewable smoke entry.
   mouse-input half). Record once per fixture, do not re-classify on
   every run.
 
+#### Mobile smoke methodology (Playwright-first; real-phone narrow)
+
+The 2026-05-16 methodology update added to
+[`docs/wterm-mobile-smoke-plan.md`](../../docs/wterm-mobile-smoke-plan.md)
+§ 5 ("2026-05-16 methodology update — Playwright-first execution
+model, real-phone narrow scope") is the source of truth; this
+subsection is its operator-runbook surface. Treat the plan as
+authoritative on row-channel mapping and the closed real-phone
+list; treat this subsection as the per-row checklist a smoke
+operator works through.
+
+The slice that surfaced the methodology was the
+`docs/mobile-smoke-methodology-update` docs slice; the dated
+entries it sits on top of are the 2026-05-15c surface-2 wterm
+smoke and the 2026-05-16 xterm-control resmoke in
+[`docs/deployment/vps-staging-smoke.md`](../../docs/deployment/vps-staging-smoke.md).
+
+##### Default channel: Playwright mobile emulation
+
+**Surface-1 narrow-viewport is NOT surface-2 Android Chrome.**
+Playwright mobile emulation at an Android-class viewport is the
+default execution channel for browser-automatable rows, but it
+does not prove anything about real Android touch, soft keyboard,
+IME, OS clipboard / paste UI, native selection handles, Android
+back gesture, real orientation events, or Chrome tab / session
+lifecycle. Those rows need a phone (see "Real-phone narrow
+scope" below). The plan calls this out in `docs/wterm-mobile-smoke-plan.md`
+§ 4 #1 and § 5; this subsection inherits that distinction.
+
+For every row of `docs/wterm-mobile-smoke-plan.md` § 5 that does
+not appear on the real-phone list below, drive the row from a
+desktop browser at an Android-class viewport via Playwright (MCP
+if a human operator is supervising; a committed runner is still
+deliberate-later per
+[`docs/renderer-smoke-harness.md`](../../docs/renderer-smoke-harness.md)
+§ "Option B").
+
+- Preferred viewport: roughly `1080 × 2340` for parity with the
+  Samsung Galaxy S10e the 2026-05-15c / 2026-05-16 entries used,
+  OR `390 × 844` (iPhone-class portrait) for parity with the
+  2026-05-15 autofit resmoke. Pick one per smoke; record which.
+- Focus via the renderer-fair input seam already documented in §
+  D → "Renderer-fair input" (`production-terminal-focus` button
+  →  `[data-relayterm-terminal-input]` → verify
+  `document.activeElement` is the marked input). Never click the
+  bare `production-terminal-viewport` element (the 2026-05-14
+  ghostty-web lesson).
+- Use server-side logs and `data-*` attribute reads as the
+  load-bearing evidence (see "Target / log inspection
+  checklist" below). Phone screenshots are NOT a substitute and
+  are not committed to the repo by default.
+
+##### Real-phone narrow scope
+
+A real Android device is the right surface only for rows
+whose evidence depends on a property that desktop emulation
+cannot exhibit. Closed list (matches the plan):
+
+- soft-keyboard open / close + `visualViewport` shrink (rows 4
+  / 5);
+- ASCII input through the OS soft keyboard (row 6, soft-keyboard
+  half only);
+- modifier-key affordances (row 7) — Android IME-dependent;
+- paste flow (row 8) — Android Chrome's clipboard permission
+  posture + the OS paste UI;
+- copy / select flow (row 9) — native selection handles + the OS
+  context menu;
+- touch ergonomics on the workspace nav / control row (row 13's
+  ergonomics half only);
+- orientation change semantics on an active session (row 14);
+- Android back gesture / button (row 15);
+- Chrome tab / session backgrounding behaviour (also row 15).
+
+Every other row defaults to Playwright emulation. Row 17
+(xterm control comparison) mirrors whichever channel its
+parent row uses.
+
+##### Operator prompt template (for real-phone rows only)
+
+When a row needs a phone, pre-stage one-instruction +
+one-question prompts with a closed-vocabulary response set.
+The operator never retypes a multi-line command. Examples
+(reproduced from the plan; record the exact wording in the
+dated smoke entry):
+
+- "Tap the terminal area. Did the on-screen keyboard rise?
+  (yes / no / partially)"
+- "Paste this one-line command from clipboard (operator
+  receives the literal command pre-staged in their clipboard
+  buffer). Did anything appear? (yes — paste-confirm panel /
+  yes — direct insertion / no)"
+- "Long-press the highlighted text. Did the OS selection
+  handles appear? (yes / no / partial)"
+- "Press the Android back gesture once. What happened?
+  (stayed on the workspace / left the workspace / the session
+  disconnected / Chrome navigated away)"
+- "Rotate to landscape. Is the input area still visible above
+  the keyboard? (yes / no / no keyboard visible)"
+- "Switch apps, then come back. Does Chrome show the session
+  still connected? (yes / no / shows 'detached (TTL window)'
+  / shows a disconnect banner)"
+
+If the operator needs to read back a `data-*` attribute, a
+`localStorage` key, or a console message, the row is in the
+wrong channel — promote it to Playwright emulation.
+
+##### SSH inbound probe — `netstat -tn`, not `docker logs`
+
+The hermetic throwaway target (`lscr.io/linuxserver/openssh-server`)
+writes only its init / boot lines to docker stdout; runtime
+sshd activity is in syslog inside the container. The
+2026-05-15c "russh never dialed" reading was based on the
+incorrect probe; the 2026-05-16 resmoke established the
+correct one (cross-link: AGENTS.md 2026-05-16 inline
+Encountered Lesson).
+
+```sh
+# Authoritative — is there an established TCP connection on 2222
+# inside the throwaway?
+docker exec <target-container> netstat -tn | grep ':2222 .*ESTABLISHED'
+
+# Authoritative — is sshd-session actually running?
+docker exec <target-container> ps -ef | grep 'sshd-session.pam'
+
+# Use only for boot / authorized_keys notes:
+docker logs --tail 50 <target-container>
+```
+
+A 90-second poll loop of the netstat probe during the launch
+window is the cheapest way to time the actual TCP
+establishment relative to POST `/api/v1/terminal-sessions`
+and WS `GET .../ws`. `net-tools` is present in the linuxserver
+image; `ss` / `ip` are not.
+
+##### Target / log inspection checklist (server-side, per row)
+
+Each row that needs a server-side observation pulls from this
+fixed set:
+
+- **Backend nginx access log** — POST 201 / WS 101 timing and
+  the POST→WS gap (the 2026-05-15c / 2026-05-16 headline
+  measurement).
+- **Postgres `session_events`** — `attached` / `detached` /
+  `closed` rows for the session UUID; `payload->>'last_seen_seq'`,
+  `payload->>'reason'`. Public metadata only.
+- **Postgres `terminal_sessions`** — `status`, `last_seen_at`,
+  `closed_at`.
+- **Postgres `audit_events`** — lifecycle rows
+  (`ssh_identity_created`, `host_key_accepted`,
+  `server_profile_created`). Public metadata only per
+  [`docs/agent/redaction-rules.md`](../../docs/agent/redaction-rules.md)
+  § 1.
+- **SSH target `netstat -tn` poll** — the ESTABLISHED
+  connection from the backend container to the throwaway on
+  port 2222.
+- **SSH target `docker logs`** — init / boot /
+  `authorized_keys` lines ONLY; never as inbound-traffic
+  evidence.
+- **Renderer viewport state** — `data-renderer`,
+  `data-renderer-experimental`, `data-renderer-fallback`,
+  `data-renderer-gate`, `data-renderer-input`,
+  `data-renderer-autofit`, `data-phase` on
+  `production-terminal`. Closed-vocabulary; no payload.
+- **WebSocket binary plane (RTB1)** — NOT inspected from
+  Playwright. Wire-level rows belong in their own
+  `vps-staging-smoke.md` dated entry per the harness plan's
+  Path E discipline.
+
+Record the **timing** of each. The 2026-05-16 resmoke
+established that POST→201, WS→101, SSH ESTABLISHED,
+`session_events.attached`, `session_events.detached`,
+`last_seen_seq`, and renderer `data-phase` are distinct
+timeline events; do not collapse any two into "the session
+attached" / "the session detached".
+
+##### Evidence classification — every row tags its evidence
+
+Every dated mobile-smoke entry from this point forward tags
+each evidence row with one of (matches the plan exactly):
+
+- **playwright-emulated** — observed from a desktop browser
+  at a mobile viewport via Playwright (MCP or scripted). Not
+  a real-device claim.
+- **real-phone operator** — the operator reported the
+  observation from the physical device.
+- **server-side inspected** — observation came from backend /
+  nginx / Postgres / SSH-target logs or DB rows.
+- **inferred** — derived from another row's evidence; cite
+  the source row.
+- **deferred — &lt;reason&gt;** — not exercised on this
+  surface. Reasons match the harness vocabulary (`renderer
+  not identified`, `clipboard permission unavailable`,
+  `fixture absent`, `blocked by Row 12`, `emulation
+  insufficient — needs phone`, `workspace-side investigation
+  pending`).
+
+A row recorded without an evidence-class label is
+unreviewable — same posture as the existing rule that a row
+without an input-path tag is unreviewable.
+
+##### Classification template for a non-pass finding
+
+Mirrors § 5's "Classification template for a finding" in the
+plan. When a row produces a non-pass, attribute it to one of:
+**renderer-specific**, **mobile workspace / session**,
+**transient**, **target / setup issue**, or **inconclusive**
+(promote inconclusive rows to `deferred — <reason>` and name
+the disambiguating slice).
+
 #### Explicit non-goals
 
 - **No committed Playwright runner.** This runbook does NOT promote
