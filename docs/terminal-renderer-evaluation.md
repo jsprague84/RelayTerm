@@ -1622,6 +1622,19 @@ evaluation smoke".
 
 ### Surfaces
 
+> **Status (2026-05-15).** The desktop-browser surface is fully
+> live: every graded renderer matrix smoke since 2026-05-14 has run
+> against Firefox 1440 × 900 on staging. The Tauri and Android
+> surfaces are scaffolded but have not yet hosted a renderer-evaluation
+> matrix pass. The wterm-on-Android plan — which scopes how to
+> exercise the matrix on surface 3 (Android Tauri WebView) and
+> introduces an Android Chrome surface that prefaces it — lives in
+> [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md);
+> the named next slice is the Android-Chrome smoke
+> (`docs/wterm-android-browser-smoke`), with the Android Tauri
+> WebView smoke (`docs/wterm-android-tauri-smoke`) as the immediate
+> follow-on.
+
 1. **Desktop browser via Playwright MCP.** Firefox at 1440 × 900
    against the throwaway staging stack
    (`https://relayterm-staging.js-node.cc`). Selector hooks:
@@ -1642,7 +1655,13 @@ evaluation smoke".
    `pnpm --filter @relayterm/mobile exec tauri android build
    --debug --apk --ci`) against staging. Pay particular attention
    to the **Platform fit** row "Mobile keyboard / soft IME" —
-   this is the row `wterm` is motivated by.
+   this is the row `wterm` is motivated by. The
+   [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+   plan also covers Android **Chrome** as a separate surface
+   (cheapest *real-mobile* surface, no APK build required) ahead
+   of the WebView smoke; it isolates "is wterm viable on mobile?"
+   from "does Android System WebView differ from Chrome in a way
+   that affects wterm?"
 4. **Throwaway staging SSH target.** Pattern is fixed:
    `linuxserver/openssh-server:latest` named
    `relayterm-staging-<smoke-id>-ssh`, attached only to the
@@ -1831,6 +1850,10 @@ will be its own slice if and when it ships:
 - [`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
   — a snapshot scorecard of current production-shell evidence for
   all four adapters, with a recommended next development lane.
+- [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+  — the mobile / WebView smoke plan that scopes how the matrix
+  extends onto surface 3 (Android WebView) and the new Android
+  Chrome surface that prefaces it.
 - [`SPEC.md`](../SPEC.md) — architectural invariants and surface
   index.
 - [`docs/spec/terminal.md`](spec/terminal.md) — terminal session

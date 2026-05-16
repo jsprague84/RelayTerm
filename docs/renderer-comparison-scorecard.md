@@ -42,8 +42,8 @@
 | **Resize / fit status** | Full `fit()` via `@xterm/addon-fit`; production "Fit" control is xterm-specific and works. **Adapter-owned `ResizeObserver` + `FitAddon` autofit** also lands under `BaseTerminalRendererOptions.autofit = true` (operator opt-in via Settings); the 2026-05-15 staging resmoke confirmed PTY reflow on container resize (`24 80` → `26 40` at 390×844). Off by default. Workspace `data-renderer-autofit="active"` post-mount under `autofitEnabled = true` verified on the production shell by the 2026-05-15b diagnostic resmoke. | `works with caveats` — no `fit()`, no grid reflow on resize. Accepts `autofit` and no-ops it honestly (`autofitActive() → false` → workspace `data-renderer-autofit="unsupported"` when autofit enabled) | `works with caveats` — no `fit()`, `autoResize` defaults `false`; **autofit shipped 2026-05-15** (`a2c806b feat(web): add renderer-neutral autofit`) wires `autofit → WTerm.autoResize`; the 2026-05-15 staging resmoke verified real PTY reflow under operator opt-in (`24 80` → `24 35` at 390×844, `24 103` after restoring to 1440×900). The workspace `data-renderer-autofit` diagnostic now lands on `"active"` post-mount under `autofitEnabled = true` — the prior Svelte 5 reactivity bug (plain `let renderer` instead of a reactive rune) was fixed in `79c216b fix(web): update autofit diagnostic after renderer mount` and verified on the production shell by the 2026-05-15b diagnostic resmoke for both wterm AND xterm. | Unknown — never rendered |
 | **Mobile / browser-native UX potential** | Baseline; canvas-rendered, mobile behaviour noted as potentially rougher | Unknown; canvas-style, no mobile smoke | **Strongest candidate** — DOM-rendered grid → native selection / copy / paste / IME / soft keyboard. *Potential, unverified* (no mobile / Tauri smoke) | Unknown |
 | **Correctness / VT potential** | Mature baseline; not the differentiating engine on its own | **Strong** — libghostty-vt parser via WASM | Promising — Zig + WASM core; alt-screen verified | Unknown — highest text-shaping ambition, never measured |
-| **Known blockers** | None | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision; no mobile / Tauri smoke | Inline-style CSP; external font fetch; WebGPU unavailable headless; `focusTarget()` missing |
-| **Next recommended action** | Optional baseline-hardening lane | Correctness / modern-VT lane (resize/reflow, advanced VT) | Product / mobile UX lane — fit/reflow investigation landed (2026-05-14j, docs-only); renderer-neutral autofit **design** AND **implementation** landed (`feat/renderer-neutral-autofit`, 2026-05-15 — wterm maps `autofit` → `WTerm.autoResize`; ships off by default per [`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md) § 1); next is the staging resmoke (`docs/wterm-fit-reflow-resmoke`) to verify wterm reflows under a narrowed container with the operator opt-in, then the mobile smoke | Separate viability decision — not promotion work |
+| **Known blockers** | None | Production CSP (`wasm-unsafe-eval`); open resize/reflow decision | Production CSP (`wasm-unsafe-eval`); no mobile / Tauri smoke (the mobile / WebView **plan** landed in [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md); the smoke itself has not yet run). Resize/reflow is substantively closed under operator opt-in (off by default; turning it on by default is its own later decision). | Inline-style CSP; external font fetch; WebGPU unavailable headless; `focusTarget()` missing |
+| **Next recommended action** | Optional baseline-hardening lane | Correctness / modern-VT lane (resize/reflow, advanced VT) | Product / mobile UX lane — fit/reflow investigation landed (2026-05-14j, docs-only); renderer-neutral autofit **design** AND **implementation** landed (`feat/renderer-neutral-autofit`, 2026-05-15 — wterm maps `autofit` → `WTerm.autoResize`; ships off by default per [`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md) § 1); the autofit staging resmoke (2026-05-15) and the `data-renderer-autofit` diagnostic resmoke (2026-05-15b) have **both landed**; the **mobile / WebView smoke plan has now landed** in [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md). Next is the Android-Chrome smoke (`docs/wterm-android-browser-smoke`) per § 11 of that plan — surface 2 first, surface 3 (Android Tauri WebView) immediately after | Separate viability decision — not promotion work |
 
 ## 3. Evidence summary per renderer
 
@@ -93,7 +93,11 @@
   libghostty-vt parser.
 - **Possible next work:** resize / reflow investigation, an
   advanced-VT / curses-app smoke, a mobile smoke, a performance
-  benchmark.
+  benchmark. The named follow-on
+  [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+  is **wterm-focused** by design — once the wterm Android-Chrome
+  smoke lands, that smoke's harness shape transfers cleanly to a
+  ghostty-web mobile smoke if it is run.
 
 ### wterm
 
@@ -123,10 +127,17 @@
 - **Not a GPU / WebGPU renderer.** wterm's advantage is DOM
   integration, not graphics acceleration — do not describe it as
   GPU-accelerated.
-- **Known concerns:** resize / fit / reflow `works with caveats`
-  (no `fit()`, `autoResize` defaults `false`, no grid reflow);
-  needs the `'wasm-unsafe-eval'` relaxation to mount; no
-  mobile / Tauri smoke yet.
+- **Known concerns:** needs the `'wasm-unsafe-eval'` relaxation to
+  mount; no mobile / Tauri smoke yet (a **plan** for that smoke is
+  now landed — see
+  [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md) —
+  the smoke itself has not run). The earlier resize / fit / reflow
+  concern (`works with caveats`, no `fit()`, `autoResize` defaults
+  `false`, no grid reflow) is **substantively closed under operator
+  opt-in** by the autofit implementation + 2026-05-15 resmoke +
+  2026-05-15b diagnostic fix; it remains "off by default" so a
+  default-flip story still owns the decision of when to make
+  autofit on by default.
 - **Resize/reflow root cause established (2026-05-14j,
   docs-only investigation).** wterm is *not* the blocker —
   `WTerm.resize(cols, rows)` genuinely reflows the grid,
@@ -215,8 +226,8 @@ Qualitative labels (the repo has no numeric scoring convention):
 | Paste | baseline | strong (trusted Ctrl+V → paste-safety pipeline) | strong (DOM textarea paste handler → paste-safety pipeline) | unknown |
 | Alternate screen | baseline | promising (enter / leave verified; no `tput` on target) | promising (switch + restore verified) | unknown |
 | Detach / reconnect / replay | baseline | strong (wire-side) | strong (wire-side; fresh remount) | unknown |
-| Resize / fit / reflow | baseline (full `fit()`) | deferred (no `fit()`, no reflow — open Gate-1 decision) | deferred (no `fit()`, no reflow — open Gate-1 decision) | unknown |
-| Narrow / mobile viewport | baseline | deferred (same reflow caveat) | deferred (same reflow caveat) | unknown |
+| Resize / fit / reflow | baseline (full `fit()` + adapter-owned autofit under opt-in) | deferred (no `fit()`, no reflow — open Gate-1 decision) | promising under operator opt-in (autofit maps to `WTerm.autoResize`; PTY reflow verified 2026-05-15) | unknown |
+| Narrow / mobile viewport | baseline | deferred (same reflow caveat) | promising under operator opt-in (390 × 844 reflowed to `24 35` in the 2026-05-15 desktop-browser resmoke; real-mobile rows still **unmeasured** — see [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)) | unknown |
 | Copy / select / find potential | baseline (canvas selection model) | unknown (canvas) | promising (DOM nodes → native selection) | unknown |
 | Accessibility potential | baseline | unknown | promising (DOM-rendered output) | unknown |
 | Bundle / runtime cost | baseline (main chunk) | promising (lazy chunk + ~423 KB WASM asset, off the default path) | strong (~41 KB lazy chunk incl. inlined WASM) | deferred (~3 MB JS + inlined WASM; lazy, off the default path) |
@@ -264,20 +275,25 @@ Qualitative labels (the repo has no numeric scoring convention):
   behaviour — the dimensions a web/desktop/mobile SSH client most
   needs to get right and that xterm's canvas model handles less
   naturally.
-- The renderer-fair production-shell matrix smoke has **already
-  landed** (2026-05-14i), and the **`feat/wterm-fit-reflow-investigation`**
-  slice has now landed too (2026-05-14j, docs-only): it established
-  that the wterm non-reflow is a RelayTerm-side abstraction gap, not
-  a wterm limitation, and that the fix wants an **observer-shaped**
-  renderer-neutral autofit capability rather than xterm's synchronous
-  `fit()`. That **design slice has now landed**
-  ([`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md),
-  docs-only): a mount-time renderer-neutral `autofit` option plus an
-  optional `autofitActive()` query, transferable to ghostty-web. The
-  next slice is therefore the `feat/renderer-neutral-autofit`
-  **implementation**, which resolves the open Gate-1 resize/fit
-  decision. A mobile / Android-WebView smoke is the natural follow-on
-  once that behaviour is settled and resmoked.
+- The renderer-fair production-shell matrix smoke landed 2026-05-14i;
+  the fit / reflow investigation landed 2026-05-14j; the
+  renderer-neutral autofit **design** landed
+  ([`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md))
+  and the **implementation** landed in `feat/renderer-neutral-autofit`
+  (2026-05-15). The staging resmoke (2026-05-15) verified PTY reflow
+  end-to-end (1440 × 900 → `24 80`, 390 × 844 → `24 35`); the
+  diagnostic resmoke (2026-05-15b) confirmed
+  `data-renderer-autofit="active"` from the production shell.
+- The **mobile / WebView smoke plan** has now landed
+  ([`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)),
+  docs-only: it scopes the surfaces (desktop narrow viewport,
+  Android Chrome, Android Tauri WebView, desktop Tauri sanity, iOS
+  explicitly out of scope), the 17 candidate rows, the
+  instrumentation / redaction posture, and the decision outputs.
+  The next slice is the **Android-Chrome smoke**
+  (`docs/wterm-android-browser-smoke`) per § 11 of that plan;
+  Android-Tauri (`docs/wterm-android-tauri-smoke`) is the immediate
+  follow-on once the Chrome surface is green.
 
 **Secondary (backup): ghostty-web correctness lane.**
 
@@ -293,24 +309,21 @@ slice on restty until that decision is made.
 
 ## 7. Next slice proposals (ranked)
 
-1. **`feat/renderer-neutral-autofit` implementation** — the
-   follow-on to the now-landed `feat/wterm-fit-reflow-investigation`
-   (2026-05-14j) and the `docs/renderer-neutral-autofit-design`
-   design slice. The **design is done**
-   ([`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md)):
-   an **observer-shaped** mount-time `autofit` option on
-   `BaseTerminalRendererOptions` plus an optional `autofitActive()`
-   query on `TerminalRenderer` (xterm wires `ResizeObserver` +
-   `FitAddon`; wterm maps it to `WTerm.autoResize`; ghostty-web /
-   restty accept-and-no-op it), a local-only Settings toggle, and a
-   `data-renderer-autofit` diagnostic. The implementation slice builds
-   that and resolves the open Gate-1 resize/fit decision; a
-   `docs/wterm-fit-reflow-resmoke` staging resmoke follows once
-   behaviour changes. *Primary lane, highest leverage — the design is
-   done; this is the real next step.*
-2. **`docs/wterm-mobile-smoke-plan`** — plan the Android-WebView /
-   Tauri mobile smoke that would *verify* wterm's native-UX
-   potential instead of asserting it.
+1. **`docs/wterm-android-browser-smoke`** — run the mobile / WebView
+   smoke against **Android Chrome** first, per
+   [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+   § 11 (no APK build required; isolates "is wterm viable on
+   mobile?" from "does Android System WebView differ from Chrome?").
+   *Primary lane, highest leverage — the autofit fit/reflow story is
+   substantively closed under operator opt-in; this is the next real
+   measurement.*
+2. **`docs/wterm-android-tauri-smoke`** — immediate follow-on once
+   the Chrome smoke is green: same surface scope on the existing
+   `@relayterm/mobile` Tauri v2 debug APK
+   (`pnpm --filter @relayterm/mobile exec tauri android build
+   --debug --apk --ci`). Piggy-backs on the 2026-05-09 Android
+   Tauri shell infrastructure (Galaxy S10e, bundled-shell handoff
+   already proven).
 3. **`docs/ghostty-web-advanced-vt-smoke-plan`** — plan an
    advanced-VT / curses-app smoke (needs a larger-tooling target
    image; the current target lacks `tput` / `tmux`).
@@ -349,13 +362,18 @@ slice on restty until that decision is made.
   the four renderer-adapter contracts and the per-adapter
   "Production-shell evaluation status" caveats.
 - [`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md)
-  — the observer-shaped renderer-neutral autofit design (the
-  ranked next slice in § 7).
+  — the observer-shaped renderer-neutral autofit design + the
+  per-adapter implemented contract (now landed).
+- [`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+  — the mobile / WebView smoke plan (surfaces, rows,
+  instrumentation, redaction posture, decision outputs); the basis
+  for § 7's ranked next slice.
 - [`docs/renderer-smoke-harness.md`](renderer-smoke-harness.md) —
   the input-path taxonomy and command matrix the smokes inherit.
 - [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
   — the staging smoke entries this scorecard summarises
-  (2026-05-13 through 2026-05-14i).
+  (2026-05-13 through 2026-05-15b; the next renderer-evaluation
+  entry will be the wterm Android-Chrome smoke).
 - [`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § "D. Renderer
   evaluation smoke" — the operator runbook for the matrix.
 - [`docs/ghostty-web-wasm-csp.md`](ghostty-web-wasm-csp.md) — the
