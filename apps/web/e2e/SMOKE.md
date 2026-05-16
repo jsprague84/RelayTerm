@@ -2213,6 +2213,111 @@ itself is useful from day one for cross-renderer comparisons
 is the load-bearing contract a future smoke would need to
 quote.
 
+**Update (2026-05-16d — verification ran).** The
+`docs/terminal-launch-timing-diagnostics-smoke` slice ran the
+six-step verification above against staging end-to-end and
+**confirmed the nginx-records-close-time reading** (client
+`ws_close` matched the nginx `GET .../ws 101` line to within
+~0.15 s; client `ws_open` was ~117 s away from the nginx
+line and is NOT what nginx logged). See
+[`docs/deployment/vps-staging-smoke.md`](../../docs/deployment/vps-staging-smoke.md)
+§ "2026-05-16d · `docs/terminal-launch-timing-diagnostics-
+smoke`" for the full evidence table. Two additional
+methodology traps the slice surfaced — pin BOTH before
+running this verification again:
+
+###### Methodology trap 1 — cache-bust the SPA after web-container recreation
+
+When a staging smoke recreates the relayterm-web container
+to pick up new code, the browser frequently still serves a
+cached `index.html` that references the OLD bundle hash —
+even though `/` returns the fresh HTML on a hard reload from
+the workstation `curl`. The first Playwright (or operator)
+launch from a stale tab will load the OLD bundle and exhibit
+the OLD code's behaviour — including, in this slice's run,
+ZERO timing diagnostics on a launch that DID reach the new
+container. That superficially looks like the first-launch
+detach pattern the next slice is investigating; in the cache
+case it is just the cache. BEFORE asserting that a missing
+selector / missing diagnostic / detach-at-seq-0 is a real
+signal, run ONCE per recreation cycle (inside Playwright MCP
+`browser_evaluate`):
+
+```js
+// Wrapped as an IIFE so this snippet is portable across both
+// Playwright MCP's `browser_evaluate` (which accepts a bare
+// arrow function) AND a vanilla `page.evaluate(...)` /
+// devtools console paste (which requires a value expression,
+// not a top-level statement).
+(async () => {
+  if ('caches' in window) {
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => caches.delete(k)));
+  }
+  if ('serviceWorker' in navigator) {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map(r => r.unregister()));
+  }
+  return { clearedCaches: true };
+})()
+```
+
+THEN close the tab (`browser_close`) AND navigate fresh with
+a cache-busting query string (`browser_navigate '…?cachebust=
+<ts>'`). Verify the loaded script src matches the freshly-
+built bundle hash before treating any assertion as real:
+
+```js
+() => Array.from(document.querySelectorAll('script[src]'))
+  .map(s => s.getAttribute('src'))
+```
+
+The relayterm-staging stack sends `cache-control: public,
+immutable, max-age=31536000` on the **bundle** (`/assets/
+index-<hash>.js`), which is correct — the hash changes when
+the bundle changes, so the immutable bundle cache is exactly
+right and should NOT be "fixed". The trap is upstream of
+that: the browser tab's already-parsed DOM holds a stale
+`index.html` reference to the OLD `<script src="/assets/
+index-OLDHASH.js">`. Cache-busting the navigation forces a
+re-fetch of `index.html`, which now points at the new bundle
+hash; the fresh bundle then loads (and the new bundle's
+immutable-cache header takes effect for the next operator).
+
+###### Methodology trap 2 — staging nginx idle-closes WebSocket upgrades at ~60 s
+
+The staging reverse-proxy idle-closes the
+`/api/v1/terminal-sessions/<id>/ws` upstream after **~60 s
+of no traffic** in either direction (consistent with nginx's
+default `proxy_read_timeout 60s` applied to the proxied
+WebSocket). On top of that the orchestrator's
+detached-live-PTY TTL adds the documented 30 s reconnect
+window, after which the session row auto-closes. So:
+
+- A `lifetime_X_then_close` hold of **X > ~60 s with no
+  operator input** will trigger an nginx-driven WS close
+  before the operator clicks End-session. The `close_requested`
+  recorder row will stay `pending` (the click runs after the
+  wire is already closed, so the workspace's `closeClicked`
+  handler can not fire a wire `Close` frame); `ws_close`
+  fires from the transport `close` event. The lifetime
+  measurement is still valid (`ws_close − ws_open` is the
+  natural lifetime); it just is NOT operator-controlled.
+- For an operator-controlled close, pick X ≤ ~50 s — well
+  inside the idle window. The 30 s recommended default
+  upstream is safe.
+- For a lifetime > ~60 s, the test is now measuring "wire
+  lifetime under nginx idle-close" rather than "operator
+  click → wire close". Either is fine but be explicit in the
+  dated entry about which one the row reports.
+
+These are properties of the deployed staging proxy config,
+not of RelayTerm code. If a future operator UX needs longer
+detached windows, the fix is in the nginx reverse-proxy
+config on the location for the WS upgrade path
+(`proxy_read_timeout` and/or `proxy_send_timeout`), not in
+any RelayTerm crate.
+
 ##### Evidence classification — every row tags its evidence
 
 Every dated mobile-smoke entry from this point forward tags

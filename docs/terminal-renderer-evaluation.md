@@ -1714,6 +1714,33 @@ staging is deferred until explicitly approved. The optional
 companion slice `feat/api-session-attach-timing-events`
 (backend-side attach-timing events) is also still deferred.
 
+**Update (2026-05-16d).** The
+`docs/terminal-launch-timing-diagnostics-smoke` slice ran the
+new client-side timing strip against staging end-to-end with
+one xterm session on a throwaway target and ran the
+mandatory `lifetime_X_then_close` verification sub-step.
+**Result: the nginx WebSocket access-log line records the
+CLOSE moment on the staging stack as deployed today** (client
+`ws_close` wall-clock matched the nginx `GET .../ws 101`
+timestamp to within ~0.15 s; client `ws_open` wall-clock was
+~117 s away from the nginx line and is NOT what nginx
+logged). The 2026-05-16b methodology correction is now
+pinned. Every documented timing event (`launch_started …
+ws_close`) observed; redaction sweep clean (zero hits across
+backend / web nginx / SSH-target logs for the private-key,
+session-token, paste, and smoke sentinels; zero timing-event
+names persisted to localStorage / sessionStorage). Full
+evidence in `docs/deployment/vps-staging-smoke.md` §
+"2026-05-16d · `docs/terminal-launch-timing-diagnostics-smoke`".
+**Posture unchanged:** xterm remains the production default;
+experimental gate stays off; no renderer promotion; no
+CSP / deploy / protocol changes. The optional companion slice
+`feat/api-session-attach-timing-events` stays deferred. The
+next executable mobile-side slice is
+`docs/android-phone-launch-timing-resmoke` (real Galaxy S10e
+read of the new shortcut attributes via Chrome DevTools USB
+attach).
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

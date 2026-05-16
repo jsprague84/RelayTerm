@@ -11100,6 +11100,505 @@ across a more expensive surface.
 
 ---
 
+### 2026-05-16d · `docs/terminal-launch-timing-diagnostics-smoke` — client-side launch-timing strip verified end-to-end on staging; `lifetime_X_then_close` confirms nginx WS access-log line records the WS CLOSE moment
+
+Docs-only verification slice for the client-side launch-timing
+diagnostics that landed earlier today (commit
+`ee89764 · feat(web): add terminal launch timing diagnostics`).
+No code, no CSP, no CI/deploy, no protocol, no renderer-default
+change. xterm remains the production default. The slice's load-
+bearing question was: **does the client-side timing strip
+emit the documented events and shortcut attributes against
+staging, AND does the controlled `lifetime_X_then_close` test
+(per `apps/web/e2e/SMOKE.md` § D → "Launch timing diagnostics
+→ Lifetime_X_then_close verification sub-step") confirm the
+2026-05-16b methodology correction that nginx's WS access-log
+line records the WebSocket CLOSE moment, not the OPEN moment?**
+
+**Stack pin.** Web: `git.js-node.cc/jsprague/relayterm-web@
+sha256:6d5e477fd7f52083cfd1a4f3589e9e72b7b1701ebefb652148bf0b25f8adafa3`
+(built 2026-05-16T16:49Z, ~5 min after the feature commit;
+served as `/assets/index-ChbaJjba.js`). Backend:
+`git.js-node.cc/jsprague/relayterm-backend:main` (unchanged
+2026-05-14 image; no backend code in scope for this slice).
+Staging CSP unchanged: `default-src 'self'; script-src 'self'
+'wasm-unsafe-eval'` — no `'unsafe-eval'`, no `data:`, no
+`blob:`, no `connect-src` widening.
+
+#### Preflight findings (image freshness gate)
+
+The web container running at slice start was created
+`2026-05-15 18:16 CDT`, ~17 h BEFORE commit `ee89764` landed.
+The served bundle (`index-9Ss46Hol.js`) had **zero** matches
+for `production-terminal-launch-timing`, `data-launch-event`,
+`data-launch-timing`, `launch_started`, `ws_open`, `ws_close`,
+`first_server_message`, `first_output`,
+`create_session_post_started`, `attached`, `detach_requested`,
+`close_requested`, `data-launch-event-ms`, or
+`data-launch-event-state`. Per the runbook's "If staging web
+is behind, stop and ask approval" gate, the operator approved
+recreating the web container only (`docker compose pull
+relayterm-web && docker compose up -d --force-recreate
+--no-deps relayterm-web`). The fresh bundle
+`index-ChbaJjba.js` (668387 bytes) contains all 24 timing
+selectors and labels (counts inline below). Backend was not
+recreated; Postgres was not touched.
+
+| Selector / label | Hits in `index-ChbaJjba.js` |
+|---|---|
+| `production-terminal` | 34 |
+| `production-terminal-launch-timing` | 6 |
+| `production-terminal-launch-timing-list` | 1 |
+| `data-launch-event` / `-event-ms` / `-event-state` | 3 / 1 / 1 |
+| `data-launch-timing` (with `-create-post-outcome`/`-error-kind`/`-ws-open-ms`/`-ws-close-ms`/`-first-output-ms`) | 6 |
+| `launch_started` | 4 |
+| `create_session_post_started` / `_resolved` | 3 / 3 |
+| `ws_connect_started` / `ws_open` / `ws_close` | 3 / 4 / 5 |
+| `first_server_message` / `first_output` | 4 / 4 |
+| `detach_requested` / `close_requested` | 3 / 3 |
+| `"launch click"` / `"WebSocket open"` / `"first server frame"` / `"first Output frame"` / `"POST resolved"` (labels) | 1 each |
+
+(Counted with `LC_ALL=C grep -aoF` after `curl -s
+.../assets/index-ChbaJjba.js > /tmp/bundle.js` — the bundle is
+one ~668 KiB line so the C-locale grep is required, the
+default locale silently skips matches.)
+
+**Methodology trap caught mid-smoke (worth flagging for the
+next staging smoke).** The first Playwright launch after the
+web-container recreation reached the new container but loaded
+the OLD entry HTML from the browser cache, which referenced
+`/assets/index-9Ss46Hol.js`. The launch reached `data-phase=
+"detached"` at `last_seen_seq` 0 with the diagnostic strip
+completely absent (`data-launch-timing` attribute missing —
+the OLD bundle did not render the strip OR the shortcut
+attributes). That superficially looked like the very
+first-launch detach pattern the next slice is investigating;
+in this case it was the cache. After
+`navigator.serviceWorker.getRegistrations().unregister()`,
+`caches.delete(...)` for every cache key, and a fresh
+navigation with a cache-busting query string, the second
+launch loaded `index-ChbaJjba.js` and produced the full
+diagnostic strip on the first try. The methodology takeaway:
+**a staging smoke that immediately follows a web-container
+recreation MUST cache-bust the SPA (close the tab, clear
+service workers + caches, OR navigate to a URL with a fresh
+query string) before treating any "missing diagnostic" or
+"detach at seq=0" reading as a signal — otherwise the old
+bundle's behaviour gets attributed to the new code.** The
+mis-attribution risk is highest when the new code adds DOM
+surfaces (selectors, attributes); a smoke that asserts only on
+pre-existing surfaces would have missed this.
+
+#### Setup (idempotent, all via API + one operator-approved `docker run`)
+
+- Throwaway target (operator-approved exact command):
+  `docker run -d --name relayterm-staging-launch-timing-smoke-
+  ssh --hostname launch-timing-smoke-host --network
+  relayterm-staging_relayterm-staging-internal --restart no
+  -e PUID=1000 -e PGID=1000 -e USER_NAME=smoke -e
+  PASSWORD_ACCESS=false -e SUDO_ACCESS=false -e TZ=UTC -e
+  PUBLIC_KEY='<vault-generated ed25519 public half from the
+  RelayTerm-side identity>' linuxserver/openssh-server:latest`
+  — no host port, internal-only on
+  `relayterm-staging_relayterm-staging-internal`,
+  `0.0.0.0:2222` listening per
+  `docker exec ... netstat -tln`; host key ed25519
+  `SHA256:DDV74vnZyGA/TOnmWR2yFdMGDcpZexyrrCsFv9t9+3o`.
+- SSH identity `7075d914-be36-47c5-bb1b-313f9aad11e1`
+  (`launch-timing-smoke-identity`, ed25519,
+  `SHA256:UBovn6P2ZYsOCszCRr0C7Ud0KXsnkLqPVbvRBeHycdE`).
+  `POST /api/v1/ssh-identities` response carries no
+  `encrypted_private_key` / `private_key` field (per
+  `dto/ssh_identity.rs` redaction contract).
+- Host `34eb5266-99bf-41d2-96b4-2f6b5053efaf`
+  (`Launch-Timing-Smoke-Host` → `launch-timing-smoke-host:2222`,
+  default username `smoke`).
+- Server profile `50bb2136-6344-476e-8c0f-c3f4df4339ce`
+  (`launch-timing-smoke-xterm-profile`, tags `[timing, xterm,
+  smoke]`).
+- Host-key preflight returned `host_key_status: "unknown"`
+  with `host_key_fingerprint:
+  SHA256:DDV74vnZyGA/TOnmWR2yFdMGDcpZexyrrCsFv9t9+3o`
+  — **byte-identical** to the container's
+  `/config/ssh_host_keys/ssh_host_ed25519_key.pub` per
+  `ssh-keygen -lf`. Trusted via `POST .../trust-host-key`
+  with the same `expected_fingerprint`; `known_host_entries`
+  row `f9277060-7039-4abc-9acf-55344fa3f10b` written.
+- Auth-check returned `status: "authentication_succeeded"`
+  (KEX + pubkey accepted; no PTY allocated, no command run).
+- Browser settings (verified via Playwright `localStorage`
+  read of `relayterm.terminal-settings.v2` BEFORE launching):
+  `rendererId=xterm`, `experimentalRendererEvaluationEnabled=
+  false`, `autofitEnabled=false` — canonical values for an
+  xterm-only smoke; never mutated by this slice.
+
+#### Primary measurement — `lifetime_X_then_close` against the throwaway
+
+**One xterm session against the throwaway. Desktop Playwright
+viewport (1440 × 900). No mobile emulation.** Session UUID
+`c94bf32b-2f8a-41ec-aaac-77e8d8e7134e`.
+
+Wall-clock anchors captured inside `browser_evaluate`
+(`Date.now()` snapshots; the recorder's `relativeMs` values
+are anchored on `launch_started` at click time):
+
+- Launch click: **17:44:13.711 UTC** (`__smokeLaunchClickAtMs`).
+- First diagnostic snapshot read at `data-phase="attached"`:
+  17:44:37.912 UTC (the 15-second `browser_wait_for "launch
+  click"` overshot the actual attach moment; the recorder's
+  monotonic `relativeMs` values below are the source of truth
+  for sub-second timing).
+- One `whoami\n` round-trip via `page.keyboard.press(...)` on
+  the marked `[data-relayterm-terminal-input]` element
+  (`rendererInputMarked=true`,
+  `data-renderer-input="marked"`); viewport showed
+  `whoami\nsmoke\nlaunch-timing-smoke-host:~$`.
+- 30-second no-input hold via `browser_wait_for time: 30`.
+- End-session click attempted: **17:46:22.348 UTC**
+  (`__smokeCloseClickAtMs`); but `close_requested` row stayed
+  `pending` in the final snapshot — the WS had already closed
+  on its own ~11 s earlier (see `ws_close` row + nginx
+  comparison below).
+- Final snapshot read: 17:46:32.544 UTC; `data-phase=
+  "detached"`.
+
+**Client-side timing snapshot (per-event `data-launch-event-ms`
+on the diagnostic strip, plus the shortcut attributes on
+`production-terminal`):**
+
+| Event | `data-launch-event-state` | `data-launch-event-ms` | wall-clock (anchor + relativeMs) |
+|---|---|---|---|
+| `launch_started` | observed | 0 | 17:44:13.711 |
+| `create_session_post_started` | observed | 0.1 | 17:44:13.711 |
+| `create_session_post_resolved` | observed | 170.9 | 17:44:13.882 |
+| `ws_connect_started` | observed | 218.0 | 17:44:13.929 |
+| `ws_open` | observed | 362.6 | 17:44:14.074 |
+| `first_server_message` | observed | 366.6 | 17:44:14.078 |
+| `attached` | observed | 366.7 | 17:44:14.078 |
+| `first_output` | observed | 56365.3 | 17:45:10.076 |
+| `detach_requested` | pending | (empty) | — |
+| `close_requested` | pending | (empty) | — |
+| `ws_close` | observed | 117438.6 | 17:46:11.150 |
+| `error` | pending | (empty) | — |
+
+Plus the shortcut attributes on `production-terminal`:
+- `data-launch-timing="available"`
+- `data-launch-timing-create-post-outcome="ok"`
+- `data-launch-timing-error-kind=""`
+- `data-launch-timing-ws-open-ms="362.60000002384186"`
+- `data-launch-timing-ws-close-ms="117438.60000002384"`
+- `data-launch-timing-first-output-ms="56365.30000001192"`
+
+Plus the rest of the renderer-diagnostic attribute set was
+unchanged: `data-renderer="xterm"`,
+`data-renderer-experimental="false"`,
+`data-renderer-fallback=""`, `data-renderer-gate="off"`,
+`data-renderer-input="marked"`, `data-renderer-autofit="off"`,
+`data-phase="attached"` (then `"detached"` post wire-close).
+
+**Server-side cross-check during the live window** (`docker
+exec relayterm-staging-launch-timing-smoke-ssh netstat -tn |
+grep ":2222"`):
+
+```
+tcp 0 0 172.21.0.5:2222 172.21.0.3:45808 ESTABLISHED
+```
+
+— SSH inbound visibly ESTABLISHED from the backend (172.21.0.3)
+to the throwaway (172.21.0.5) on port 2222 throughout the live
+window, on the corrected `netstat -tn` probe (the 2026-05-16
+lesson: linuxserver/openssh-server runtime SSH activity does
+NOT appear in `docker logs`, so a `docker logs`-based
+SSH-inbound assertion would have been wrong).
+
+**`terminal_sessions` row at slice end** (`GET .../
+terminal-sessions/{id}`):
+
+```json
+{
+  "id": "c94bf32b-2f8a-41ec-aaac-77e8d8e7134e",
+  "server_profile_id": "50bb2136-6344-476e-8c0f-c3f4df4339ce",
+  "status": "closed",
+  "cols": 80, "rows": 24,
+  "created_at": "2026-05-16T17:44:13.774916Z",
+  "last_seen_at": "2026-05-16T17:46:41.169800Z",
+  "closed_at":    "2026-05-16T17:46:41.169359Z"
+}
+```
+
+— `created_at` matches client launch click (17:44:13.711 vs
+DB `17:44:13.775`, within ~64 ms). `closed_at` is 17:46:41.169,
+which is **30 s after the wire `ws_close` at 17:46:11.150** —
+matches the SPEC-pinned detached-live-PTY TTL default
+(`detached_live_pty_ttl_seconds = 30`), so the row auto-closed
+when the TTL window ran out without a reconnect.
+
+#### Lifetime_X_then_close — nginx CLOSE-time interpretation: **confirmed**
+
+The mandatory verification step from `apps/web/e2e/SMOKE.md`
+§ D → "Lifetime_X_then_close verification sub-step":
+
+- Client `ws_open` wall-clock: **17:44:14.074 UTC**.
+- Client `ws_close` wall-clock: **17:46:11.150 UTC**.
+- Client `ws_close_ms − ws_open_ms`: **117 076 ms ≈ 117.1 s**
+  (well above the runbook's `X > 5 s` minimum).
+- Backend nginx access log line for the session UUID
+  (`docker logs --since 20m relayterm-staging-relayterm-web-1
+  | grep c94bf32b`):
+
+```
+172.18.0.6 - - [16/May/2026:17:44:13 +0000] "GET /api/v1/terminal-sessions/c94bf32b-2f8a-41ec-aaac-77e8d8e7134e HTTP/1.1" 200 247 …
+172.18.0.6 - - [16/May/2026:17:46:11 +0000] "GET /api/v1/terminal-sessions/c94bf32b-2f8a-41ec-aaac-77e8d8e7134e/ws HTTP/1.1" 101 576 …
+```
+
+The first line is the session-info GET (issued by
+`ServersView.launchProfile` BEFORE the launch path opens the
+WebSocket); the WS line is the one that matters for the
+verification. Comparing the WS line's timestamp against the
+two client wall-clocks:
+
+| Source | Wall-clock | Δ to nginx WS line (17:46:11) |
+|---|---|---|
+| Client `ws_open` | 17:44:14.074 | **+116.9 s** (NOT equal) |
+| Client `ws_close` | 17:46:11.150 | **+0.15 s** (within ~1 s jitter — equal) |
+
+**Outcome: the nginx `GET .../ws HTTP/1.1 101` access-log line
+records the WebSocket CLOSE moment, NOT the OPEN moment**, on
+this nginx config. The 2026-05-16b methodology correction is
+confirmed for the staging stack as deployed today; any future
+investigation reading the nginx access log MUST treat the WS
+line as a close-time reading, not an open-time reading. The
+client-side `data-launch-timing-ws-open-ms` is the canonical
+"WS observed open by the client" measurement; the nginx line
+is the canonical "WS observed closed by the proxy"
+measurement. Combining them lets a future smoke characterise
+the close trigger (operator-driven vs idle-timeout-driven vs
+upstream-driven) WITHOUT inferring open time from a
+close-time log line.
+
+#### Incidental finding — staging nginx idle-closes the WebSocket at ~60 s of no traffic
+
+Not part of the verification question, but worth flagging
+because the next mobile / workspace investigation will see
+it: in this run the WS closed **on its own** ~11 s before the
+operator clicked End-session (`close_requested` stayed
+`pending`; `ws_close` fired at +117.4 s). The last
+operator-side activity was the `whoami` round-trip at
+~17:45:12 UTC; the wire closed at 17:46:11 UTC ≈ **59 s of
+idle later**. That is consistent with nginx's default
+`proxy_read_timeout 60s` applied to the proxied WebSocket
+upstream. The backend's detached-live-PTY TTL then ran the
+session row to `closed` 30 s later (17:46:41).
+
+This is not a regression — it is existing staging behaviour
+that the previous mobile smoke entries (2026-05-16b Phase A:
+76 s lifetime; Phase B: 20 s; Phase C: 32 s) did not happen
+to exceed. Operator implications: any "detach for >60 s"
+flow on the current staging proxy config will lose the WS
+to the nginx idle timeout; the bounded reconnect window is
+the orchestrator's 30 s detached-TTL on top of that. NOT
+addressed by this slice. If a future operator UX needs
+longer detached windows on staging, the fix is in the nginx
+reverse-proxy config (`proxy_read_timeout` on the
+`/api/v1/terminal-sessions/{id}/ws` location), not in any
+RelayTerm code. A focused config slice would be the right
+home for that decision; this entry just records the
+observation so the next investigator doesn't re-derive it.
+
+#### Incidental finding — `first_output` arrived ~56 s after `attached`
+
+The `first_output` event fired at `relativeMs = 56365.3` —
+about 56 s after `attached` (366.7 ms) and BEFORE any
+operator keystroke landed (the `whoami` press sequence
+started ~58 s after click). The viewport content at first
+read showed the shell prompt
+`launch-timing-smoke-host:~$` — i.e. the **initial PTY
+output** (the linuxserver/openssh-server's PAM session
+banner / shell prompt) was the first Output frame, not a
+response to operator input. The ~56 s delay is most
+plausibly upstream of any RelayTerm code (the
+linuxserver/openssh-server image's PAM session-open path is
+known to be slow on first connection on this image; this is
+NOT a RelayTerm-side measurement), but a future slice on a
+non-linuxserver throwaway would isolate the cause cleanly. Not blocking; recorded so a future
+investigator does not attribute it to the launch path.
+
+#### Renderer-fairness input via the marked input target
+
+The `[data-relayterm-terminal-input]` selector resolved to
+xterm's hidden helper textarea (per the 2026-05-14
+focus-target ambiguity lesson); Playwright's `browser_type`
+on it failed because the element is positioned off-screen
+(`element is not visible`), but `page.keyboard.press(...)`
+per-character after `[data-testid="production-terminal-
+focus"]` clicked landed cleanly. xterm round-tripped
+`whoami` → `smoke` → prompt in the viewport. Recording this
+specifically because the marked-input attribute is the
+documented renderer-neutral input target, and a future
+adapter (ghostty-web, restty, wterm) whose marked element
+IS visible to Playwright will work with `browser_type`
+directly; xterm's helper-textarea is the visibility
+exception, not the rule, and the per-key press path is the
+fallback.
+
+#### Redaction sweep — clean
+
+15-minute log window covering all three containers (backend +
+relayterm-web nginx + linuxserver/openssh-server throwaway,
+76 lines total). Substring grep for `encrypted_private_key`,
+`private_key_openssh`, `BEGIN OPENSSH PRIVATE KEY`,
+`openssh-key-v1`, `passphrase`, `session_token`,
+`token_hash`, `data_b64`, `REDACT-MARKER`, `password=`,
+`passwd=`, `Authorization:`, `Cookie:`, and the smoke
+sentinel `relayterm-launch-timing-smoke` → **zero hits**.
+One known false positive: `User/password ssh access is
+disabled.` on the linuxserver/openssh-server boot banner
+(the image always prints it regardless of `PASSWORD_ACCESS`
+env). Zero hits on `missing session cookie` for this window
+(the slice was authenticated for every state-changing call).
+
+**Workspace DOM + storage sweep** (Playwright
+`browser_evaluate`):
+
+- Diagnostic-strip outerHTML (2942 chars): contains only
+  closed-vocabulary event names, the documented English
+  labels (`"launch click"`, `"WebSocket open"`, etc.),
+  numeric `relativeMs` values, and the operator-facing pill
+  text `"POST ok"`. Zero substring hits for the throwaway
+  workload sentinels (`whoami`,
+  `relayterm-launch-timing-smoke`, `encrypted_private_key`,
+  `BEGIN OPENSSH`, `openssh-key-v1`, `passphrase`,
+  `session_token`, `token_hash`,
+  `launch-timing-smoke-host`). The single sentinel that
+  matched anywhere was `"smoke"` inside the
+  `relayterm.active-terminal.v1` localStorage record's
+  `profile_label: "launch-timing-smoke-xterm-profile"` — the
+  operator-supplied display label that the empty-state
+  reconnect affordance is designed to render. NOT a payload
+  leak; the literal `smoke` substring appears in the profile
+  name because of how the slice named the profile.
+- Every `data-launch-event-ms` attribute parses as a finite
+  Number; none carry text, none carry wall-clock timestamps,
+  none carry event payload.
+- `data-launch-timing-error-kind=""` and
+  `data-renderer-fallback=""` — no error / fallback strings
+  leaked.
+- `localStorage` keys: only
+  `relayterm.terminal-settings.v2`,
+  `relayterm.terminal-settings.v1`,
+  `relayterm.active-terminal.v1` (the standard set).
+  **Zero** occurrences of any timing-event name
+  (`launch_started`, `ws_open`, …) — the recorder's "in
+  memory only, never persists" contract holds on the wire.
+  `sessionStorage` empty.
+
+#### Cleanup (operator-approved exact scope)
+
+After operator approval — "Remove the throwaway SSH
+container; Disable the server profile (do not delete);
+Remove workstation temp files; Leave SSH identity, host,
+known_host_entries, terminal_sessions, session_events,
+audit_events, staging stack, staging CSP, and Postgres
+untouched" — the following were executed:
+
+```
+POST /api/v1/server-profiles/50bb2136-…/disable
+  → 200, disabled_at = "2026-05-16T18:01:53.462047Z"
+ssh cloud-edge 'docker rm -f relayterm-staging-launch-timing-smoke-ssh'
+  → relayterm-staging-launch-timing-smoke-ssh removed
+rm -f /tmp/relayterm-timing-smoke.{cookie,identity,host,profile,preflight,login}.json
+  → all 6 files gone (chmod 600 on the cookie was honored
+    by `install -m 600 /dev/null` at login time)
+```
+
+Confirmation: `docker ps -a --filter
+name=relayterm-staging-launch-timing` returns no rows;
+`ls /tmp/relayterm-timing-smoke.*` returns no matches. The
+SSH identity, host, known_host_entries row,
+`terminal_sessions` rows (the verified
+`c94bf32b-…` `status=closed`, plus the stale-bundle
+casualty `b1db7c7d-5a41-4e94-a365-29ad3ba6d53b` which was
+expected to self-close within ~30 s of its own WS drop per
+the detached-live-PTY TTL and is no longer live by the time
+this entry was written), and all audit rows are LEFT in
+place per the operator's custom scope. The
+disabled profile is the inventory default destructive action
+(server profiles disable, not delete — per `docs/agent/
+redaction-rules.md` § 3 + SPEC.md "Inventory lifecycle and
+destructive-action policy"). The staging stack stays running;
+staging CSP unchanged; Postgres untouched.
+
+#### Posture (load-bearing)
+
+- **No renderer promotion.** xterm remains the production
+  default. The experimental gate stays `off`. This slice did
+  not exercise ghostty-web / restty / wterm.
+- **No source / CSP / deploy / CI / protocol / orchestrator
+  change.** The slice is docs-only; the only staging-side
+  writes were `docker compose pull + force-recreate
+  relayterm-web` (operator-approved per the freshness gate),
+  one `docker run` of the throwaway target
+  (operator-approved with the exact command), four API
+  POSTs to create the identity / host / profile / known-host
+  trust + one POST to disable the profile during cleanup, and
+  one `docker rm` to remove the throwaway.
+- **Methodology takeaways pinned for the next slice.** (1)
+  After any staging web-container recreation, cache-bust the
+  SPA before the first Playwright assertion. (2) When the
+  client `ws_close` and the nginx WS-log timestamp diverge,
+  the nginx line is the proxy's close-observation moment —
+  not the wire's open moment. (3) Staging's current nginx
+  config idle-closes WebSocket upgrades at ~60 s of no
+  traffic, on top of the orchestrator's 30 s
+  detached-live-PTY TTL.
+
+#### Next slice (proposed; not executed by this slice)
+
+The lifetime_X_then_close verification step demanded by the
+2026-05-16b operator request is now CLOSED on the desktop
+Playwright path. The remaining open questions from the
+2026-05-15c / 2026-05-16 first-launch detach pattern are:
+
+- **`docs/android-phone-launch-timing-resmoke`** (recommended
+  next slice). Re-run the same `lifetime_X_then_close` shape
+  AND a fresh launch on a real Samsung Galaxy S10e against
+  the same throwaway pattern, reading the client-side
+  `data-launch-timing-ws-open-ms` /
+  `data-launch-timing-ws-close-ms` /
+  `data-launch-timing-first-output-ms` shortcuts directly via
+  Chrome DevTools `chrome://inspect` USB attach (since adb
+  uiautomator cannot read DOM `data-*` attributes inside the
+  WebView, per the 2026-05-15c lesson). The goal is to
+  characterise the still-unreproduced 60–68 s first-launch
+  gap on the real-phone surface as either (a) WS-open delay
+  (ws_open >> click), (b) attach-stub delay (attached >>
+  ws_open), or (c) first-output stall (first_output >>
+  attached) — answer is unambiguous from the per-event ms
+  values.
+- **`feat/api-session-attach-timing-events`** (optional
+  follow-on). Add backend-side `session_events` rows for the
+  attach-path milestones (proposed names — e.g. `ws_upgraded`
+  / `first_attach_seen` / `first_output_emitted`, subject to
+  design review on the companion slice; this docs entry does
+  NOT pre-commit the wire names) with absolute UTC timestamps
+  (public metadata only per `docs/agent/redaction-rules.md`
+  § 1) so the client-side monotonic deltas can be
+  cross-checked against absolute backend wall-clocks without
+  inferring through the proxy. Defer unless the real-phone
+  slice above turns up evidence the client-side strip alone
+  can not characterise.
+- **`docs/wterm-android-tauri-smoke`** (still deferred per
+  2026-05-16b). Tauri Android WebView smoke stays deferred
+  until the real-phone first-launch pattern is classified;
+  running it before would re-collect the same intermittent
+  detach across a more expensive surface.
+
+The Tauri Android browser-shell matrix smoke
+(`docs/wterm-android-browser-matrix-smoke`) is also still
+gated by the real-phone classification.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

@@ -996,6 +996,41 @@ deferred until explicitly approved. The optional companion
 slice `feat/api-session-attach-timing-events` (backend-side
 attach-timing events) is also still deferred.
 
+**Update (2026-05-16d — staging verification landed).** The
+`docs/terminal-launch-timing-diagnostics-smoke` slice ran the
+client-side timing strip against staging end-to-end (one xterm
+session, desktop Playwright 1440 × 900, throwaway
+linuxserver/openssh-server target on the internal Compose
+network) AND ran the mandatory `lifetime_X_then_close`
+verification sub-step. Result: **the nginx WebSocket
+access-log line records the CLOSE moment** on the staging
+stack as deployed today — client `ws_close` wall-clock
+17:46:11.150 UTC vs nginx `GET .../ws 101` line at
+17:46:11 UTC (Δ ≈ +0.15 s, within jitter), client `ws_open`
+wall-clock 17:44:14.074 UTC was Δ +116.9 s away from the
+nginx line and is NOT what nginx logged. Lifetime (`ws_close
+− ws_open`) ≈ 117.1 s, well above the 5 s minimum. Every
+documented timing event observed on a clean launch flow:
+`launch_started → create_session_post_started (0.1 ms) →
+create_session_post_resolved (170.9 ms, ok) → ws_connect_started
+(218 ms) → ws_open (362.6 ms) → first_server_message
+(366.6 ms) → attached (366.7 ms) → first_output (56 365.3 ms)
+→ ws_close (117 438.6 ms)`. The 2026-05-16b methodology
+correction is now PINNED — any subsequent mobile / workspace
+investigation that quotes an nginx `GET .../ws 101` timestamp
+MUST treat it as a close-moment reading, never an open-moment
+reading. Full evidence, redaction sweep, and per-event timing
+table in `docs/deployment/vps-staging-smoke.md` §
+"2026-05-16d · `docs/terminal-launch-timing-diagnostics-smoke`".
+The next executable slice for mobile is
+`docs/android-phone-launch-timing-resmoke` (real Galaxy S10e
+read of `data-launch-timing-ws-open-ms` /
+`data-launch-timing-ws-close-ms` /
+`data-launch-timing-first-output-ms` via Chrome DevTools USB
+attach); the optional backend companion slice
+`feat/api-session-attach-timing-events` stays deferred. No
+renderer promotion; xterm remains the production default.
+
 **Methodology update (2026-05-16).** Any subsequent surface-2
 or surface-3 row sweep — whether under the workspace-fix slice
 above or after it lands — runs under the **"Playwright-first,
