@@ -1315,6 +1315,81 @@ autofit`. Adapter contracts:
 [`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
 § "Resize / fit status".
 
+### 2026-05-15b · `docs/wterm-autofit-diagnostic-resmoke` staging resmoke (`data-renderer-autofit="active"` workspace fix verified for wterm AND xterm; SMOKE.md autofit precondition is now truthful from the production shell)
+
+**Status:** docs-only resmoke verifying the
+production-shell behaviour of
+`79c216b fix(web): update autofit diagnostic after
+renderer mount`. **No** renderer / `terminal-core` /
+production-shell-non-doc / protocol / backend /
+session / orchestrator / CSP / CI / deploy file was
+edited.
+
+**Surface.** `https://relayterm-staging.js-node.cc`,
+Playwright MCP browser. Operator-approved web-only
+recreate from fresh `:main` registry image
+`sha256:cb9620986ddf…` (image config) created
+`2026-05-15T23:00:42Z` — built **after** the
+2026-05-15 (`a`) entry's `sha256:7fc53fc7aba0…`
+image, carrying the fix commit. Backend + Postgres
+untouched (the diagnostic fix is web-only).
+
+**What changed at runtime.** With the operator opted
+in via Settings (`autofitEnabled: true`,
+`experimentalRendererEvaluationEnabled: true`,
+`rendererId: wterm`), the production-terminal
+workspace now reports `data-renderer-autofit="active"`
+on first paint after the renderer mounts (the
+2026-05-15a state was `"unsupported"`); the
+Fit-button autofit-active tooltip ("Autofit is
+keeping the terminal sized to its container.")
+finally renders, and the attribute stays `"active"`
+through a narrow-viewport resize cycle. The xterm
+control row (autofit on, gate off,
+`rendererId: xterm`) reports the same `"active"`
+and the same tooltip. The
+[2026-05-15a entry](#2026-05-15--docswterm-fit-reflow-resmoke-staging-resmoke-real-pty-reflow-verified-for-wterm-and-xterm-under-operator-opt-in-autofit-data-renderer-autofit-workspace-diagnostic-bug-discovered)'s
+"the `autofit="active"` precondition is structurally
+unverifiable from the production shell until that
+ships" caveat is **closed** for both renderers
+under the production-shell autofit path.
+
+**Scope is intentionally narrow** — this is the
+workspace-diagnostic resmoke; it is NOT a renderer
+promotion, NOT a renderer-default change, NOT a
+renderer-evaluation matrix re-run, and NOT a re-do
+of the 2026-05-15a reflow verification (which
+already pinned the underlying wterm + xterm autofit
+reflow behaviour end-to-end).
+
+**Promotion posture unchanged.** wterm remains
+experimental and unpromoted; xterm remains the
+production compatibility baseline and the production
+default renderer. Gate 1 / Gate 2 criteria under
+[§ "Promotion criteria"](#promotion-criteria) are
+unchanged.
+
+**Cleanup posture.** Throwaway SSH target
+`relayterm-staging-wterm-autofit-diagnostic-smoke-ssh`
+and the new server profile
+`wterm-autofit-diagnostic-smoke-profile` are still
+in place — cleanup is deferred pending operator
+approval (see the smoke entry's Cleanup section for
+the full resource list and the exact cleanup
+commands). Settings were reset to fresh-user
+defaults in the smoke browser at slice end.
+
+**Cross-links.** Smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-15b · wterm autofit diagnostic resmoke".
+Bug origin: the 2026-05-15a entry above. Fix
+commit: `79c216b fix(web): update autofit diagnostic
+after renderer mount`. Design unchanged:
+[`docs/renderer-neutral-autofit.md`](renderer-neutral-autofit.md).
+Adapter contracts unchanged:
+[`docs/spec/terminal-adapters.md`](spec/terminal-adapters.md)
+§ "Implementation status (since 2026-05-15…)".
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

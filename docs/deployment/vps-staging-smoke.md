@@ -9592,6 +9592,362 @@ renderer promotion or xterm-default flip; production
 CSP decisions; tmux/screen persistence; durable
 VT-snapshot persistence.
 
+### 2026-05-15b · wterm autofit diagnostic resmoke (`data-renderer-autofit="active"` fix verified for wterm AND xterm under operator-opt-in autofit; underlying autofit reflow still works)
+
+**Date.** 2026-05-15 23:08 UTC – 23:24 UTC (≈16 min).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+**Stack pin.** Web force-recreated from the fresh
+`:main` registry image built **after** the
+2026-05-15a (`db0286e docs(deployment): record wterm
+autofit resmoke`) entry, carrying
+`79c216b fix(web): update autofit diagnostic after
+renderer mount`:
+
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  image config digest
+  `sha256:cb9620986ddfcb69ac44a80cc8709d3b46a1fbd7fac5ace092012f6f312d3198`,
+  image `Created` `2026-05-15T23:00:42Z`,
+  container `Created` `2026-05-15T23:16:27Z`.
+  Pre-recreate the running web image was
+  `sha256:7fc53fc7aba06e3602d41cb2197ba7404897d4f8e8fc0d8c2f997d2fe7b8d83f`
+  — **byte-identical to the image digest the
+  2026-05-15a resmoke ran on** (the entry above pinned
+  the same digest), so the workspace reactivity bug
+  the prior entry recorded was structurally present
+  in the running stack. `Last-Modified` on `/` moved
+  from `Fri, 15 May 2026 19:53:43 GMT` (pre-recreate)
+  to `Fri, 15 May 2026 23:00:41 GMT` (post-recreate).
+- backend
+  `git.js-node.cc/jsprague/relayterm-backend:main`,
+  digest unchanged, **untouched** (diagnostic fix is
+  web-only).
+- postgres `postgres:17-alpine`, **untouched**
+  (`Up 6 days` before AND after).
+
+Operator approval was requested and granted before
+recreating the web service. Postgres / backend were
+explicitly held. Recreate command (on cloud-edge under
+`/home/ubuntu/docker-compose/relayterm-staging`):
+`docker compose up -d --no-deps --force-recreate
+--pull never relayterm-web`.
+
+Pre-flight bundle verification: pulled the fresh
+`:main` web image into a throwaway container and
+confirmed the main chunk hash had moved
+(`index-9Ss46Hol.js`, 663,717 bytes) vs the
+2026-05-15a entry's `index-4Fc6yR-p.js`. The new
+main chunk contains `data-renderer-autofit`,
+`settings-autofit-enabled`, and the literal
+"Autofit is keeping" copy.
+
+**Branch.** `docs/wterm-autofit-diagnostic-resmoke`
+off `main` (docs-only).
+**Browser surface.** Playwright MCP (Chrome / Linux)
+at 1440 × 900 (briefly resized to 390 × 844 for the
+mobile-layout row, restored after). Auth: existing
+`staging-throwaway-20260509173230` cookie session, no
+re-login.
+
+**Goal.** Verify on the production shell that
+`79c216b fix(web): update autofit diagnostic after
+renderer mount` actually flips
+`data-renderer-autofit` from `"unsupported"` (the
+2026-05-15a bug-discovery state) to `"active"` once a
+renderer with a wired autofit path is mounted, and
+that the Fit-button autofit-active tooltip ("Autofit
+is keeping the terminal sized to its container.")
+finally appears. **Scope is intentionally narrow** —
+this is the workspace-diagnostic resmoke; it is NOT
+a renderer-evaluation matrix re-run, NOT a renderer
+promotion, NOT a renderer-default change, and NOT a
+re-do of the 2026-05-15a reflow verification.
+
+**Slice boundary (docs-only).** No repo source / CI /
+schema / migration / auth / session / orchestrator /
+`terminal-core` / production-shell / renderer-adapter /
+nginx-template / deploy-template / CSP file was
+edited. The only host-side actions were the
+operator-approved web recreate (above) and the
+throwaway SSH target lifecycle (below).
+
+**CSP posture (unchanged from 2026-05-14c).**
+`curl -sSI https://relayterm-staging.js-node.cc/`:
+
+```
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+```
+
+`'unsafe-eval'` NOT present; `data:` NOT present;
+`blob:` NOT present; `connect-src` not widened. This
+slice did not touch CSP.
+
+**Endpoint smoke (post-recreate).** `GET /` → `200`,
+`GET /healthz` → `200`, `GET /api/v1/auth/me` without
+cookie → `401`. Production SPA loads; Settings card
+still exposes the autofit checkbox
+(`[data-testid="settings-autofit-enabled"]`) and the
+experimental-renderer gate toggle. Flipping the gate
+ON, selecting `wterm`, ticking the autofit checkbox,
+pressing "Save changes" wrote
+`relayterm.terminal-settings.v2 = {…, "rendererId":"wterm",
+"experimentalRendererEvaluationEnabled":true,
+"autofitEnabled":true}` to storage. The legacy v1
+entry remained alongside per the documented
+non-destructive migration.
+
+**Throwaway SSH target (newly created).** A
+`linuxserver/openssh-server:latest` container named
+`relayterm-staging-wterm-autofit-diagnostic-smoke-ssh`,
+attached only to
+`relayterm-staging_relayterm-staging-internal` with
+DNS alias `wterm-autofit-smoke-host` → `172.21.0.5`.
+**No host port published** (`docker port` empty;
+only `2222/tcp` exposed internally).
+`USER_NAME=smoke`, `SUDO_ACCESS=false`,
+`PASSWORD_ACCESS=false`, `PUBLIC_KEY=<the existing
+wterm-autofit-smoke-identity OpenSSH public-key line>`.
+The public-key line was fetched from
+`/api/v1/ssh-identities/cd2a619b-…` via
+`browser_evaluate` (response carried **no**
+`private_key` / `encrypted_private_key` field —
+verified inline), validated locally with
+`ssh-keygen -lf` (fingerprint
+`SHA256:3VwSZ/Z0OJ/kz7M711FLEn1aIfS86aEfn6f1HMajcak`,
+byte-identical to the prior smoke), `scp`'d to the
+VPS into `/tmp/wterm-autofit-identity.pub` (mode
+`0600`), passed into `docker run -e PUBLIC_KEY=…`,
+and the local + remote temp files `shred`ded. No
+PEM / private-key bytes touched any tool-call
+payload, log, or the operator filesystem.
+
+**Inventory reuse + new profile.** Existing host
+`Wterm-Autofit-Smoke-Host` (id
+`1ae1004e-f7d8-4d9e-8b63-27442517476d`, hostname
+`wterm-autofit-smoke-host`, port `2222`, default user
+`smoke`) and identity `wterm-autofit-smoke-identity`
+(id `cd2a619b-7c5a-4672-b9da-7865a9f8e761`) were
+**reused unchanged** — neither was recreated; no
+duplicate audit row was generated for them. A fresh
+server profile `wterm-autofit-diagnostic-smoke-profile`
+(id `5a938136-11cf-43ed-8d64-a4bbff6839c1`, tags
+`renderer / wterm / autofit / diagnostic`) was
+created via `POST /api/v1/server-profiles` linking
+the existing host + identity. The disabled prior
+`wterm-autofit-smoke-profile` was **not** re-enabled
+(the slice runbook deliberately avoids re-enabling
+historical disabled profiles).
+
+**Host-key preflight + replace.** The fresh
+throwaway container generated a new ed25519 host key
+on first boot, so the preflight saw a `Changed
+ed25519` mismatch against the prior smoke's pinned
+fingerprint. The new fingerprint
+`SHA256:e5xE0d+GlYo6Z8nS2OLeY/5PZtoe3Yplv9is68YF+/U`
+was **byte-identical** to the running container's
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+Used the workspace's "Replace trusted host key"
+deliberate-confirmation flow with reason
+`lab_target_recreated`, typed `REPLACE`, submitted;
+status flipped to `Trusted ed25519`. This is the
+expected supported lifecycle path for a recreated
+lab/staging target — no manual `known_host_entries`
+poking, no DB writes.
+
+**Auth-check.** Status flipped to `Authenticated` at
+`2026-05-15T23:21:13.573Z`.
+
+**Renderer mount diagnostics (the load-bearing
+finding of this slice).** `profile-launch-terminal`
+opened `/terminal` and created session UUID
+`086efa75-36ec-4ef6-874f-b2810e630c7b` (the wterm
+session). The production-terminal workspace surfaced:
+
+- `data-phase="attached"` (`production-terminal-phase`
+  text `live`)
+- `data-renderer="wterm"`
+- `data-renderer-experimental="true"`
+- `data-renderer-fallback=""` (empty — **no
+  `adapter_mount_failed`**)
+- `data-renderer-gate="on"`
+- `data-renderer-input="marked"`
+- **`data-renderer-autofit="active"`** ← **the fix
+  works.** The 2026-05-15a state was
+  `"unsupported"` on the same renderer / settings;
+  on this stack the derivation re-runs once
+  `renderer = r` assigns (now `$state.raw`-tracked)
+  and the post-mount truth lands on the attribute.
+- Fit button: `disabled`, **`title="Autofit is
+  keeping the terminal sized to its container."`** ←
+  the autofit-active tooltip the 2026-05-15a entry
+  reported missing now renders.
+- `production-terminal-error` NOT rendered
+
+**Minimal command (wterm).** Per the slice runbook:
+clicked `production-terminal-focus`, verified
+`document.activeElement === [data-relayterm-terminal-input]`
+(one such marker element, on wterm's hidden
+keyboard `<textarea>`), then typed
+`echo relayterm-wterm-autofit-diagnostic && whoami`
+via Playwright `pressSequentially` (line-by-line so
+the wterm input handler sees individual keydowns).
+Viewport rendered the sentinel literal and the
+`smoke` username on the next line.
+
+**Narrow viewport re-check.** Resized the browser to
+390 × 844, waited 2 s for the renderer
+`ResizeObserver` to settle (`.wterm` collapsed to
+327 × 448 px, same as the prior smoke). Re-read the
+workspace attributes: `data-renderer-autofit` stayed
+**`"active"`**, Fit-button tooltip unchanged. The
+fix holds across the renderer's lifetime, not only
+at first mount. Restored to 1440 × 900. (Did NOT
+re-run the full `stty size` reflow matrix — that was
+the 2026-05-15a goal and is not in scope here; the
+underlying reflow already verified end-to-end there.)
+
+**xterm autofit control row.** Closed the wterm
+session (`production-terminal-close`), navigated to
+Settings, reset `rendererId = xterm`,
+`experimentalRendererEvaluationEnabled = false`,
+**kept `autofitEnabled = true`** deliberately so the
+xterm control row exercises the same fix on the
+production-default renderer. Launched a fresh xterm
+session against the same profile (session UUID
+`7610534f-f08e-46e6-8c91-e2a653476648`). Workspace:
+
+- `data-renderer="xterm"`
+- `data-renderer-experimental="false"`
+- `data-renderer-fallback=""`
+- `data-renderer-gate="off"`
+- `data-renderer-input="marked"`
+- **`data-renderer-autofit="active"`** ← same fix,
+  pinned for the production default renderer too.
+- Fit button: `disabled`, **`title="Autofit is
+  keeping the terminal sized to its container."`**
+
+Typed `echo relayterm-xterm-autofit-diagnostic &&
+whoami` via the renderer-fair input path; the
+`.xterm-rows` DOM rendered the sentinel literal and
+`smoke` on the next line. Closed the session.
+
+**Settings reset.** Settings panel → "Reset to
+defaults" → "Save changes". Persisted `v2` snapshot
+verified: `rendererId="xterm"`,
+`experimentalRendererEvaluationEnabled=false`,
+`autofitEnabled=false`. Fresh-user posture restored
+in this browser.
+
+**Comparison vs the 2026-05-15a (bug-discovery)
+state.**
+
+| Property | 2026-05-15a (pre-fix; bug discovered) | 2026-05-15b (this slice; fix landed) |
+|---|---|---|
+| Running web image config digest | `sha256:7fc53fc7…` | `sha256:cb962098…` |
+| Main JS chunk hash | `index-4Fc6yR-p.js` | `index-9Ss46Hol.js` |
+| `data-renderer-autofit` (wterm, `autofitEnabled=true`) | `"unsupported"` | **`"active"`** |
+| `data-renderer-autofit` (xterm, `autofitEnabled=true`) | `"unsupported"` | **`"active"`** |
+| Fit-button tooltip on autofit-on session | `"Fit is not supported by the current renderer."` | `"Autofit is keeping the terminal sized to its container."` |
+| Underlying wterm reflow on narrow viewport | works (`24 35`) | works (not re-verified here; not in scope) |
+| Browser console error count | baseline noise | baseline noise + 1 (a deliberate 422 from the slice's `display_name` vs `name` first-try POST during profile create — not a renderer error) |
+| Redaction sweep | clean | clean |
+
+**Backend / web / target log redaction.** Bounded
+`docker logs --since 30m` over the smoke window:
+backend = 2 lines (1 known-FP `WARN missing session
+cookie` pre-smoke line, 1 INFO retention sweep);
+web/nginx = 64 lines (request log only, no
+payloads); target sshd = 128 lines (linuxserver
+entrypoint chatter only). Sentinel sweep across all
+three streams against
+`{private_key_openssh, encrypted_private_key,
+"BEGIN OPENSSH PRIVATE KEY", openssh-key-v1,
+passphrase, session_token, token_hash, data_b64,
+REDACT-MARKER, relayterm-wterm-autofit-diagnostic,
+relayterm-xterm-autofit-diagnostic}` — **zero
+matches** in any stream.
+
+**Browser-side redaction sweep.** `document.cookie.length
+= 0` (auth cookie HttpOnly ✓). `localStorage` keys:
+exactly `relayterm.terminal-settings.v1` and
+`relayterm.terminal-settings.v2` (v1 preserved per
+the documented non-destructive migration).
+`sessionStorage` empty. Sentinel sweep of
+`document.documentElement.outerHTML` for the same
+11-string list returned **zero matches** (both
+terminal sessions had been closed, so the otherwise
+legitimate sentinel-in-viewport text was gone).
+
+**Backend / DB.** No bounded SQL queries needed for
+this slice; every load-bearing observation is on the
+browser surface. The smoke produced two
+`terminal_sessions` rows (`086efa75-…` wterm +
+`7610534f-…` xterm), each with the standard
+`created → attached → closed` event sequence in
+`session_events`. Per the per-session-telemetry
+rule, none crossed into `audit_events`. New
+`audit_events` from this slice: server-profile
+create (1), host-key replace with reason
+`lab_target_recreated` (1), auth-check (1). No
+audit-side payload leak per the bounded backend log.
+
+**Cleanup posture (deferred — pending operator
+approval).** Resources still in place at slice-end:
+
+- Throwaway SSH container
+  `relayterm-staging-wterm-autofit-diagnostic-smoke-ssh`
+  (internal network only, no host port).
+- Server profile `wterm-autofit-diagnostic-smoke-profile`
+  (id `5a938136-…`, 2 closed sessions in its history).
+- Existing host + identity records (re-used, not new
+  this slice — leaving in place either way).
+- Host-key pin replaced from
+  `SHA256:JwTBTV4F…` (the prior smoke's pin) to
+  `SHA256:e5xE0d+G…` (the new container's actual
+  key) with reason `lab_target_recreated`. Leaving
+  pinned to the new key is the supported posture for
+  the recreated target.
+- Terminal sessions / session_events / audit_events
+  rows in Postgres — left in place per the per-session
+  retention contract.
+
+Settings panel was reset to fresh-user defaults in
+this browser. The cleanup cohort recommended by the
+slice runbook (disable the new profile, stop+remove
+the throwaway SSH container) was offered to the
+operator but **not executed** — operator declined
+the cleanup prompt during the slice. Future cleanup
+(if/when chosen): `disable wterm-autofit-diagnostic-smoke-profile`
+via the UI/API, then `docker stop && docker rm
+relayterm-staging-wterm-autofit-diagnostic-smoke-ssh`
+on cloud-edge. Postgres + staging stack stay
+untouched; staging stack stays running.
+
+**Promotion decision.** wterm remains experimental
+and unpromoted; xterm remains the production
+compatibility baseline and the production default
+renderer. Gate 1 / Gate 2 criteria under
+[`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md)
+§ "Promotion criteria" are unchanged. The renderer
+default flip is NOT recommended by this slice. The
+2026-05-15a follow-on slice
+(`fix(web): make renderer reactive for data-renderer-autofit`)
+is now landed and verified by this resmoke; the
+2026-05-15a entry's "the `autofit="active"`
+precondition is structurally unverifiable from the
+production shell" caveat is **closed** for wterm AND
+xterm under the production-shell autofit path.
+
+**Intentionally deferred (this slice owns none of
+these).** Renderer-evaluation matrix re-run (the
+2026-05-15a entry covers it for wterm; this slice
+does not re-grade rows); ghostty-web / restty real
+autofit implementations; restty `focusTarget()` and
+CSP / WebGPU viability; desktop-Tauri / Android-Tauri
+renderer smokes; performance / benchmark automation;
+renderer promotion or xterm-default flip; production
+CSP decisions; tmux/screen persistence; durable
+VT-snapshot persistence.
+
 ---
 
 ## See also
