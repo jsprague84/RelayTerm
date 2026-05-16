@@ -221,6 +221,52 @@ record of what the first surface-2 execution could and could
 not reach. Promotion / xterm-default decisions are NOT on the
 table from this row set alone.
 
+### Status after the 2026-05-16 xterm-control resmoke
+
+The follow-on slice `docs/wterm-android-browser-resmoke` ran
+**Row 17 (xterm control comparison) first** on the same
+Samsung phone / same home wifi / same staging stack — see the
+[`2026-05-16 · docs/wterm-android-browser-resmoke (surface 2,
+xterm control)`](deployment/vps-staging-smoke.md#2026-05-16-docswterm-android-browser-resmoke-surface-2-xterm-control--first-launch-reproduces-the-2026-05-15c-detach-pattern-retries-recover-bug-is-workspace-bound--transient-not-wterm-specific)
+dated entry in the staging-smoke log. The xterm control result
+resolves the 2026-05-15c Row 12 open question:
+
+- **Row 12** is reclassified from **OPEN QUESTION** (wterm-bound
+  vs workspace-bound) to **WORKSPACE-BOUND + TRANSIENT**. The
+  very first xterm launch reproduced the 68 s POST→WS gap and
+  immediate detach-at-seq-0 pattern; launches 2 and 3 on the
+  same renderer / phone / network / throwaway went live within
+  ≈2 s of POST. wterm is therefore **not implicated** as the
+  cause of the 2026-05-15c detach finding. The next slice owner
+  is *workspace-side WS-open timing*, not *wterm*.
+- **Row 17** is **PASS for xterm** as a renderer (it mounted,
+  attached, and round-tripped operator input on Android Chrome
+  in launches 2 and 3). It is **not yet PASS for wterm** — but
+  the comparison the row was added to make is now possible: the
+  xterm result tells us the detach is *not* a wterm-vs-xterm
+  delta, so a future re-test of wterm on the same surface
+  should be evaluated on the workspace-side fix, not on the
+  renderer.
+- **Methodology correction.** The 2026-05-15c "SSH-target
+  container shows zero inbound connections" reading was based
+  on `docker logs` of the linuxserver/openssh-server throwaway,
+  which only writes init / boot lines to stdout. Runtime sshd
+  activity goes to syslog inside the container. The correct
+  probe is `netstat -tn` inside the throwaway (or
+  `ps -ef | grep sshd-session`). With the corrected probe,
+  launches 2 and 3 showed a sustained ESTABLISHED connection
+  from the backend container to the throwaway on port 2222;
+  the russh dial path is fine. The 2026-05-15c detach
+  finding is **most plausibly** the WS upgrade arriving after
+  the orchestrator's server-side attach-timeout — not "russh
+  never dialed". This slice does not rewrite the 2026-05-15c
+  entry in place; the 2026-05-16 dated entry flags the
+  interpretation correction at its end.
+- **Rows D–H / L / surface-3-Tauri** remain deferred — the
+  same workspace-side question blocks them, and the next
+  executable slice is workspace-investigation, not another
+  surface-2 row sweep.
+
 ## 6. Test prerequisites
 
 - **Staging URL.** `https://relayterm-staging.js-node.cc` (the
@@ -521,6 +567,22 @@ slice behind it. The next executable slice is
 the same phone, same network, same staging stack), not the Tauri
 shell. See the "Next slice proposed" subsection in the 2026-05-15c
 dated entry for the exact scope.
+
+**Update after the 2026-05-16 xterm-control resmoke.** The
+xterm-first rerun landed (see the 2026-05-16 dated entry in
+`docs/deployment/vps-staging-smoke.md`). Row 12 is reclassified
+as **workspace-bound + transient** (xterm reproduced the 68 s
+POST→WS gap + detach-at-seq-0 on its first launch; launches 2
+and 3 went live in ≈2 s). wterm is exonerated as the cause of
+the 2026-05-15c finding. The **next executable slice is now
+workspace-side**, not surface-2 / surface-3 wterm: a
+`docs/mobile-first-launch-ws-investigation` (working title)
+that instruments the mobile-Chrome WS-open timing and the
+orchestrator's server-side attach-timeout. Running the Tauri
+smoke (`docs/wterm-android-tauri-smoke`) or a wterm surface-2
+re-test before the workspace-side fix lands would re-collect
+the same intermittent first-launch detach pattern across every
+renderer and is not useful evidence.
 
 If the Chrome smoke (surface 2) reveals that wterm is **not yet**
 mobile-ready as built — likely the modifier-bar gap or a

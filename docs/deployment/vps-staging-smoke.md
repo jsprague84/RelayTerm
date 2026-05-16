@@ -10392,6 +10392,270 @@ Rows D – H / L / surface-3-Tauri attempts resume.
 
 ---
 
+### 2026-05-16 · `docs/wterm-android-browser-resmoke` (surface 2, xterm control) — first launch reproduces the 2026-05-15c detach pattern; retries recover; bug is workspace-bound + transient, not wterm-specific
+
+Diagnostic resmoke against the same Samsung phone / same home
+wifi / same staging stack as the 2026-05-15c surface-2 smoke,
+with the renderer flipped back to the **xterm** production
+baseline (`experimentalRendererEvaluationEnabled = false`,
+`rendererId = xterm`). Goal of this slice: run Row 17 of
+[`docs/wterm-mobile-smoke-plan.md`](../wterm-mobile-smoke-plan.md)
+§ 5 (xterm control comparison) **first**, to distinguish
+whether the 2026-05-15c detach-at-seq-0 / 60s POST→WS gap
+pattern is renderer-bound (wterm-specific) or workspace-bound
+(every renderer). Outcome: **the very first xterm launch
+reproduced the 2026-05-15c pattern (68-second POST→WS gap,
+immediate detach on WS upgrade, `last_seen_seq` = `null`),
+and two subsequent xterm launches went live within ~2 seconds
+of POST and round-tripped operator input.** The bug is **not
+renderer-specific** (xterm shows it too) and **not a hard
+reproduction** (retry recovers); it is a transient first-launch
+client-side WS-upgrade-delay issue, plus a methodology
+correction for 2026-05-15c's "russh never dialed" reading
+(`docker logs` does not see sshd activity on
+linuxserver/openssh-server — `netstat -tn` inside the throwaway
+does).
+
+**Date.** 2026-05-16 14:30 – 14:40 UTC (≈ 10 min on-device,
+plus log triage and cleanup).
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+
+**Stack pin (unchanged from 2026-05-15c).**
+
+- web `git.js-node.cc/jsprague/relayterm-web:main`,
+  container image
+  `sha256:cb9620986ddfcb69ac44a80cc8709d3b46a1fbd7fac5ace092012f6f312d3198`,
+  served `Last-Modified: Fri, 15 May 2026 23:00:41 GMT`, ETag
+  `"6a07a599-1ab"`.
+- backend `git.js-node.cc/jsprague/relayterm-backend:main`,
+  container image
+  `sha256:90573e96bcbca4dba962330ffa264365200ecf5af03390dac933ba6e2a23cb52`.
+- CSP unchanged:
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+
+**Smoke target setup.** Throwaway SSH target
+`relayterm-staging-android-resmoke-ssh`, image
+`lscr.io/linuxserver/openssh-server:latest`
+(`10.2_p1-r0-ls225`), user `smoke`, pubkey-only,
+`SUDO_ACCESS=false`. The throwaway was initially created with
+the 2026-05-15c host-port idiom (`-p 127.0.0.1:2226:2222`) for
+comparability, but the staging backend (on the
+`relayterm-staging_relayterm-staging-internal` bridge network,
+gateway `172.21.0.1`) had no path to the cloud-edge host's
+loopback-bound port and preflight failed with
+`failed to lookup address information: Name or service not known`
+(the operator's Host row used the literal `172.21.0.1:2226`
+string, which is not a valid DNS name). The throwaway was then
+`docker network connect`ed to
+`relayterm-staging_relayterm-staging-internal` with
+`--network-alias android-resmoke-ssh`, disconnected from the
+default `bridge`, and the SPA Host row was updated (direct
+`UPDATE` against `hosts` since the SPA-side fixup was plumbing,
+not user-meaningful state) to `hostname='android-resmoke-ssh'`,
+`port=2222`. After the network fix, preflight + trust-host-key
++ auth-check all returned 200. **This is a different network
+plumbing from 2026-05-15c** — the load-bearing diagnostic
+property (russh dial through a vault-managed ed25519 identity
+to a hermetic throwaway target with no host port exposure) is
+preserved, but the staging backend reaches the throwaway via
+container DNS on the internal bridge rather than via the
+cloud-edge host's loopback. The renderer-comparison variable
+is unchanged.
+
+**Inventory rows from the phone (all via SPA).** SSH identity
+`android-resmoke-identity` (ed25519, vault-generated,
+fingerprint `SHA256:izZJEtVri0Lm+meI7oDHhwNelLL4SvWy8ngxOkEnCNU`,
+public-key bytes recorded as `audit_events.payload` public
+metadata, never plaintext PEM). Host `Android-resmoke-host` →
+`android-resmoke-ssh:2222`. Server profile
+`Android-resmoke-xterm-profile` (UUID
+`a7e6db5d-97e5-4d29-99f9-e293c7eb7ddf`).
+
+**Device + browser.** Same Samsung phone as 2026-05-15c
+(`R38N500TY3E`), Android Chrome `148.0.0.0`, same home wifi,
+same Cloudflare-fronted staging endpoint.
+
+**Renderer setting.** Settings → renderer evaluation gate
+**OFF**, renderer **xterm** (production baseline). This slice
+**did not** flip the gate on at any point; **wterm was not
+re-tested**. Per the Phase 1 → Phase 2 decision tree in the
+slice spec, the xterm result was structurally sufficient to
+classify the prior 2026-05-15c finding without re-touching
+wterm.
+
+#### Three xterm launches against the same throwaway
+
+| # | Session UUID | POST `/terminal-sessions` | WS upgrade (`GET …/ws`) | POST→WS gap | `session_events.attached` | `session_events.detached` | SSH ESTABLISHED inside throwaway | Outcome |
+|---|---|---|---|---|---|---|---|---|
+| 1 | `a469711b-10e0-4e33-8682-199c3afc2903` | 14:30:42 → 201 | 14:31:50 → 101 | **68 s** | 14:30:43 (`live=true, attachment_id c83f3f93…`) | 14:31:50 (`last_seen_seq: null`) | not measured (session closed before probe) | **detached at seq=0**; workspace banner showed "detached (TTL window)"; operator tapped Reconnect at 14:33:25 → `GET …/ws` returned 409 (session had auto-closed at 14:32:20 `client_requested`) |
+| 2 | `494fd0f5-0648-420d-9a1b-b360c753b28c` | 14:33:39 → 201 | (no `/ws` line observed before the session auto-closed) | n/a | 14:33:40 (`live=true, attachment_id 78e8f1f9…`) | (none observed) | **YES** — `172.21.0.3:60646 → 172.21.0.5:2222 ESTABLISHED`, `sshd-session.pam: smoke@pts/0` visible in `ps -ef` inside throwaway at 14:34 | **live**; operator typed `echo` and `whoami`; `hi` echoed back; `whoami` returned `smoke` (the throwaway user) — full input round-trip |
+| 3 | `7cbbb2d8-4143-4623-a552-3f33ca7ef49f` | 14:37:57 → 201 | (no `/ws` line in 90 s capture window after POST) | n/a (fast) | (not queried — netstat probe was the load-bearing signal) | (none observed) | **YES** — netstat poll inside throwaway showed `established_to_2222=0` at 14:37:46–14:37:56, then **`=1` from 14:37:59 (≈2 s after POST) sustained through 14:39:14** (end of 90 s window) | **live**; operator typed the slice sentinel `echo relayterm-android-xterm-resmoke` |
+
+**Headline.** Launch 1 reproduced the 2026-05-15c pattern
+*with the xterm production baseline renderer*: ~68-second
+gap between POST `/terminal-sessions` 201 and the `/ws` 101
+upgrade, immediate detach on WS arrival, `last_seen_seq`
+recorded as `null` in `session_events.payload` (the WS never
+even acknowledged seq 0). The orchestrator's `attached` event
+fires 0.3 s after POST regardless — that is the workspace
+optimistically pre-marking the session, **not** a real
+WS-attach success. Launches 2 and 3 went live within seconds
+of POST against the *exact same* throwaway / network / phone
+/ renderer; launch 3 was verified via `netstat -tn` inside
+the throwaway (the `ss` / `ip` tools are absent in the
+linuxserver image, but `netstat` from `net-tools` is present).
+
+**Methodology correction for 2026-05-15c.** That entry's
+"SSH-target container shows zero inbound connections (russh
+never dialed)" reading was based on `docker logs --since 30m
+relayterm-staging-wterm-android-browser-smoke-ssh`. The
+linuxserver/openssh-server image writes **only its init /
+boot lines** to docker stdout — runtime sshd connection
+activity goes to syslog inside the container, not to docker
+stdout. The accurate probe is either `netstat -tn | grep :2222
+ESTABLISHED` from inside the throwaway, or `ps -ef | grep
+sshd-session` from inside the throwaway. With the correct
+probe, the actual question 2026-05-15c was hitting is almost
+certainly **"the WS upgrade arrived after the orchestrator's
+server-side attach-timeout, so the WS was detached on arrival
+at `last_seen_seq null` and the live PTY was torn down at
+the TTL"** — not "russh never dialed". The render of "russh
+never dialed" should be **softened to "not measured"** in the
+2026-05-15c entry's evidence inventory; this slice **does
+not** rewrite that historical entry but flags the
+interpretation gap here.
+
+#### Redaction sweep — clean
+
+20-minute log window covering all three launches across
+backend + web/nginx + SSH-target containers (47 lines total).
+Substring grep for `relayterm-android-xterm-resmoke`,
+`relayterm-android-wterm-resmoke`, `encrypted_private_key`,
+`private_key_openssh`, `BEGIN OPENSSH PRIVATE KEY`,
+`openssh-key-v1`, `passphrase`, `session_token`, `token_hash`,
+`data_b64`, `REDACT-MARKER`, `PEM`, `argon2`, `Authorization:`,
+`Cookie:`, `password=`, `passwd=` → **zero hits**.
+`session_events.payload` for all 3 session UUIDs: zero
+sentinel hits, public metadata only (`cols`, `rows`, `stub`,
+`live`, `client_info` UA string, `remote_addr: null`,
+`attachment_id`, `last_seen_seq: null`). `audit_events.payload`
+for the resmoke window: only `ssh_identity_created` (with
+public metadata: `name`, `source: generated`, `key_type:
+ed25519`, fingerprint SHA-256, identity UUID) and
+`server_profile_created` (with public metadata: `name`,
+`host_id`, `ssh_identity_id`, `server_profile_id`,
+`disabled_at: null`); no private-key bytes, no PEM delimiters,
+no argon2 hashes, no session cookie, no `Authorization` header.
+
+**Note on the `host_key_accepted` audit gap.** A
+`known_host_entries` row for the new Host (fingerprint
+`SHA256:sBbo1EMrs/m59YqAW19K1+OdM0veOXl/+w09hk+1uCY`) was
+created at 14:30:20 from the trust-host-key call, but **no
+`host_key_accepted` audit event** was written for it (the
+audit kind `host_key_accepted` exists in the schema's CHECK
+constraint and is in the closed-vocabulary kind list). This
+is an audit-policy gap, not a redaction concern. Tracked here
+for the next reviewer; not in scope for this slice to fix.
+
+#### Cleanup
+
+After operator approval (operator selected: "Stop+remove SSH
+target container only" and "Operator resets Android Chrome
+Settings on the phone"), the throwaway target was removed:
+
+```
+ssh cloud-edge 'docker rm -f relayterm-staging-android-resmoke-ssh'
+```
+
+→ container removed; no residual containers matching
+`resmoke` / `wterm-android` / `xterm-android` on cloud-edge.
+The `Android-resmoke-host` host row, `Android-resmoke-xterm-profile`
+server profile, `android-resmoke-identity` SSH identity, the
+single `known_host_entries` row, and the three
+`terminal_sessions` rows (`a469711b`, `494fd0f5`, `7cbbb2d8`)
+are **left in place in staging DB** for reuse by any
+follow-on workspace-side WS-attach-investigation slice. Per
+inventory lifecycle policy default, server_profiles are
+**disabled, not deleted**, when retired; this slice's operator
+explicitly scoped cleanup to the container only. Settings
+reset on the phone is operator-driven (xterm renderer + gate
+off + autofit off).
+
+#### Classification
+
+The 2026-05-15c open question — "is the surface-2 detach
+finding renderer-bound (wterm-specific) or workspace-bound?"
+— resolves to **workspace-bound + transient**:
+
+- **Not renderer-specific.** xterm reproduced the same
+  detach-at-seq-0 / ≥60s POST→WS gap pattern on its first
+  launch against this throwaway. The 2026-05-15c wterm
+  finding is therefore *not* attributable to wterm. wterm's
+  experimental status, the xterm production default, and the
+  scorecard's "wterm Mobile UX = potential" framing are all
+  **unchanged** by this slice.
+- **Not a hard reproduction.** Launches 2 and 3 on the same
+  renderer / phone / network / throwaway went live within
+  ≈2 s of POST. The bug is transient — most plausibly a
+  first-launch-after-fresh-state client-side WS-handshake
+  delay that exceeds the server-side attach-timeout window.
+- **Working hypotheses** (not asserted by this slice; the
+  next investigation slice owns them):
+  1. The mobile-Chrome WebSocket handshake on a freshly
+     opened tab has a path-MTU / DNS-prewarming / TLS-cache
+     warm-up tail that runs ≥60 s on the first attempt and
+     drops to milliseconds on subsequent attempts. Phone is
+     on home wifi, not LTE.
+  2. Cloudflare → origin WS-upgrade latency on the
+     `relayterm-staging.js-node.cc` tunnel sometimes adds a
+     ≥60 s tail on the first request after a long idle.
+  3. The workspace's client-side WS-open is scheduled inside
+     a `tick` / `requestAnimationFrame` chain that stalls
+     for ≥60 s on a freshly-mounted production-terminal
+     shell, *only on first launch* in the SPA's lifetime.
+  4. The server-side attach-timeout (the value the
+     orchestrator uses to decide "if no WS attaches within
+     T, detach the session") sits at a value that the mobile
+     surface's first launch reliably trips.
+- **Posture for the next slice owner.** Do NOT promote
+  wterm. Do NOT flip the xterm production baseline. The
+  next executable slice is a **workspace-side investigation
+  of the first-launch 60-68 s POST→WS gap**: instrument the
+  mobile-Chrome WS-open timing (workspace's `WebSocket`
+  constructor call → `open` event delta), measure the
+  orchestrator-side attach-timeout knob, and add a
+  workspace-visible diagnostic the operator can see *during*
+  the gap (today the workspace just sits at "connecting"
+  with no progress signal). Tauri Android (surface 3) smoke
+  stays deferred until that workspace investigation lands.
+
+#### Intentionally deferred (this slice owns none of these)
+
+Renderer promotion or xterm-default flip; any wterm rerun;
+any change to the `detached_live_pty_ttl_seconds` knob or
+the orchestrator attach-timeout; any workspace-side fix to
+the first-launch WS-open path; backend / russh tracing
+instrumentation; CSP changes; Tauri Android APK build;
+performance / scroll-jank measurement; any other rows from
+`docs/wterm-mobile-smoke-plan.md` § 5 (rows D – L from the
+plan are still blocked by the *same* workspace question and
+are still carried forward).
+
+#### Next slice proposed (not run by this slice)
+
+**`docs/mobile-first-launch-ws-investigation`** (working
+title) — workspace-side: add timing instrumentation to the
+WS-open path so the 60-68 s first-launch gap can be
+attributed to (a) the mobile-Chrome side, (b) the
+Cloudflare → origin side, or (c) the workspace's own client
+state machine. Until that lands, mobile launches remain
+intermittently broken on first attempt across **every**
+renderer including xterm — this slice's evidence makes that
+explicit, where 2026-05-15c could only flag it as a wterm
+open question.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

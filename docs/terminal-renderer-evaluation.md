@@ -1486,6 +1486,97 @@ Scorecard updates:
 § "wterm" Known concerns, § "Mobile / browser-native UX
 potential" footnote.
 
+### 2026-05-16 · `docs/wterm-android-browser-resmoke` (surface 2, xterm control) — Row 12 reclassified as workspace-bound + transient; wterm exonerated as the cause of the 2026-05-15c finding
+
+**Status:** docs-only diagnostic resmoke against the deployed
+staging stack with the renderer flipped to the **xterm**
+production baseline. **No** renderer / `terminal-core` /
+production-shell-non-doc / protocol / backend / session /
+orchestrator / CSP / CI / deploy file was edited. Per the
+slice's Phase 1 → Phase 2 decision tree, **wterm was not
+re-tested** — the xterm result was structurally sufficient
+to resolve the 2026-05-15c open question.
+
+**Surface.** Same Samsung phone (`R38N500TY3E`), Android
+Chrome `148.0.0.0`, same home wifi, same staging stack as
+2026-05-15c. Web + backend container digests unchanged
+(`sha256:cb9620986ddf…` / `sha256:90573e96bcbc…`). CSP
+unchanged (`default-src 'self'; script-src 'self'
+'wasm-unsafe-eval'`).
+
+**Renderer setting.** Settings → renderer evaluation gate
+**OFF**, renderer **xterm**. Gate never flipped on during
+this slice.
+
+**What landed.** Three xterm Launch attempts against the same
+hermetic throwaway target on the same network:
+
+- **Launch 1** (`a469711b`) — POST `/terminal-sessions` 201
+  at 14:30:42, `GET …/ws` 101 at 14:31:50 — **68-second
+  POST→WS gap**. The `session_events.attached` row fired at
+  14:30:43 (orchestrator pre-mark), then `session_events.detached`
+  fired at 14:31:50 with `last_seen_seq: null` (the WS upgrade
+  arrived past the server-side attach-timeout window;
+  immediate detach on arrival). The session auto-closed at
+  14:32:20 (`reason: client_requested`). **Reproduces the
+  2026-05-15c pattern with the xterm production baseline
+  renderer.**
+- **Launch 2** (`494fd0f5`) — POST → 201 at 14:33:39, attach
+  event at 14:33:40, **`netstat -tn` inside the throwaway
+  showed an ESTABLISHED `172.21.0.3:60646 → 172.21.0.5:2222`
+  connection** with a live `sshd-session.pam: smoke@pts/0`
+  process. Operator typed `echo` and `whoami`; both
+  round-tripped (`whoami → smoke` confirms the throwaway
+  user is the live PTY's identity).
+- **Launch 3** (`7cbbb2d8`) — POST → 201 at 14:37:57. Inside
+  the throwaway, the per-3-second netstat poll showed
+  `established_to_2222=0` at 14:37:46 – 14:37:56, then
+  **`=1` from 14:37:59 (≈2 s after POST) sustained through
+  the full 90 s capture window**. Operator typed the slice
+  sentinel `echo relayterm-android-xterm-resmoke`.
+
+**Methodology correction for 2026-05-15c.** The
+linuxserver/openssh-server throwaway image writes only its
+init / boot lines to docker stdout — runtime sshd
+connection activity goes to syslog inside the container,
+not visible via `docker logs`. The accurate "is the SSH
+PTY actually live" probe is `netstat -tn | grep :2222`
+inside the throwaway, or `ps -ef | grep sshd-session`. The
+2026-05-15c read of "russh never dialed" was based on the
+incorrect probe; with the corrected probe, the 2026-05-15c
+detach pattern most plausibly maps to "WS upgrade arrived
+past the server-side attach-timeout window, immediate
+detach on arrival" — *not* "russh never dialed". This
+slice does not edit the 2026-05-15c entry in place; the
+2026-05-16 dated entry in the staging-smoke log carries
+the interpretation correction.
+
+**Why this is a renderer-NEUTRAL finding.** The xterm
+production baseline reproduced the 2026-05-15c detach
+pattern on its first launch. wterm is therefore **not
+implicated** as the cause — the bug is on the workspace /
+mobile-Chrome / orchestrator attach-timeout side, and
+solving it for xterm solves it for every renderer.
+
+**Posture.** Do NOT promote wterm. Do NOT flip the xterm
+production baseline. xterm's 2026-05-13 baseline smoke
+remains the last graded data point on the desktop surface;
+this 2026-05-16 resmoke is xterm's first surface-2 (Android
+Chrome) data point and is "**works with intermittent
+first-launch detach pattern shared with every renderer**".
+
+**Cross-links.** Smoke entry:
+[`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+§ "2026-05-16 · `docs/wterm-android-browser-resmoke`
+(surface 2, xterm control)". Plan:
+[`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
+§ 5 ("Status after the 2026-05-16 xterm-control resmoke")
+and § 11 ("Update after the 2026-05-16 xterm-control
+resmoke"). Scorecard update:
+[`docs/renderer-comparison-scorecard.md`](renderer-comparison-scorecard.md)
+§ "wterm" Known concerns (the 2026-05-15c mobile detach
+finding is now reclassified as workspace-bound).
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

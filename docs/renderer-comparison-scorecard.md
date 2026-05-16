@@ -134,16 +134,28 @@
   § "2026-05-15c · wterm Android Chrome (surface 2) browser
   smoke") and produced a mixed signal: the wterm renderer *mounts*
   cleanly on Android Chrome and survives rotation, but the
-  workspace session lifecycle never reached a live PTY in two
+  workspace session lifecycle did not reach a live PTY in two
   consecutive attempts (`detached (TTL window) seq=0`; backend
-  nginx confirmed WS upgrade at HTTP 101, but russh never dialed
-  the SSH target). That detach pattern is *not* known to be
-  wterm-specific yet — the next slice
-  (`docs/wterm-android-browser-resmoke`) reruns Row M (xterm
-  control) on the same phone / network first to distinguish
-  workspace-bound vs renderer-bound. Tauri Android (surface 3)
-  smoke stays deferred until the Row 12 question has a
-  hypothesis. The earlier resize / fit / reflow
+  nginx confirmed WS upgrade at HTTP 101). **The 2026-05-16
+  xterm-control resmoke**
+  ([`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+  § "2026-05-16 · `docs/wterm-android-browser-resmoke` (surface
+  2, xterm control)") reproduced the same 68 s POST→WS gap +
+  detach-at-seq-0 pattern on its very first launch *with the
+  xterm production baseline*, then went live within ≈ 2 s of
+  POST on launches 2 and 3 against the same throwaway. The
+  detach pattern is therefore **workspace-bound + transient**,
+  not wterm-specific — wterm is exonerated as the cause. The
+  next executable slice is workspace-side
+  (`docs/mobile-first-launch-ws-investigation`, working title),
+  not another wterm surface-2 / surface-3 attempt. The
+  2026-05-15c read of "russh never dialed the SSH target" is
+  also corrected: it was based on `docker logs` of the
+  linuxserver/openssh-server throwaway, which only writes
+  init / boot lines to stdout; `netstat -tn` inside the
+  throwaway is the correct probe. Tauri Android (surface 3)
+  smoke stays deferred until the workspace-side fix lands.
+  The earlier resize / fit / reflow
   concern (`works with caveats`, no `fit()`, `autoResize` defaults
   `false`, no grid reflow) is **substantively closed under operator
   opt-in** by the autofit implementation + 2026-05-15 resmoke +
