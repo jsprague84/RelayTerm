@@ -8,6 +8,8 @@
  * phase) lives on `ProductionTerminal.svelte` for the duration of one
  * attachment.
  */
+import type { LaunchTimingRecorder } from "./terminalLaunchTiming.js";
+
 export interface ActiveLaunch {
   /** Backend `terminal_session.id` returned by `POST /api/v1/terminal-sessions`. */
   sessionId: string;
@@ -36,4 +38,22 @@ export interface ActiveLaunch {
    * to "no resume" rather than a wire-side error.
    */
   lastSeenSeq?: number;
+  /**
+   * Client-side launch-timing recorder for this launch attempt. In
+   * memory only — never persisted, never serialised. The producer
+   * (`ServersView.launchProfile` or the saved-session reconnect path)
+   * has already marked `launch_started`, `create_session_post_started`,
+   * and `create_session_post_resolved`; the production workspace
+   * subscribes for the WebSocket / client events
+   * (`ws_connect_started`, `ws_open`, `first_server_message`,
+   * `first_output`, `attached`, `detach_requested`, `close_requested`,
+   * `ws_close`, `error`).
+   *
+   * Optional because the saved-session-restore path in
+   * `activeSessionStore.buildReconnectAttempt` cannot synthesize one
+   * (the recorder is anchored on the click handler, not on the saved
+   * record). The workspace tolerates the missing recorder and skips
+   * the diagnostic strip.
+   */
+  timing?: LaunchTimingRecorder;
 }

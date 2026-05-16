@@ -96,6 +96,14 @@
     evaluatePaste,
     type PasteDecision,
   } from "./pastePolicy.js";
+  import {
+    formatRelativeMs,
+    LAUNCH_TIMING_EVENT_LABELS,
+    LAUNCH_TIMING_EVENT_NAMES,
+    type LaunchTimingEventName,
+    type LaunchTimingRecorder,
+    type LaunchTimingSnapshot,
+  } from "./terminalLaunchTiming.js";
 
   interface Props {
     sessionId: string;
@@ -117,6 +125,18 @@
      * wire `attach` skips the replay handshake.
      */
     initialLastSeenSeq?: number;
+    /**
+     * Client-side launch-timing recorder for this launch attempt.
+     * Optional — the saved-session reconnect path cannot synthesize one
+     * (the recorder is anchored on the operator click, not on the saved
+     * record). When supplied, the workspace marks WebSocket / client
+     * events (`ws_connect_started`, `ws_open`, `first_server_message`,
+     * `first_output`, `attached`, `detach_requested`, `close_requested`,
+     * `ws_close`, `error`) and renders a compact diagnostic strip
+     * sourced from the recorder's snapshot. Payload-free by contract —
+     * see `terminalLaunchTiming.ts`'s "Redaction posture" comment.
+     */
+    timing?: LaunchTimingRecorder;
     /** Called when the user presses the "Back to servers" button. */
     onExit?: () => void;
     /**
@@ -143,10 +163,49 @@
     rows,
     profileLabel,
     initialLastSeenSeq,
+    timing,
     onExit,
     onSessionClosed,
     onLastSeenSeqUpdate,
   }: Props = $props();
+
+  /**
+   * Reactive mirror of {@link timing}'s snapshot. Initialised to `null`
+   * and seeded inside `onMount` from the recorder's current state (so
+   * the strip renders the already-recorded `launch_started` +
+   * create-POST events on first paint) and refreshed on every
+   * `subscribe` callback. The mount-time seed pattern (rather than a
+   * `$state(...)` initializer reading the prop) mirrors the
+   * `lastSeenSeq` precedent above — Svelte 5's
+   * `state_referenced_locally` warning fires on initializers that read
+   * props, even though the parent's `{#key sessionId}` block guarantees
+   * a remount on session-id change. `null` while pre-mount AND when no
+   * recorder was supplied — the diagnostic strip is hidden in either
+   * case.
+   */
+  let timingSnapshot = $state<LaunchTimingSnapshot | null>(null);
+
+  /**
+   * Helper used by every event-mark call site so the timing recorder
+   * stays optional. Inlined as a closure to keep the call sites
+   * readable; the compiler hoists the no-op branch out cleanly when
+   * `timing` is unset.
+   */
+  function recordTiming(name: LaunchTimingEventName): void {
+    if (!timing) return;
+    timing.mark(name);
+  }
+
+  /**
+   * Map a {@link TerminalClientError} `kind` to the recorder's closed
+   * vocabulary AND mark `error`. The wire / transport `message` field is
+   * NEVER read by the recorder — only the `kind` enum is. The recorder
+   * dedupes silently; only the first error kind sticks.
+   */
+  function recordTimingError(kind: TerminalClientError["kind"]): void {
+    if (!timing) return;
+    timing.markError(kind);
+  }
 
   let clientState = $state<TerminalSessionState | null>(null);
   let replayActive = $state(false);
@@ -452,18 +511,47 @@
         // within the bounded TTL window. The shell-side helper guards
         // on session-id match; the seq itself is metadata-only.
         onLastSeenSeqUpdate?.(lastSeenSeq);
+        // Wire-side disconnect: record `ws_close` regardless of cause
+        // (server `Detach`, transport drop, or post-TTL detach). The
+        // recorder dedupes; reconnect within the TTL window does NOT
+        // re-arm `ws_close`.
+        recordTiming("ws_close");
       }
-      if (s === "closed" && !closeNotified) {
-        closeNotified = true;
-        onSessionClosed?.();
+      if (s === "closed") {
+        // Mark `ws_close` here AND in the `s === "detached"` branch
+        // above so either lifecycle path records the wire-side close
+        // moment. The recorder is one-shot per event name (see
+        // `terminalLaunchTiming.ts` § "All events are one-shot"), so a
+        // detached → closed transition keeps the detached timestamp;
+        // a direct closed transition (server `SessionClosed` arriving
+        // before any detach state) records here. Both call sites
+        // independently mark `ws_close` so dropping one does not
+        // silently strand a lifecycle path.
+        recordTiming("ws_close");
+        if (!closeNotified) {
+          closeNotified = true;
+          onSessionClosed?.();
+        }
       }
     });
     next.on("attached", () => {
       if (myGen !== generation) return;
       lastError = null;
+      // The very first server frame is, by protocol contract,
+      // `session_attached` — so observing this event also marks
+      // `first_server_message`. The recorder dedupes on either name.
+      recordTiming("first_server_message");
+      recordTiming("attached");
     });
     next.on("output", (m) => {
       if (myGen !== generation) return;
+      // Defensive: an `output` frame arriving BEFORE `session_attached`
+      // would be a protocol violation, but mark `first_server_message`
+      // here too so the recorder dedupes correctly regardless of frame
+      // ordering. The mark is name-only — no payload bytes ever reach
+      // the recorder.
+      recordTiming("first_server_message");
+      recordTiming("first_output");
       let bytes: Uint8Array;
       try {
         bytes = decodeOutputData(m.data);
@@ -496,6 +584,9 @@
     next.on("error", (err: TerminalClientError) => {
       if (myGen !== generation) return;
       lastError = describeWorkspaceError(err);
+      // Closed-vocabulary error kind only; the wire / transport
+      // `message` is intentionally NOT read by the recorder.
+      recordTimingError(err.kind);
     });
 
     unsubInput = r.onInput((data) => {
@@ -543,6 +634,10 @@
       protocol: window.location.protocol,
       host: window.location.host,
     });
+    // Mark `ws_connect_started` BEFORE the await so the timing snapshot
+    // reflects "wire dial began" rather than "wire dial resolved". The
+    // recorder NEVER receives the URL — only the event name.
+    recordTiming("ws_connect_started");
     try {
       await next.attach({
         url,
@@ -550,6 +645,15 @@
         clientId: "relayterm-web",
         lastSeenSeq: opts.resume && lastSeenSeq > 0 ? lastSeenSeq : undefined,
       });
+      // `client.attach()` resolves immediately after the transport's
+      // `connect()` promise settles (which fires on WebSocket `open`)
+      // AND the attach frame has been pushed onto the wire. This is
+      // the closest signal to "WebSocket open observed by the client"
+      // we have without changing the transport's public surface;
+      // close-vs-open differentiation is the load-bearing measurement
+      // for the lifetime_X_then_close verification (see SMOKE.md
+      // § "Launch timing diagnostics").
+      recordTiming("ws_open");
     } catch {
       // The transport `error` event already produced a typed
       // `lastError`; the thrown rejection here is a redundant signal
@@ -629,6 +733,7 @@
     pendingPasteText = null;
     pendingPasteDecision = null;
     blockedPasteDecision = null;
+    recordTiming("detach_requested");
     client?.detach();
   }
 
@@ -640,6 +745,7 @@
     pendingPasteDecision = null;
     blockedPasteDecision = null;
     closedExplicitly = true;
+    recordTiming("close_requested");
     client?.close();
   }
 
@@ -693,6 +799,13 @@
     safeClearViewport(renderer);
   }
 
+  /**
+   * Active recorder subscription. `null` when no recorder was supplied
+   * OR when the component is unmounting. Cleared in `onDestroy` so the
+   * recorder does not retain a closure into a torn-down component.
+   */
+  let unsubTiming: (() => void) | null = null;
+
   onMount(() => {
     // Resume from the seeded bookmark when present. The wire-side
     // `attach` already gates on `lastSeenSeq > 0`, so a `0` here
@@ -703,6 +816,16 @@
       lastSeenSeq = seed;
     }
     void attach({ resume: lastSeenSeq > 0 });
+
+    // Subscribe to the timing recorder so the diagnostic strip updates
+    // as events accumulate. The recorder is in-memory only; this
+    // listener never reads payload bytes and never writes to storage.
+    if (timing) {
+      timingSnapshot = timing.snapshot();
+      unsubTiming = timing.subscribe((snapshot) => {
+        timingSnapshot = snapshot;
+      });
+    }
 
     // Fire-and-forget policy lookup so the TTL hint copy stops
     // overclaiming when a deployment runs a non-default window. The
@@ -723,6 +846,8 @@
     if (lastSeenSeq > 0 && !closeNotified) {
       onLastSeenSeqUpdate?.(lastSeenSeq);
     }
+    unsubTiming?.();
+    unsubTiming = null;
     teardownLocal({ keepRenderer: false });
   });
 
@@ -750,6 +875,12 @@
   data-renderer-gate={experimentalRendererGate ? "on" : "off"}
   data-renderer-input={rendererInputMarked ? "marked" : "none"}
   data-renderer-autofit={autofitStatus}
+  data-launch-timing={timingSnapshot ? "available" : "none"}
+  data-launch-timing-create-post-outcome={timingSnapshot?.createPostOutcome ?? ""}
+  data-launch-timing-error-kind={timingSnapshot?.errorKind ?? ""}
+  data-launch-timing-ws-open-ms={timingSnapshot?.events.find((e) => e.name === "ws_open")?.relativeMs ?? ""}
+  data-launch-timing-ws-close-ms={timingSnapshot?.events.find((e) => e.name === "ws_close")?.relativeMs ?? ""}
+  data-launch-timing-first-output-ms={timingSnapshot?.events.find((e) => e.name === "first_output")?.relativeMs ?? ""}
 >
   <header class="flex flex-wrap items-baseline justify-between gap-3">
     <div class="flex flex-col gap-0.5">
@@ -1045,5 +1176,73 @@
         >
       {/if}
     </p>
+  {/if}
+
+  {#if timingSnapshot}
+    <!--
+      Launch-timing diagnostic strip. Compact, payload-free, in-memory
+      only. Designed so a smoke (or an operator) can read the per-event
+      relative-ms offsets directly from the DOM without inspecting
+      JavaScript state. Rendered as a definition list of event-name +
+      formatted ms; events that have not been observed are listed with
+      "pending" copy so the absence is unambiguous. The closed-vocabulary
+      `data-launch-event` / `data-launch-event-ms` attributes are the
+      stable selectors smokes target — see SMOKE.md § "Launch timing
+      diagnostics".
+
+      The block is rendered ONLY when a recorder was supplied — the
+      saved-session reconnect path (`buildReconnectAttempt`) cannot
+      synthesize one, so a reconnect from the empty state silently
+      omits the strip. That is the correct shape: the diagnostic is
+      anchored on the operator click moment, which is not available
+      from a persisted record.
+    -->
+    <section
+      class="flex flex-col gap-1 rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[11px] text-zinc-500"
+      data-testid="production-terminal-launch-timing"
+      aria-labelledby="production-terminal-launch-timing-heading"
+    >
+      <p
+        id="production-terminal-launch-timing-heading"
+        class="font-medium text-zinc-400"
+      >
+        Launch timing
+        {#if timingSnapshot.createPostOutcome}
+          <span
+            class="ml-1 font-mono text-[10px] text-zinc-500"
+            data-testid="production-terminal-launch-timing-post-outcome"
+          >· POST {timingSnapshot.createPostOutcome}</span
+          >
+        {/if}
+        {#if timingSnapshot.errorKind}
+          <span
+            class="ml-1 font-mono text-[10px] text-rose-300"
+            data-testid="production-terminal-launch-timing-error-kind"
+          >· error: {timingSnapshot.errorKind}</span
+          >
+        {/if}
+      </p>
+      <dl
+        class="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-0.5 font-mono text-[10px]"
+        data-testid="production-terminal-launch-timing-list"
+      >
+        {#each LAUNCH_TIMING_EVENT_NAMES as eventName (eventName)}
+          {@const observed = timingSnapshot.events.find(
+            (e) => e.name === eventName,
+          )}
+          <dt
+            class="text-zinc-500"
+            data-launch-event={eventName}
+            data-launch-event-state={observed ? "observed" : "pending"}
+            data-launch-event-ms={observed ? observed.relativeMs : ""}
+          >
+            {LAUNCH_TIMING_EVENT_LABELS[eventName]}
+          </dt>
+          <dd class={observed ? "text-zinc-200" : "text-zinc-600"}>
+            {observed ? formatRelativeMs(observed.relativeMs) : "pending"}
+          </dd>
+        {/each}
+      </dl>
+    </section>
   {/if}
 </section>

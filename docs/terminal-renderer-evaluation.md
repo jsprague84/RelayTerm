@@ -1696,6 +1696,24 @@ confirm nginx's `GET .../ws 101` log timestamp equals the
 close timestamp. See the 2026-05-16b smoke entry's "Next slice
 proposed" subsection for the full scope.
 
+**Update (2026-05-16c).** The client-side half landed: the
+production terminal workspace exposes a payload-free
+launch-timing diagnostic strip
+(`[data-testid="production-terminal-launch-timing"]` plus the
+shortcut attributes `data-launch-timing-ws-open-ms`,
+`data-launch-timing-ws-close-ms`,
+`data-launch-timing-first-output-ms` on
+`production-terminal`). Every future mobile or workspace
+investigation MUST read open / close / first-output timings
+from these client-side surfaces instead of inferring them from
+the nginx access log. The mandatory
+`lifetime_X_then_close` verification sub-step is documented in
+`apps/web/e2e/SMOKE.md` § D → "Launch timing diagnostics →
+Lifetime_X_then_close verification sub-step"; running it on
+staging is deferred until explicitly approved. The optional
+companion slice `feat/api-session-attach-timing-events`
+(backend-side attach-timing events) is also still deferred.
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

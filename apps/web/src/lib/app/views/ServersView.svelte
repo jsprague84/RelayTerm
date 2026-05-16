@@ -52,6 +52,7 @@
     loadSessionPolicy,
   } from "../../api/sessionPolicy.js";
   import { describeLaunchError } from "../terminal/terminalLaunch.js";
+  import { LaunchTimingRecorder } from "../terminal/terminalLaunchTiming.js";
   import type { ActiveLaunch } from "../terminal/activeLaunch.js";
   import HostKeyPanel from "./HostKeyPanel.svelte";
   import AuthCheckPanel from "./AuthCheckPanel.svelte";
@@ -829,15 +830,26 @@
     const existing = launchStates[profile.id];
     if (existing?.kind === "submitting") return;
     launchStates = { ...launchStates, [profile.id]: { kind: "submitting" } };
+    // Construct the timing recorder BEFORE the POST so `launch_started`
+    // anchors the click moment, not the post-resolution moment. The
+    // recorder is renderer-neutral and payload-free — see
+    // `terminalLaunchTiming.ts`'s "Redaction posture" comment for the
+    // full set of rules it enforces. We hand it to the production
+    // workspace on success; on a typed POST failure we drop it (no
+    // workspace mounts, no consumer).
+    const timing = new LaunchTimingRecorder();
     // Cols/rows are intentionally omitted: the helper falls through to
     // the wire-stable 80×24 defaults, and the workspace reads
     // `result.session.cols/rows` back to seed the renderer. Resize-to-fit
     // on mount is future work; until then, the row's create dims are the
     // canonical pair the workspace uses.
+    timing.mark("create_session_post_started");
     const result = await createTerminalSession({
       server_profile_id: profile.id,
     });
     if (!result.ok) {
+      timing.markCreateSessionPostResolved("error");
+      timing.markError("create_session_post");
       launchStates = {
         ...launchStates,
         [profile.id]: {
@@ -850,6 +862,7 @@
       };
       return;
     }
+    timing.markCreateSessionPostResolved("ok");
     // Drop the per-row state on success — the Terminal view owns the
     // attachment from here. Leaving a stale `submitting` would freeze
     // the button if the operator returns to this view via "Back to
@@ -862,6 +875,7 @@
       cols: result.session.cols,
       rows: result.session.rows,
       profileLabel: profile.name,
+      timing,
     });
   }
 

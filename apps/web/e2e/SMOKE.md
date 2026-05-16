@@ -160,6 +160,14 @@ update this file in the same change.
 | `[data-testid="production-terminal-error"]`       | Workspace error summary (safe formatter only — never echoes wire `message` or transport detail). |
 | `[data-testid="production-terminal-viewport"]`    | Renderer host element (terminal output renders inside; xterm by default).  |
 | `[data-testid="production-terminal-renderer-diagnostic"]` | Renderer diagnostic strip rendered in the workspace footer after the renderer mounts (text body includes `rendererLabel` + experimental/fallback hint). Provides a visible "which renderer am I looking at" cue alongside the `data-renderer` attribute on `production-terminal`. |
+| `[data-testid="production-terminal-launch-timing"]` | Launch-timing diagnostic strip rendered in the workspace footer when a launch-timing recorder was supplied by the launch caller (`ServersView.launchProfile`; the saved-session reconnect path omits the recorder so this block is absent on a reconnect from the empty-state Terminal view). Carries one `<dt>` per entry in `LAUNCH_TIMING_EVENT_NAMES` with `data-launch-event` ∈ `launch_started`/`create_session_post_started`/`create_session_post_resolved`/`ws_connect_started`/`ws_open`/`first_server_message`/`first_output`/`attached`/`detach_requested`/`close_requested`/`ws_close`/`error`, `data-launch-event-state` ∈ `observed`/`pending`, and `data-launch-event-ms` set to the relative-monotonic offset (in ms) for observed events (empty for pending). Payload-free by contract — see `apps/web/src/lib/app/terminal/terminalLaunchTiming.ts`'s "Redaction posture" comment. |
+| `[data-testid="production-terminal-launch-timing-post-outcome"]` | Inline pill inside the launch-timing strip; appears only after `create_session_post_resolved` lands. Closed vocabulary: `POST ok` / `POST error`. Never carries an HTTP status, a wire `message`, or any URL fragment. |
+| `[data-testid="production-terminal-launch-timing-error-kind"]` | Inline pill inside the launch-timing strip; appears only after the first typed client / transport / POST error fires. Closed vocabulary mirroring the recorder's `LaunchTimingErrorKind` union (`create_session_post`/`transport`/`decode`/`unexpected_first_frame`/`send_before_attached`/`send_after_terminal`/`server_error`/`unknown`). Never carries a free-form message. |
+| `[data-testid="production-terminal-launch-timing-list"]` | Definition-list container holding the per-event rows. One `<dt>`/`<dd>` pair per name in `LAUNCH_TIMING_EVENT_NAMES`; iterate the children to walk the full snapshot. |
+| `data-launch-timing` (attribute on `production-terminal`) | `"available"` when a launch-timing recorder was supplied by the launch caller (a Servers-view launch); `"none"` when no recorder was supplied (saved-session reconnect path) OR pre-mount. Use this to gate any smoke assertion that relies on the timing strip / per-event attributes. |
+| `data-launch-timing-create-post-outcome` (attribute on `production-terminal`) | Closed vocabulary `ok`/`error`/`""` (empty before the POST resolves). Mirror of the inline pill above; pull from the section root when you only need the create-POST outcome and don't want to traverse the strip. |
+| `data-launch-timing-error-kind` (attribute on `production-terminal`) | Closed vocabulary mirroring `LaunchTimingErrorKind`; empty until the first error fires. Mirror of the inline pill above. |
+| `data-launch-timing-ws-open-ms` / `data-launch-timing-ws-close-ms` / `data-launch-timing-first-output-ms` (attributes on `production-terminal`) | Per-event relative-ms shortcuts for the three measurements smokes most commonly read. Empty string until the corresponding event lands. The lifetime_X_then_close verification (see § "Launch timing diagnostics" below) compares `data-launch-timing-ws-open-ms` against `data-launch-timing-ws-close-ms` and the backend nginx access-log timestamp. |
 | `data-renderer` (attribute on `production-terminal`) | The renderer id the workspace actually mounted: `xterm`, `ghostty-web`, `restty`, `wterm`, or `unmounted` before the attach resolves. Use this — not visual cues — when proving renderer identity for a smoke row. |
 | `data-renderer-experimental` (attribute on `production-terminal`) | `"true"` when the mounted renderer is experimental, `"false"` otherwise (including `unmounted`). |
 | `data-renderer-fallback` (attribute on `production-terminal`) | Closed-vocabulary fallback taxonomy: `""` on the happy path, otherwise one of `experimental_gate_off` / `unknown_renderer_id` / `adapter_load_failed` / `adapter_mount_failed`. The first three are produced by `rendererLoader.ts`'s synchronous paths (gate, unknown id, dynamic-import / constructor failure) AND fall back to xterm with `data-renderer="xterm"`. `adapter_mount_failed` is produced by `ProductionTerminal.svelte`'s `mountRendererSafely` call when the renderer's asynchronous `mount(target)` rejects (e.g., CSP-blocked WASM init); the workspace stays `data-renderer="unmounted"` and surfaces the operator-facing copy `Renderer failed to mount. Switch back to xterm in Settings and reopen the terminal.` in `production-terminal-error`. A fallback row in the smoke entry MUST quote this attribute, not the workspace copy. |
@@ -2085,6 +2093,125 @@ established that POST→201, WS→101, SSH ESTABLISHED,
 `last_seen_seq`, and renderer `data-phase` are distinct
 timeline events; do not collapse any two into "the session
 attached" / "the session detached".
+
+##### Launch timing diagnostics (client-side; payload-free)
+
+The production terminal workspace exposes a client-side
+launch-timing diagnostic strip (`[data-testid="production-terminal-launch-timing"]`)
+seeded by a `LaunchTimingRecorder` constructed at the moment of
+the "Launch terminal" click in the Servers view. Each lifecycle
+event renders as a `<dt>` carrying `data-launch-event`,
+`data-launch-event-state` (`observed` / `pending`), and
+`data-launch-event-ms` (relative monotonic offset from
+`launch_started`, in ms). The same surface mirrors three of
+the most-read events onto attributes on `production-terminal`
+itself: `data-launch-timing-ws-open-ms`,
+`data-launch-timing-ws-close-ms`, and
+`data-launch-timing-first-output-ms`.
+
+**Why this exists.** The 2026-05-16b investigation established
+that the staging nginx `access_log` line for the
+`GET …/ws → 101` upgrade records the WebSocket-upgrade
+**close** timestamp, not the open timestamp. A POST→WS-open
+delay can no longer be inferred from the nginx log alone. The
+client-side recorder gives every smoke a first-class
+"WebSocket open observed by the client" signal that does not
+require backend access — and a `ws_close` signal that can be
+compared against the nginx line to validate the
+close-time interpretation.
+
+**Redaction posture (smoke contract).** The recorder NEVER
+captures terminal payload bytes, server `message` strings,
+WebSocket URLs, cookies, headers, tokens, or any
+`Error.message` text. Errors collapse to a closed-vocabulary
+kind. The diagnostic lives entirely in memory; nothing writes
+to `localStorage` / `sessionStorage`. The redaction sweep in
+this section's "Redaction sweep" subsection MUST verify the
+strip's DOM against the sentinel set; a row that quotes a
+`data-launch-event-ms` value is acceptable, a row that quotes
+text from the strip beyond the closed-vocabulary labels is
+not.
+
+**Reading the strip from Playwright MCP.** After the workspace
+mounts (`[data-testid="production-terminal"]` present with
+`data-phase ∈ {"connecting","attached","replaying","detached","closed"}`):
+
+```js
+// browser_evaluate
+() => {
+  const root = document.querySelector('[data-testid="production-terminal"]');
+  const rows = Array.from(
+    document.querySelectorAll('[data-testid="production-terminal-launch-timing-list"] [data-launch-event]'),
+  ).map((el) => ({
+    name: el.getAttribute('data-launch-event'),
+    state: el.getAttribute('data-launch-event-state'),
+    ms: el.getAttribute('data-launch-event-ms') || null,
+  }));
+  return {
+    available: root?.getAttribute('data-launch-timing'),
+    postOutcome: root?.getAttribute('data-launch-timing-create-post-outcome'),
+    errorKind: root?.getAttribute('data-launch-timing-error-kind'),
+    wsOpenMs: root?.getAttribute('data-launch-timing-ws-open-ms'),
+    wsCloseMs: root?.getAttribute('data-launch-timing-ws-close-ms'),
+    firstOutputMs: root?.getAttribute('data-launch-timing-first-output-ms'),
+    rows,
+  };
+}
+```
+
+Pass criteria for a renderer-evaluation row that uses launch
+timing as evidence: `available === "available"`, the
+`postOutcome` is `"ok"`, `errorKind` is empty, and `ws_open` /
+`first_server_message` / `first_output` are all in the
+`observed` state with monotonically non-decreasing ms values.
+
+###### Lifetime_X_then_close verification sub-step (load-bearing)
+
+Before any downstream code change relies on the "nginx
+`GET …/ws → 101` line records close time, not open time"
+interpretation, run a controlled lifetime_X_then_close
+verification using the new client-side timing diagnostic:
+
+1. Open one production terminal session in Playwright MCP
+   against staging. Wait for `data-phase="attached"`. Capture
+   the `data-launch-timing-ws-open-ms` attribute value AND the
+   wall-clock time of the snapshot read (`Date.now()` in the
+   same `browser_evaluate` call).
+2. Hold the session open with **no operator-side input** for a
+   known X seconds. The recommended pinning value is
+   `X = 30` seconds — long enough to exceed network jitter
+   and short enough to fit inside one Playwright MCP slot.
+   The lifetime_X_then_close design REQUIRES X > 5 s so the
+   gap is unambiguous against any single-RTT jitter; values
+   ≤ 1 s do not differentiate open from close.
+3. Click `[data-testid="production-terminal-close"]` (End
+   session). Wait for `data-phase="closed"`. Read
+   `data-launch-timing-ws-close-ms` AND the wall-clock
+   timestamp of the close snapshot.
+4. Inspect the backend nginx access log for the
+   `GET /api/v1/terminal-sessions/<id>/ws HTTP/1.1 101` line
+   for the captured session UUID. Capture its wall-clock
+   timestamp.
+5. **Expected outcome:** the nginx log timestamp from step 4
+   equals the close-snapshot wall-clock from step 3 within
+   ~1 second (network + nginx flush jitter); it does NOT equal
+   the open-snapshot wall-clock from step 1. The client's
+   `ws_close_ms − ws_open_ms` should be ~X × 1000 ms ± jitter.
+6. **If the outcome differs:** the close-time interpretation
+   from the 2026-05-16b investigation does not hold for this
+   nginx config; STOP and re-read the proxy directives before
+   any further investigation builds on that assumption.
+
+Record the result as a new dated entry in
+`docs/deployment/vps-staging-smoke.md` under the section
+`"<date> · lifetime_X_then_close nginx WS log verification"`.
+Do NOT promote the launch-timing strip to a renderer-promotion
+input until the verification has passed — the diagnostic
+itself is useful from day one for cross-renderer comparisons
+(every renderer goes through the same launch flow), but the
+"lifetime measurement matches nginx close-time" interpretation
+is the load-bearing contract a future smoke would need to
+quote.
 
 ##### Evidence classification — every row tags its evidence
 

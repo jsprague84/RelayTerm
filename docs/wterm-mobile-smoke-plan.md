@@ -967,6 +967,35 @@ stay real-phone), but a wterm or ghostty-web surface-2 re-run
 adds no signal — the same intermittent pattern would surface
 across every renderer.
 
+**Update (2026-05-16c — client-side timing landed).** The
+client-side half of the workspace + backend timing slice has
+landed (`feat/web-terminal-launch-timing-diagnostics`): the
+production terminal workspace now renders a payload-free
+launch-timing diagnostic strip
+(`[data-testid="production-terminal-launch-timing"]`) with
+per-event `data-launch-event-state` / `data-launch-event-ms`
+attributes for `launch_started`,
+`create_session_post_started`, `create_session_post_resolved`,
+`ws_connect_started`, `ws_open`, `first_server_message`,
+`first_output`, `attached`, `detach_requested`,
+`close_requested`, `ws_close`, and `error`. Three
+high-value events also surface as shortcut attributes on
+`production-terminal`: `data-launch-timing-ws-open-ms`,
+`data-launch-timing-ws-close-ms`, and
+`data-launch-timing-first-output-ms`. Every future Android
+Chrome (surface 2) and Tauri (surface 3) mobile investigation
+of the first-launch detach pattern MUST quote these
+client-side timings instead of inferring them from the nginx
+access log. The mandatory `lifetime_X_then_close` verification
+sub-step is documented in
+`apps/web/e2e/SMOKE.md` § D → "Launch timing diagnostics →
+Lifetime_X_then_close verification sub-step"; the verification
+itself is **NOT** part of this docs-only entry — running it
+against staging is the next executable slice and remains
+deferred until explicitly approved. The optional companion
+slice `feat/api-session-attach-timing-events` (backend-side
+attach-timing events) is also still deferred.
+
 **Methodology update (2026-05-16).** Any subsequent surface-2
 or surface-3 row sweep — whether under the workspace-fix slice
 above or after it lands — runs under the **"Playwright-first,

@@ -205,6 +205,7 @@
       rows={launch.rows}
       profileLabel={launch.profileLabel}
       initialLastSeenSeq={launch.lastSeenSeq}
+      timing={launch.timing}
       {onExit}
       {onSessionClosed}
       {onLastSeenSeqUpdate}
