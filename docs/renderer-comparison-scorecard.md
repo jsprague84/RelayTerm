@@ -473,6 +473,11 @@ slice on restty until that decision is made.
 
 ## See also
 
+- [`docs/v1-production-readiness.md`](v1-production-readiness.md)
+  — the v1 cutline. Marks renderer evaluation (this doc included)
+  as explicitly post-v1; xterm stays the v1 production default on
+  every surface. Useful when a renderer-lane decision needs to be
+  weighed against v1 release pressure.
 - [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)
   — the renderer-evaluation plan, the per-date smoke history, and
   the Gate 1 / Gate 2 promotion criteria.

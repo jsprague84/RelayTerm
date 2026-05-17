@@ -50,6 +50,13 @@ labels, recommended next development lane). It is a snapshot of
 evidence, not a promotion, and is the recommended starting point
 for choosing the next renderer slice.
 
+**Relationship to v1 production readiness.** Renderer evaluation
+is explicitly **off the v1 critical path** — see
+[`docs/v1-production-readiness.md`](v1-production-readiness.md) §
+"Decision on renderer lane" and § "V1 non-goals". v1 ships with
+xterm as the production default; this evaluation plan continues
+independently in its own lane and does not block v1.
+
 ### 2026-05-13 · ghostty-web renderer-evaluation status (docs-only)
 
 A docs-only evaluation slice on 2026-05-13 attempted to carry the
