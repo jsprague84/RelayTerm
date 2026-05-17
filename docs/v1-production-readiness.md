@@ -454,11 +454,17 @@ UI had already landed in commit `f1f0691` — see B1 above. The
 end-to-end, so B1 is fully DONE; the next-most-impactful slices are
 B2 / release checklist / B3 in that order.)
 
-1. **`docs/v1-release-checklist`**. The release-day checklist that
-   composes runbook §4 (first deploy), §10 (post-deploy smoke), §11
-   (secret rotation hygiene), and §9 of this doc (cutline smoke).
-   Owner-facing; trims the operator's "did I forget anything?"
-   surface to a single page.
+1. ~~**`docs/v1-release-checklist`**~~ **DONE — 2026-05-17.** Landed
+   on `docs/v1-release-checklist` as
+   [`docs/v1-release-checklist.md`](v1-release-checklist.md). The
+   release-day operator checklist composes runbook §4 (first
+   deploy), §10 (post-deploy smoke), §11 (secret rotation hygiene),
+   and §9 of this doc (cutline smoke) into a single page with a
+   §12 decision table and a §13 sign-off template. B1 is recorded
+   as PASS (staging evidence) and B2 / B3 stay PENDING, matching
+   this cutline. The two cutline blockers remaining are now
+   surfaced as the explicit next-slice candidates §7 row 2 and
+   row 3 below.
 2. **`docs/v1-production-smoke-record`** (resolves B2). The
    operator-recorded production-walked smoke entry. Format mirrors
    the staging-smoke entries; lives under
@@ -613,13 +619,13 @@ otherwise.
   choice.
 - **Is mobile browser support required at v1, or is desktop-first
   acceptable?** Default: "usable on mobile Chrome" is required (and
-  B4 records the proof); deliberate mobile polish stays post-v1.
+  B3 records the proof); deliberate mobile polish stays post-v1.
 - **Is recording enabled for v1, or optional / disabled?** Default:
   OFF (matches the shipped default and avoids the plaintext-at-rest
   question for v1).
 - **Is multi-user out of scope for v1?** Default: yes, out of scope.
   v1 is single-user self-hosted.
-- **Which v1 hostname is the production smoke (B3) walked against?**
+- **Which v1 hostname is the production smoke (B2) walked against?**
   Open — operator picks.
 - **Are the Tauri desktop / Android shells in scope for v1 release
   notes, or shipped only as "available, build-it-yourself"?**
@@ -631,6 +637,10 @@ otherwise.
 
 ## See also
 
+- [`docs/v1-release-checklist.md`](v1-release-checklist.md) —
+  operator-facing release-day checklist that turns this cutline
+  into a step-by-step gate (§3–§11), a decision table (§12), and
+  a sign-off template (§13).
 - [`AGENTS.md`](../AGENTS.md) — agent-facing conventions and the
   architectural invariants this cutline rests on.
 - [`SPEC.md`](../SPEC.md) — product spec; the cutline does not

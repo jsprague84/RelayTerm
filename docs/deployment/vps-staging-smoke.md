@@ -12874,3 +12874,7 @@ any of these as staging-verified by this entry):**
 - [`docs/deployment/tauri-local-build.md`](./tauri-local-build.md) —
   desktop / mobile local build, AppImage strip workaround, WebKitGTK
   cache caveat.
+- [`docs/v1-release-checklist.md`](../v1-release-checklist.md) —
+  release-day operator checklist; the 2026-05-17
+  `docs/inventory-edit-delete-ui-staging-smoke` entry here is the
+  B1 evidence cited in that checklist's §12 decision table.
