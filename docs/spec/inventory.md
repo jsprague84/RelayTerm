@@ -30,7 +30,7 @@
 
 ### Production inventory read-only views
 
-The Servers and Identities views are inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. The Servers view today stays read-only for hosts and server-profiles outside of disable / enable; the Identities view also wires SSH-identity rename + delete on top of the read-only baseline. (Host-key trust, auth-check, SSH identity generation, terminal launch, and the API helpers for host / server-profile edit + delete are now wired — see the per-flow sections below.)
+The Servers and Identities views are inventories of `hosts`, `server_profiles`, and `ssh_identities`. They prove the production shell can fetch real backend data through typed, redaction-safe helpers without pulling in the dev lab or any renderer adapter. The Servers view today wires read + create + disable / enable + edit + delete for hosts and server-profiles; the Identities view also wires SSH-identity rename + delete on top of the read-only baseline. (Host-key trust, auth-check, SSH identity generation, terminal launch, and the host / server-profile edit + delete UI are all wired — see the per-flow sections below.)
 
 **Scope (load-bearing — this slice).**
 
@@ -56,7 +56,7 @@ The Servers and Identities views are inventories of `hosts`, `server_profiles`, 
 
 **Future work (explicit out-of-scope for this slice).**
 
-Inline edit / delete UI for hosts and server-profiles (API helpers exist; no view calls them yet); private-key import; route-param detail pages and `get_by_id` round-trips; password bootstrap / `ssh-copy-id`; browser-driven SPA inventory smoke (mutation surface is API-smoked + unit-test-pinned today); durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice. (SSH identity generation, host-key preflight + trust UI, auth-check UI, terminal launch from the production shell, SSH-identity rename + delete, read-only inventory detail panels, and inventory-management backend mutation routes are now wired — see the per-flow sections below.)
+Route-param detail pages and `get_by_id` round-trips; password bootstrap / `ssh-copy-id`; browser-driven SPA inventory smoke (mutation surface is API-smoked + unit-test-pinned today); durable session-recording UI; real auth UI; mobile/Tauri shell integration. Each is a separate slice. (SSH identity generation, host-key preflight + trust UI, auth-check UI, terminal launch from the production shell, SSH-identity rename + delete, read-only inventory detail panels, inventory-management backend mutation routes, and the inline host + server-profile edit + delete UI are now wired — the edit + delete UI ships inside the host / server-profile detail panels with `host-detail-edit-*` / `host-detail-delete-*` / `profile-detail-edit-*` / `profile-detail-delete-*` test ids; the `409 referenced` reason is routed by `describeDeleteServerProfileError` to "disable instead" for profiles that have terminal session history. See the per-flow sections below and `apps/web/src/lib/app/views/ServersView.svelte`.)
 
 ### Production read-only inventory detail panels
 
@@ -87,7 +87,7 @@ A click-to-select detail panel sits next to each inventory list (Hosts, Server p
 
 **Future work (explicit out-of-scope for this slice).**
 
-Route-param detail pages (e.g. `/servers/:id`); full-page detail routes; `get_by_id` round-trips and per-detail backend calls; edit / delete / rename UI for any inventory entity; private-key import; password bootstrap / `ssh-copy-id`; live host-key trust / auth-check status surfaced inside the detail panel beyond what the row already renders; multi-tab workspace with sticky detail; mobile/Tauri-specific detail layout; pagination over the inventory list. (Client-side search and filters are now wired — see "Production inventory client-side search & filters" below.) Each is a separate slice.
+Route-param detail pages (e.g. `/servers/:id`); full-page detail routes; `get_by_id` round-trips and per-detail backend calls; private-key import; password bootstrap / `ssh-copy-id`; live host-key trust / auth-check status surfaced inside the detail panel beyond what the row already renders; multi-tab workspace with sticky detail; mobile/Tauri-specific detail layout; pagination over the inventory list. (Client-side search and filters are now wired — see "Production inventory client-side search & filters" below. Inline edit / delete UI now ships inside the host and server-profile detail panels themselves — see "Production inventory create-host & create-profile forms" below for the data-testid vocabulary; private-key import has also landed on Identities; SSH-identity rename + delete have landed on Identities.) Each is a separate slice.
 
 ### Production inventory client-side search & filters
 
@@ -200,7 +200,7 @@ The next production-safe write flows on the Servers view: an operator can create
 
 **Future work (explicit out-of-scope for this slice).**
 
-Inline edit / delete UI for hosts and server-profiles in the Servers view (the underlying `updateHost` / `deleteHost` / `updateServerProfile` / `deleteServerProfile` API helpers are landed and unit-tested in `apps/web/src/lib/api/{hosts,serverProfiles}.ts`; the view does not call them yet); password bootstrap / `ssh-copy-id`; route-param detail / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice. (Host-key preflight + trust UI and auth-check UI are now wired — see "Production host-key preflight & trust UI" and "Production SSH auth-check UI" below. Inventory-management backend mutation routes for host / server-profile / SSH-identity edit + delete are also landed and API-smoked against staging on 2026-05-12 — see `docs/deployment/vps-staging-smoke.md`.)
+Password bootstrap / `ssh-copy-id`; route-param detail / `get_by_id` panels; mobile/Tauri shell integration. Each is a separate slice. (Host-key preflight + trust UI and auth-check UI are now wired — see "Production host-key preflight & trust UI" and "Production SSH auth-check UI" below. Inventory-management backend mutation routes for host / server-profile / SSH-identity edit + delete are landed and API-smoked against staging on 2026-05-12 — see `docs/deployment/vps-staging-smoke.md`. The inline host + server-profile edit + delete UI in the detail panels is also wired — `host-detail-edit-{display-name,hostname,port,username,save,cancel}` / `host-detail-delete-{open,confirm,confirm-input,confirm-submit,cancel}` for hosts, `profile-detail-edit-{name,host,identity,username-override,tags,save,cancel}` / `profile-detail-delete-{open,confirm,confirm-input,confirm-submit,cancel}` for profiles, with `describeDeleteServerProfileError` routing `409 referenced` to the disable-instead copy.)
 
 ### Production host-key preflight & trust UI
 

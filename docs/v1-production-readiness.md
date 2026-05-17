@@ -248,10 +248,10 @@ Capability rollup. Each row is one of:
 | Capability | Mark | Evidence |
 |---|---|---|
 | Hosts read / detail / create UI | DONE | `ServersView.svelte`; `inventoryApi.test.ts` |
-| Hosts edit / delete UI | **BLOCKER (B1)** | API helpers exist (`apps/web/src/lib/api/hosts.ts`); no view calls them — see [`docs/spec/inventory.md`](spec/inventory.md) "UI implications" |
+| Hosts edit / delete UI | DONE / smoke | Wired in `ServersView.svelte` host detail panel (`host-detail-edit-*`, `host-detail-delete-*` test ids); calls `updateHost` / `deleteHost` with typed `409 referenced` handling. Final operator-walked smoke against an inventory mutation is the remaining v1 gate (cutline §9 "Inventory") |
 | Server-profile read / detail / create UI | DONE | Same |
 | Server-profile disable / enable UI | DONE | `profileLifecycle.ts`; runbook + staging smoke 2026-05-12 |
-| Server-profile edit / delete UI | **BLOCKER (B1)** | API helpers exist; no view calls them |
+| Server-profile edit / delete UI | DONE / smoke | Wired in `ServersView.svelte` profile detail panel (`profile-detail-edit-*`, `profile-detail-delete-*` test ids); `describeDeleteServerProfileError` routes a `409 referenced` (session-history) refusal to "disable it instead". Final operator-walked smoke against an inventory mutation is the remaining v1 gate (cutline §9 "Inventory") |
 | SSH identity generate UI | DONE | `IdentitiesView.svelte` |
 | SSH identity import (Ed25519 OpenSSH, unencrypted) | DONE | Landed in `feat/private-key-import-v1`; staging-smoked 2026-05-13 ([`docs/private-key-import.md`](private-key-import.md) banner) |
 | SSH identity rename + delete UI | DONE | `IdentitiesView.svelte` |
@@ -321,19 +321,42 @@ Capability rollup. Each row is one of:
 These are the true blockers — concrete missing surfaces an operator
 running v1 would hit, with the evidence behind each.
 
-- **B1. Frontend edit / delete UI for hosts and server profiles.**
-  The API helpers (`apps/web/src/lib/api/hosts.ts`,
-  `apps/web/src/lib/api/serverProfiles.ts`) land with typed
-  formatters and unit tests, but no production view calls them today
-  (per [`docs/spec/inventory.md`](spec/inventory.md) "UI
-  implications"). A v1 operator who mistypes a hostname or wants to
-  remove a stale profile has to drop to `curl` or `psql`. Scope to
-  resolve: thin Edit / Delete affordances on `ServersView.svelte`
-  reusing the helpers and the existing typed-409 formatter. Server
-  profiles already have the disable / enable lifecycle, so delete
-  can keep its "blocked while sessions reference" 409 path — the UI
-  needs to route the operator to "disable instead" the way the spec
-  prescribes.
+- ~~**B1. Frontend edit / delete UI for hosts and server profiles.**~~
+  **RESOLVED (implementation, staging smoke pending) — 2026-05-17.**
+  The cutline drafted on `1813552` flagged this as a blocker on the
+  premise that no production view called the `updateHost` /
+  `deleteHost` / `updateServerProfile` / `deleteServerProfile`
+  helpers. In fact the wiring landed earlier in commit `f1f0691`
+  ("feat(api): add inventory management mutations", 2026-05-12) and
+  ships today inside the existing host and server-profile detail
+  panels on `ServersView.svelte`:
+  - Host detail panel: `host-detail-edit-open` opens the edit form
+    (`host-detail-edit-{display-name,hostname,port,username}`),
+    `host-detail-delete-open` opens a typed-name confirmation
+    (`host-detail-delete-confirm-input`,
+    `host-detail-delete-confirm-submit`), the `409 referenced` reason
+    is mapped by `describeDeleteHostError` to the "still used by a
+    saved server profile or has trusted host keys" copy.
+  - Profile detail panel: `profile-detail-edit-open` opens the edit
+    form (`profile-detail-edit-{name,host,identity,
+    username-override,tags}` with delta-build so an empty save
+    surfaces "change at least one field"), `profile-detail-delete-
+    open` opens a typed-name confirmation
+    (`profile-detail-delete-confirm-input`,
+    `profile-detail-delete-confirm-submit`), the `409 referenced`
+    reason is mapped by `describeDeleteServerProfileError` to "it
+    has terminal session history — disable it instead to keep the
+    history while blocking new launches" — routing the operator to
+    the existing disable flow exactly as the spec prescribes.
+  Helpers + describers are exhaustively unit-tested in
+  `apps/web/tests/inventoryMutationsApi.test.ts` (52 tests, includes
+  redaction-sentinel sweeps). Disable confirmation logic is pinned
+  by `apps/web/tests/profileLifecycle.test.ts` (24 tests). The
+  remaining v1 gate is the operator-walked inventory mutation smoke
+  in cutline §9 ("Inventory" rows: edit a profile, delete an unused
+  profile, attempt a delete that should refuse with the disable
+  guidance) which is the same hand-walk the rest of B2/B3 already
+  define.
 
 - **B2. No production-walked end-to-end smoke recorded.** The
   staging smoke history at
@@ -405,25 +428,24 @@ perspective.
 
 ## 7. Recommended next implementation slices (ranked)
 
-Four docs / features ordered by "what most moves the needle toward a
+Three docs / features ordered by "what most moves the needle toward a
 shippable v1" — prefer production readiness over renderer experiments.
+(`feat/inventory-edit-delete-ui` was the originally-listed top slice;
+it resolved as docs-only on 2026-05-17 once the audit caught that the
+UI had already landed in commit `f1f0691` — see B1 above.)
 
-1. **`feat/inventory-edit-delete-ui`** (resolves B1). Wire Edit and
-   Delete affordances on `ServersView.svelte` for hosts and server
-   profiles using the existing `lib/api/hosts.ts` and
-   `lib/api/serverProfiles.ts` helpers. Honour the typed-409
-   envelopes (`409 referenced`); route delete attempts on profiles
-   with session history toward the existing disable flow.
-2. **`docs/v1-release-checklist`**. The release-day checklist that
+1. **`docs/v1-release-checklist`**. The release-day checklist that
    composes runbook §4 (first deploy), §10 (post-deploy smoke), §11
    (secret rotation hygiene), and §9 of this doc (cutline smoke).
    Owner-facing; trims the operator's "did I forget anything?"
    surface to a single page.
-3. **`docs/v1-production-smoke-record`** (resolves B2). The
+2. **`docs/v1-production-smoke-record`** (resolves B2). The
    operator-recorded production-walked smoke entry. Format mirrors
    the staging-smoke entries; lives under
-   `docs/deployment/vps-staging-smoke.md` or a new sibling.
-4. **`docs/v1-mobile-portrait-sanity-smoke`** (resolves B3). One
+   `docs/deployment/vps-staging-smoke.md` or a new sibling. Should
+   include the inventory edit + delete + delete-refused-by-history
+   walks now that B1 is implementation-complete.
+3. **`docs/v1-mobile-portrait-sanity-smoke`** (resolves B3). One
    operator-recorded run on a real Android phone against the default
    xterm production path, using the existing renderer-fair smoke
    methodology from `apps/web/e2e/SMOKE.md` § D as the input rules.
