@@ -12494,6 +12494,371 @@ action requested by the operator.
 
 ---
 
+### 2026-05-17 · `docs/inventory-edit-delete-ui-staging-smoke` — operator-visible browser proof for host + server-profile edit / delete / disable UI; resolves v1 readiness blocker B1
+
+Slice `docs/inventory-edit-delete-ui-staging-smoke` closes
+the residual "implemented, staging smoke pending" gate on
+v1 readiness blocker B1
+([`docs/v1-production-readiness.md`](../v1-production-readiness.md)
+§ 5). The inventory mutation UI landed in commit `f1f0691`
+("feat(api): add inventory management mutations", 2026-05-12)
+and the SPA-level mutation surface was API-smoked the same day
+(2026-05-12 entry above) plus browser-driven that next day
+(2026-05-13 entry above) but those entries pre-date the v1
+cutline, and the v1 readiness doc explicitly required an
+operator-visible UI walk against the production-shell
+inventory-mutation surface. This slice records that walk.
+
+Docs-only. **No source / schema / migration / route / CSP / CI /
+deploy / orchestrator / protocol / renderer change.** The
+production xterm default is unchanged; no experimental renderer
+was loaded; no Tauri shell or mobile production code was
+touched.
+
+**Surface.** Playwright MCP driving Chromium against
+`https://relayterm-staging.js-node.cc`. Desktop viewport
+1440 × 900 for rows A–G + I, mobile viewport 390 × 844 for
+row H. The MCP browser session was already authenticated as
+the throwaway staging user `staging+throwaway-…@example.com`
+(`f968b6f5-…`, the same user the 2026-05-09 / -12 / -13 / later
+2026-05 entries exercise) from prior smoke work; no password
+crossed any tool argv this slice. (`/api/v1/auth/me` returned
+the bootstrapped user pre-walk.)
+
+**Image freshness.** No-op vs. prior recent entries.
+`docker compose ps` on `cloud-edge` at
+`/home/ubuntu/docker-compose/relayterm-staging`:
+
+- `relayterm-backend` image `git.js-node.cc/jsprague/relayterm-backend:main` — Up 3 days (healthy).
+- `relayterm-web` image `git.js-node.cc/jsprague/relayterm-web:main` — Up 25 hours (healthy). The served SPA bundle is `index-ChbaJjba.js` with `last-modified: Sat, 16 May 2026 16:49:27 GMT` (2026-05-16 wterm matrix smoke build). The bundle text contains every `host-detail-edit-*`, `host-detail-delete-*`, `profile-detail-edit-*`, `profile-detail-delete-*`, and `profile-disable-*` selector listed in
+  [`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) §
+  "Stable selectors" (verified by `grep -aoE 'host-detail-[a-z-]+' index-ChbaJjba.js` after `curl`-fetching the asset — 20 distinct hooks just for `host-detail-…`, 23 for `profile-detail-…`).
+- `postgres:17-alpine` — Up 8 days (healthy). Untouched by this slice.
+
+No `docker pull` / recreate this slice; this is the same
+image pair the 2026-05-16 / 2026-05-17 prior entries exercise.
+
+**Preflight (§ 7.3 re-checked).** `GET /` → 200 (HTML), `GET
+/healthz` → 200 `{"status":"ok"}`, `GET /api/v1/auth/me`
+without cookie → 401 `{"error":{"code":"unauthorized",
+"message":"unauthorized"}}`. CSP header on the SPA asset
+remains the strict `default-src 'self'; script-src 'self'
+'wasm-unsafe-eval'` — unchanged from the 2026-05-16e posture.
+
+**Inventory setup (timestamp suffix `t20260517`, prefix
+`inv-ui-`).** Five throwaway records created via authenticated
+POST helpers from the in-browser fetch context (the slice
+prompt explicitly allows API setup; the mutations UNDER TEST
+are then driven through the production UI). Names chosen so
+the rows are trivially identifiable and trivially distinct
+from the 2026-05-12 `inv-smoke-…-t20260512` records that the
+prior smoke left in place:
+
+| Role | ID | Initial name |
+|---|---|---|
+| Identity (paired to every fresh profile) | `46a8c81a-…` | `inv-ui-identity-smoke-t20260517` |
+| Host A (rows A + B target) | `ed53e6bd-…` | `inv-ui-host-edit-delete-smoke-t20260517` |
+| Host B (row C subject — referenced) | `8cc71225-…` | `inv-ui-host-referenced-smoke-t20260517` |
+| Profile A (rows D + E target) | `3523352b-…` | `inv-ui-profile-edit-delete-smoke-t20260517` |
+| Profile B (row C blocker, references host B) | `f8e3ca4f-…` | `inv-ui-profile-referenced-blocker-smoke-t20260517` |
+
+Row F (history-conflict) re-uses the pre-existing
+`ux-smoke-profile-v2` (`d1207a25-…`, 7 historical
+`terminal_sessions` rows per the 2026-05-12 entry above), so
+the slice did NOT create any new `terminal_sessions`,
+`session_events`, or `audit_events` rows beyond the inventory
+lifecycle audits below.
+
+**Browser smoke rows (UI-driven, in execution order — A then D then C then F then G then E then B then H then I; chosen so edit precedes delete, conflict precedes success, and success deletes run in dependency-safe reverse order so cleanup never leaves dangling references).**
+
+| Row | Goal | UI flow | Wire | Observed |
+|---|---|---|---|---|
+| A | Host edit round-trip | `host-row-select` → `host-detail-edit-open` → update `host-detail-edit-{display-name,port,username}` → `host-detail-edit-save` | `PATCH /api/v1/hosts/ed53e6bd-… → 200 289 bytes` (nginx access line @ 18:08:28 UTC) | Edit form closed; `host-detail-display-name` now `…-edited`, `host-detail-port` now `2222`, `host-detail-username` now `smoke-edited`; list row text reflects new values (`inv-ui-host-edit-delete-smoke-t20260517-edited  inv-ui-edit-delete.example.invalid:2222  Default user smoke-edited`); zero edit error rendered |
+| D | Server-profile edit round-trip | `profile-row-select` → `profile-detail-edit-open` → update `profile-detail-edit-{name,username-override,tags}` → `profile-detail-edit-save` | `PATCH /api/v1/server-profiles/3523352b-… → 200 417 bytes` (nginx access line @ 18:08:57 UTC) | Edit form closed; `profile-detail-name` now `…-edited`; follow-up `GET /api/v1/server-profiles/3523352b-…` returns `username_override: "override-smoke-user"` and `tags: ["inv-ui","smoke","edited"]` — every edited field round-tripped; zero edit error rendered |
+| C | Host referenced-delete conflict | `host-row-select` → `host-detail-delete-open` → type display-name into `host-detail-delete-confirm-input` → `host-detail-delete-confirm-submit` | `DELETE /api/v1/hosts/8cc71225-… → 409 57 bytes` (nginx access line @ 18:09:45 UTC) | `host-detail-delete-error` text reads **byte-exactly** `"Cannot delete host: it is still used by a saved server profile or has trusted host keys — remove the dependent items first"` — matches `describeDeleteHostError` 409-referenced branch at `apps/web/src/lib/api/hosts.ts:619-638`; row preserved; detail panel still mounted; the wire `message` field ("host referenced") is NOT echoed |
+| F | Server-profile terminal-history delete conflict | `profile-row-select` → `profile-detail-delete-open` → type profile name → `profile-detail-delete-confirm-submit` | `DELETE /api/v1/server-profiles/d1207a25-… → 409 67 bytes` (nginx access line @ 18:10:13 UTC) | `profile-detail-delete-error` text reads **byte-exactly** `"Cannot delete server profile: it has terminal session history — disable it instead to keep the history while blocking new launches"` — matches `describeDeleteServerProfileError` 409-referenced branch at `apps/web/src/lib/api/serverProfiles.ts:749-770`; row preserved; the operator is routed to the disable flow exactly as the inventory-lifecycle policy prescribes |
+| G | Server-profile disable + re-enable on a profile with history | `profile-disable-open` → type profile name into `profile-disable-confirm-input` → `profile-disable-submit` → verify badges + launch state → `profile-enable-submit` to restore | `POST /api/v1/server-profiles/d1207a25-…/disable → 200 370 bytes` (@ 18:10:36) then `POST /api/v1/server-profiles/d1207a25-…/enable → 200 345 bytes` (@ 18:10:45) | After disable: row `profile-lifecycle-badge` text `disabled`, detail `profile-detail-lifecycle-badge` text `disabled`, `profile-disabled-notice` reads "This profile is disabled. New terminal launches, host-key preflight / trust, and auth-check are blocked. Existing live sessions are unaffected.", `profile-launch-terminal` button is `disabled=true` with hint "Re-enable this profile to start a new terminal session." After re-enable: detail lifecycle badge back to `enabled`, launch button enabled again. Original state restored. |
+| E | Server-profile delete success | `profile-row-select` → `profile-detail-delete-open` → type profile name → `profile-detail-delete-confirm-submit` | `DELETE /api/v1/server-profiles/3523352b-… → 204 0 bytes` (nginx access line @ 18:11:07 UTC) | Detail panel collapsed (no `profile-detail-panel` in DOM); zero `profile-row-select` matches the search; follow-up `GET /api/v1/server-profiles/3523352b-…` → 404 |
+| B | Host delete success | `host-row-select` (host A — `host-detail-profile-count` confirmed `0` after row E) → `host-detail-delete-open` → type display-name → `host-detail-delete-confirm-submit` | `DELETE /api/v1/hosts/ed53e6bd-… → 204 0 bytes` (nginx access line @ 18:11:41 UTC) | Detail panel collapsed; zero `host-row-select` matches the search; follow-up `GET /api/v1/hosts/ed53e6bd-…` → 404 |
+| H | Mobile portrait reachability | Viewport resize to **390 × 844**, navigate to host detail (host B — still present) and profile detail (profile B — still present); measure edit / delete / disable buttons in the production shell | (no wire — read-only DOM measurement) | Host detail `host-detail-edit-open` = 71 × 26 px, `host-detail-delete-open` = 87 × 26 px — both `inViewport`, `pointer-events: auto`, not `disabled`, no hover gate. Profile detail `profile-detail-edit-open` = 83 × 26, `profile-detail-delete-open` = 98 × 26, per-row `profile-disable-open` = 108 × 26 — same posture. Caveat: 26 px height meets WCAG 2.5.5 minimum (24 × 24) but is below iOS HIG 44 × 44; this is a known mobile-polish gap and is explicitly post-v1 per the cutline ("§ 2 V1 non-goals — Full mobile app polish" + § 6 "Mobile portrait polish past 'usable'"). The reachability claim is **"the controls are reachable without hover and respond to a tap-equivalent click"**, not "tap-target sizing is iOS-grade." |
+| I | Redaction / log / audit sweep | `docker compose logs --since 30m relayterm-{backend,web}` + DB query against `audit_events` for `actor_id = f968b6f5-…` over the smoke window | (no wire) | See "Redaction sweep" below. Zero sentinel hits across both container log streams AND zero sentinel hits in any `audit_events.payload` written by this slice. |
+
+**Row C / F copy is byte-exact mapping evidence.** The error
+copy strings rendered by the SPA are not paraphrased
+operator-friendly approximations — they are the exact branches
+in `describeDeleteHostError` (`hosts.ts:619`) and
+`describeDeleteServerProfileError` (`serverProfiles.ts:749`)
+that map `409 conflict` + `reason === "referenced"` to a
+function of `kind` + `status` + `code` + the derived `reason`
+discriminator only. The wire `message` field (literally
+`"host referenced"` and `"server_profile referenced"`) is
+deliberately NOT echoed. This is the load-bearing redaction
+posture for the inventory-mutation UI; this slice's UI walk
+proves it on the live staging slot end-to-end.
+
+**Backend audit-events tally for the smoke window**
+(`actor_id = f968b6f5-…`, `recorded_at > now() - interval
+'30 minutes'`):
+
+```
+            kind          | count
+--------------------------+-------
+ ssh_identity_created     |     1   ← setup (P_id, source="generated")
+ server_profile_created   |     2   ← setup (P_A, P_B)
+ server_profile_updated   |     1   ← row D
+ server_profile_disabled  |     1   ← row G disable
+ server_profile_enabled   |     1   ← row G re-enable
+ server_profile_deleted   |     1   ← row E
+```
+
+Zero `host_*` audit rows — the `audit_events_kind_chk`
+constraint deliberately omits `host_*` kinds; host mutations
+are inventory metadata only (same observation as the
+2026-05-12 entry). Zero conflict-attempt audit rows — rows C
+and F refused at the route-layer policy short-circuit
+BEFORE the audit append, matching the canonical pattern in
+[`docs/spec/inventory.md`](../spec/inventory.md) § "Server
+profile lifecycle audit" and the AGENTS.md "Things to avoid"
+line "append an audit row on a redundant/idempotent lifecycle
+call".
+
+**Audit payload redaction.** Each of the 7 audit rows
+written by this slice was field-by-field inspected against
+the canonical sentinel list (`private_key`,
+`encrypted_private_key`, `BEGIN OPENSSH`, `openssh-key-v1`,
+`passphrase`, `session_token`, `token_hash`, `password`,
+`data_b64`, `REDACT-MARKER`). Direct DB sweep:
+
+```
+SELECT count(*) FROM audit_events
+ WHERE recorded_at > now() - interval '30 minutes'
+   AND (payload::text ~ 'private_key|encrypted_private_key|
+                        BEGIN OPENSSH|openssh-key-v1|
+                        passphrase|session_token|token_hash|
+                        data_b64|password|REDACT-MARKER');
+-- → 0
+```
+
+Payload shapes (all public metadata):
+- `ssh_identity_created`: `{ssh_identity_id, name, key_type, fingerprint_sha256, created_at, source: "generated"}`.
+- `server_profile_{created,updated,disabled,enabled,deleted}`: `{server_profile_id, name, host_id, ssh_identity_id, disabled_at}`.
+
+No `encrypted_private_key`, no `public_key` bytes, no PEM, no
+peer banner, no cookie, no session id, no raw russh / DB error
+string, no `data_b64`. The sentinel-test guard
+`AUDIT_FORBIDDEN_SUBSTRINGS` in the API integration suite
+remains the in-CI backstop.
+
+**Log / nginx redaction sweep — staging containers for the
+~7-minute smoke window** (`--since 30m` covers it). Backend
+captured a single WARN line for the pre-smoke
+`/api/v1/auth/me` probe (`unauthorized request detail="missing
+session cookie"`); the word `cookie` appears ONLY as the
+literal diagnostic label naming the ABSENCE of a value, not as
+an echo. Successful mutations produced **zero backend log
+lines** — the routes do not `tracing::info!` on success, so
+no row content is leaked through the structured-log path.
+The web nginx container captured 43 lines for the same
+window; 29 are inventory-route access lines (5 × POST setup,
+2 × PATCH, 4 × DELETE — including the two 409 refusals — plus
+1 × POST disable and 1 × POST enable). Bodies are NOT logged
+by nginx; URIs contain only UUIDs and the standard `status` /
+`bytes_sent` / `referer` / `user-agent` / `x-real-ip` fields.
+High-value sentinel sweep
+(`private_key|encrypted_private_key|BEGIN OPENSSH|openssh-key-v1|
+passphrase|session_token|token_hash|data_b64|REDACT-MARKER`)
+returned **zero hits** in both streams. Console errors from
+the SPA were ONLY the expected 409 entries from rows C and F
+(verified via the Playwright console feed — every error was
+`"Failed to load resource: the server responded with a status
+of 409 ()"` against the inventory route under test).
+
+**Mobile reachability claim — narrow.** Row H is a
+**reachability** measurement, not a mobile-portrait
+production-readiness claim. The Edit / Delete / Disable
+controls render in-viewport on a 390 × 844 portrait viewport,
+are not hover-gated, have `pointer-events: auto`, and are
+not `disabled`. The control heights (26 px) meet WCAG 2.5.5
+minimum (24 × 24) but are below iOS HIG (44 × 44); a deliberate
+tap-target sizing pass is post-v1 per the cutline. The row H
+walk **does NOT** prove typography, soft-keyboard, paste
+affordance, IME composition, or any other mobile-polish row —
+those continue to be tracked by v1 blocker B3 and the renderer
+evaluation lane. **B3 remains OPEN** per § 5 of
+[`docs/v1-production-readiness.md`](../v1-production-readiness.md);
+this slice does not claim to advance B3, and the 2026-05-17
+multi-run real-Android-Chrome resmoke entry above also stops
+short of the operator-recorded portrait sanity walk B3 names.
+
+**Cleanup posture / inventory state at slice end.**
+
+Per the AGENTS.md "Inventory lifecycle and destructive-action
+policy" and the slice's "Before cleanup, report resources and
+ask approval" rule, this entry is recorded BEFORE any
+post-smoke cleanup. Inventory state at end of smoke walk:
+
+- Identity `46a8c81a-…` (`inv-ui-identity-smoke-t20260517`) — KEPT; no `terminal_sessions` history; bound to the still-extant profile B. Safe to delete after profile B is deleted.
+- Host A (`ed53e6bd-…`) — DELETED by row B (success path); row absent; no `host_*` audit (constraint omits it).
+- Host B (`8cc71225-…`, `inv-ui-host-referenced-smoke-t20260517`) — KEPT; still referenced by profile B; would refuse 409 if deleted. Safe to delete only after profile B is deleted.
+- Profile A (`3523352b-…`) — DELETED by row E (success path); `server_profile_deleted` audit row is the durable record.
+- Profile B (`f8e3ca4f-…`, `inv-ui-profile-referenced-blocker-smoke-t20260517`) — KEPT; no `terminal_sessions` history; safely deletable through the UI.
+- `ux-smoke-profile-v2` (`d1207a25-…`) — UNCHANGED. The disable + re-enable in row G left it back at its prior `enabled` state. Its 7 historical `terminal_sessions` rows were NOT touched (the slice never opened a PTY against it).
+- All other 2026-05-12 `inv-smoke-…-t20260512` records (H1, H3, I1, I2, P1, P3) and the older `ux-smoke-profile-v2` history — UNTOUCHED.
+
+**Cleanup proposed (NOT executed by this slice — stops before
+operator approval per slice prompt).** Safe post-approval
+cleanup, in order:
+
+1. Delete profile B (`f8e3ca4f-…`) via the production UI — no
+   `terminal_sessions` history; expected `204`.
+2. Delete host B (`8cc71225-…`) via the production UI — after
+   step 1, has no remaining `server_profiles` referent and no
+   `known_host_entries` (the smoke never ran host-key
+   preflight or trust on it); expected `204`.
+3. Delete identity (`46a8c81a-…`) via the Identities UI — after
+   step 1, no `server_profiles` reference it; expected `204`
+   plus an `ssh_identity_deleted` audit row.
+
+If the operator prefers to leave the `inv-ui-…-t20260517`
+records in place for future re-verification, that is also
+consistent with the AGENTS.md inventory-lifecycle policy — no
+state is "in flight" and nothing depends on cleanup. **NO
+manual `DELETE` against `terminal_sessions`, `session_events`,
+`audit_events`, or `known_host_entries` is in this slice's
+cleanup proposal; those tables remain append-only / lifecycle-
+preserving per AGENTS.md "Things to avoid".**
+
+**Verified.**
+
+- The host edit / delete and server-profile edit / delete /
+  disable / enable UI on the production shell drives the
+  expected backend mutations end-to-end against the live
+  staging slot.
+- The 409-referenced error copy for both host-delete-blocked-by-
+  profile AND profile-delete-blocked-by-history is **byte-
+  exact** the safe formatter strings in `describeDeleteHostError`
+  / `describeDeleteServerProfileError` — the wire `message`
+  field is NOT echoed. This satisfies the load-bearing
+  redaction discipline ("never echoes wire message of an HTTP
+  error or thrown Error.message") pinned by
+  `apps/web/tests/inventoryMutationsApi.test.ts`.
+- The inventory-lifecycle policy from AGENTS.md and
+  [`docs/spec/inventory.md`](../spec/inventory.md) holds against
+  the live UI: the disable / enable path is the deliberate
+  alternative to delete for profiles with history; deleted
+  records are immediately absent from list and detail (no
+  ghost rows); audit rows are written field-by-field with
+  public metadata only on the kinds that have an audit schema
+  CHECK; the route-layer policy short-circuit prevents audit
+  rows on the 409 conflict-attempt branches.
+- Mobile portrait reachability of Edit / Delete / Disable
+  controls on the host and server-profile detail panels at
+  390 × 844 — controls render in-viewport, are not hover-gated,
+  and respond to a tap-equivalent click. Tap-target sizing
+  (26 px height) is below iOS HIG and is a known post-v1
+  polish item.
+- Log + nginx + audit-payload sentinel sweep CLEAN across the
+  smoke window.
+- v1 readiness blocker B1 ("frontend edit / delete UI for hosts
+  and server profiles — implemented, staging smoke pending")
+  now has operator-visible staging proof. **B1 → DONE.**
+
+**Deferred (intentional non-goals for this run; do NOT treat
+any of these as staging-verified by this entry):**
+
+- **Real-tap mobile validation on a real Android device.** Row
+  H is a Playwright viewport-resize reachability measurement;
+  it is NOT a real-tap walk on a hardware phone. The
+  pre-existing renderer-evaluation slice for mobile (the
+  2026-05-17 multi-run real-Android-Chrome entry above) is the
+  closer-to-real-hardware evidence for the v1 mobile-portrait
+  claim. A real-tap inventory-mutation walk against the
+  production shell is not blocking for B1 but would close the
+  remaining inch of the mobile claim.
+- **`known_host_entries`-only host-delete-conflict via UI.**
+  Same out-of-scope reasoning as the 2026-05-12 entry: walking
+  the trust flow against a throwaway SSH target only to test
+  the UI surface of the second 409 branch is disproportionate.
+  The route-layer `any_dependents_for_user` predicate is a
+  single short-circuit OR across both refs and is fully
+  exercised by the integration tests in
+  `crates/relayterm-api/tests/api.rs`.
+- **Tauri desktop / Android shell exercise of the same UI.**
+  Out of scope; the cutline tracks Tauri release packaging as
+  post-v1 (§ 2 V1 non-goals → "Tauri desktop / mobile release
+  packaging").
+- **SSH identity rename + delete UI walk.** Out of scope —
+  those landed and staging-smoked in earlier entries
+  (private-key import 2026-05-13; identity rename + delete
+  exercised in the 2026-05-12 / 2026-05-13 entries above).
+  This slice is focused on the hosts + server-profiles UI gap
+  the v1 cutline called out by ID.
+- **Re-running the full 2026-05-12 mutation matrix.** The
+  2026-05-12 entry above already covers the API-level wire-
+  envelope matrix (`200` / `400` / `404` / `409` / `401` /
+  `403` for every PATCH / DELETE on `hosts` / `server-profiles`
+  / `ssh-identities`); this slice is the deliberate UI-level
+  complement, not a re-walk.
+- **Promotion of `experimentalRendererEvaluationEnabled` or
+  any renderer-default change.** xterm stays the production
+  default; the experimental gate stays `off`. The renderer
+  lane is independent and continues per
+  [`docs/terminal-renderer-evaluation.md`](../terminal-renderer-evaluation.md).
+- **Production-walked end-to-end smoke (B2).** Still open —
+  this slice is staging-only, and the v1 readiness doc B2
+  explicitly distinguishes staging from "real production
+  hostname." A dedicated `docs/v1-production-smoke-record`
+  slice is the next recommended cutline-clearing slice (see
+  v1-production-readiness § 7).
+
+#### Posture (load-bearing)
+
+- **No renderer promotion.** xterm remains the production
+  default. The experimental gate stayed `off` for the entire
+  slice. Zero experimental-renderer code paths were loaded
+  by the SPA.
+- **No source / schema / migration / route / CSP / deploy /
+  CI / orchestrator / protocol / renderer change.** Docs-only.
+  Staging-side writes during the smoke window were limited to
+  the 5 inventory-setup POSTs, the 2 PATCHes under test, the
+  4 DELETEs under test (2 success, 2 refused 409), and 1 ×
+  disable + 1 × enable. No PTYs were opened; no `terminal_
+  sessions` rows were created or deleted; no `known_host_
+  entries` rows were created or revoked.
+- **Operator credentials never crossed any tool argv.** The
+  Playwright MCP browser session was already authenticated
+  from prior smoke work; the smoke user's password remained
+  operator-held throughout. The `relayterm_session` cookie is
+  `HttpOnly` and was never read by the slice.
+
+#### Next slice (proposed; not executed by this slice)
+
+- **`docs/v1-release-checklist`** (v1-readiness §7 row 1).
+  Single operator-facing page that composes runbook §4 / §10 /
+  §11 with the v1 cutline §9 punch list. With B1 now DONE,
+  this is the next-most-impactful unblock on the v1 critical
+  path because it tightens the operator's "did I miss
+  anything?" surface to a single page.
+- **`docs/v1-production-smoke-record`** (resolves B2;
+  v1-readiness §7 row 2). The operator-recorded production-
+  walked smoke entry against a real production hostname (not
+  the throwaway staging slot). Now that B1 is DONE, the
+  production smoke can include the inventory edit / delete /
+  disable rows the cutline previously deferred.
+- **`docs/v1-mobile-portrait-sanity-smoke`** (resolves B3;
+  v1-readiness §7 row 3). One operator-recorded run on a real
+  Android phone against the default xterm production path
+  using the renderer-fair smoke methodology in
+  [`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) §D
+  as the input rules. The 2026-05-17 multi-run resmoke is the
+  closest evidence today but stops short of the portrait
+  sanity walk this slice would record.
+- **Honourable mention** (not v1-critical):
+  `docs/backup-restore-rehearsal-record` — closes the §4.4
+  "DONE / smoke" item on the restore-test rehearsal row.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

@@ -8,7 +8,11 @@
 > **Status as of 2026-05-17:** drafted on
 > `docs/v1-production-readiness-cutline` against the snapshot of `main`
 > at commit `1813552` ("docs(testing): record Android multi-run launch
-> timing resmoke").
+> timing resmoke"). Updated 2026-05-17 on
+> `docs/inventory-edit-delete-ui-staging-smoke` to record the
+> operator-visible UI walk that resolves B1 — see § 5 row B1 and the
+> 2026-05-17 entry in
+> [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md).
 >
 > This doc supersedes nothing. It does NOT redefine the architectural
 > invariants in `AGENTS.md` or the data / behavior contracts in
@@ -248,10 +252,10 @@ Capability rollup. Each row is one of:
 | Capability | Mark | Evidence |
 |---|---|---|
 | Hosts read / detail / create UI | DONE | `ServersView.svelte`; `inventoryApi.test.ts` |
-| Hosts edit / delete UI | DONE / smoke | Wired in `ServersView.svelte` host detail panel (`host-detail-edit-*`, `host-detail-delete-*` test ids); calls `updateHost` / `deleteHost` with typed `409 referenced` handling. Final operator-walked smoke against an inventory mutation is the remaining v1 gate (cutline §9 "Inventory") |
+| Hosts edit / delete UI | DONE | Wired in `ServersView.svelte` host detail panel (`host-detail-edit-*`, `host-detail-delete-*` test ids); calls `updateHost` / `deleteHost` with typed `409 referenced` handling. Operator-walked staging UI smoke recorded 2026-05-17 in [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md) § "2026-05-17 · `docs/inventory-edit-delete-ui-staging-smoke`" rows A + B + C |
 | Server-profile read / detail / create UI | DONE | Same |
 | Server-profile disable / enable UI | DONE | `profileLifecycle.ts`; runbook + staging smoke 2026-05-12 |
-| Server-profile edit / delete UI | DONE / smoke | Wired in `ServersView.svelte` profile detail panel (`profile-detail-edit-*`, `profile-detail-delete-*` test ids); `describeDeleteServerProfileError` routes a `409 referenced` (session-history) refusal to "disable it instead". Final operator-walked smoke against an inventory mutation is the remaining v1 gate (cutline §9 "Inventory") |
+| Server-profile edit / delete UI | DONE | Wired in `ServersView.svelte` profile detail panel (`profile-detail-edit-*`, `profile-detail-delete-*` test ids); `describeDeleteServerProfileError` routes a `409 referenced` (session-history) refusal to "disable it instead". Operator-walked staging UI smoke recorded 2026-05-17 in [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md) § "2026-05-17 · `docs/inventory-edit-delete-ui-staging-smoke`" rows D + E + F + G (disable + re-enable verified end-to-end against a profile with terminal-session history) |
 | SSH identity generate UI | DONE | `IdentitiesView.svelte` |
 | SSH identity import (Ed25519 OpenSSH, unencrypted) | DONE | Landed in `feat/private-key-import-v1`; staging-smoked 2026-05-13 ([`docs/private-key-import.md`](private-key-import.md) banner) |
 | SSH identity rename + delete UI | DONE | `IdentitiesView.svelte` |
@@ -322,14 +326,28 @@ These are the true blockers — concrete missing surfaces an operator
 running v1 would hit, with the evidence behind each.
 
 - ~~**B1. Frontend edit / delete UI for hosts and server profiles.**~~
-  **RESOLVED (implementation, staging smoke pending) — 2026-05-17.**
-  The cutline drafted on `1813552` flagged this as a blocker on the
+  **DONE — 2026-05-17.** Implementation landed earlier in commit
+  `f1f0691` ("feat(api): add inventory management mutations",
+  2026-05-12); the operator-visible staging UI walk that the v1
+  cutline required was recorded 2026-05-17 in
+  [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+  § "2026-05-17 · `docs/inventory-edit-delete-ui-staging-smoke`"
+  (rows A–I; B1-relevant rows are A host edit, B host delete, C host
+  delete refused by referenced profile, D profile edit, E profile
+  delete, F profile delete refused by terminal-session history, G
+  profile disable + re-enable on a profile with history, H 390 × 844
+  mobile reachability of all edit / delete / disable controls, I
+  redaction sweep returning zero sentinel hits across backend log,
+  nginx access log, AND every `audit_events.payload` written in the
+  smoke window). The error copy on the two 409-refusal rows is
+  byte-exact the safe-formatter strings in `describeDeleteHostError`
+  / `describeDeleteServerProfileError` (no wire `message` echo). The
+  cutline drafted on `1813552` flagged this as a blocker on the
   premise that no production view called the `updateHost` /
   `deleteHost` / `updateServerProfile` / `deleteServerProfile`
-  helpers. In fact the wiring landed earlier in commit `f1f0691`
-  ("feat(api): add inventory management mutations", 2026-05-12) and
-  ships today inside the existing host and server-profile detail
-  panels on `ServersView.svelte`:
+  helpers; that was a stale reading of `ServersView.svelte`. For
+  reference (now historical), the UI lives inside the host + server-
+  profile detail panels:
   - Host detail panel: `host-detail-edit-open` opens the edit form
     (`host-detail-edit-{display-name,hostname,port,username}`),
     `host-detail-delete-open` opens a typed-name confirmation
@@ -352,11 +370,10 @@ running v1 would hit, with the evidence behind each.
   `apps/web/tests/inventoryMutationsApi.test.ts` (52 tests, includes
   redaction-sentinel sweeps). Disable confirmation logic is pinned
   by `apps/web/tests/profileLifecycle.test.ts` (24 tests). The
-  remaining v1 gate is the operator-walked inventory mutation smoke
-  in cutline §9 ("Inventory" rows: edit a profile, delete an unused
-  profile, attempt a delete that should refuse with the disable
-  guidance) which is the same hand-walk the rest of B2/B3 already
-  define.
+  operator-walked staging UI smoke that the cutline previously named
+  as the remaining v1 gate now lives at
+  [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+  § 2026-05-17.
 
 - **B2. No production-walked end-to-end smoke recorded.** The
   staging smoke history at
@@ -432,7 +449,10 @@ Three docs / features ordered by "what most moves the needle toward a
 shippable v1" — prefer production readiness over renderer experiments.
 (`feat/inventory-edit-delete-ui` was the originally-listed top slice;
 it resolved as docs-only on 2026-05-17 once the audit caught that the
-UI had already landed in commit `f1f0691` — see B1 above.)
+UI had already landed in commit `f1f0691` — see B1 above. The
+2026-05-17 staging UI smoke walked the cutline §9 inventory rows
+end-to-end, so B1 is fully DONE; the next-most-impactful slices are
+B2 / release checklist / B3 in that order.)
 
 1. **`docs/v1-release-checklist`**. The release-day checklist that
    composes runbook §4 (first deploy), §10 (post-deploy smoke), §11
@@ -444,7 +464,9 @@ UI had already landed in commit `f1f0691` — see B1 above.)
    the staging-smoke entries; lives under
    `docs/deployment/vps-staging-smoke.md` or a new sibling. Should
    include the inventory edit + delete + delete-refused-by-history
-   walks now that B1 is implementation-complete.
+   walks now that B1 is fully DONE (the 2026-05-17 staging entry is
+   the template; the production walk re-runs the same rows against
+   the operator's real production hostname).
 3. **`docs/v1-mobile-portrait-sanity-smoke`** (resolves B3). One
    operator-recorded run on a real Android phone against the default
    xterm production path, using the existing renderer-fair smoke
@@ -536,8 +558,14 @@ Each row maps to existing infrastructure; nothing here is new code.
 - [ ] Create an SSH identity (generate or import Ed25519).
 - [ ] Create a host.
 - [ ] Create a server profile binding the host + identity.
-- [ ] (Once B1 lands) edit the profile metadata; delete an unused
-  profile.
+- [x] (staging, 2026-05-17) Edit the profile metadata; delete an
+  unused profile; attempt a delete that refuses with the disable
+  guidance. (B1 resolved — see
+  [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+  § 2026-05-17 rows A + B + C + D + E + F + G. **§9 [x] marks
+  here record staging proof; the final production walk re-ticks
+  each row against the operator's real production hostname per
+  B2.**)
 - [ ] Trust the host key via the preflight + trust UI.
 - [ ] Auth-check succeeds against the target.
 - [ ] Disable the profile; confirm launch is refused; re-enable.
