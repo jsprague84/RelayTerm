@@ -2014,7 +2014,70 @@ dated smoke entry):
 
 If the operator needs to read back a `data-*` attribute, a
 `localStorage` key, or a console message, the row is in the
-wrong channel — promote it to Playwright emulation.
+wrong channel — promote it to Playwright emulation, **OR** drive
+the real phone via the USB-DevTools / CDP read channel
+described in the next subsection. The 2026-05-15c "uiautomator
+cannot read DOM" lesson still holds; what changed in 2026-05-16e
+is that Chrome DevTools USB attach is now a verified real-phone
+read path that bypasses uiautomator entirely.
+
+##### Real-phone DOM read via USB DevTools (CDP attach)
+
+When a row's evidence genuinely depends on a real-device
+property (soft-keyboard `visualViewport` shrink, native
+selection handles, OS clipboard / paste UI, real orientation
+events, real-Android-Chrome network behaviour) AND also needs
+a `data-*` / `localStorage` / `document.activeElement`
+read-back, drive the read-back from the workstation via
+Chrome DevTools USB attach. Verified on a real Samsung Galaxy
+S10e in the 2026-05-16e
+[`docs/android-phone-launch-timing-resmoke`](../../docs/deployment/vps-staging-smoke.md#2026-05-16e-docsandroid-phone-launch-timing-resmoke--real-android-chrome-first-launch-reads-the-new-client-side-timing-strip-the-2026-05-15c--2026-05-16-first-launch-transient-is-not-reproduced-on-this-attempt-nginx-records-close-time-re-confirmed-on-the-real-phone-surface)
+slice.
+
+```sh
+# 1. Verify the device is authorized.
+adb devices
+
+# 2. Forward Chrome DevTools to a local port.
+adb forward tcp:9222 localabstract:chrome_devtools_remote
+
+# 3. Find the per-page debugger WS URL — FILTER STRICTLY on the
+#    RelayTerm host first, never print non-RelayTerm titles.
+curl -s http://127.0.0.1:9222/json/list \
+  | jq '[.[] | select(.url | startswith("https://relayterm-staging.js-node.cc/")) | {id, url, ws: .webSocketDebuggerUrl}]'
+```
+
+A tiny Node script (Node 22+ has global `WebSocket`) connects
+to the per-page WS URL and runs `Runtime.enable` +
+`Runtime.evaluate { returnByValue: true, awaitPromise: true }`
+for each readback — the same evaluation shape Playwright MCP
+uses. Reads are pure DOM inspection; do NOT enable the
+`Network`, `Fetch`, `Page` (screenshot), or `Tracing` CDP
+domains, do NOT call `Page.captureScreenshot`, and do NOT
+collect `cookies()` / request headers. The
+`relayterm_session` cookie is `HttpOnly` and invisible to JS
+anyway (a real-phone CDP `document.cookie` read returns `""`).
+
+**Privacy gotchas (load-bearing).**
+
+- `curl /json/list` without a filter dumps **every** open tab's
+  title + URL, including non-RelayTerm tabs the operator was
+  browsing. Filter strictly on
+  `relayterm-staging.js-node.cc` BEFORE printing or
+  forwarding to chat. If a non-RelayTerm title slips through,
+  flag it inline, do not commit, do not memorise.
+- Phone screenshots, screen recordings, `Page.captureScreenshot`
+  CDP calls, and tab-switcher captures are out of scope for
+  these rows.
+- A single `localStorage.setItem` write to normalise the
+  `relayterm.terminal-settings.v2` record before a launch is
+  acceptable IF the operator approves it in chat and the
+  dated entry records the before/after value. Anything beyond
+  that (writing to `relayterm.active-terminal.v1`, clearing
+  storage, calling `navigator.serviceWorker.getRegistrations().unregister()`,
+  evicting `caches.delete(...)`) goes through the
+  cache-bust subsection of "Launch timing diagnostics", not
+  here.
 
 ##### SSH inbound probe — `netstat -tn`, not `docker logs`
 

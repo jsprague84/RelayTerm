@@ -267,6 +267,73 @@ resolves the 2026-05-15c Row 12 open question:
   executable slice is workspace-investigation, not another
   surface-2 row sweep.
 
+### Status after the 2026-05-16e real-phone launch-timing resmoke
+
+The follow-on slice `docs/android-phone-launch-timing-resmoke`
+ran **one xterm launch on the real Samsung phone** while reading
+the new client-side launch-timing diagnostic strip (the wrapper
+`[data-testid="production-terminal-launch-timing"]` around an
+inner `[data-testid="production-terminal-launch-timing-list"]`
+`<dl>` of per-event `<dt>` rows, plus the `data-launch-timing-*`
+shortcut attributes on `[data-testid="production-terminal"]` —
+all landed with `feat(web): add terminal launch timing
+diagnostics`) over Chrome DevTools USB attach (CDP
+`Runtime.evaluate`) — see the
+[`2026-05-16e · docs/android-phone-launch-timing-resmoke`](deployment/vps-staging-smoke.md#2026-05-16e-docsandroid-phone-launch-timing-resmoke--real-android-chrome-first-launch-reads-the-new-client-side-timing-strip-the-2026-05-15c--2026-05-16-first-launch-transient-is-not-reproduced-on-this-attempt-nginx-records-close-time-re-confirmed-on-the-real-phone-surface)
+dated entry. The result narrows what Row 12 / the workspace-side
+"first-launch detach" question can still mean, and unblocks the
+*CDP path* as a real-phone read channel for any row whose evidence
+depends on per-event ms timing:
+
+- **Row 12 (`launch` mount + visible block cursor) reading is
+  reaffirmed PASS for xterm on this attempt.** Client-side
+  `ws_open` fired at +477.7 ms after launch click; SSH
+  ESTABLISHED inside the throwaway 1.08 s after the cloud-edge
+  nginx POST 201; client `attached` at +479.7 ms. The
+  2026-05-15c wterm and 2026-05-16 xterm-control "Launch 1
+  detach-at-seq-0 + 60–68 s POST→WS gap" pattern is **not
+  present on this attempt**. Sample size 1 here does not
+  disprove the prior intermittent finding, but with the
+  client-side recorder visibility the prior "60–68 s POST→WS
+  gap" reading no longer has the open-vs-close ambiguity it
+  had to argue around.
+- **Real-phone read channel.** USB DevTools `adb forward
+  tcp:9222 localabstract:chrome_devtools_remote` plus CDP
+  `Runtime.evaluate { returnByValue: true }` on the per-page
+  WebSocket gives clean `data-*` and `localStorage` readbacks
+  from a real Samsung Galaxy S10e tab without resorting to
+  uiautomator (the 2026-05-14 lesson — Chrome's WebView on
+  Android is opaque to uiautomator). Any future row that needs
+  to read a `data-*` attribute, a `localStorage` key, or
+  `document.activeElement` from a real device can use the same
+  channel. Privacy gotcha pinned in the dated entry: the
+  default CDP `/json/list` enumeration leaks non-RelayTerm tab
+  titles into context; filter strictly on
+  `relayterm-staging.js-node.cc` BEFORE printing.
+- **Methodology re-confirmation (2026-05-16b / 2026-05-16d
+  reading).** The nginx access-log line
+  `GET …/ws HTTP/1.1 101` records the WebSocket-upgrade
+  **close** moment, not the open moment — confirmed again
+  here on the real-phone surface (client `ws_close` matched
+  the nginx line within ~2 s = clock skew + nginx
+  granularity; client `ws_open` was 60 s away). Any future
+  smoke that quotes a "POST→WS gap" number must source the
+  open moment from the client-side recorder.
+- **Methodology footnote — Android back gesture / Chrome tab
+  lifecycle (Row 15).** On the abandoned attempt 2 the back
+  gesture cleared the whole RelayTerm tab off the phone
+  (`/json/list` returned zero `relayterm-staging.js-node.cc`
+  pages). Recorded as a Row 15 data point — not evaluated
+  here because the slice's primary question was timing, not
+  back-gesture ergonomics. A future Row 15 row should anchor
+  against the same CDP poll pattern.
+- **Rows D–H / L / surface-3-Tauri** remain deferred. The
+  recommended next executable slice in this lane is a
+  **multi-run real-phone timing resmoke** (≥ 3 sequential
+  launches with the same CDP read channel) rather than a row
+  sweep on a more expensive surface; see the staging-smoke
+  entry's "Next slice" subsection.
+
 ### 2026-05-16 methodology update — Playwright-first execution model, real-phone narrow scope
 
 The 2026-05-15c surface-2 first execution and the 2026-05-16

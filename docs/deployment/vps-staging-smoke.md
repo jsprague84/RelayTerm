@@ -11599,6 +11599,441 @@ gated by the real-phone classification.
 
 ---
 
+### 2026-05-16e · `docs/android-phone-launch-timing-resmoke` — real Android Chrome first launch reads the new client-side timing strip; the 2026-05-15c / 2026-05-16 first-launch transient is NOT reproduced on this attempt; nginx-records-close-time re-confirmed on the real-phone surface
+
+Docs-only follow-on to the 2026-05-16d desktop verification slice
+(`docs/terminal-launch-timing-diagnostics-smoke`). Goal: read the
+new client-side launch-timing diagnostics
+(`data-launch-timing-*` on `[data-testid="production-terminal"]`,
+plus the per-event `<dt>` rows of
+`[data-testid="production-terminal-launch-timing-list"]`)
+**directly from a real Samsung Galaxy S10e Android Chrome session**
+via USB DevTools (CDP attach), to determine whether the 2026-05-15c
+wterm and 2026-05-16 xterm-control first-launch detach-at-seq-0
+patterns reproduce when the client side has unambiguous
+sub-second timing visibility. No code, no CSP, no CI/deploy, no
+protocol, no renderer-default change. xterm remains the production
+default; the experimental gate stayed `off`; wterm was NOT
+exercised in this slice.
+
+**Stack pin (byte-identical to 2026-05-16d, except where noted).**
+
+- Web: `git.js-node.cc/jsprague/relayterm-web:main`, served as
+  `/assets/index-ChbaJjba.js` (668387 bytes; ETag
+  `"6a08a017-a32e3"`). Selector spot-check before the launch
+  confirmed the bundle carries the launch-timing diagnostic
+  surface (`production-terminal-launch-timing: 6`,
+  `data-launch-timing: 6`, `launch_started: 4`, `ws_open: 4`,
+  `production-terminal: 34` — `LC_ALL=C grep -aoF` over the
+  served bundle).
+- Backend: `git.js-node.cc/jsprague/relayterm-backend:main`
+  (unchanged 2026-05-14 image).
+- Staging CSP unchanged:
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'` —
+  no `'unsafe-eval'`, no `data:`, no `blob:`, no `connect-src`
+  widening.
+
+**Date.** 2026-05-16. Smoke wall-clock window: 21:18 UTC (login)
+→ 23:39 UTC (cleanup); the launch + capture window was a small
+slice of that (~21:29 – 21:30:31 UTC for the only launch
+attempt). The long mid-slice gap was wait time, not new work.
+
+**Staging URL.** `https://relayterm-staging.js-node.cc`.
+
+**Real device / browser.** Samsung Galaxy S10e (adb serial
+`R38N500TY3E`), Android 10, Chrome `148.0.7778.167` (mobile UA
+`Chrome/148.0.0.0 Mobile Safari/537.36`), portrait viewport
+`360 × 617 px @ DPR 3`. Same physical phone / same home wifi /
+same Cloudflare-fronted staging endpoint as the 2026-05-15c and
+2026-05-16 entries.
+
+**USB DevTools / CDP availability.** `adb` from
+`/home/jsprague/Android/Sdk/platform-tools/adb`; device
+authorized at slice start. `adb forward tcp:9222
+localabstract:chrome_devtools_remote` succeeded; CDP
+`/json/version` returned `Browser: Chrome/148.0.7778.167`,
+`Protocol-Version: 1.3`. The RelayTerm dashboard tab was
+identified (tab id `357`,
+`webSocketDebuggerUrl ws://127.0.0.1:9222/devtools/page/357`) by
+strict-URL filter on `relayterm-staging.js-node.cc`. **CDP eval
+helper.** A small Node script (`/tmp/cdp-eval.mjs`, deleted at
+cleanup) connected to that WS URL and ran `Runtime.enable` +
+`Runtime.evaluate { returnByValue: true, awaitPromise: true }`
+for each readback. Every CDP eval was read-only DOM /
+`localStorage` inspection except the single `localStorage.setItem`
+write described below (autofit normalisation); no
+`Page.captureScreenshot`, no `Tracing.start`, no `Network` /
+`Fetch` domain enables, no tab-list collection beyond the
+strict-URL filter.
+
+**Privacy posture (real device).** No screenshots collected. No
+phone screen recordings. The first CDP `/json/list` call
+inadvertently surfaced two non-RelayTerm tab titles in the
+prompt context (operator-supplied browsing); flagged inline at
+the time, **not committed**, **not memorised**, and the helper
+was tightened to a strict
+`'relayterm-staging.js-node.cc' in url` filter for every
+subsequent read. No cookie values, no headers, no request bodies
+were captured. The `relayterm_session` cookie is `HttpOnly` and
+therefore invisible to JS reads (`document.cookie` returned
+`""`); the workstation-side `curl` chain ran with a 600-mode
+cookie jar at `/tmp/relayterm-atlrs.cookie` (removed at
+cleanup), never `cat`-ed into the conversation.
+
+**Methodology surface.** Per
+[`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) § D →
+"Mobile smoke methodology" + "Launch timing diagnostics", with
+the **real-phone narrow scope** discipline (read `data-*`
+attributes, server-side nginx + Postgres + throwaway `netstat
+-tn`, never reach for `docker logs` of the
+linuxserver/openssh-server image as an SSH-inbound source).
+Evidence-class labels per the methodology: **real-phone
+operator** (the launch tap itself), **CDP-inspected** (DOM
+`data-*` reads from the phone Chrome via USB), **server-side
+inspected** (cloud-edge nginx, backend, Postgres, throwaway
+`netstat -tn`), **inferred** (cross-row), or **deferred —
+&lt;reason&gt;**.
+
+**Smoke target setup.** Throwaway SSH target
+`relayterm-staging-android-timing-resmoke-ssh`, image
+`lscr.io/linuxserver/openssh-server:latest`, user `smoke`,
+pubkey-only (`PASSWORD_ACCESS=false`, `SUDO_ACCESS=false`).
+**No host port** published; container attached to
+`relayterm-staging_relayterm-staging-internal` with
+`--hostname android-timing-resmoke-host`. sshd LISTENed on
+`0.0.0.0:2222`; container ed25519 host key was
+`SHA256:7eTXqfuxkzyPerheHOAe61MUAPuzllyOEeMzdRJcrdE`. Public
+key for the throwaway came from a vault-generated identity
+created on the backend via `POST /api/v1/ssh-identities` —
+the private half never left the vault, the operator-facing
+response carried `key_type`, `fingerprint_sha256`, and
+`public_key` only (no `encrypted_private_key`, no
+`private_key`, no PEM delimiters).
+
+**Inventory rows (workstation-side via authenticated `curl`).**
+
+- SSH identity `704912b9-f6fc-4c4e-a898-b213743f5728`
+  (`android-timing-resmoke-identity`, ed25519,
+  `SHA256:Y4cwZEFJ0k5x+Ik9bHOH8h525dzdrecPPdd7p1Ds8NM`).
+- Host `2c9d39dd-3ee9-4f9a-835b-4cc55fcc4d27`
+  (`Android-Timing-Resmoke-Host` →
+  `android-timing-resmoke-host:2222`, default username
+  `smoke`).
+- Server profile `5888de4b-c046-401a-9834-dea2fd8c639b`
+  (`android-timing-resmoke-xterm-profile`, tags `[timing,
+  xterm, android, resmoke]`).
+- Host-key preflight returned `host_key_status: "unknown"` with
+  fingerprint **byte-identical** to the container's
+  `/config/ssh_host_keys/ssh_host_ed25519_key.pub` per
+  `ssh-keygen -lf`. `trust-host-key` accepted that fingerprint
+  (`known_host_entry_id 42bfdfdf-b805-407b-bee1-a9f2c0cd17e8`,
+  `trusted_at 2026-05-16T21:19:39.909222Z`).
+- `auth-check` returned `status:
+  "authentication_succeeded"` with the canonical "no PTY
+  allocated, no command executed" message.
+
+**Phone Settings BEFORE the launch (CDP read of
+`relayterm.terminal-settings.v2`).** `rendererId="xterm"` ✓,
+`experimentalRendererEvaluationEnabled=false` ✓,
+`autofitEnabled=true` — the only operator-side divergence
+from the slice's requested posture. With operator approval
+(recorded in chat) the value was flipped to `false` via one
+CDP `localStorage.setItem` call (verified with a read-back);
+the rest of the settings record was left untouched. This
+aligns the run with the 2026-05-16d desktop baseline where
+autofit was also off.
+
+#### One real Android Chrome launch attempt against the throwaway
+
+Session UUID `0be6f747-5fa7-4c58-ab4a-1770a127a1cf`.
+Wall-clock anchors (UTC):
+
+- CDP location-change `/dashboard → /servers`: `21:28:30.337` —
+  operator opened side-nav, tapped Servers.
+- CDP location-change `/servers → /terminal`: `21:29:01.568` —
+  Launch tap on the freshly-created profile (this is the
+  closest CDP-side anchor to `launch_started`; the recorder
+  itself uses `performance.now()` and reports
+  `launch_started = 0` as the per-launch anchor).
+- First CDP diagnostic snapshot read: `21:29:34.060` (after
+  phase reached `attached`).
+- nginx POST `/terminal-sessions 201`: `[16/May/2026:21:29:01
+  +0000]` (cloud-edge clock; workstation→cloud-edge skew
+  measured at +1.06 s at slice start, so this is workstation
+  ≈ 21:29:00).
+- nginx WS line `GET .../ws HTTP/1.1 101`: `[16/May/2026:21:30:01
+  +0000]` (close-time per 2026-05-16d reading; matches client
+  `ws_close` within ~2 s = 1 s clock skew + 1 s nginx
+  granularity).
+- `terminal_sessions.closed_at`: `2026-05-16T21:30:31.776Z`
+  (30 s after WS close = matches
+  `detached_live_pty_ttl_seconds = 30`).
+
+**Client-side timing snapshot** (per-event `data-launch-event-ms`
+read from
+`[data-testid="production-terminal-launch-timing-list"]` plus
+the shortcut attributes on `production-terminal`):
+
+| Event | `data-launch-event-state` | `data-launch-event-ms` | notes |
+|---|---|---|---|
+| `launch_started` | observed | 0 | recorder anchor (constructor) |
+| `create_session_post_started` | observed | 0.1 | |
+| `create_session_post_resolved` | observed | 194.6 | outcome `ok` (per `data-launch-timing-create-post-outcome`) |
+| `ws_connect_started` | observed | 274.1 | |
+| `ws_open` | observed | **477.7** | `data-launch-timing-ws-open-ms="477.70000000298023"` |
+| `first_server_message` | observed | 479.6 | |
+| `attached` | observed | 479.7 | `data-phase="attached"`, phase text `live` |
+| `first_output` | **pending** | (empty) | never fired — PAM session-open lag exceeded nginx idle window |
+| `detach_requested` | pending | (empty) | operator did not tap Detach |
+| `close_requested` | pending | (empty) | operator did not tap End-session (no prompt to type into) |
+| `ws_close` | observed | **60 603.9** | `data-launch-timing-ws-close-ms="60603.90000000596"` — nginx `proxy_read_timeout 60s` idle-close |
+| `error` | pending | (empty) | `data-launch-timing-error-kind=""` |
+
+Plus the renderer-diagnostic attribute set, unchanged from
+2026-05-16d's xterm baseline: `data-renderer="xterm"`,
+`data-renderer-experimental="false"`,
+`data-renderer-fallback=""`, `data-renderer-gate="off"`,
+`data-renderer-input="marked"`, `data-renderer-autofit="off"`.
+
+**Server-side cross-check.**
+
+- Throwaway `netstat -tn` polled once per second from
+  cloud-edge across the launch window. First sample showing
+  `:2222 *ESTABLISHED` was at `21:29:02.245` — **1.08 s after
+  the cloud-edge nginx POST 201**. The poll continued sampling
+  `=1` through `21:30:31.000` (when the TTL ran out) and then
+  `=0` at `21:30:31.924`. The 2026-05-16 lesson holds: the
+  authoritative inbound-SSH probe is `netstat -tn` inside the
+  throwaway, NOT `docker logs` of the linuxserver image.
+- Postgres `session_events` for session `0be6f747` (recorded
+  in slice scratch):
+  `created` (21:29:01.296Z, `{"cols":80,"rows":24,"stub":true}`),
+  `attached` (21:29:01.666Z, `{"live":true,"stub":false,
+  "client_info":"<Android Chrome 148 mobile UA>","remote_addr":
+  null,"attachment_id":"1732fead-…"}`),
+  `detached` (21:30:01.764Z,
+  `{"attachment_id":"1732fead-…","last_seen_seq":null}`),
+  `closed` (21:30:31.778Z, `{"reason":"client_requested"}`).
+  Public metadata only — no payload bytes, no token, no key
+  material. `last_seen_seq: null` on detached is consistent
+  with the recorder's `first_output: pending` observation
+  (zero Output frames were ack'd before the wire closed).
+- Postgres `terminal_sessions` row: `status="closed"`,
+  `created_at 2026-05-16T21:29:01.291967Z`,
+  `last_seen_at 2026-05-16T21:30:31.776266Z`,
+  `closed_at 2026-05-16T21:30:31.776076Z`.
+
+#### Lifetime relationship and nginx-records-close-time re-validation
+
+| Source (evidence-class) | Wall-clock | Δ vs nginx WS line (21:30:01 cloud-edge) |
+|---|---|---|
+| Client `ws_open` — **CDP-inspected** (phone Chrome recorder via USB DevTools `Runtime.evaluate`) | ≈ 21:29:01.478 (workstation; anchor + 477.7 ms) | **+60 s** (NOT equal — the line is not the open moment) |
+| Client `ws_close` — **CDP-inspected** (same phone Chrome recorder) | ≈ 21:30:01.604 (workstation; anchor + 60 603.9 ms) | **≈ +1 s** (equal within clock-skew + nginx granularity — the line IS the close moment) |
+| nginx `GET .../ws HTTP/1.1 101` line — **server-side inspected** (`docker logs relayterm-staging-relayterm-web-1`) | `[16/May/2026:21:30:01 +0000]` cloud-edge | (the reference row this table compares against) |
+
+The 2026-05-16b methodology correction and the 2026-05-16d
+desktop verification are **re-confirmed on the real-phone
+surface**: nginx's `GET …/ws HTTP/1.1 101` access-log line
+records the WebSocket-upgrade CLOSE moment, not the OPEN moment.
+The client-side `data-launch-timing-ws-open-ms` is the
+canonical "WS observed open by the client" measurement; the
+nginx line is the canonical "WS observed closed by the proxy"
+measurement. Any future investigation reading the nginx access
+log MUST treat the WS line as a close-time reading.
+
+#### Attempt 2 — abandoned, not run
+
+After attempt 1 the operator tapped to navigate back to /servers
+for a second comparison launch. The Android back gesture
+inadvertently cleared the RelayTerm tab off the phone (the CDP
+poll watched `/terminal → / (title: Google)` and then `0`
+relayterm-staging.js-node.cc tabs returned from `/json/list`).
+With operator approval the slice proceeded with sample size 1
+rather than re-stage attempt 2. This is itself a Row 15
+("Android back gesture / Chrome tab lifecycle") data point —
+**recorded** rather than evaluated, since the slice's primary
+question is timing-diagnostic readability, not back-gesture
+ergonomics. A future surface-2 row that exercises back-gesture
+deliberately should anchor its observation against the same CDP
+poll pattern; see
+[`docs/wterm-mobile-smoke-plan.md`](../wterm-mobile-smoke-plan.md)
+§ 5 Row 15 for the row spec.
+
+#### Classification (single attempt; per
+[`docs/wterm-mobile-smoke-plan.md`](../wterm-mobile-smoke-plan.md)
+§ "Classification template for a finding")
+
+**First-launch transient: not reproduced on this attempt.**
+
+- **Not a WS-open delay.** Client `ws_open` fired at +477.7 ms.
+- **Not a russh-dial stall.** Throwaway `netstat -tn` showed
+  `ESTABLISHED` 1.08 s after POST 201.
+- **Not an orchestrator-attach-timeout trip.** The client
+  reached `attached` at +479.7 ms; the orchestrator recorded
+  `attached` (live) in `session_events` 374 ms after the POST
+  201 in `terminal_sessions.created_at`.
+- **Not a first-output stall on the wire.** The wire stayed
+  ESTABLISHED for the full 60 s nginx-idle window. The reason
+  `first_output` stayed `pending` on the recorder is that the
+  linuxserver/openssh-server image's PAM session-open path was
+  slower than nginx's 60 s idle window (same lag the
+  2026-05-16d desktop run characterised at ~56 s; on this
+  attempt the prompt did not land at all before WS close, but
+  the SSH side stayed live throughout). This is **upstream of
+  RelayTerm code** and a known image quirk; if a future slice
+  needs to exercise input round-trip on real phone, a
+  non-linuxserver throwaway (or pre-warming the PAM session)
+  would isolate it.
+
+The 2026-05-15c wterm and 2026-05-16 xterm-control "Launch 1
+detach-at-seq-0 + 60–68 s POST→WS gap" pattern is **not present
+on this attempt**. With the workspace + recorder visibility the
+slice now demands, the prior "60–68 s POST→WS gap" reading is
+disambiguated against the per-event recorder values — and on
+this run, no recorder event exhibits an unexpected gap. The
+pattern remains classifiable as transient on prior attempts;
+sample size 1 here is not a disproof, but it is structurally
+stronger evidence than any single prior real-phone attempt
+because the client-side strip removes the ambiguity that
+2026-05-15c and 2026-05-16 had to argue around.
+
+#### Redaction sweep — clean
+
+20-minute log window covering nginx + backend + throwaway
+`netstat`, plus the CDP DOM read for the diagnostic strip.
+
+- Sentinel grep across `/tmp/relayterm-atlrs.{nginx,backend,
+  netstat}.log` (all removed at cleanup) for
+  `encrypted_private_key|private_key_openssh|BEGIN OPENSSH
+  PRIVATE KEY|openssh-key-v1|passphrase|session_token|
+  token_hash|cookie value|password value|data_b64|
+  REDACT-MARKER|Authorization: |Cookie: |password=|passwd=|
+  argon2` plus the smoke-user password as a literal — **zero
+  hits** across all three files. Zero hits on the known
+  false-positive `User/password ssh access is disabled` for
+  this window. Zero hits on `missing session cookie`.
+- Diagnostic-strip DOM (read via CDP `Runtime.evaluate
+  { returnByValue: true }`): every `data-launch-event-ms`
+  attribute parsed as a finite Number; the only string content
+  was the closed-vocabulary event names (`launch_started`,
+  `create_session_post_started`, …), the documented English
+  labels (`launch click`, `WebSocket open`, …), the closed-
+  vocabulary post-outcome (`ok`), and the empty
+  `data-launch-timing-error-kind`.
+- `localStorage` keys on the phone at the only CDP read:
+  `relayterm.terminal-settings.v2` only (no
+  `relayterm.active-terminal.v1` because the only launch
+  closed via TTL, not via an explicit "Save active session"
+  edge). No `sessionStorage` writes observed.
+- Postgres `audit_events` rows from the smoke window
+  (recorded_at 2026-05-16T21:18:00Z–21:36:00Z): three rows —
+  `login_succeeded` (payload `{method, user_id, login_at}`),
+  `ssh_identity_created` (payload `{name, source: generated,
+  key_type, created_at, ssh_identity_id, fingerprint_sha256}`),
+  `server_profile_created` (payload `{name, host_id,
+  ssh_identity_id, server_profile_id, disabled_at: null}`).
+  Plus one more at cleanup time (`server_profile_disabled` at
+  23:39:46.737546Z, same payload shape). All public metadata
+  only — no private-key bytes, no PEM, no cookie, no
+  `session_token`, no `token_hash`, no `argon2` hash. No
+  `host_key_accepted` audit was written for the trust-host-key
+  call — **same audit-policy gap previously flagged by
+  2026-05-16**; not in scope for this slice to fix.
+
+#### Cleanup (operator-approved exact scope)
+
+After operator approval — "Cleanup: 2026-05-16d scope" — the
+following were executed:
+
+```
+POST /api/v1/server-profiles/5888de4b-…/disable
+  → 200, disabled_at = "2026-05-16T23:39:46.734402Z"
+  (one `server_profile_disabled` audit row written; payload public-metadata only)
+ssh cloud-edge 'docker rm -f relayterm-staging-android-timing-resmoke-ssh'
+  → container removed; no rows matching the name on `docker ps -a`
+rm -fv /tmp/relayterm-atlrs.* /tmp/relayterm-bundle.js \
+       /tmp/relayterm-staging-index.html /tmp/cdp-eval.mjs
+  → 15 files removed (12 × atlrs.* + bundle + index.html + cdp-eval.mjs)
+/home/jsprague/Android/Sdk/platform-tools/adb forward --remove tcp:9222
+  → no forwards remaining on `adb forward --list`
+```
+
+**Left in place per operator scope** (matches 2026-05-16d
+default): SSH identity `704912b9-…`, host `2c9d39dd-…`
+(`Android-Timing-Resmoke-Host`), known_host_entries
+`42bfdfdf-…`, terminal_sessions row `0be6f747-…` (status
+`closed`), all `session_events`, all `audit_events`, staging
+stack, staging CSP, Postgres. The
+disabled profile is the inventory default destructive action
+(server profiles disable, not delete — per
+[`docs/agent/redaction-rules.md`](../agent/redaction-rules.md)
+§ 3 + SPEC.md "Inventory lifecycle and destructive-action
+policy").
+
+**Phone Chrome localStorage** for the
+`https://relayterm-staging.js-node.cc` origin holds:
+`rendererId="xterm"`, `experimentalRendererEvaluationEnabled=
+false`, `autofitEnabled=false` (the value I wrote during
+pre-launch normalisation). These match the slice-spec posture;
+no further reset action requested by the operator.
+
+#### Posture (load-bearing)
+
+- **No renderer promotion.** xterm remains the production
+  default. The experimental gate stayed `off` for the entire
+  slice. This slice did not exercise ghostty-web / restty /
+  wterm.
+- **No source / CSP / deploy / CI / protocol / orchestrator
+  change.** Docs-only. The only staging-side writes were five
+  authenticated API POSTs (identity / host / preflight / trust
+  / profile create, then a profile disable at cleanup), one
+  `docker run` of the throwaway target
+  (operator-approved with the exact command), one `docker rm`
+  to remove it, and one `POST .../auth-check` (which does NOT
+  open a PTY).
+- **Methodology takeaways pinned for the next slice.** (1) The
+  client-side launch-timing strip is readable end-to-end via
+  CDP `Runtime.evaluate` from a USB-attached Android Chrome —
+  no Playwright Android driver required. (2) `adb` is not on
+  `$PATH` on this workstation by default; the path is
+  `/home/jsprague/Android/Sdk/platform-tools/adb`. (3) The
+  default `/json/list` enumeration on a personal phone leaks
+  non-RelayTerm tab titles into the conversation — strict
+  filter on `relayterm-staging.js-node.cc` BEFORE printing.
+  (4) The Android back gesture on `/terminal` cleared the
+  whole RelayTerm tab from the phone in this slice; back-
+  gesture row work should anchor against the same CDP poll
+  pattern this slice used.
+
+#### Next slice (proposed; not executed by this slice)
+
+- **`docs/android-phone-launch-timing-multi-run-resmoke`**
+  (proposed, optional). Same surface, same throwaway pattern,
+  but run **N ≥ 3** sequential launches with a short reset
+  between each (reload tab → re-launch) so the
+  first-attempt-after-fresh-state hypothesis from
+  2026-05-15c / 2026-05-16 gets a real sample-size test
+  against the client-side recorder. Each launch records a
+  fresh `launch_started` anchor; deviations from the
+  attempt-1 shape here would be unambiguous in the per-event
+  ms readings.
+- **`feat/api-session-attach-timing-events`** (still optional;
+  carried forward from 2026-05-16d). Backend-side
+  `session_events` rows for the attach-path milestones with
+  absolute UTC timestamps so the client-side monotonic deltas
+  can be cross-checked against absolute backend wall-clocks
+  without inferring through the proxy. Defer unless a future
+  real-phone run turns up evidence the client-side strip
+  alone cannot characterise.
+- **`docs/wterm-android-tauri-smoke`** and
+  **`docs/wterm-android-browser-matrix-smoke`** stay deferred
+  per 2026-05-16b / 2026-05-16d; the real-phone first-launch
+  pattern continues to look intermittent rather than
+  systematic and re-running expensive surfaces before a
+  multi-run resmoke would just re-collect noise.
+
+---
+
 ## See also
 
 - [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)

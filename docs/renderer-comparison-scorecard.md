@@ -359,40 +359,50 @@ slice on restty until that decision is made.
 
 ## 7. Next slice proposals (ranked)
 
-1. **`feat/web-terminal-launch-timing-diagnostics`** +
-   optional **`feat/api-session-attach-timing-events`** —
-   workspace-side + backend-side timing instrumentation so the
-   60-68 s first-launch POST→WS gap surfaced by the 2026-05-15c
-   surface-2 wterm smoke and reproduced under the xterm
-   production baseline in the 2026-05-16 resmoke can be
-   attributed when it next appears on a real phone. The
-   Playwright-first **`docs/mobile-first-launch-ws-investigation`**
-   slice that ran on 2026-05-16b (see
+1. **`feat/web-terminal-launch-timing-diagnostics`** **landed**
+   (commit `ee89764`), and has been **verified end-to-end**:
+   the 2026-05-16d desktop-side slice
+   `docs/terminal-launch-timing-diagnostics-smoke` ran the
+   controlled `lifetime_X_then_close` test (see
    [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
-   § "2026-05-16b") did NOT reproduce the gap under desktop
-   Chromium at mobile viewport across two consecutive launches,
-   narrowing the hypothesis space to (a) real-Android-Chrome
-   WS-handshake on a freshly opened tab, (b) an intermittent
-   russh dial / `attach_session` first-attempt stall, or (c)
-   both. That slice also surfaced a **methodology issue**: the
-   nginx `access_log` line for `GET .../ws` records the close
-   timestamp, not the open timestamp, so the prior "60-68 s
-   POST→WS gap" measurements should be re-read as "session
-   lifespan from POST to detach". *Primary lane.* The first
-   sub-step of the instrumentation slice MUST verify the
-   "nginx logs WS upgrades at close" interpretation with a
-   controlled `lifetime_X_then_close` test before any code
-   change downstream relies on it. Until the instrumentation +
-   verification land, every mobile renderer smoke (wterm OR
-   xterm OR ghostty-web) re-collects the same intermittent
-   first-launch detach pattern as evidence of the wrong
-   question; running a surface-3 Tauri smoke first would only
-   double the redaction surface for no incremental signal. The
-   Playwright-first / real-phone-narrow methodology
+   § "2026-05-16d") and **confirmed the nginx-records-close-time
+   reading** (client `ws_close` matched the nginx
+   `GET .../ws → 101` line within ~0.15 s; client `ws_open` was
+   ~117 s away); the 2026-05-16e real-phone slice
+   `docs/android-phone-launch-timing-resmoke` ran the same
+   reading via USB DevTools (CDP attach) on a real Samsung
+   Galaxy S10e (see
+   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+   § "2026-05-16e") and **re-confirmed it on the real-phone
+   surface** (client `ws_close` matched the nginx line within
+   ~2 s = clock skew + nginx granularity; client `ws_open` was
+   60 s away). The 2026-05-16e attempt also did NOT reproduce
+   the 2026-05-15c / 2026-05-16 first-launch detach-at-seq-0
+   pattern on real Android Chrome (client `ws_open` fired at
+   +477.7 ms; SSH ESTABLISHED inside the throwaway 1.08 s
+   after POST 201; client `attached` at +479.7 ms; sample size
+   1). The Playwright-first **`docs/mobile-first-launch-ws-investigation`**
+   slice (2026-05-16b) likewise did NOT reproduce the gap
+   under desktop Chromium at mobile viewport. Across desktop
+   Chromium (mobile viewport), desktop Chromium (desktop
+   viewport, 2026-05-16d), and real Android Chrome
+   (2026-05-16e) the pattern remains classifiable as
+   transient on prior real-phone attempts rather than a
+   systematic per-surface issue. The recommended follow-on is
+   **`docs/android-phone-launch-timing-multi-run-resmoke`** —
+   N ≥ 3 sequential real-phone launches with the same CDP
+   read channel so the intermittent-vs-systematic question
+   gets a real sample-size test against the now-verified
+   client-side recorder. The optional
+   **`feat/api-session-attach-timing-events`** backend-side
+   timing slice remains optional — defer unless the multi-run
+   resmoke turns up evidence the client-side strip alone
+   cannot characterise. The Playwright-first / real-phone-narrow
+   methodology
    ([`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
    § 5 "2026-05-16 methodology update" +
    [`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § D →
-   "Mobile smoke methodology") sits on top of this slice when
+   "Mobile smoke methodology") sits on top of this lane when
    the next real-phone reproduction runs.
 2. **`docs/wterm-android-tauri-smoke`** — surface-3 Tauri
    Android WebView smoke. **Deferred** until the workspace
