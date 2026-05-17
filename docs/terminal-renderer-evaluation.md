@@ -1741,6 +1741,47 @@ next executable mobile-side slice is
 read of the new shortcut attributes via Chrome DevTools USB
 attach).
 
+**Update (2026-05-17).** The
+`docs/android-phone-launch-timing-multi-run-resmoke` slice ran
+**three sequential xterm launches** on a real Samsung Galaxy
+S10e / Android Chrome 148 / USB DevTools (CDP attach) — same
+surface as the 2026-05-16e single-launch slice — against a
+shared throwaway. Result: **0 / 3 attempts reproduced the
+2026-05-15c / 2026-05-16 first-launch detach-at-seq-0
+pattern**; client `ws_open` was 1 022 / 608 / 823 ms across
+the three, throwaway `netstat -tn` saw SSH ESTABLISHED ≤ 1.2 s
+after POST 201 on every attempt, client `attached` fired in
+1 029 / 633 / 834 ms, and the orchestrator's `attached` row
+landed within 0.7 s of POST in `session_events` on every
+attempt. Combined with the 2026-05-16d desktop (1/1
+successful) and 2026-05-16e real-phone single (1/1 successful)
+the prior detach pattern is now classifiable as **transient
+on the 2026-05-15c / 2026-05-16 attempts**, not systematic per
+surface. The nginx-records-close-time reading was **re-confirmed
+on a third independent surface and across three sequential
+launches** (Δ ≤ 0.5 s between nginx `GET .../ws 101` and
+`session_events.detached.recorded_at` on every attempt — the
+tightest staging reading to date). Redaction sweep clean.
+The slice added a new evidence-class label
+**CDP-driven on real device** (synthetic `click()` via
+`Runtime.evaluate` on the real phone; strictly stronger than
+Playwright emulation, strictly weaker than real touch) — used
+because the operator could not physically tap the
+off-screen Launch button on the 360 × 617 px viewport.
+**Posture unchanged:** xterm remains the production default;
+experimental gate stays off; no renderer promotion; no
+CSP / deploy / protocol changes. **Optional next slices:**
+the backend-side `feat/api-session-attach-timing-events` is
+now weakly motivated; `docs/target-shell-login-latency-investigation`
+(or a `feat/web-pam-session-warmup-toggle`) is the more
+useful follow-on because `first_output: pending` has now
+blocked input round-trip measurement on three timing slices
+in a row (the linuxserver/openssh-server image's PAM
+session-open path is slower than the staging nginx 60 s idle
+window). Full evidence in
+`docs/deployment/vps-staging-smoke.md` § "2026-05-17
+· `docs/android-phone-launch-timing-multi-run-resmoke`".
+
 ## Purpose
 
 Decide which terminal renderer RelayTerm should ship in production —

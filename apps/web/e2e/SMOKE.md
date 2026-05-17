@@ -2391,6 +2391,28 @@ each evidence row with one of (matches the plan exactly):
   a real-device claim.
 - **real-phone operator** — the operator reported the
   observation from the physical device.
+- **CDP-driven on real device** — added 2026-05-17. The JS
+  side of the row (the click, the input, the state read)
+  runs in the real Android Chrome on a USB-attached real
+  device via Chrome DevTools Protocol `Runtime.evaluate`,
+  but the trigger is a synthetic `click()` / DOM mutation,
+  not a real-touch / OS-keyboard / OS-paste event. Strictly
+  stronger than **playwright-emulated** (real Android JS
+  engine + real network stack + real WS + real WASM);
+  strictly weaker than **real-phone operator** (no
+  hit-test, no soft-keyboard interaction, no `pointerdown`
+  / `touchstart` chain, no OS clipboard / paste UI, no
+  native selection handles, no back-gesture). Use ONLY for
+  rows whose primary evidence is network / WS / JS /
+  WASM / attach-timing on a real device. Do NOT use for
+  any row in the "Real-phone narrow scope" closed list
+  above — those rows stay real-phone-operator-only because
+  hardware behaviour IS the evidence. Verified
+  end-to-end by the 2026-05-17 slice
+  `docs/android-phone-launch-timing-multi-run-resmoke`
+  (three sequential xterm launches on a Galaxy S10e where
+  the operator could not physically tap the off-screen
+  Launch button on the 360 × 617 px viewport).
 - **server-side inspected** — observation came from backend /
   nginx / Postgres / SSH-target logs or DB rows.
 - **inferred** — derived from another row's evidence; cite

@@ -334,6 +334,87 @@ depends on per-event ms timing:
   sweep on a more expensive surface; see the staging-smoke
   entry's "Next slice" subsection.
 
+### Status after the 2026-05-17 multi-run real-phone launch-timing resmoke
+
+The follow-on slice
+`docs/android-phone-launch-timing-multi-run-resmoke` ran the
+N ≥ 3 multi-run real-phone timing resmoke proposed by the
+2026-05-16e dated entry. Three sequential xterm launches
+against a shared throwaway on the same Galaxy S10e / same
+Chrome / same staging stack — see the
+[`2026-05-17 · docs/android-phone-launch-timing-multi-run-resmoke`](deployment/vps-staging-smoke.md#2026-05-17--docsandroid-phone-launch-timing-multi-run-resmoke--3-sequential-real-android-chrome-xterm-launches-via-cdp-the-2026-05-15c--2026-05-16-first-launch-detach-at-seq-0-pattern-is-not-reproduced-in-any-of-the-three-nginx-records-close-time-re-confirmed-on-a-third-independent-surface)
+dated entry. Results that update Row 12 / the workspace-side
+"first-launch detach" question and the row-channel mapping
+below:
+
+- **Row 12 reading on Android Chrome: sub-second `ws_open`
+  across three attempts; the first-launch detach pattern is
+  NOT reproduced.** Client `ws_open` was 1 022 / 608 / 823 ms;
+  throwaway `netstat -tn` saw SSH ESTABLISHED within 1.2 s of
+  POST 201 on every attempt; client `attached` fired in
+  1 029 / 633 / 834 ms; orchestrator recorded `attached`
+  (live=true, stub=false) within 0.7 s of POST in
+  `session_events` on every attempt. Note: launches were
+  **CDP-driven on real device** (synthetic `click()` via
+  `Runtime.evaluate`), not real-touch — so this is timing
+  evidence, not a full Row 12 hit-test pass; do not promote
+  to a row-level grade until a real-touch attempt is also
+  green. **The 2026-05-15c wterm and 2026-05-16 xterm-control
+  "Launch 1 detach-at-seq-0 + 60–68 s POST→WS gap" pattern is
+  NOT reproduced on any of the three sequential launches.**
+  Per the slice's decision-rule mapping (3/3 succeed → the
+  prior first-launch issue is not reproduced in N = 3;
+  likely intermittent / transient), combined with the
+  2026-05-16e single attempt (1/1 successful) and the
+  2026-05-16d desktop attempt (1/1 successful), the pattern
+  remains classifiable as **transient on the 2026-05-15c /
+  2026-05-16 attempts**, not systematic.
+- **New evidence-class label for the row-channel mapping:
+  CDP-driven on real device.** In this slice the operator
+  could not physically tap a small, off-screen Launch button
+  on the 360 × 617 px viewport (the profile row was at
+  y = 5348 in a 30-profile list and the scroll position kept
+  resetting). With operator approval the slice switched to
+  CDP `Runtime.evaluate` calling `btn.click()` on the
+  located `[data-testid="profile-launch-terminal"]`. The
+  resulting evidence is **strictly stronger than Playwright
+  emulation** (real Android JS engine, real network stack,
+  real WS, real WASM) and **strictly weaker than a real
+  touch** (no hit-test, no soft-keyboard interaction, no
+  `pointerdown` chain). For any row whose primary evidence
+  is network / WS / JS / attach-timing on a real device this
+  is now a defensible variant; for any row in this plan's
+  closed real-phone list (back gesture, soft keyboard, IME,
+  OS paste menu, OS clipboard, native selection handles,
+  orientation events, tab / session lifecycle, touch
+  ergonomics) it is NOT a substitute and the row stays
+  real-phone-operator-only.
+- **`first_output: pending` is now the load-bearing follow-on
+  question.** All three attempts in this slice — plus the
+  2026-05-16d desktop attempt and the 2026-05-16e single-launch
+  real-phone attempt — saw `first_output` stay `pending`
+  because the linuxserver/openssh-server image's PAM
+  session-open path is slower than the staging nginx
+  `proxy_read_timeout 60s` window. The slice's recommended
+  follow-on is `docs/target-shell-login-latency-investigation`
+  (or a small workspace-side `feat/web-pam-session-warmup-toggle`)
+  to unblock the input round-trip measurement on real phone;
+  the next time a real-phone slice wants to grade typed-input
+  rows (`docs/wterm-mobile-smoke-plan.md` § 5 Rows 6 / 7 / 8)
+  it should swap the throwaway image OR pre-warm PAM, not
+  re-stage another `whoami`-via-CDP attempt against the same
+  linuxserver image.
+- **Methodology re-confirmation (load-bearing).** The 2026-05-16b
+  nginx-records-close-time reading is **re-confirmed on a third
+  independent surface and across three sequential launches**:
+  on every attempt the nginx `GET .../ws HTTP/1.1 101`
+  access-log line matched `session_events.detached.recorded_at`
+  within ≤ 0.5 s (A1 +0.5, A2 +0.08, A3 +0.46) — the tightest
+  reading the staging surface has produced to date. Any future
+  smoke that quotes a "POST→WS gap" number must source the
+  open moment from the client-side recorder; the nginx line is
+  the close moment only.
+
 ### 2026-05-16 methodology update — Playwright-first execution model, real-phone narrow scope
 
 The 2026-05-15c surface-2 first execution and the 2026-05-16

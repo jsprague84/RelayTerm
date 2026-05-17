@@ -360,8 +360,8 @@ slice on restty until that decision is made.
 ## 7. Next slice proposals (ranked)
 
 1. **`feat/web-terminal-launch-timing-diagnostics`** **landed**
-   (commit `ee89764`), and has been **verified end-to-end**:
-   the 2026-05-16d desktop-side slice
+   (commit `ee89764`), and has been **verified end-to-end across
+   five slices**: the 2026-05-16d desktop-side slice
    `docs/terminal-launch-timing-diagnostics-smoke` ran the
    controlled `lifetime_X_then_close` test (see
    [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
@@ -376,34 +376,60 @@ slice on restty until that decision is made.
    § "2026-05-16e") and **re-confirmed it on the real-phone
    surface** (client `ws_close` matched the nginx line within
    ~2 s = clock skew + nginx granularity; client `ws_open` was
-   60 s away). The 2026-05-16e attempt also did NOT reproduce
-   the 2026-05-15c / 2026-05-16 first-launch detach-at-seq-0
-   pattern on real Android Chrome (client `ws_open` fired at
-   +477.7 ms; SSH ESTABLISHED inside the throwaway 1.08 s
-   after POST 201; client `attached` at +479.7 ms; sample size
-   1). The Playwright-first **`docs/mobile-first-launch-ws-investigation`**
+   60 s away); and the 2026-05-17 multi-run slice
+   `docs/android-phone-launch-timing-multi-run-resmoke` ran
+   **three sequential real-Android-Chrome xterm launches** via
+   CDP-driven click (see
+   [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
+   § "2026-05-17") and re-confirmed the nginx-close-time
+   reading on a third independent surface (Δ ≤ 0.5 s between
+   nginx WS line and `session_events.detached.recorded_at` on
+   every attempt — the tightest reading the staging surface
+   has produced to date). The 2026-05-16e attempt did NOT
+   reproduce the 2026-05-15c / 2026-05-16 first-launch
+   detach-at-seq-0 pattern on real Android Chrome (client
+   `ws_open` fired at +477.7 ms; SSH ESTABLISHED inside the
+   throwaway 1.08 s after POST 201; client `attached` at
+   +479.7 ms; sample size 1) — **and neither did any of the
+   three 2026-05-17 sequential attempts** (client `ws_open`
+   1 022 / 608 / 823 ms; SSH ESTABLISHED ≤ 1.2 s after POST
+   on every attempt; client `attached` 1 029 / 633 / 834 ms;
+   `last_seen_seq = null` on detached on every attempt, but
+   that is upstream PAM-lag, not detach-at-seq-0). The
+   Playwright-first **`docs/mobile-first-launch-ws-investigation`**
    slice (2026-05-16b) likewise did NOT reproduce the gap
    under desktop Chromium at mobile viewport. Across desktop
    Chromium (mobile viewport), desktop Chromium (desktop
-   viewport, 2026-05-16d), and real Android Chrome
-   (2026-05-16e) the pattern remains classifiable as
-   transient on prior real-phone attempts rather than a
-   systematic per-surface issue. The recommended follow-on is
-   **`docs/android-phone-launch-timing-multi-run-resmoke`** —
-   N ≥ 3 sequential real-phone launches with the same CDP
-   read channel so the intermittent-vs-systematic question
-   gets a real sample-size test against the now-verified
-   client-side recorder. The optional
+   viewport, 2026-05-16d), real Android Chrome single-launch
+   (2026-05-16e), and real Android Chrome multi-run
+   (2026-05-17) the pattern is now classifiable as **transient
+   on the 2026-05-15c / 2026-05-16 attempts rather than a
+   systematic per-surface issue**. The optional
    **`feat/api-session-attach-timing-events`** backend-side
-   timing slice remains optional — defer unless the multi-run
-   resmoke turns up evidence the client-side strip alone
-   cannot characterise. The Playwright-first / real-phone-narrow
-   methodology
+   timing slice remains optional and is now weakly motivated —
+   the 2026-05-17 slice's sub-second nginx-vs-detached Δ across
+   three attempts means the client-side strip + Postgres
+   `session_events` already give a clean cross-check; defer
+   unless a future real-phone or real-Tauri run turns up
+   evidence the client-side strip alone cannot characterise.
+   The first-output / PAM-lag question (every timing slice
+   since 2026-05-16d has had `first_output: pending`) is now
+   the more useful follow-on lane —
+   `docs/target-shell-login-latency-investigation` (swap the
+   throwaway image, or pre-warm PAM on the linuxserver image)
+   would unblock the input round-trip measurement on real
+   phone. The Playwright-first / real-phone-narrow methodology
    ([`docs/wterm-mobile-smoke-plan.md`](wterm-mobile-smoke-plan.md)
    § 5 "2026-05-16 methodology update" +
    [`apps/web/e2e/SMOKE.md`](../apps/web/e2e/SMOKE.md) § D →
    "Mobile smoke methodology") sits on top of this lane when
-   the next real-phone reproduction runs.
+   the next real-phone reproduction runs; the 2026-05-17
+   slice added one new evidence-class label,
+   **CDP-driven on real device**, which is strictly stronger
+   than Playwright emulation (real Android JS engine + real
+   network stack) and strictly weaker than real touch (no
+   hit-test, no soft-keyboard interaction, no `pointerdown`
+   chain).
 2. **`docs/wterm-android-tauri-smoke`** — surface-3 Tauri
    Android WebView smoke. **Deferred** until the workspace
    slice above lands; the same workspace-bound first-launch
