@@ -691,6 +691,11 @@ otherwise.
   operator-facing release-day checklist that turns this cutline
   into a step-by-step gate (§3–§11), a decision table (§12), and
   a sign-off template (§13).
+- [`docs/v1-release-notes.md`](v1-release-notes.md) — draft v1
+  user-facing release notes (what v1 is, included features,
+  caveats, post-v1 roadmap, sign-off template). Pairs with the
+  release-checklist §13 sign-off and the v1 production-smoke §5
+  entry header.
 - [`AGENTS.md`](../AGENTS.md) — agent-facing conventions and the
   architectural invariants this cutline rests on.
 - [`SPEC.md`](../SPEC.md) — product spec; the cutline does not

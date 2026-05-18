@@ -693,11 +693,16 @@ moves the needle. Order matches cutline §7.
    the rehearsal closes the verification gap. The
    release-checklist §10 / §12 row "Restore-from-backup
    rehearsal" stays PENDING until the rehearsal entry lands.
-4. **`docs/v1-release-notes-draft`** (or equivalent). The
-   user-facing changelog for the v1 tag: what is in v1, the
-   explicit post-v1 list, the upgrade caveats, the operator
-   smoke summary. Drafted against this checklist's §12
-   decision table.
+4. ~~**`docs/v1-release-notes-draft`**~~ **DONE — 2026-05-17.**
+   Landed on `docs/v1-release-notes-draft` as
+   [`docs/v1-release-notes.md`](v1-release-notes.md). User-facing
+   draft changelog for the v1 tag: what v1 is, what it includes,
+   the explicit post-v1 list, the upgrade / rollback / security
+   caveats, the renderer posture, and a §11 sign-off template
+   that pairs with this checklist's §13 sign-off and the v1
+   production smoke §5 header. Drafted against this checklist's
+   §12 decision table; the body of the published v1 release
+   notes will be §1–§10 of that file.
 
 Honourable mentions (not v1-critical):
 
@@ -730,6 +735,11 @@ Deliberately NOT recommended as next slices:
 - [`docs/v1-production-readiness.md`](v1-production-readiness.md)
   — the v1 cutline this checklist composes into a release
   gate.
+- [`docs/v1-release-notes.md`](v1-release-notes.md) — draft v1
+  release notes; the body of the published changelog. Pairs
+  with §13 of this checklist (the sign-off template) and §5 of
+  [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
+  (the production-smoke entry).
 - [`docs/deployment/production-runbook.md`](deployment/production-runbook.md)
   — the load-bearing operator runbook. §3 (tag policy), §4
   (first deploy), §6 (rollback), §7 (migration), §8 (backup /
