@@ -486,22 +486,25 @@ the image tag without ad-hoc improvisation.
   restore-from-backup; no automated `migrate down`. → runbook
   §6.2.
 - [ ] Restore-from-backup procedure read end-to-end. → runbook
-  §8 + §6.2. If a restore rehearsal has not been run against a
-  throwaway Postgres at least once, mark this as a **REQUIRED
-  POST-V1 FOLLOW-UP** in the §12 decision table (slice:
-  `docs/backup-restore-rehearsal-record`). Restoring from a
-  never-tested backup on a real incident is not acceptable for
-  v1 hygiene; rehearse before relying on it.
+  §8 + §6.2, plus the operator-facing manual procedure in
+  [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
+  §5 (restore) + §6 (rollback). If a restore rehearsal has not
+  been run against a throwaway Postgres at least once, mark
+  this as a **REQUIRED POST-V1 FOLLOW-UP** in the §12 decision
+  table (slice: `docs/backup-restore-rehearsal-record`).
+  Restoring from a never-tested backup on a real incident is
+  not acceptable for v1 hygiene; rehearse before relying on it.
 - [ ] Backup location recorded in the §13 sign-off template.
 
-If the operator does not yet have a committed backup-restore
-runbook beyond runbook §8: the **minimum manual process** is
-
-1. `pg_dump -Fc` (above) to off-host.
-2. `tar -czf relayterm-config-<date>.tgz .env nginx.conf` to
-   the same off-host location.
-3. Document the restore steps in `docs/backup-restore-runbook`
-   (post-v1 follow-up slice) before a second deploy.
+The full operator-facing backup, restore, and rollback procedure
+(including the protect-list, the sensitive-material warning, the
+recording-specific caveat, the rehearsal record template, and
+the v1 / post-v1 non-goal split) lives in
+[`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md).
+The runbook is docs-only; it composes runbook §4 / §6 / §7 / §8
+and this checklist's §10 / §11 into a single page. If you have
+not walked it once before today's deploy, walk it now — at
+minimum read §4 (pre-upgrade backup) and §5 (restore) end-to-end.
 
 ## 11. Security / redaction checks
 
@@ -593,8 +596,8 @@ Each gate is one row. Status values:
 | Terminal walk on production (§8) | Production-host xterm launch / I/O / reattach / close | PENDING | Yes | This release log entry |
 | Production-walked end-to-end smoke (B2, cutline blocker) | Operator-recorded production smoke entry against a real production hostname | **PENDING** | Yes | Template skeleton landed 2026-05-17 at [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md) (NOT EXECUTED — template only); next slice walks §5 of that file against a real production hostname (see §14) |
 | Mobile portrait sanity on default xterm (B3, cutline blocker) | Operator-recorded Android Chrome walk per §9 | **PENDING** | Yes | Next slice: `docs/v1-mobile-portrait-sanity-smoke` (see §14) |
-| Backup / restore / rollback (§10) | Pre-deploy `pg_dump` + config backup off-host; rollback tag known | PENDING | Yes | This release log entry |
-| Restore-from-backup rehearsal | Operator-recorded restore against a throwaway Postgres at least once | **PENDING** | Yes (minimum: documented manual process committed) | Next slice: `docs/backup-restore-rehearsal-record` (see §14) |
+| Backup / restore / rollback (§10) | Pre-deploy `pg_dump` + config backup off-host; rollback tag known; backup/restore runbook walked | PENDING | Yes | This release log entry; runbook at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) |
+| Restore-from-backup rehearsal | Operator-recorded restore against a throwaway Postgres at least once (runbook §5 Case R-B; template at runbook §10) | **PENDING** | Yes (minimum: backup/restore runbook committed — DONE 2026-05-17 at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md); rehearsal still pending) | Next slice: `docs/backup-restore-rehearsal-record` (see §14) |
 | Security / redaction sweep (§11) | Log + audit-payload sentinels return zero hits | PENDING | Yes | This release log entry |
 | Experimental renderer promotion | Any flip of the production default away from xterm | **POST-V1** | No | [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md) |
 | Production renderer selector UI | Operator-selectable renderer in production | **POST-V1** | No | Cutline §6 |
@@ -673,14 +676,23 @@ moves the needle. Order matches cutline §7.
    the default xterm production path using §9 of this
    checklist + `apps/web/e2e/SMOKE.md` § D as the input
    methodology. NOT a wterm / mobile-renderer matrix.
-3. **`docs/backup-restore-runbook`** (closes the §10
-   "minimum manual process" gap if it is not already covered
-   by runbook §8 to the operator's taste). The full restore
-   procedure end-to-end, including the rehearsal cadence and
-   the off-host storage policy. Pair with
-   `docs/backup-restore-rehearsal-record` (operator-recorded
-   restore against a throwaway Postgres) so the row is
-   verified, not just documented.
+3. ~~**`docs/backup-restore-runbook`**~~ **DONE — 2026-05-17.**
+   Landed on `docs/backup-restore-runbook` as
+   [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md).
+   Full operator-facing backup / restore / rollback procedure;
+   composes runbook §4 / §6 / §7 / §8 and this checklist's
+   §10 / §11 into a single page (protect-list, sensitive-
+   material warning, pre-upgrade backup, restore, rollback,
+   migration caveat, recording caveat, verification checklist,
+   rehearsal record template, v1 / post-v1 non-goal split).
+   Docs-only; no code / schema / deploy change.
+   **Pair (still pending):** the operator-recorded
+   `docs/backup-restore-rehearsal-record` (Case R-B restore
+   against a throwaway Postgres, per the new runbook §5.0 +
+   §10 template). The runbook closes the documentation gap;
+   the rehearsal closes the verification gap. The
+   release-checklist §10 / §12 row "Restore-from-backup
+   rehearsal" stays PENDING until the rehearsal entry lands.
 4. **`docs/v1-release-notes-draft`** (or equivalent). The
    user-facing changelog for the v1 tag: what is in v1, the
    explicit post-v1 list, the upgrade caveats, the operator
@@ -721,6 +733,10 @@ Deliberately NOT recommended as next slices:
   2026-05-17 (NOT EXECUTED). Future production-walked smoke
   entries land here as dated sections; entries here are the
   B2 evidence the §12 decision table is gated on.
+- [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
+  — operator-facing backup, restore, and rollback procedure;
+  closes the §10 "minimum manual process" gap. Pair with the
+  future `docs/backup-restore-rehearsal-record` slice.
 - [`docs/deployment/docker-compose.md`](deployment/docker-compose.md)
   — Compose stack reference, env contract, reverse-proxy
   notes.

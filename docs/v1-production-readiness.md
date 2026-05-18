@@ -301,9 +301,9 @@ Capability rollup. Each row is one of:
 | Migration revert on backward-incompatible upgrade | DONE / smoke | Runbook §6.2 — restore from backup is the documented path; no formal automated revert. Pre-rehearsal recommended |
 | Staging-smoke runbook | DONE | [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md) |
 | Production-walked end-to-end smoke | **BLOCKER (B2)** | Staging smoke is extensive; an explicit v1-cutline production smoke against a real production hostname (not the throwaway staging slot) has not been recorded |
-| Backup procedure (`pg_dump -Fc` + off-site reminder) | DONE | Runbook §8 |
-| Restore-from-backup procedure | DONE | Runbook §8 + §6.2 |
-| Restore-test rehearsal | DONE / smoke | Runbook §8.3 — recommended quarterly; needs an operator-recorded rehearsal entry |
+| Backup procedure (`pg_dump -Fc` + off-site reminder) | DONE | Runbook §8; operator-facing manual procedure at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §4 |
+| Restore-from-backup procedure | DONE | Runbook §8 + §6.2; operator-facing manual procedure at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §5 + §6 |
+| Restore-test rehearsal | DONE / runbook exists; rehearsal pending | Runbook §8.3 + the new [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §10 rehearsal record template; recommended quarterly; the operator-recorded rehearsal entry (`docs/backup-restore-rehearsal-record`, §7 honourable mention) is the still-pending row that closes verification |
 | Secret rotation (signing key / vault key / bootstrap / registry / DB) | DONE | Runbook §11 — with explicit caveats on vault-key rotation (no re-encryption pass in v1) |
 | Tauri desktop / mobile release packaging | POST-V1 | Scaffolds + local-build docs only; no CI |
 
@@ -498,9 +498,19 @@ B2 / release checklist / B3 in that order.)
 
 Honourable mentions (would help but not v1-critical):
 
+- ~~**`docs/backup-restore-runbook`**~~ **DONE — 2026-05-17.**
+  Landed on `docs/backup-restore-runbook` as
+  [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md).
+  Operator-facing manual backup / restore / rollback runbook;
+  closes the §4.4 "DONE / smoke" doc gap on restore procedure
+  ergonomics. Pair-with slice below remains pending.
 - **`docs/backup-restore-rehearsal-record`** — an operator-recorded
-  restore-from-`pg_dump` rehearsal against a throwaway Postgres,
-  closing the "DONE / smoke" item under §4.4.
+  restore-from-`pg_dump` rehearsal against a throwaway Postgres
+  (Case R-B in the new
+  [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
+  §5.0; recorded against the §10 template there). Closes the
+  remaining verification gap on the §4.4 "Restore-test
+  rehearsal" row.
 - **`feat/operator-status-page`** — a small operations page in
   Settings surfacing healthcheck status, current effective quotas,
   and recording on/off — handy at deploy time but not v1-required.
@@ -613,9 +623,12 @@ Each row maps to existing infrastructure; nothing here is new code.
 - [ ] Post-deploy smoke (runbook §10) walked top to bottom.
 - [ ] Redaction sweep (the `grep -E` line in runbook §10 last bullet)
   returns "ok: no leakage sentinels found."
-- [ ] At least one `pg_dump -Fc` backup written to off-host storage.
+- [ ] At least one `pg_dump -Fc` backup written to off-host storage
+  (procedure: [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §4).
 - [ ] Restore-from-backup rehearsal: pre-rehearsed at least once
-  against a throwaway Postgres (runbook §8.3).
+  against a throwaway Postgres (runbook §8.3; procedure
+  [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §5 Case R-B,
+  template §10).
 - [ ] Rollback path identified for the current tag (which earlier
   `vX.Y.Z` / `sha-<short>` is the rollback target).
 - [ ] (Once B2 records) the production-walked smoke entry committed.
@@ -673,6 +686,9 @@ otherwise.
   — v1 production smoke log; template skeleton landed
   2026-05-17 (NOT EXECUTED). Operator-walked entries here are
   the B2 evidence track.
+- [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
+  — operator-facing manual backup / restore / rollback
+  procedure that closes the §4.4 doc gap on restore ergonomics.
 - [`docs/production-auth.md`](production-auth.md) and
   [`docs/auth-smoke.md`](auth-smoke.md) — auth operator surface.
 - [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)

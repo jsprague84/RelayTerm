@@ -131,7 +131,12 @@ confirmed" block when starting a real walk.
 - [ ] **Backup posture** decided. The pre-deploy `pg_dump -Fc`
   exists and is off-host; the path/object key is recorded.
   Restore-from-backup procedure read end-to-end (runbook §8 +
-  §6.2). Restore rehearsal status recorded (PASS / PENDING).
+  §6.2; operator-facing manual procedure at
+  [`backup-restore-runbook.md`](backup-restore-runbook.md) §4
+  for backup and §5 + §6 for restore / rollback). Restore
+  rehearsal status recorded (PASS / PENDING; rehearsal template
+  at [`backup-restore-runbook.md`](backup-restore-runbook.md)
+  §10).
 - [ ] **Rollback posture** decided. The previous `vX.Y.Z` AND
   `sha-<short>` for both backend and web images are recorded
   next to the deploy log entry (runbook §6.1). Mark rollback
@@ -315,7 +320,7 @@ for the renderer-fair input methodology.
 
 | Row | Goal | Result | Wire / observed |
 |---|---|---|---|
-| P | DB backup evidence pre-smoke | PENDING | <!-- pre-deploy pg_dump path/object key recorded (off-host); chmod 600 preserved on .env copy. If a restore runbook does not yet exist beyond runbook §8, mark "minimum manual process documented" and link to a follow-up backup-restore-runbook slice. --> |
+| P | DB backup evidence pre-smoke | PENDING | <!-- pre-deploy pg_dump path/object key recorded (off-host); chmod 600 preserved on .env copy. Walk the operator-facing procedure at backup-restore-runbook.md §4 (backup) and have §5 (restore) + §6 (rollback) read end-to-end before recording PASS. If rehearsal status is PENDING, record it as such (the rehearsal entry lands separately via docs/backup-restore-rehearsal-record). --> |
 | Q | Rollback evidence | PENDING | <!-- Current image tag/digest recorded; previous known-good `vX.Y.Z` + sha-<short> recorded; rollback procedure (runbook §6.1) read end-to-end. Mark "untested" unless actually rehearsed. --> |
 
 #### Cleanup posture
@@ -559,6 +564,9 @@ production stack touched). No cleanup needed.
   — load-bearing operator runbook (§4 first deploy, §6
   rollback, §7 migration, §8 backup/restore, §9 reverse proxy,
   §10 post-deploy smoke, §11 secret rotation).
+- [`docs/deployment/backup-restore-runbook.md`](backup-restore-runbook.md)
+  — operator-facing manual backup / restore / rollback procedure
+  the §3 backup-posture prerequisite and §5 row P rest on.
 - [`docs/deployment/vps-staging-smoke.md`](vps-staging-smoke.md)
   — staging-only smoke log; do not co-mingle entries.
 - [`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) — SPA
