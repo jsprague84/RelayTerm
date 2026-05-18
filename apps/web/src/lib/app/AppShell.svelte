@@ -281,7 +281,7 @@
       onToggleMobileNav={() => (mobileNavOpen = !mobileNavOpen)}
     />
     <main
-      class="flex-1 overflow-y-auto px-6 py-6"
+      class="flex-1 overflow-y-auto px-3 py-4 sm:px-6 sm:py-6"
       data-testid="app-shell-main"
       data-view={selected}
     >

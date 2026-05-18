@@ -910,10 +910,19 @@
     </div>
   </header>
 
+  <!--
+    Workspace control row. Mobile portrait gets larger touch targets
+    (min-h-9 + py-1.5) so the eight closely-spaced buttons are reachable
+    with a fingertip; from `sm:` and up the row collapses back to the
+    compact `px-3 py-1` desktop sizing. Pinned by
+    `tests/mobileControlAffordance.test.ts` so a regression that drops
+    the min-h-9 token on production-terminal control buttons fails the
+    suite.
+  -->
   <div class="flex flex-wrap gap-2">
     <button
       type="button"
-      class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={focusClicked}
       disabled={!enablement.focus}
       data-testid="production-terminal-focus"
@@ -923,7 +932,7 @@
     </button>
     <button
       type="button"
-      class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={fitClicked}
       disabled={!fitButton.enabled}
       data-testid="production-terminal-fit"
@@ -934,7 +943,7 @@
     </button>
     <button
       type="button"
-      class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={clearViewportClicked}
       disabled={!enablement.clear}
       data-testid="production-terminal-clear"
@@ -942,10 +951,10 @@
     >
       Clear local viewport
     </button>
-    <span class="mx-1 self-center text-zinc-700" aria-hidden="true">·</span>
+    <span class="mx-1 hidden self-center text-zinc-700 sm:inline" aria-hidden="true">·</span>
     <button
       type="button"
-      class="rounded-md border border-amber-700/60 bg-amber-900/20 px-3 py-1 text-xs text-amber-100 transition hover:border-amber-600 hover:bg-amber-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-amber-700/60 bg-amber-900/20 px-3 py-1.5 text-xs text-amber-100 transition hover:border-amber-600 hover:bg-amber-900/40 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={detachClicked}
       disabled={!enablement.detach}
       data-testid="production-terminal-detach"
@@ -955,7 +964,7 @@
     </button>
     <button
       type="button"
-      class="rounded-md border border-rose-800/60 bg-rose-900/20 px-3 py-1 text-xs text-rose-100 transition hover:border-rose-700 hover:bg-rose-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-rose-800/60 bg-rose-900/20 px-3 py-1.5 text-xs text-rose-100 transition hover:border-rose-700 hover:bg-rose-900/40 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={closeClicked}
       disabled={!enablement.close}
       data-testid="production-terminal-close"
@@ -965,7 +974,7 @@
     </button>
     <button
       type="button"
-      class="rounded-md border border-indigo-800/60 bg-indigo-900/20 px-3 py-1 text-xs text-indigo-100 transition hover:border-indigo-700 hover:bg-indigo-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-indigo-800/60 bg-indigo-900/20 px-3 py-1.5 text-xs text-indigo-100 transition hover:border-indigo-700 hover:bg-indigo-900/40 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={() => void reconnectClicked()}
       disabled={!enablement.reconnect}
       data-testid="production-terminal-reconnect"
@@ -975,7 +984,7 @@
     </button>
     <button
       type="button"
-      class="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+      class="min-h-9 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
       onclick={disposeClicked}
       disabled={!enablement.dispose}
       data-testid="production-terminal-dispose"
@@ -986,7 +995,7 @@
     {#if onExit}
       <button
         type="button"
-        class="ml-auto rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300 transition hover:border-zinc-600 hover:bg-zinc-800"
+        class="min-h-9 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 transition hover:border-zinc-600 hover:bg-zinc-800 sm:ml-auto sm:min-h-0 sm:py-1"
         onclick={onExit}
         data-testid="production-terminal-back"
       >

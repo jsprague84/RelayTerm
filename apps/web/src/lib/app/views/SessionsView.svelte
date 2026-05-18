@@ -480,10 +480,16 @@
             </p>
           {/if}
 
+          <!--
+            Per-row action buttons. Mobile portrait bumps min-h-9 + py-1.5
+            so the affordances clear a fingertip; desktop collapses back
+            to compact via `sm:` overrides. Pinned by
+            `tests/mobileControlAffordance.test.ts`.
+          -->
           <div class="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              class="rounded-md border border-indigo-800/60 bg-indigo-900/20 px-3 py-1 text-xs text-indigo-100 transition hover:border-indigo-700 hover:bg-indigo-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+              class="min-h-9 rounded-md border border-indigo-800/60 bg-indigo-900/20 px-3 py-1.5 text-xs text-indigo-100 transition hover:border-indigo-700 hover:bg-indigo-900/40 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
               onclick={() => reconnectClicked(session, profileName)}
               disabled={!canReconnect(session.status) || isActive || isVerifying}
               data-testid="sessions-row-reconnect"
@@ -503,7 +509,7 @@
             </button>
             <button
               type="button"
-              class="rounded-md border border-rose-800/60 bg-rose-900/20 px-3 py-1 text-xs text-rose-100 transition hover:border-rose-700 hover:bg-rose-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+              class="min-h-9 rounded-md border border-rose-800/60 bg-rose-900/20 px-3 py-1.5 text-xs text-rose-100 transition hover:border-rose-700 hover:bg-rose-900/40 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
               onclick={() => closeClicked(session)}
               disabled={!canClose(session.status) ||
                 closingState?.kind === "submitting"}
@@ -517,7 +523,7 @@
             {#if onViewRecording && offersRecording(session.status)}
               <button
                 type="button"
-                class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+                class="min-h-9 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 sm:min-h-0 sm:py-1"
                 onclick={() => onViewRecording?.(session.id, profileName)}
                 data-testid="sessions-row-view-recording"
                 title="Open the recording replay viewer for this session — read-only output, no live SSH"

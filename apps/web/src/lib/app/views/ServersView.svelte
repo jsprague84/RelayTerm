@@ -1577,7 +1577,14 @@
           </p>
         {/if}
 
-        <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+        <!--
+          Mobile portrait stacks dt/dd so long hostnames and timestamps
+          don't push the grid wider than the container. `sm:` restores
+          the original two-column key/value layout. The mobile dt picks
+          up a thin bottom border so the eye still reads "label then
+          value" without the side-by-side alignment.
+        -->
+        <dl class="flex flex-col gap-1 text-sm sm:grid sm:grid-cols-[max-content_1fr] sm:gap-x-4 sm:gap-y-2">
           <dt class="text-xs uppercase tracking-wide text-zinc-500">
             Display name
           </dt>
@@ -1671,7 +1678,7 @@
           {#if editHostState.kind !== "open" || editHostState.hostId !== host.id}
             <button
               type="button"
-              class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50"
+              class="min-h-9 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
               onclick={() => openEditHost(host)}
               disabled={editHostState.kind === "submitting" ||
                 deleteHostState.kind === "submitting"}
@@ -1683,7 +1690,7 @@
           {#if deleteHostState.kind !== "confirming" || deleteHostState.hostId !== host.id}
             <button
               type="button"
-              class="rounded-md border border-red-800/60 bg-red-950/40 px-2.5 py-1 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50"
+              class="min-h-9 rounded-md border border-red-800/60 bg-red-950/40 px-3 py-1.5 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
               onclick={() => openDeleteHost(host)}
               disabled={editHostState.kind === "submitting" ||
                 deleteHostState.kind === "submitting"}
@@ -1763,14 +1770,14 @@
             <div class="flex items-center gap-2">
               <button
                 type="submit"
-                class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+                class="min-h-9 rounded-md border border-emerald-700 bg-emerald-800 px-3 py-1.5 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
                 data-testid="host-detail-edit-save"
               >
                 Save
               </button>
               <button
                 type="button"
-                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                class="min-h-9 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800 sm:min-h-0 sm:px-2.5 sm:py-1"
                 onclick={cancelEditHost}
                 data-testid="host-detail-edit-cancel"
               >
@@ -1827,7 +1834,7 @@
             <div class="flex items-center gap-2">
               <button
                 type="button"
-                class="rounded-md border border-red-700 bg-red-800 px-2.5 py-1 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50"
+                class="min-h-9 rounded-md border border-red-700 bg-red-800 px-3 py-1.5 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
                 onclick={() => submitDeleteHost(host)}
                 disabled={deleteHostState.typed !== host.display_name}
                 data-testid="host-detail-delete-confirm-submit"
@@ -1836,7 +1843,7 @@
               </button>
               <button
                 type="button"
-                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                class="min-h-9 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800 sm:min-h-0 sm:px-2.5 sm:py-1"
                 onclick={cancelDeleteHost}
                 data-testid="host-detail-delete-cancel"
               >
@@ -2016,7 +2023,7 @@
               <div class="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  class="rounded-md border border-emerald-700/60 bg-emerald-900/20 px-3 py-1 text-xs text-emerald-100 transition hover:border-emerald-600 hover:bg-emerald-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  class="min-h-9 rounded-md border border-emerald-700/60 bg-emerald-900/20 px-3 py-1.5 text-xs text-emerald-100 transition hover:border-emerald-600 hover:bg-emerald-900/40 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
                   onclick={() => void launchProfile(profile)}
                   disabled={profileDisabled || launchState?.kind === "submitting"}
                   data-testid="profile-launch-terminal"
@@ -2085,7 +2092,7 @@
                     <div class="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        class="rounded-md border border-amber-700 bg-amber-800 px-3 py-1 text-xs text-amber-50 transition hover:border-amber-600 hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        class="min-h-9 rounded-md border border-amber-700 bg-amber-800 px-3 py-1.5 text-xs text-amber-50 transition hover:border-amber-600 hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
                         onclick={() => void submitDisable(profile)}
                         disabled={!typedMatches}
                         data-testid="profile-disable-submit"
@@ -2094,7 +2101,7 @@
                       </button>
                       <button
                         type="button"
-                        class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+                        class="min-h-9 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 sm:min-h-0 sm:py-1"
                         onclick={() => cancelDisableConfirmation(profile.id)}
                         data-testid="profile-disable-cancel"
                       >
@@ -2104,7 +2111,7 @@
                   {:else if lifecycleState?.kind === "submitting" && lifecycleState.action === "disable"}
                     <button
                       type="button"
-                      class="self-start rounded-md border border-amber-700 bg-amber-800 px-3 py-1 text-xs text-amber-50 disabled:opacity-50"
+                      class="min-h-9 self-start rounded-md border border-amber-700 bg-amber-800 px-3 py-1.5 text-xs text-amber-50 disabled:opacity-50 sm:min-h-0 sm:py-1"
                       disabled
                       data-testid="profile-disable-submitting"
                     >
@@ -2113,7 +2120,7 @@
                   {:else}
                     <button
                       type="button"
-                      class="self-start rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-1 text-xs text-amber-100 transition hover:border-amber-800 hover:bg-amber-900/40"
+                      class="min-h-9 self-start rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-1.5 text-xs text-amber-100 transition hover:border-amber-800 hover:bg-amber-900/40 sm:min-h-0 sm:py-1"
                       onclick={() => openDisableConfirmation(profile.id)}
                       data-testid="profile-disable-open"
                     >
@@ -2129,7 +2136,7 @@
                   </p>
                   <button
                     type="button"
-                    class="self-start rounded-md border border-emerald-700 bg-emerald-800 px-3 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    class="min-h-9 self-start rounded-md border border-emerald-700 bg-emerald-800 px-3 py-1.5 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:py-1"
                     onclick={() => void submitEnable(profile)}
                     disabled={lifecycleState?.kind === "submitting"}
                     data-testid="profile-enable-submit"
@@ -2219,7 +2226,9 @@
           </p>
         {/if}
 
-        <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+        <!-- Mobile portrait stacks dt/dd; see host-detail dl above for
+             the rationale. `sm:` restores the original key/value grid. -->
+        <dl class="flex flex-col gap-1 text-sm sm:grid sm:grid-cols-[max-content_1fr] sm:gap-x-4 sm:gap-y-2">
           <dt class="text-xs uppercase tracking-wide text-zinc-500">Name</dt>
           <dd class="text-zinc-100" data-testid="profile-detail-name">
             {detail.profile.name}
@@ -2372,7 +2381,7 @@
           {#if editProfileState.kind !== "open" || editProfileState.profileId !== detail.profile.id}
             <button
               type="button"
-              class="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50"
+              class="min-h-9 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-100 transition hover:border-zinc-600 hover:bg-zinc-700 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
               onclick={() => openEditProfile(detail.profile)}
               disabled={editProfileState.kind === "submitting" ||
                 deleteProfileState.kind === "submitting"}
@@ -2384,7 +2393,7 @@
           {#if deleteProfileState.kind !== "confirming" || deleteProfileState.profileId !== detail.profile.id}
             <button
               type="button"
-              class="rounded-md border border-red-800/60 bg-red-950/40 px-2.5 py-1 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50"
+              class="min-h-9 rounded-md border border-red-800/60 bg-red-950/40 px-3 py-1.5 text-xs text-red-200 transition hover:border-red-700 hover:bg-red-900/40 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
               onclick={() => openDeleteProfile(detail.profile)}
               disabled={editProfileState.kind === "submitting" ||
                 deleteProfileState.kind === "submitting"}
@@ -2488,14 +2497,14 @@
             <div class="flex items-center gap-2">
               <button
                 type="submit"
-                class="rounded-md border border-emerald-700 bg-emerald-800 px-2.5 py-1 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700"
+                class="min-h-9 rounded-md border border-emerald-700 bg-emerald-800 px-3 py-1.5 text-xs text-emerald-50 transition hover:border-emerald-600 hover:bg-emerald-700 sm:min-h-0 sm:px-2.5 sm:py-1"
                 data-testid="profile-detail-edit-save"
               >
                 Save
               </button>
               <button
                 type="button"
-                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                class="min-h-9 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800 sm:min-h-0 sm:px-2.5 sm:py-1"
                 onclick={cancelEditProfile}
                 data-testid="profile-detail-edit-cancel"
               >
@@ -2552,7 +2561,7 @@
             <div class="flex items-center gap-2">
               <button
                 type="button"
-                class="rounded-md border border-red-700 bg-red-800 px-2.5 py-1 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50"
+                class="min-h-9 rounded-md border border-red-700 bg-red-800 px-3 py-1.5 text-xs text-red-50 transition hover:border-red-600 hover:bg-red-700 disabled:opacity-50 sm:min-h-0 sm:px-2.5 sm:py-1"
                 onclick={() => submitDeleteProfile(detail.profile)}
                 disabled={deleteProfileState.typed !== detail.profile.name}
                 data-testid="profile-detail-delete-confirm-submit"
@@ -2561,7 +2570,7 @@
               </button>
               <button
                 type="button"
-                class="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
+                class="min-h-9 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800 sm:min-h-0 sm:px-2.5 sm:py-1"
                 onclick={cancelDeleteProfile}
                 data-testid="profile-detail-delete-cancel"
               >
