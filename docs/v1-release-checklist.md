@@ -591,7 +591,7 @@ Each gate is one row. Status values:
 | Inventory walk on staging (B1, cutline §9) | Operator-walked staging UI smoke 2026-05-17 (rows A–I) | **PASS** | No (staging evidence; production re-walk happens in §7) | [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md) § "2026-05-17 · `docs/inventory-edit-delete-ui-staging-smoke`" |
 | Inventory walk on production (§7) | Production-host re-walk of B1 rows | PENDING | Yes | This release log entry |
 | Terminal walk on production (§8) | Production-host xterm launch / I/O / reattach / close | PENDING | Yes | This release log entry |
-| Production-walked end-to-end smoke (B2, cutline blocker) | Operator-recorded production smoke entry against a real production hostname | **PENDING** | Yes | Next slice: `docs/v1-production-smoke-record` (see §14) |
+| Production-walked end-to-end smoke (B2, cutline blocker) | Operator-recorded production smoke entry against a real production hostname | **PENDING** | Yes | Template skeleton landed 2026-05-17 at [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md) (NOT EXECUTED — template only); next slice walks §5 of that file against a real production hostname (see §14) |
 | Mobile portrait sanity on default xterm (B3, cutline blocker) | Operator-recorded Android Chrome walk per §9 | **PENDING** | Yes | Next slice: `docs/v1-mobile-portrait-sanity-smoke` (see §14) |
 | Backup / restore / rollback (§10) | Pre-deploy `pg_dump` + config backup off-host; rollback tag known | PENDING | Yes | This release log entry |
 | Restore-from-backup rehearsal | Operator-recorded restore against a throwaway Postgres at least once | **PENDING** | Yes (minimum: documented manual process committed) | Next slice: `docs/backup-restore-rehearsal-record` (see §14) |
@@ -657,12 +657,17 @@ moves the needle. Order matches cutline §7.
 
 1. **`docs/v1-production-smoke-record`** (resolves B2). The
    operator-recorded production-walked smoke entry against a
-   real production hostname. Mirrors the 2026-05-17 staging
-   entry format; lives under
+   real production hostname. The template skeleton landed
+   2026-05-17 at
+   [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
+   (NOT EXECUTED; status NOT YET EXECUTED — operator had not
+   yet chosen a production hostname). The next slice copies §5
+   of that file into a new dated entry and walks §3–§8 + §10–
+   §11 of this checklist against the real production
+   hostname. The staging template is the 2026-05-17 entry in
    [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
-   or a new `docs/deployment/production-deploys.md` sibling.
-   Walks §3–§8 + §10–§11 of this checklist against the real
-   production hostname.
+   — do NOT co-mingle the staging log with the production
+   log.
 2. **`docs/v1-mobile-portrait-sanity-smoke`** (resolves B3).
    One operator-recorded run on a real Android phone against
    the default xterm production path using §9 of this
@@ -711,6 +716,11 @@ Deliberately NOT recommended as next slices:
 - [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
   — staging smoke history; the 2026-05-17 inventory edit /
   delete entry is the B1 evidence cited in §12.
+- [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
+  — v1 production smoke log; template skeleton landed
+  2026-05-17 (NOT EXECUTED). Future production-walked smoke
+  entries land here as dated sections; entries here are the
+  B2 evidence the §12 decision table is gated on.
 - [`docs/deployment/docker-compose.md`](deployment/docker-compose.md)
   — Compose stack reference, env contract, reverse-proxy
   notes.

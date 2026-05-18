@@ -383,7 +383,16 @@ running v1 would hit, with the evidence behind each.
   end-to-end pass against a real production hostname using the
   cutline in §9 of this doc and the runbook's §10 smoke. Scope:
   pick the operator's first production hostname, walk §9, record
-  the result. Docs-only deliverable, no code.
+  the result. Docs-only deliverable, no code. **Template
+  skeleton landed 2026-05-17** on
+  `docs/v1-production-smoke-record` at
+  [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
+  (status NOT EXECUTED — operator had not yet chosen a
+  production hostname); the §5 entry template + §3
+  prerequisites checklist there is what a successor slice
+  copies and walks against the real production hostname. **B2
+  remains PENDING** until that successor entry records PASS;
+  the template is not evidence.
 
 - **B3. Mobile portrait sanity smoke against the production xterm
   path.** The default xterm renderer is the production v1 surface;
@@ -466,13 +475,22 @@ B2 / release checklist / B3 in that order.)
    surfaced as the explicit next-slice candidates §7 row 2 and
    row 3 below.
 2. **`docs/v1-production-smoke-record`** (resolves B2). The
-   operator-recorded production-walked smoke entry. Format mirrors
-   the staging-smoke entries; lives under
-   `docs/deployment/vps-staging-smoke.md` or a new sibling. Should
-   include the inventory edit + delete + delete-refused-by-history
-   walks now that B1 is fully DONE (the 2026-05-17 staging entry is
-   the template; the production walk re-runs the same rows against
-   the operator's real production hostname).
+   operator-recorded production-walked smoke entry. **Template
+   skeleton landed 2026-05-17 (status NOT EXECUTED)** at
+   [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
+   — the slice was re-scoped to template-only because the
+   operator had not yet chosen a production hostname / deploy
+   host / image tag. The successor slice copies §5 of that
+   file into a new dated entry and walks every row against
+   the real production hostname; the entry should include the
+   inventory edit + delete + delete-refused-by-history walks
+   now that B1 is fully DONE (the 2026-05-17 staging entry is
+   the row format; the production walk re-runs the same rows
+   against the operator's real production hostname). The new
+   production smoke log is a dedicated sibling at
+   `docs/deployment/v1-production-smoke.md`, NOT an append to
+   the staging log — staging vs production must not be
+   co-mingled.
 3. **`docs/v1-mobile-portrait-sanity-smoke`** (resolves B3). One
    operator-recorded run on a real Android phone against the default
    xterm production path, using the existing renderer-fair smoke
@@ -651,6 +669,10 @@ otherwise.
   — Compose stack reference + CI image-publish detail.
 - [`docs/deployment/vps-staging-smoke.md`](deployment/vps-staging-smoke.md)
   — the staging smoke history this cutline draws evidence from.
+- [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
+  — v1 production smoke log; template skeleton landed
+  2026-05-17 (NOT EXECUTED). Operator-walked entries here are
+  the B2 evidence track.
 - [`docs/production-auth.md`](production-auth.md) and
   [`docs/auth-smoke.md`](auth-smoke.md) — auth operator surface.
 - [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)
