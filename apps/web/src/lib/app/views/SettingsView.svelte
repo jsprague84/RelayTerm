@@ -43,7 +43,9 @@
     findThemePreset,
   } from "../settings/themePresets.js";
   import { TERMINAL_UX_COPY } from "../terminal/terminalLaunch.js";
+  import type { CurrentUser } from "../../api/auth.js";
   import AuthSessionsPanel from "./AuthSessionsPanel.svelte";
+  import OperationalStatusPanel from "./OperationalStatusPanel.svelte";
   import PasswordPanel from "./PasswordPanel.svelte";
   import RecentActivityPanel from "./RecentActivityPanel.svelte";
 
@@ -56,9 +58,17 @@
      * so we do not re-POST `/auth/logout`.
      */
     onCurrentSessionRevoked?: () => void;
+    /**
+     * Authenticated caller resolved by the auth gate and forwarded by
+     * `AppShell.svelte`. Threaded into {@link OperationalStatusPanel}
+     * so the account section can render the operator-visible email /
+     * display name / created-at / last-sign-in without re-fetching
+     * `/auth/me` — the same DTO is already available from the gate.
+     */
+    user?: CurrentUser | null;
   }
 
-  let { onCurrentSessionRevoked }: Props = $props();
+  let { onCurrentSessionRevoked, user = null }: Props = $props();
 
   type SaveState =
     | { kind: "idle" }
@@ -561,6 +571,8 @@ Last login: Mon May  1 14:02:51
     (see <code class="font-mono">docs/terminal-renderer-evaluation.md</code>
     § "Promotion criteria" for the Gate 1 / Gate 2 path).
   </p>
+
+  <OperationalStatusPanel {user} />
 
   <PasswordPanel />
 

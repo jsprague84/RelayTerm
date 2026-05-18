@@ -339,6 +339,30 @@ update this file in the same change.
 | `[data-testid="renderer-option-restty"]`          | restty experimental radio (visible ONLY when the gate is on). |
 | `[data-testid="renderer-option-wterm"]`           | wterm experimental radio (visible ONLY when the gate is on). |
 | `[data-testid="settings-renderer-effective"]`     | Effective-renderer diagnostic strip rendered next to the radio group. Mirrors `effectiveRendererId(draft)` — when an experimental id is selected but the gate is off, surfaces "currently fall back to xterm." Useful for proving the gate logic in a smoke without launching a terminal session. |
+| `[data-testid="settings-operational-status"]`     | Operational Status panel root inside the Settings view. Renders a small "is it healthy?" view from already-loaded API data (`/healthz`, `/auth/sessions`, `/terminal-sessions`, `/config/session-policy`) plus local terminal settings — does NOT call any new backend endpoint and does NOT display secrets / env values / DB URLs. Sentinel-tested in `tests/operationalStatus.test.ts`. |
+| `[data-testid="settings-operational-status-refresh"]` | Manual refresh button on the Operational Status panel (no auto-refresh, no polling). 40 px tap target. |
+| `[data-testid="settings-operational-status-last-refreshed"]` | Inline "Last refreshed …" timestamp, present only after the first refresh completes. |
+| `[data-testid="settings-operational-status-account"]` | Account sub-section (email + display name + created-at + last-sign-in). Sourced from the parsed `CurrentUser` DTO — `password_hash` / `session_token` / `token_hash` / `bootstrap_token` / `private_key` / `encrypted_private_key` are absent from the DTO and cannot reach the rendered DOM. |
+| `[data-testid="settings-operational-status-account-email"]` | Operator email cell inside the account block. |
+| `[data-testid="settings-operational-status-account-display-name"]` | Operator display-name cell inside the account block. |
+| `[data-testid="settings-operational-status-account-availability"]` | One-line auth-API availability label ("Authenticated" / "Loading…" / safe failure summary from `describeAuthGateError`). |
+| `[data-testid="settings-operational-status-indicators"]` | Grid container holding the seven indicator pills (single-column under `sm:`, two-column above). |
+| `[data-testid="settings-operational-status-health"]` | Backend reachability indicator pill (mirrors `checkHealth()` against `/healthz`). |
+| `[data-testid="settings-operational-status-auth-sessions"]` | Browser-sessions indicator pill (caller's own `active` / `expired` / `revoked` aggregate from `listAuthSessions()`). |
+| `[data-testid="settings-operational-status-terminal-sessions"]` | Terminal-sessions indicator pill (one-line live + starting summary from `listTerminalSessions()`). |
+| `[data-testid="settings-operational-status-detached-ttl"]` | Detached-PTY reconnect window indicator pill (parameterised TTL copy from `loadSessionPolicy()`). |
+| `[data-testid="settings-operational-status-quotas"]` | Per-user live / starting quota indicator pill (parameterised copy from `loadSessionPolicy()`). |
+| `[data-testid="settings-operational-status-experimental-gate"]` | Experimental renderer gate indicator pill (`ON` / `off`; warn tone when ON). |
+| `[data-testid="settings-operational-status-autofit"]` | Renderer-neutral autofit indicator pill (`on` / `off`). |
+| `[data-testid="settings-operational-status-terminal-breakdown"]` | Terminal-sessions per-status breakdown sub-section (one cell per `TerminalSessionStatus`). |
+| `[data-testid="settings-operational-status-terminal-count-active"]` | "Active" cell inside the per-status breakdown. Mirror cells exist for `detached`, `starting`, `closed`. |
+| `[data-testid="settings-operational-status-defaults"]` | Terminal defaults sub-section (read-only; the next session's effective renderer + the v1-default honesty note). |
+| `[data-testid="settings-operational-status-effective-renderer"]` | "Next terminal session will mount …" copy. Always names xterm explicitly when it is the effective renderer; flags a stale experimental selection as currently downgraded. |
+| `[data-testid="settings-operational-status-diagnostics"]` | Launch-diagnostics availability sub-section. Static copy explaining that per-launch timing diagnostics are surfaced inside the terminal workspace while a session is open — this panel does NOT cache or replay them. |
+| `[data-testid="settings-operational-status-readiness"]` | Production-readiness reminders sub-section. Three short pointers: pre-upgrade backup runbook, v1 release checklist (B2 + B3 stay operator-walked), xterm-as-v1-default. Never claims B2 or B3 are done. |
+| `[data-testid="settings-operational-status-<key>-value"]` | Per-indicator value sub-element (where `<key>` is the indicator id from the rows above). Carries the tone-classed pill — present iff the indicator state is `ready`. |
+| `[data-testid="settings-operational-status-<key>-loading"]` | Per-indicator loading sub-element. Present iff the indicator state is `loading`. |
+| `[data-testid="settings-operational-status-<key>-unavailable"]` | Per-indicator "Unavailable" pill. Present iff the indicator state is `unavailable`; the adjacent label carries the safe formatter summary (never echoes wire `message` or transport detail). |
 | `[data-testid="settings-recent-activity"]`        | Recent-audit panel root inside the Settings view (current-user audit feed; read-only; not an admin view). |
 | `[data-testid="settings-recent-activity-refresh"]` | Manual refresh button inside the recent-audit panel (no auto-refresh, no polling). |
 | `[data-testid="settings-recent-activity-loading"]` | Recent-audit loading state. |
@@ -516,6 +540,53 @@ the same MCP browser tools.
       Expected: every field `true`. Whether the panel currently shows
       `loading`, `error`, `empty`, or `list` depends on whether the
       backend is up — the smoke does NOT assert a specific state.
+
+5b. Operational Status panel — also reachable from the Settings view.
+    Surfaces backend reachability, browser session counts, terminal
+    session counts, deployment quotas, experimental gate posture,
+    autofit posture, and read-only "next session will mount X" copy.
+    The smoke only asserts the panel root + the seven indicator pills
+    are present and that the read-only effective-renderer copy names
+    `xterm` (default) — it does NOT assert specific counts (those
+    depend on the operator's data) and does NOT assert health is `ok`
+    (depends on whether the backend is up):
+
+    - `browser_evaluate`:
+
+      ```js
+      () => {
+        const has = (sel) => !!document.querySelector(sel);
+        const text = (sel) =>
+          document.querySelector(sel)?.textContent?.trim() ?? null;
+        return {
+          panel: has('[data-testid="settings-operational-status"]'),
+          refresh: has('[data-testid="settings-operational-status-refresh"]'),
+          health: has('[data-testid="settings-operational-status-health"]'),
+          authSessions: has(
+            '[data-testid="settings-operational-status-auth-sessions"]',
+          ),
+          terminalSessions: has(
+            '[data-testid="settings-operational-status-terminal-sessions"]',
+          ),
+          ttl: has('[data-testid="settings-operational-status-detached-ttl"]'),
+          quotas: has('[data-testid="settings-operational-status-quotas"]'),
+          experimentalGate: has(
+            '[data-testid="settings-operational-status-experimental-gate"]',
+          ),
+          autofit: has('[data-testid="settings-operational-status-autofit"]'),
+          defaultsText: text(
+            '[data-testid="settings-operational-status-effective-renderer"]',
+          ),
+        };
+      }
+      ```
+
+      Expected: every boolean field `true`; `defaultsText` contains
+      `xterm` AND `v1 production default` (the default-gate-off
+      posture). If `defaultsText` mentions `ghostty-web` / `restty` /
+      `wterm` the operator has flipped the experimental gate; re-set
+      the gate off (`[data-testid="settings-experimental-renderer-toggle"]`)
+      and re-check.
 
 6. For each of `ghostty-web`, `restty`, `wterm`, `xterm` (in that
    order):

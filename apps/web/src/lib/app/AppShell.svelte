@@ -341,6 +341,7 @@
           <IdentitiesView />
         {:else if selected === "settings"}
           <SettingsView
+            {user}
             onCurrentSessionRevoked={signOut
               ? handleCurrentSessionRevoked
               : undefined}

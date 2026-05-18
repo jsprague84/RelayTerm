@@ -701,9 +701,19 @@ moves the needle. Order matches cutline §7.
 
 Honourable mentions (not v1-critical):
 
-- `feat/operator-status-page` — a small operations page in
-  Settings surfacing healthcheck status, effective quotas, and
-  recording on / off. Handy at deploy time but not v1-required.
+- ~~`feat/operator-status-page`~~ **DONE — 2026-05-17.** Landed
+  on `feat/v1-operational-status-page` as the Operational Status
+  panel inside the Settings view. Use it from
+  `[data-testid="settings-operational-status"]` for a quick "is it
+  healthy?" view at deploy time — backend reachability, browser
+  session counts, terminal session counts by status, effective
+  deployment quotas, experimental gate posture, and the read-only
+  next-session renderer summary. The panel does NOT substitute
+  for §6 (auth walk), §7 (inventory walk), §8 (terminal walk), §9
+  (mobile portrait sanity), or §11 (redaction sweep) — those
+  remain operator-walked. See
+  [`docs/v1-production-readiness.md`](v1-production-readiness.md)
+  §7 honourable mentions for the implementation pointer.
 
 Deliberately NOT recommended as next slices:
 

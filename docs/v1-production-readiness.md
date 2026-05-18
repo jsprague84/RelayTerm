@@ -511,9 +511,28 @@ Honourable mentions (would help but not v1-critical):
   §5.0; recorded against the §10 template there). Closes the
   remaining verification gap on the §4.4 "Restore-test
   rehearsal" row.
-- **`feat/operator-status-page`** — a small operations page in
-  Settings surfacing healthcheck status, current effective quotas,
-  and recording on/off — handy at deploy time but not v1-required.
+- ~~**`feat/operator-status-page`**~~ **DONE — 2026-05-17.** Landed
+  on `feat/v1-operational-status-page` as the Operational Status
+  panel inside the Settings view
+  (`apps/web/src/lib/app/views/OperationalStatusPanel.svelte` +
+  pure helpers at
+  `apps/web/src/lib/app/settings/operationalStatus.ts`). Surfaces
+  backend reachability (`/healthz`), browser session counts,
+  terminal session counts by status, the deployment-configured
+  detached-PTY TTL and per-user quotas (from the existing
+  `/api/v1/config/session-policy` endpoint), the local
+  experimental-renderer gate posture, the local autofit posture,
+  the read-only "next session will mount X" copy, and three
+  production-readiness reminders that point to the backup runbook
+  and the v1 release checklist. **No new backend endpoints; no
+  secrets / env values / DB URLs exposed.** Sentinel-tested in
+  `apps/web/tests/operationalStatus.test.ts` (41 tests); SMOKE.md
+  selector vocabulary documents `settings-operational-status-*`
+  test ids and the §5b dev-smoke row asserts panel presence
+  without claiming specific counts. The panel does NOT substitute
+  for B2 (production smoke) or B3 (mobile portrait sanity) — those
+  rows remain operator-walked and the panel's readiness section
+  surfaces that explicitly.
 
 Deliberately NOT recommended as next slices:
 
