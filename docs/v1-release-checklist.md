@@ -110,6 +110,18 @@ Before tagging.
 The operator's `.env` and the reverse-proxy config. Every row
 maps to a row in `deploy/relayterm.env.example`.
 
+> **Boot-time placeholder refusal.** Production mode refuses to
+> start if any of `RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64`,
+> `RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN`,
+> `RELAYTERM_VAULT__MASTER_KEY_B64`,
+> `RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64`, or
+> the Postgres password in `RELAYTERM_DATABASE__URL` still
+> contains the literal `CHANGE_ME` substring from
+> `deploy/relayterm.env.example`. The boot error names the
+> failing field but never echoes the placeholder value. If you
+> hit this, generate a real value per the row below — do NOT
+> work around the refusal.
+
 - [ ] `RELAYTERM_AUTH__MODE=production` (production envelope; boot
   refuses to start without it).
 - [ ] `RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64` set to a freshly

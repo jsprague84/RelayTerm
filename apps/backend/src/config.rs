@@ -15,6 +15,32 @@ use relayterm_vault::VaultMasterKey;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+/// Substring used by every `CHANGE_ME_*` placeholder in
+/// `deploy/relayterm.env.example` and the example Compose files. Operators
+/// who copy the example unchanged would otherwise boot production with a
+/// literal placeholder where a real secret belongs; the v1 session model
+/// does not consume the signing key, so the placeholder would survive
+/// today's `validate_auth` presence-check without surfacing — and the moment
+/// a future signed-cookie / signed-CSRF slice starts consuming the key,
+/// every untouched deploy is silently compromised. Refuse the placeholder
+/// at boot in production mode so the misconfiguration becomes a startup
+/// error pointing at the field, not a quiet weak-secret deployment.
+///
+/// The check is a substring scan so `CHANGE_ME`, `CHANGE_ME_postgres_password`,
+/// `CHANGE_ME_base64_32_bytes`, and any future placeholder shape are all
+/// caught with a single sentinel.
+const PRODUCTION_PLACEHOLDER_MARKER: &str = "CHANGE_ME";
+
+/// `true` when the supplied secret-shaped string contains the
+/// [`PRODUCTION_PLACEHOLDER_MARKER`] sentinel, i.e. the operator left the
+/// example file's placeholder where a real secret should sit. Used by
+/// [`Config::validate_production_secrets`] in production mode only — dev
+/// builds keep accepting whatever the contributor pasted, including
+/// throwaway fixtures.
+fn contains_production_placeholder(value: &str) -> bool {
+    value.contains(PRODUCTION_PLACEHOLDER_MARKER)
+}
+
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) server: ServerConfig,
@@ -1353,6 +1379,104 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse the `deploy/relayterm.env.example` placeholders at boot in
+    /// production mode.
+    ///
+    /// `validate_auth` only checks that secret-shaped fields are *present*;
+    /// it never decodes them. The session signing key in particular is
+    /// "reserved, not consumed" by the v1 hashed-opaque-token session model
+    /// — so a deploy that left `RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64=
+    /// CHANGE_ME_base64_32_bytes` in `.env` boots successfully today and
+    /// silently carries a known weak value into whichever future slice
+    /// starts consuming the key. This validator is the defence-in-depth
+    /// backstop: every secret-shaped production input gets its body scanned
+    /// for the `CHANGE_ME` sentinel and the boot is refused on a hit.
+    ///
+    /// Posture mirrors the other validators:
+    /// * `dev` mode → always Ok. Contributors paste throwaway fixtures
+    ///   freely.
+    /// * `production` mode → enforce on every secret-shaped field. Error
+    ///   messages name the failing FIELD and the `.env` file, but NEVER
+    ///   echo the offending value (it is operator-controlled but the
+    ///   redaction discipline here is uniform with `validate_auth` and
+    ///   `validate_terminal_recording`).
+    ///
+    /// Fields covered (every one is a `RELAYTERM_*` env var the operator
+    /// pastes from the example file):
+    /// * `auth.session_signing_key_b64`
+    /// * `auth.first_user_bootstrap_token`
+    /// * `database.url` (catches `postgres://user:CHANGE_ME_postgres_password@...`)
+    /// * `vault.master_key_b64`
+    /// * `terminal_recording.encryption.master_key_b64`
+    ///
+    /// `*_file` variants are NOT inspected — a file path is operator-owned
+    /// metadata, not the secret itself, and the file's contents flow through
+    /// the same decode paths (`VaultMasterKey::from_base64` etc.) that
+    /// already reject the placeholder structurally.
+    pub(crate) fn validate_production_secrets(&self) -> anyhow::Result<()> {
+        if !matches!(self.auth.mode, AuthMode::Production) {
+            return Ok(());
+        }
+        if let Some(v) = self.auth.session_signing_key_b64.as_deref()
+            && contains_production_placeholder(v)
+        {
+            bail!(
+                "auth.session_signing_key_b64 still contains the \
+                 `{PRODUCTION_PLACEHOLDER_MARKER}` placeholder from \
+                 deploy/relayterm.env.example — generate a real 32-byte \
+                 base64 value (`openssl rand -base64 32`) and update \
+                 RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64 before starting \
+                 production"
+            );
+        }
+        if let Some(v) = self.auth.first_user_bootstrap_token.as_deref()
+            && contains_production_placeholder(v)
+        {
+            bail!(
+                "auth.first_user_bootstrap_token still contains the \
+                 `{PRODUCTION_PLACEHOLDER_MARKER}` placeholder — generate a \
+                 real URL-safe token (`openssl rand -base64 32 | tr '+/' '-_' \
+                 | tr -d '='`) and update \
+                 RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN, or unset it \
+                 entirely after first-user bootstrap"
+            );
+        }
+        if contains_production_placeholder(&self.database.url) {
+            bail!(
+                "database.url still contains the `{PRODUCTION_PLACEHOLDER_MARKER}` \
+                 placeholder — replace the Postgres password in \
+                 RELAYTERM_DATABASE__URL (or in POSTGRES_PASSWORD if the URL \
+                 is composed via Compose interpolation) before starting \
+                 production"
+            );
+        }
+        if let Some(v) = self.vault.master_key_b64.as_deref()
+            && contains_production_placeholder(v)
+        {
+            bail!(
+                "vault.master_key_b64 still contains the \
+                 `{PRODUCTION_PLACEHOLDER_MARKER}` placeholder — generate a \
+                 real 32-byte base64 value (`openssl rand -base64 32`, MUST \
+                 differ from the session signing key) and update \
+                 RELAYTERM_VAULT__MASTER_KEY_B64 before starting production"
+            );
+        }
+        if let Some(v) = self.terminal_recording.encryption.master_key_b64.as_deref()
+            && contains_production_placeholder(v)
+        {
+            bail!(
+                "terminal_recording.encryption.master_key_b64 still contains the \
+                 `{PRODUCTION_PLACEHOLDER_MARKER}` placeholder — generate a \
+                 real 32-byte base64 value (MUST differ from the vault master \
+                 key) and update \
+                 RELAYTERM_TERMINAL_RECORDING__ENCRYPTION__MASTER_KEY_B64, or \
+                 leave RELAYTERM_TERMINAL_RECORDING__ENABLED=false (the v1 \
+                 default) until you wire a real recording key"
+            );
+        }
+        Ok(())
+    }
+
     /// Detached-live-PTY TTL as a `Duration`. Production callers pass
     /// the result into [`relayterm_terminal::TerminalSessionManager::with_detach_ttl`].
     /// Assumes [`Self::validate_terminal_sessions`] has already passed —
@@ -2240,6 +2364,243 @@ mode = "dev"
             assert!(
                 !err.to_string().contains(SECRET_MARKER),
                 "cookie_secure error must not echo secret-shaped values: {err}"
+            );
+        }
+    }
+
+    // --- Production placeholder refusal -----------------------------
+
+    /// The exact placeholder shape `relayterm.env.example` ships for the
+    /// session signing key. Pinned here so a future edit that changes the
+    /// example's placeholder shape forces a corresponding refactor to the
+    /// validator — keeping the env example, the validator, and these tests
+    /// in lockstep.
+    const SESSION_KEY_PLACEHOLDER: &str = "CHANGE_ME_base64_32_bytes";
+    const POSTGRES_PASSWORD_PLACEHOLDER: &str = "CHANGE_ME_postgres_password";
+
+    #[test]
+    fn placeholder_sentinel_substring_is_pinned() {
+        // The validator scans for the `CHANGE_ME` substring; every
+        // placeholder shape in the example file must carry it so a single
+        // sentinel covers them all.
+        assert!(SESSION_KEY_PLACEHOLDER.contains(PRODUCTION_PLACEHOLDER_MARKER));
+        assert!(POSTGRES_PASSWORD_PLACEHOLDER.contains(PRODUCTION_PLACEHOLDER_MARKER));
+    }
+
+    #[test]
+    fn validate_production_secrets_is_noop_in_dev_mode() {
+        // Dev contributors paste throwaway fixtures freely — the placeholder
+        // refusal is a production-only envelope.
+        let mut cfg = empty_cfg();
+        cfg.auth.mode = AuthMode::Dev;
+        cfg.auth.session_signing_key_b64 = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        cfg.auth.first_user_bootstrap_token = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        cfg.database.url = format!("postgres://u:{POSTGRES_PASSWORD_PLACEHOLDER}@h/d");
+        cfg.vault.master_key_b64 = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        cfg.terminal_recording.encryption.master_key_b64 = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        cfg.validate_production_secrets()
+            .expect("dev mode must skip the placeholder refusal");
+    }
+
+    #[test]
+    fn auth_mode_production_refuses_placeholder_session_signing_key() {
+        let mut cfg = production_cfg();
+        cfg.auth.session_signing_key_b64 = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        let err = cfg.validate_production_secrets().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session_signing_key_b64"),
+            "error must name the failing field: {msg}"
+        );
+        assert!(
+            msg.contains(PRODUCTION_PLACEHOLDER_MARKER),
+            "error must call out the placeholder sentinel: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_refuses_placeholder_bootstrap_token() {
+        let mut cfg = production_cfg();
+        cfg.auth.first_user_bootstrap_token = Some(format!(
+            "{PRODUCTION_PLACEHOLDER_MARKER}_throwaway_bootstrap_token"
+        ));
+        let err = cfg.validate_production_secrets().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("first_user_bootstrap_token"),
+            "error must name the failing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_refuses_placeholder_database_url() {
+        let mut cfg = production_cfg();
+        cfg.database.url =
+            format!("postgres://relayterm:{POSTGRES_PASSWORD_PLACEHOLDER}@postgres:5432/relayterm");
+        let err = cfg.validate_production_secrets().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("database.url"),
+            "error must name the failing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_refuses_placeholder_vault_master_key() {
+        let mut cfg = production_cfg();
+        cfg.vault.master_key_b64 = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        let err = cfg.validate_production_secrets().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vault.master_key_b64"),
+            "error must name the failing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_production_refuses_placeholder_recording_master_key() {
+        let mut cfg = production_cfg();
+        cfg.terminal_recording.encryption.master_key_b64 = Some(SESSION_KEY_PLACEHOLDER.to_owned());
+        let err = cfg.validate_production_secrets().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("terminal_recording.encryption.master_key_b64"),
+            "error must name the failing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_production_secrets_accepts_minimal_production_config() {
+        // The canonical production fixture (`production_cfg`) uses real
+        // base64-encoded zero bytes for the signing key and leaves the
+        // optional secret-shaped fields (bootstrap token, vault key,
+        // recording key, custom DB URL) unset / default. Validation must
+        // pass: presence of the placeholder is the trigger, absence is
+        // never a problem here (the other validators handle
+        // required-but-missing).
+        let cfg = production_cfg();
+        cfg.validate_production_secrets()
+            .expect("real-shaped minimal production config must validate");
+    }
+
+    #[test]
+    fn validate_production_secrets_accepts_real_values_on_every_field() {
+        // Walk the inverse of the per-field rejection tests: every
+        // secret-shaped field carries a real, non-placeholder value.
+        // The acceptance test pins that the validator does NOT
+        // false-positive on a value that *happens* to share characters
+        // with the sentinel but does NOT contain the `CHANGE_ME`
+        // substring (e.g. a base64-encoded random key with arbitrary
+        // alphanumeric noise).
+        let real_b64 = BASE64_STANDARD.encode([0x42u8; 32]);
+        let real_token = "ChAnGeNo7HinG_AaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa";
+        assert!(
+            !real_b64.contains(PRODUCTION_PLACEHOLDER_MARKER),
+            "test fixture for `real_b64` must not contain the sentinel substring",
+        );
+        assert!(
+            !real_token.contains(PRODUCTION_PLACEHOLDER_MARKER),
+            "test fixture for `real_token` must not contain the sentinel substring",
+        );
+        let mut cfg = production_cfg();
+        cfg.auth.session_signing_key_b64 = Some(real_b64.clone());
+        cfg.auth.first_user_bootstrap_token = Some(real_token.to_owned());
+        cfg.database.url = "postgres://relayterm:realpassword@postgres:5432/relayterm".to_owned();
+        cfg.vault.master_key_b64 = Some(real_b64.clone());
+        // Recording key MUST differ from the vault key per the
+        // separateness contract enforced by `validate_terminal_recording`;
+        // this validator only inspects bodies for the placeholder, so a
+        // distinct real value satisfies it without tripping that
+        // separate check.
+        cfg.terminal_recording.encryption.master_key_b64 =
+            Some(BASE64_STANDARD.encode([0x99u8; 32]));
+        cfg.validate_production_secrets()
+            .expect("non-placeholder values on every field must validate");
+    }
+
+    #[test]
+    fn validate_production_secrets_does_not_inspect_file_paths() {
+        // `*_file` variants are operator-owned metadata, not the secret
+        // body. The file contents flow through the same decode paths
+        // (`VaultMasterKey::from_base64` etc.) that already reject the
+        // placeholder structurally. Pin that the validator does NOT scan
+        // the path itself — an operator who stores their key file at
+        // `/etc/relayterm/CHANGE_ME-keys/v1` (silly but legal) should not
+        // be blocked.
+        let mut cfg = production_cfg();
+        cfg.auth.session_signing_key_b64 = None;
+        cfg.auth.session_signing_key_file =
+            Some(std::path::PathBuf::from("/etc/relayterm/CHANGE_ME-keys/v1"));
+        cfg.vault.master_key_b64 = None;
+        cfg.vault.master_key_file = Some(std::path::PathBuf::from(
+            "/etc/relayterm/CHANGE_ME-keys/vault",
+        ));
+        cfg.validate_production_secrets()
+            .expect("placeholder substring in file PATH must not trip the validator");
+    }
+
+    #[test]
+    fn validate_production_secrets_errors_do_not_echo_secret_values() {
+        // Mirrors `auth_validation_errors_do_not_echo_secret_env_values`:
+        // every reachable failure path must NOT splice the placeholder-
+        // bearing value into the operator-visible error string. A
+        // `CHANGE_ME_<freshly-generated-but-still-bogus>` sentinel that
+        // also encodes the operator's environment (e.g. their hostname)
+        // should not appear verbatim in the boot error log. We use a
+        // distinguishing trailing marker on top of the sentinel so the
+        // assertion has a unique substring to look for.
+        const FIELD_SUFFIX: &str = "AAAA-PLACEHOLDER-VALUE-MARKER-AAAA";
+        let with_value =
+            |field: &str| format!("{PRODUCTION_PLACEHOLDER_MARKER}_{field}_{FIELD_SUFFIX}");
+
+        // (1) session signing key
+        {
+            let mut cfg = production_cfg();
+            cfg.auth.session_signing_key_b64 = Some(with_value("sig"));
+            let err = cfg.validate_production_secrets().unwrap_err();
+            assert!(
+                !err.to_string().contains(FIELD_SUFFIX),
+                "session-key placeholder error must not echo the operator value: {err}"
+            );
+        }
+        // (2) bootstrap token
+        {
+            let mut cfg = production_cfg();
+            cfg.auth.first_user_bootstrap_token = Some(with_value("boot"));
+            let err = cfg.validate_production_secrets().unwrap_err();
+            assert!(
+                !err.to_string().contains(FIELD_SUFFIX),
+                "bootstrap-token placeholder error must not echo the operator value: {err}"
+            );
+        }
+        // (3) database url (operator-controlled, but still echo-free)
+        {
+            let mut cfg = production_cfg();
+            cfg.database.url = format!("postgres://u:{}@h/d", with_value("dbpw"));
+            let err = cfg.validate_production_secrets().unwrap_err();
+            assert!(
+                !err.to_string().contains(FIELD_SUFFIX),
+                "database-url placeholder error must not echo the operator value: {err}"
+            );
+        }
+        // (4) vault master key
+        {
+            let mut cfg = production_cfg();
+            cfg.vault.master_key_b64 = Some(with_value("vault"));
+            let err = cfg.validate_production_secrets().unwrap_err();
+            assert!(
+                !err.to_string().contains(FIELD_SUFFIX),
+                "vault-key placeholder error must not echo the operator value: {err}"
+            );
+        }
+        // (5) recording master key
+        {
+            let mut cfg = production_cfg();
+            cfg.terminal_recording.encryption.master_key_b64 = Some(with_value("rec"));
+            let err = cfg.validate_production_secrets().unwrap_err();
+            assert!(
+                !err.to_string().contains(FIELD_SUFFIX),
+                "recording-key placeholder error must not echo the operator value: {err}"
             );
         }
     }

@@ -36,6 +36,18 @@ async fn main() -> anyhow::Result<()> {
     // signing key, non-empty `allowed_origins`, and `cookie_secure =
     // true`; dev relaxes all three for local convenience).
     cfg.validate_auth().context("validate auth config")?;
+    // Defence-in-depth refusal of the `deploy/relayterm.env.example`
+    // placeholders in production mode. `validate_auth` only checks
+    // presence; this validator scans the body of every secret-shaped
+    // production input for the `CHANGE_ME` sentinel and bails on a hit
+    // so an operator who copied the example file unchanged sees a clear
+    // boot error pointing at the field rather than carrying the
+    // placeholder forward as a real secret. Dev mode is exempt — local
+    // contributors paste throwaway fixtures freely. See
+    // `Config::validate_production_secrets` for the field list and the
+    // redaction posture (error names the field, never echoes the value).
+    cfg.validate_production_secrets()
+        .context("validate production secrets")?;
     // Recording config foundation. Step 1b (this slice) wires typed
     // config + boot validation only — there is no chunk writer, no
     // replay API, no UI yet. Validation runs alongside auth so a

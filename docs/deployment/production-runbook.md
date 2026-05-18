@@ -184,6 +184,18 @@ files.
 
 In `.env`, confirm:
 
+> **Boot-time placeholder refusal.** Production mode refuses to
+> start if any of the secret-shaped fields below still contains
+> the literal `CHANGE_ME` substring from
+> `deploy/relayterm.env.example` — covering session signing key,
+> bootstrap token, vault master key, recording master key, and
+> the Postgres password embedded in `RELAYTERM_DATABASE__URL`.
+> The boot error names the failing field but never echoes the
+> placeholder value. If you hit this, generate a real value per
+> the matching bullet below — do NOT work around the refusal
+> (every refused value would have shipped a known weak secret
+> into the deploy).
+
 - `RELAYTERM_AUTH__MODE=production`. Never deploy `dev` to a public
   host — the boot validator's relaxed rules in `dev` mode are a
   development-only ergonomic.
