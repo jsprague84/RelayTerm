@@ -503,7 +503,9 @@ the image tag without ad-hoc improvisation.
   §5 (restore) + §6 (rollback). If a restore rehearsal has not
   been run against a throwaway Postgres at least once, mark
   this as a **REQUIRED POST-V1 FOLLOW-UP** in the §12 decision
-  table (slice: `docs/backup-restore-rehearsal-record`).
+  table (rehearsal log:
+  [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md);
+  next slice: `docs/backup-restore-rehearsal-run`).
   Restoring from a never-tested backup on a real incident is
   not acceptable for v1 hygiene; rehearse before relying on it.
 - [ ] Backup location recorded in the §13 sign-off template.
@@ -609,7 +611,7 @@ Each gate is one row. Status values:
 | Production-walked end-to-end smoke (B2, cutline blocker) | Operator-recorded production smoke entry against a real production hostname | **PENDING** | Yes | Template skeleton landed 2026-05-17 at [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md) (NOT EXECUTED — template only); next slice walks §5 of that file against a real production hostname (see §14) |
 | Mobile portrait sanity on default xterm (B3, cutline blocker) | Operator-recorded Android Chrome walk per §9 | **PENDING** | Yes | Next slice: `docs/v1-mobile-portrait-sanity-smoke` (see §14) |
 | Backup / restore / rollback (§10) | Pre-deploy `pg_dump` + config backup off-host; rollback tag known; backup/restore runbook walked | PENDING | Yes | This release log entry; runbook at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) |
-| Restore-from-backup rehearsal | Operator-recorded restore against a throwaway Postgres at least once (runbook §5 Case R-B; template at runbook §10) | **PENDING** | Yes (minimum: backup/restore runbook committed — DONE 2026-05-17 at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md); rehearsal still pending) | Next slice: `docs/backup-restore-rehearsal-record` (see §14) |
+| Restore-from-backup rehearsal | Operator-recorded restore against a throwaway Postgres at least once (runbook §5 Case R-B; canonical log + §5 template + §9 redaction sweep at [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md)) | **PENDING** | Yes (minimum: backup/restore runbook committed — DONE 2026-05-17 at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md); rehearsal template committed — DONE 2026-05-18 at [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md); rehearsal walk still pending) | Next slice: `docs/backup-restore-rehearsal-run` (see §14) |
 | Security / redaction sweep (§11) | Log + audit-payload sentinels return zero hits | PENDING | Yes | This release log entry |
 | Experimental renderer promotion | Any flip of the production default away from xterm | **POST-V1** | No | [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md) |
 | Production renderer selector UI | Operator-selectable renderer in production | **POST-V1** | No | Cutline §6 |
@@ -698,13 +700,21 @@ moves the needle. Order matches cutline §7.
    migration caveat, recording caveat, verification checklist,
    rehearsal record template, v1 / post-v1 non-goal split).
    Docs-only; no code / schema / deploy change.
-   **Pair (still pending):** the operator-recorded
-   `docs/backup-restore-rehearsal-record` (Case R-B restore
-   against a throwaway Postgres, per the new runbook §5.0 +
-   §10 template). The runbook closes the documentation gap;
-   the rehearsal closes the verification gap. The
+   ~~**Pair (still pending):**~~ **Template pair DONE —
+   2026-05-18.** The rehearsal record template landed on
+   `docs/backup-restore-rehearsal-record` as
+   [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md)
+   (preconditions, safety rules, §5 record template, §6/§7/§8
+   verification checklists, §9 redaction sweep, §10
+   verification log seeded NOT RUN). The runbook closes the
+   documentation gap; the rehearsal template closes the
+   template gap; the still-pending successor
+   **`docs/backup-restore-rehearsal-run`** is the
+   operator-walked Case R-B restore against a throwaway
+   Postgres that closes the verification gap. The
    release-checklist §10 / §12 row "Restore-from-backup
-   rehearsal" stays PENDING until the rehearsal entry lands.
+   rehearsal" stays PENDING until that successor entry records
+   PASS.
 4. ~~**`docs/v1-release-notes-draft`**~~ **DONE — 2026-05-17.**
    Landed on `docs/v1-release-notes-draft` as
    [`docs/v1-release-notes.md`](v1-release-notes.md). User-facing
@@ -767,8 +777,13 @@ Deliberately NOT recommended as next slices:
   B2 evidence the §12 decision table is gated on.
 - [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
   — operator-facing backup, restore, and rollback procedure;
-  closes the §10 "minimum manual process" gap. Pair with the
-  future `docs/backup-restore-rehearsal-record` slice.
+  closes the §10 "minimum manual process" gap. Paired with
+  [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md).
+- [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md)
+  — operator-recorded rehearsal log; §5 template + §10
+  verification log. The §12 row "Restore-from-backup
+  rehearsal" closes when the first dated entry under §10
+  there records PASS.
 - [`docs/deployment/docker-compose.md`](deployment/docker-compose.md)
   — Compose stack reference, env contract, reverse-proxy
   notes.

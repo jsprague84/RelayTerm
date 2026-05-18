@@ -781,10 +781,16 @@ discipline. Each block is independently meaningful.
 
 ## 10. Rehearsal record template
 
-Use this template for `docs/backup-restore-rehearsal-record`
-entries (the v1-readiness §7 honourable-mention slice) or for
-any operator-recorded rehearsal entry the operator chooses to
-keep alongside the deploy log.
+Use this short-form template for any operator-recorded rehearsal
+entry the operator chooses to keep alongside the deploy log. The
+canonical, fuller rehearsal log is
+[`backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md)
+— that file's §5 template is a superset of this block (preconditions
+checklist, restore-target isolation statement, per-row PASS/FAIL
+gates, redaction sweep). Use this short form for ad-hoc deploy-log
+entries; use the canonical log for entries that close the
+v1-release-checklist §10 / §12 "Restore-from-backup rehearsal"
+row.
 
 ```
 ## YYYY-MM-DD · Backup-restore rehearsal
@@ -816,16 +822,20 @@ has never been restored as a hope, not a backup (runbook §8.3).
 
 How this runbook plugs into the v1 cutline:
 
-- **v1 can ship with the runbook in place before a full restore
-  rehearsal has been recorded.** This runbook closes the
-  documentation gap; the rehearsal closes the verification gap.
-  The release-checklist §10 row "Restore-from-backup rehearsal"
-  remains PENDING until the rehearsal happens. The
+- **v1 can ship with the runbook in place AND the rehearsal
+  template in place before a full restore rehearsal has been
+  recorded.** This runbook closes the documentation gap; the
+  rehearsal template at
+  [`backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md)
+  closes the template gap; the first dated entry in that
+  file's §10 verification log closes the verification gap.
+  The release-checklist §10 row "Restore-from-backup
+  rehearsal" remains PENDING until that first dated entry
+  records PASS. The
   [`docs/v1-production-readiness.md`](../v1-production-readiness.md)
-  §4.4 row "Restore-test rehearsal" reads "DONE / runbook
-  exists; rehearsal pending" with the same meaning — the
-  rehearsal entry (`docs/backup-restore-rehearsal-record`,
-  §7 honourable mention) is what closes verification.
+  §4.4 row "Restore-test rehearsal" reads "DONE / runbook +
+  rehearsal template exist; actual rehearsal pending" with
+  the same meaning.
 - **Before public / personal production reliance, at least one
   backup MUST have been taken.** Spinning up a fresh deploy and
   using it for real SSH work without ever exercising §4 is the
@@ -897,13 +907,19 @@ stays single-page. Each line is a separate post-v1 slice.
 
 Ranked by what most moves the needle, given v1 readiness.
 
-1. **`docs/backup-restore-rehearsal-record`** (v1-readiness §7
-   honourable mention). Operator-recorded restore-from-`pg_dump`
-   rehearsal against a throwaway Postgres (Case R-B in §5.0),
-   committed as a dated entry. Closes the
-   v1-release-checklist §10 row "Restore-from-backup rehearsal"
-   and the v1-production-readiness §4.4 row "Restore-test
-   rehearsal." Uses the §10 template here.
+1. ~~**`docs/backup-restore-rehearsal-record`**~~ **DONE
+   (template) — 2026-05-18.** Landed on
+   `docs/backup-restore-rehearsal-record` as
+   [`backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md).
+   Rehearsal record template + §10 verification log; the §10
+   "first record entry" is the placeholder seed (status NOT
+   RUN). The still-pending successor slice is
+   **`docs/backup-restore-rehearsal-run`** — operator-walked
+   Case R-B restore against a throwaway Postgres, recorded as
+   the first dated entry under §10 of the rehearsal record.
+   Closes the v1-release-checklist §10 row "Restore-from-backup
+   rehearsal" and the v1-production-readiness §4.4 row
+   "Restore-test rehearsal" with a dated PASS.
 2. **`feat/operational-status-page`** (v1-readiness §7
    honourable mention). A small operations page in Settings
    surfacing healthcheck status, effective quotas, and
@@ -927,6 +943,11 @@ Ranked by what most moves the needle, given v1 readiness.
 
 ## See also
 
+- [`backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md)
+  — operator-recorded rehearsal log; §5 template + §10
+  verification log; the canonical destination for entries that
+  close the v1-release-checklist §10 / §12 "Restore-from-backup
+  rehearsal" row.
 - [`docs/deployment/production-runbook.md`](production-runbook.md)
   — §4 (first deploy), §6 (rollback), §7 (migration), §8
   (backup + restore reminders), §10 (post-deploy smoke), §11

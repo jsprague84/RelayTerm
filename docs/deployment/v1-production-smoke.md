@@ -134,9 +134,9 @@ confirmed" block when starting a real walk.
   §6.2; operator-facing manual procedure at
   [`backup-restore-runbook.md`](backup-restore-runbook.md) §4
   for backup and §5 + §6 for restore / rollback). Restore
-  rehearsal status recorded (PASS / PENDING; rehearsal template
-  at [`backup-restore-runbook.md`](backup-restore-runbook.md)
-  §10).
+  rehearsal status recorded (PASS / PENDING; canonical log +
+  §5 template at
+  [`backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md)).
 - [ ] **Rollback posture** decided. The previous `vX.Y.Z` AND
   `sha-<short>` for both backend and web images are recorded
   next to the deploy log entry (runbook §6.1). Mark rollback
@@ -320,7 +320,7 @@ for the renderer-fair input methodology.
 
 | Row | Goal | Result | Wire / observed |
 |---|---|---|---|
-| P | DB backup evidence pre-smoke | PENDING | <!-- pre-deploy pg_dump path/object key recorded (off-host); chmod 600 preserved on .env copy. Walk the operator-facing procedure at backup-restore-runbook.md §4 (backup) and have §5 (restore) + §6 (rollback) read end-to-end before recording PASS. If rehearsal status is PENDING, record it as such (the rehearsal entry lands separately via docs/backup-restore-rehearsal-record). --> |
+| P | DB backup evidence pre-smoke | PENDING | <!-- pre-deploy pg_dump path/object key recorded (off-host); chmod 600 preserved on .env copy. Walk the operator-facing procedure at backup-restore-runbook.md §4 (backup) and have §5 (restore) + §6 (rollback) read end-to-end before recording PASS. If rehearsal status is PENDING, record it as such (the rehearsal log is backup-restore-rehearsal-record.md; the operator-walked entry lands there via the future docs/backup-restore-rehearsal-run slice). --> |
 | Q | Rollback evidence | PENDING | <!-- Current image tag/digest recorded; previous known-good `vX.Y.Z` + sha-<short> recorded; rollback procedure (runbook §6.1) read end-to-end. Mark "untested" unless actually rehearsed. --> |
 
 #### Cleanup posture
@@ -544,11 +544,16 @@ production stack touched). No cleanup needed.
   release-checklist §9 against a real Android phone on the
   default xterm production path.
 - **Honourable mention:**
-  `docs/backup-restore-rehearsal-record` — operator-recorded
-  restore-from-`pg_dump` rehearsal against a throwaway
-  Postgres; closes v1-readiness §4.4 "DONE / smoke" row on
-  restore-test rehearsal. Not v1-blocking but tightens P / Q
-  rows of any future production smoke entry here.
+  ~~`docs/backup-restore-rehearsal-record`~~ **DONE
+  (template) — 2026-05-18** at
+  [`backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md).
+  Operator-recorded rehearsal log skeleton (§5 template, §10
+  verification log seeded NOT RUN). Successor slice
+  `docs/backup-restore-rehearsal-run` is the operator-walked
+  Case R-B restore against a throwaway Postgres that closes
+  v1-readiness §4.4 "Restore-test rehearsal." Not v1-blocking
+  but tightens P / Q rows of any future production smoke
+  entry here.
 
 ---
 
@@ -567,6 +572,10 @@ production stack touched). No cleanup needed.
 - [`docs/deployment/backup-restore-runbook.md`](backup-restore-runbook.md)
   — operator-facing manual backup / restore / rollback procedure
   the §3 backup-posture prerequisite and §5 row P rest on.
+- [`docs/deployment/backup-restore-rehearsal-record.md`](backup-restore-rehearsal-record.md)
+  — operator-recorded rehearsal log; §3 backup-posture
+  prerequisite and §5 row P cite this file for the rehearsal
+  status.
 - [`docs/deployment/vps-staging-smoke.md`](vps-staging-smoke.md)
   — staging-only smoke log; do not co-mingle entries.
 - [`apps/web/e2e/SMOKE.md`](../../apps/web/e2e/SMOKE.md) — SPA

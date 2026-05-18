@@ -303,7 +303,7 @@ Capability rollup. Each row is one of:
 | Production-walked end-to-end smoke | **BLOCKER (B2)** | Staging smoke is extensive; an explicit v1-cutline production smoke against a real production hostname (not the throwaway staging slot) has not been recorded |
 | Backup procedure (`pg_dump -Fc` + off-site reminder) | DONE | Runbook §8; operator-facing manual procedure at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §4 |
 | Restore-from-backup procedure | DONE | Runbook §8 + §6.2; operator-facing manual procedure at [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §5 + §6 |
-| Restore-test rehearsal | DONE / runbook exists; rehearsal pending | Runbook §8.3 + the new [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §10 rehearsal record template; recommended quarterly; the operator-recorded rehearsal entry (`docs/backup-restore-rehearsal-record`, §7 honourable mention) is the still-pending row that closes verification |
+| Restore-test rehearsal | DONE / runbook + rehearsal template exist; actual rehearsal pending | Runbook §8.3 + the [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md) §10 short-form rehearsal template + the canonical [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md) (§5 template, §6/§7/§8 verification checklists, §9 redaction sweep, §10 verification log seeded NOT RUN); recommended quarterly; the still-pending successor slice `docs/backup-restore-rehearsal-run` is the operator-walked Case R-B entry that closes verification |
 | Secret rotation (signing key / vault key / bootstrap / registry / DB) | DONE | Runbook §11 — with explicit caveats on vault-key rotation (no re-encryption pass in v1) |
 | Tauri desktop / mobile release packaging | POST-V1 | Scaffolds + local-build docs only; no CI |
 
@@ -504,13 +504,19 @@ Honourable mentions (would help but not v1-critical):
   Operator-facing manual backup / restore / rollback runbook;
   closes the §4.4 "DONE / smoke" doc gap on restore procedure
   ergonomics. Pair-with slice below remains pending.
-- **`docs/backup-restore-rehearsal-record`** — an operator-recorded
-  restore-from-`pg_dump` rehearsal against a throwaway Postgres
-  (Case R-B in the new
-  [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
-  §5.0; recorded against the §10 template there). Closes the
-  remaining verification gap on the §4.4 "Restore-test
-  rehearsal" row.
+- ~~**`docs/backup-restore-rehearsal-record`**~~ **DONE
+  (template) — 2026-05-18.** Landed on
+  `docs/backup-restore-rehearsal-record` as
+  [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md).
+  Operator-recorded rehearsal log skeleton — §1 status, §2
+  scope (T1–T4), §3 preconditions, §4 safety rules, §5 record
+  template, §6/§7/§8 verification checklists for backup /
+  restore / rollback, §9 redaction sweep (sentinels mirror
+  v1-production-smoke §5.1), §10 verification log seeded NOT
+  RUN. Closes the template gap; the still-pending successor
+  slice **`docs/backup-restore-rehearsal-run`** is the
+  operator-walked Case R-B entry that closes the remaining
+  verification gap on the §4.4 "Restore-test rehearsal" row.
 - ~~**`feat/operator-status-page`**~~ **DONE — 2026-05-17.** Landed
   on `feat/v1-operational-status-page` as the Operational Status
   panel inside the Settings view
@@ -713,6 +719,11 @@ otherwise.
 - [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)
   — operator-facing manual backup / restore / rollback
   procedure that closes the §4.4 doc gap on restore ergonomics.
+- [`docs/deployment/backup-restore-rehearsal-record.md`](deployment/backup-restore-rehearsal-record.md)
+  — operator-recorded rehearsal log; §5 template + §10
+  verification log seeded NOT RUN. Paired with the runbook
+  above; the §4.4 "Restore-test rehearsal" row closes when the
+  first dated entry under §10 there records PASS.
 - [`docs/production-auth.md`](production-auth.md) and
   [`docs/auth-smoke.md`](auth-smoke.md) — auth operator surface.
 - [`docs/terminal-renderer-evaluation.md`](terminal-renderer-evaluation.md)
