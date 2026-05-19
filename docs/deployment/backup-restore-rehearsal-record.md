@@ -315,11 +315,25 @@ rollback>
                             backward-incompatible — restore-from-backup path took
                             place per runbook §6.2>`
 
-**Health checks (T2 / T3 / T4 only).**
+**Health checks (T2 / T3 / T4 only).** Probe semantics (mirrors
+[`backup-restore-runbook.md`](backup-restore-runbook.md) §5.6 and
+[`production-runbook.md`](production-runbook.md) §10): `/healthz`
+is process-alive on the backend (static body; not DB readiness);
+`/_web_health` is nginx-static on the web container (does not
+reach the backend); the unauthenticated `/api/v1/auth/me` is a
+routing + auth-gate sanity check — **`401` is the expected pass
+condition**, a `2xx` is the failure case.
+
 - `docker compose ps`    : postgres / backend / web all `(healthy)` — `<PASS | FAIL>`
+                           (`(healthy)` on `relayterm-backend` is process-alive
+                           only; the `postgres` row is the DB-side liveness
+                           signal — both are required.)
 - `curl -sf http://127.0.0.1:<port>/_web_health` → `ok` — `<PASS | FAIL>`
 - `curl -sf http://127.0.0.1:<port>/healthz` → `{"status":"ok"}` — `<PASS | FAIL>`
 - `curl -i http://127.0.0.1:<port>/api/v1/auth/me` unauthenticated → `401` — `<PASS | FAIL>`
+                           (PASS = `401`; a `2xx` answer is the failure case
+                           and means the auth gate is missing — STOP, do not
+                           record PASS.)
 
 **Sanity walk against restored data (T2 / T3 / T4 only).**
 - Login check            : SPA login with operator credentials → `<PASS | FAIL>`
@@ -409,10 +423,12 @@ runbook.
   "restored is newer — pinned `RELAYTERM_IMAGE_TAG`").
 - [ ] App stack started; `docker compose ps` reaches healthy on
   all three services (runbook §5.5).
-- [ ] `/healthz` and `/_web_health` return OK from loopback
-  (runbook §5.6).
-- [ ] `/api/v1/auth/me` returns `401` unauthenticated (runbook
-  §5.6).
+- [ ] `/healthz` (process-alive; static `{"status":"ok"}`, not
+  DB readiness) and `/_web_health` (nginx-static; does not reach
+  the backend) return OK from loopback (runbook §5.6).
+- [ ] `/api/v1/auth/me` returns `401` unauthenticated — `401` is
+  the expected pass condition (routing + auth-gate sanity); a
+  `2xx` here is the failure case (runbook §5.6).
 - [ ] SPA login with the dump's operator credentials succeeds
   (runbook §5.6 — note the "pre-dump password is what works
   post-restore" caveat).

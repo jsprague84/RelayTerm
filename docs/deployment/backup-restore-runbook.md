@@ -503,14 +503,24 @@ migrate container again unless §5.4 told you to.
 ### 5.6 Health checks and sanity walk
 
 Each of these is a hard gate. Do not declare the restore done
-until all of them pass.
+until all of them pass. Probe semantics (mirrors
+[`production-runbook.md`](production-runbook.md) §10):
+`/healthz` is a backend process-alive probe (static
+`{"status":"ok"}`; not DB readiness); `/_web_health` is an
+nginx-static probe on the web container (does not reach the
+backend); the unauthenticated `/api/v1/auth/me` returns `401` —
+**`401` is the expected pass condition**, not a failure.
 
 - `docker compose ps` — `(healthy)` on `postgres`,
-  `relayterm-backend`, `relayterm-web`.
+  `relayterm-backend`, `relayterm-web`. `(healthy)` on
+  `relayterm-backend` is process-alive only; the `postgres` row
+  (driven by `pg_isready`) is the corresponding DB-side
+  liveness — both are required after a restore.
 - `curl -sf http://127.0.0.1:8081/_web_health` → `ok`.
 - `curl -sf http://127.0.0.1:8081/healthz` → `{"status":"ok"}`.
 - `curl -i http://127.0.0.1:8081/api/v1/auth/me` without cookie
-  → `401`.
+  → `401` (expected; a `2xx` here means the auth gate is
+  missing from the protected route — STOP).
 - **Login check.** Sign in through the SPA at the production
   origin with the operator's existing credentials. `GET
   /api/v1/auth/me` returns the user. (If the operator's
@@ -756,13 +766,20 @@ discipline. Each block is independently meaningful.
 
 ### 9.2 After a restore (§5)
 
+`/healthz` is process-alive (not DB readiness); `/_web_health`
+is nginx-static (does not reach the backend); the
+unauthenticated `/api/v1/auth/me → 401` is a routing + auth-gate
+sanity check, and `401` is the expected pass condition. See §5.6
+for the full context.
+
 - [ ] `docker compose ps` shows `(healthy)` on `postgres`,
   `relayterm-backend`, `relayterm-web`.
 - [ ] `curl -sf http://127.0.0.1:8081/_web_health` → `ok`.
 - [ ] `curl -sf http://127.0.0.1:8081/healthz` →
   `{"status":"ok"}`.
 - [ ] `curl -i http://127.0.0.1:8081/api/v1/auth/me`
-  unauthenticated → `401`.
+  unauthenticated → `401` (expected; `2xx` here is the
+  failure case).
 - [ ] SPA login with operator credentials succeeds.
 - [ ] Sessions page loads.
 - [ ] Inventory loads (`IdentitiesView`, `ServersView`).

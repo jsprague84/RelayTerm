@@ -627,9 +627,29 @@ A 60-second proxy timeout will close idle terminals without notice.
 Walk this after every fresh deploy (§4), every upgrade (§5), and
 every rollback (§6).
 
+> **What each health probe actually means.** Read this once;
+> every bullet below assumes it.
+>
+> - `/_web_health` is a static `200 ok\n` served by the inner
+>   `relayterm-web` nginx with `access_log off`. It confirms the
+>   web container is up and serving. It does NOT reach the backend.
+> - `/healthz` is a static `200 {"status":"ok"}` served by the
+>   backend process and reverse-proxied by the inner nginx at the
+>   same path. It is a **process-alive probe only** — it does NOT
+>   confirm DB connectivity, migration state, vault unwrap, or
+>   russh capability. A `(healthy)` `relayterm-backend` in
+>   `docker compose ps` means the process accepts a request on
+>   `:8080`; the `(healthy)` `postgres` row (driven by
+>   `pg_isready`) is the corresponding DB-side liveness signal.
+> - `/api/v1/auth/me` without a cookie is a **routing + auth-gate
+>   sanity check**, NOT a health endpoint. `401` is the expected
+>   answer; any `2xx` here means the auth gate has been bypassed
+>   and is a security regression.
+
 - [ ] **Compose state.** `docker compose ps` shows every service as
       `running`, and `postgres` / `relayterm-backend` /
-      `relayterm-web` as `healthy`.
+      `relayterm-web` as `healthy`. Note `(healthy)` on
+      `relayterm-backend` is process-alive only — see the box above.
 - [ ] **Backend logs.** `docker compose logs --tail=200
       relayterm-backend` — startup is clean; no `ERROR` lines; the
       retention worker starts (when enabled) and reports empty sweeps
@@ -641,9 +661,14 @@ every rollback (§6).
       §6.4.6 of `docker-compose.md` for the historical fix).
 - [ ] **Backend health through the proxy.** `curl -sf
       http://127.0.0.1:8081/healthz` returns `{"status":"ok"}`.
+      (Also reachable publicly at `https://<origin>/healthz` because
+      the inner nginx proxies the same path — same static body,
+      same process-alive semantics.)
 - [ ] **Auth gate from the loopback.** `curl -i
       http://127.0.0.1:8081/api/v1/auth/me` returns `401` without a
-      cookie.
+      cookie. **`401` is the expected result** — this confirms
+      `/api/*` is routed to the backend AND the auth gate is in
+      front of protected routes. A `2xx` here is the failure case.
 - [ ] **Public-origin reachability.** From a workstation: the public
       URL serves the SPA over HTTPS; `GET https://<origin>/_web_health`
       returns `ok`.

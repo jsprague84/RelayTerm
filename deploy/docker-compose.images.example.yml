@@ -128,6 +128,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # `/healthz` is a static `200 {"status":"ok"}` served by the
+    # backend process — process-alive probe ONLY. A `(healthy)` row
+    # here does NOT certify DB connectivity, migration state, vault
+    # unwrap, or russh capability; the `postgres` `pg_isready`
+    # healthcheck above is the corresponding DB-side liveness signal.
+    # See `docs/deployment/production-runbook.md` §10.
     healthcheck:
       test:
         - CMD-SHELL
@@ -156,6 +162,10 @@ services:
     depends_on:
       relayterm-backend:
         condition: service_healthy
+    # `/_web_health` is a static `200 ok\n` served by the inner nginx
+    # (see `deploy/nginx/web.conf.template`) with `access_log off`. It
+    # confirms the web container is up and serving — it does NOT
+    # reach the backend (use `/healthz` for that).
     healthcheck:
       test:
         - CMD-SHELL

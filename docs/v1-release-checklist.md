@@ -232,11 +232,22 @@ exact form from runbook §4 / §7 / §10.
   `docker compose up -d postgres relayterm-backend relayterm-web`.
 - [ ] Healthchecks reach healthy on all three services:
   `docker compose ps` shows `(healthy)` for `postgres`,
-  `relayterm-backend`, and `relayterm-web`.
+  `relayterm-backend`, and `relayterm-web`. The `(healthy)` row
+  on `relayterm-backend` is **process-alive only** (a
+  `wget /healthz` succeeded inside the container); DB-side
+  liveness is the `postgres` row (`pg_isready`). The Compose
+  `depends_on: postgres: condition: service_healthy` guard plus
+  the backend's eager pool (`PgPoolOptions::connect`) mean a
+  `(healthy)` backend opened at least one DB connection at
+  startup — but a mid-deploy DB restart or pool exhaustion will
+  surface on the first request, not in `/healthz`.
 - [ ] Backend health endpoint OK from the host loopback:
-  `curl -sf http://127.0.0.1:8081/healthz`.
+  `curl -sf http://127.0.0.1:8081/healthz` (returns
+  `{"status":"ok"}`; static body, no DB / config / version
+  exposure).
 - [ ] Web health endpoint OK from the host loopback:
-  `curl -sf http://127.0.0.1:8081/_web_health`.
+  `curl -sf http://127.0.0.1:8081/_web_health` (returns `ok`;
+  nginx-static, does not reach the backend).
 - [ ] Public origin reachable from the operator workstation:
   `curl -sf https://<origin>/_web_health`.
 - [ ] Rollback tag IDs known and recorded next to the deploy

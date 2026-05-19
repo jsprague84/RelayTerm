@@ -224,11 +224,22 @@ in this entry.
 **Prerequisites confirmed.** Copy the §3 list above and tick
 each box. Any unchecked row blocks the entry from PASS.
 
-**Preflight (§ 5 of the release-checklist re-checked).**
+**Preflight (§ 5 of the release-checklist re-checked).** Probe
+semantics (do NOT re-derive per row): `/healthz` is a
+process-alive probe on the backend (static `{"status":"ok"}`; no
+DB / config / version exposure); `/_web_health` is an
+nginx-static probe on the web container (does not reach the
+backend); `/api/v1/auth/me` without a cookie is a routing +
+auth-gate sanity check — **`401` is the expected result, not a
+failure**.
+
 - `GET https://<prod-origin>/` → `200 (HTML)`.
-- `GET https://<prod-origin>/healthz` → `200 {"status":"ok"}`.
+- `GET https://<prod-origin>/healthz` → `200 {"status":"ok"}`
+  (process-alive; not DB readiness).
 - `GET https://<prod-origin>/api/v1/auth/me` without cookie →
-  `401 {"error":{"code":"unauthorized","message":"unauthorized"}}`.
+  `401 {"error":{"code":"unauthorized","message":"unauthorized"}}`
+  (`401` is the PASS condition; a `2xx` here is a security
+  regression).
 - TLS cert valid from the operator workstation (browser AND
   `curl -sf` both succeed; no `--insecure`).
 - Reverse proxy verified to preserve `Origin`, pass WS upgrade
@@ -238,11 +249,13 @@ each box. Any unchecked row blocks the entry from PASS.
   `default-src 'self'` posture — NO `'wasm-unsafe-eval'`,
   NO experimental-renderer relaxations.
 - Backend health from the deploy-host loopback:
-  `curl -sf http://127.0.0.1:8081/healthz` → `ok`.
+  `curl -sf http://127.0.0.1:8081/healthz` → `{"status":"ok"}`.
 - Web health from the deploy-host loopback:
   `curl -sf http://127.0.0.1:8081/_web_health` → `ok`.
 - `docker compose ps` shows `postgres` / `relayterm-backend` /
-  `relayterm-web` as `(healthy)`.
+  `relayterm-web` as `(healthy)`. Note `(healthy)` on
+  `relayterm-backend` is process-alive only; the `postgres` row
+  (driven by `pg_isready`) is the corresponding DB-side liveness.
 - Migration status: final applied migration ID `<id>` (no
   pending / failed migration on the migrate container).
 
