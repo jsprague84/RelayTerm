@@ -326,6 +326,14 @@ The load-bearing rules for v1:
 The operator runbooks are the load-bearing source; this section
 is the index.
 
+- First-deploy planning page (recommended read before the
+  release-day checklist):
+  [`docs/deployment/first-production-deploy-plan.md`](deployment/first-production-deploy-plan.md)
+  — opinionated, short. Says what to decide, the recommended
+  posture, the §4 deploy outline, the §5 first-smoke rows that
+  resolve cutline blocker B2, and what counts as "ready for
+  personal use." Composes the release-day checklist + production
+  runbook + backup-restore runbook into a single page.
 - Release-day checklist:
   [`docs/v1-release-checklist.md`](v1-release-checklist.md) —
   walk this top to bottom before tagging and deploying v1. The
@@ -522,6 +530,9 @@ unrecorded.
   — the v1 cutline these notes summarize.
 - [`docs/v1-release-checklist.md`](v1-release-checklist.md) —
   the release-day operator gate.
+- [`docs/deployment/first-production-deploy-plan.md`](deployment/first-production-deploy-plan.md)
+  — short opinionated planning page for the first personal
+  production deploy; pairs with the release-day checklist.
 - [`docs/deployment/v1-production-smoke.md`](deployment/v1-production-smoke.md)
   — production smoke template (NOT EXECUTED until B2 lands).
 - [`docs/deployment/backup-restore-runbook.md`](deployment/backup-restore-runbook.md)

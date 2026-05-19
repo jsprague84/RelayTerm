@@ -124,6 +124,14 @@ branch tip. Don't pin it on a production host.
 
 Do this **once**, on a fresh host, with no existing RelayTerm state.
 
+> **First personal deploy?** Read
+> [`docs/deployment/first-production-deploy-plan.md`](first-production-deploy-plan.md)
+> first — it is the short, opinionated planning page that says
+> what to decide (§2), what the recommended posture is (§3), and
+> what counts as "ready for personal use" (§7). It composes this
+> runbook + the backup-restore runbook + the v1 release checklist
+> into a single page; this §4 stays the load-bearing procedure.
+
 ### 4.1 Choose a host directory
 
 Pick a directory the operator account owns; this is where the Compose
@@ -919,6 +927,10 @@ is a separate slice.
 
 ## See also
 
+- [`docs/deployment/first-production-deploy-plan.md`](./first-production-deploy-plan.md)
+  — short, opinionated planning page for the first personal
+  production deploy; composes this runbook + the backup-restore
+  runbook + the v1 release checklist into a single page.
 - [`docs/deployment/docker-compose.md`](./docker-compose.md) — the
   Compose-stack reference: services, env contract, CI workflow,
   registry publish.

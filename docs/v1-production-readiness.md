@@ -697,6 +697,12 @@ otherwise.
   operator-facing release-day checklist that turns this cutline
   into a step-by-step gate (§3–§11), a decision table (§12), and
   a sign-off template (§13).
+- [`docs/deployment/first-production-deploy-plan.md`](deployment/first-production-deploy-plan.md)
+  — short, opinionated planning page for the first personal
+  production deploy; answers §10 "Open questions for the
+  operator" with conservative defaults and points back at the
+  release-day checklist for the row-by-row gate. Planning-only;
+  does not change B2 / B3 status.
 - [`docs/v1-release-notes.md`](v1-release-notes.md) — draft v1
   user-facing release notes (what v1 is, included features,
   caveats, post-v1 roadmap, sign-off template). Pairs with the

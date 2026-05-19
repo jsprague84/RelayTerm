@@ -34,6 +34,16 @@ This doc is NOT a replacement for those sources. Treat it as the
 operator's single page of checkboxes; chase each `→` link to the
 load-bearing detail when you actually walk a row.
 
+> **First personal production deploy?** Read
+> [`docs/deployment/first-production-deploy-plan.md`](deployment/first-production-deploy-plan.md)
+> alongside this checklist. That doc is the short, opinionated
+> planning page — it answers cutline §10 "Open questions for the
+> operator" with conservative defaults, lists the recommended
+> first-deploy posture, and points back at this checklist for the
+> load-bearing row-by-row gate. This checklist remains the
+> authoritative pre-tag walk; the plan is what makes the first
+> deploy decision-light.
+
 ## 2. Release posture
 
 State these out loud before starting; they pin operator
@@ -776,6 +786,10 @@ Deliberately NOT recommended as next slices:
 - [`docs/v1-production-readiness.md`](v1-production-readiness.md)
   — the v1 cutline this checklist composes into a release
   gate.
+- [`docs/deployment/first-production-deploy-plan.md`](deployment/first-production-deploy-plan.md)
+  — short, opinionated planning page for the first personal
+  production deploy; pairs with this checklist as the "decide
+  before walking" sibling.
 - [`docs/v1-release-notes.md`](v1-release-notes.md) — draft v1
   release notes; the body of the published changelog. Pairs
   with §13 of this checklist (the sign-off template) and §5 of
