@@ -29,7 +29,9 @@ This runbook is the operator-facing manual procedure for:
 
 **In scope.** A single self-hosted RelayTerm v1 deploy running
 the published Compose stack from
-[`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml)
+[`deploy/docker-compose.production.example.yml`](../../deploy/docker-compose.production.example.yml)
+(or the equivalent
+[`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml))
 behind an outer reverse proxy, operated by a single self-hosted
 operator who is also the only RelayTerm user.
 
@@ -65,7 +67,7 @@ of state whose loss is irrecoverable from the rest of the system.
 |---|---|---|
 | Postgres database (users, password hashes, hosts, identities, server profiles, known-host entries, terminal session metadata + history, session events, audit events, optional recording chunks/markers) | Docker named volume `relayterm-pgdata` (or external managed Postgres) | **Yes** — all RelayTerm state |
 | RelayTerm `.env` (session signing key, vault master key, DB password, bootstrap token if still set, knob overrides) | `<compose-dir>/.env` on the deploy host (`chmod 600`) | **Yes** — the vault master key in this file is the ONLY way to decrypt stored SSH identities |
-| Docker Compose file | `<compose-dir>/docker-compose.yml` on the deploy host (copy of `deploy/docker-compose.images.example.yml`) | No — can be re-fetched from the repo, but back it up to record any local overrides |
+| Docker Compose file | `<compose-dir>/docker-compose.yml` on the deploy host (copy of `deploy/docker-compose.production.example.yml` or `deploy/docker-compose.images.example.yml`) | No — can be re-fetched from the repo, but back it up to record any local overrides |
 | Outer reverse-proxy config (Traefik dynamic config, Caddyfile, outer-nginx site config) | Operator-chosen — typically `/etc/traefik/`, `/etc/caddy/`, `/etc/nginx/conf.d/` | **Yes** — needed verbatim to restore the same public origin / TLS / WS-upgrade / `Origin` preservation posture |
 | TLS / ACME state if managed locally by the outer proxy | Operator-chosen — typically `/etc/letsencrypt/`, Caddy's `data/` dir, Traefik's `acme.json` | **Partial** — ACME can re-issue, but you eat a rate-limit hit and a brief TLS outage; back it up if practical |
 | Image tag / digest currently deployed AND the previous known-good tag / digest | `RELAYTERM_IMAGE_TAG` in `.env` PLUS your deploy log entry | **Yes** — required for §6 rollback. Record both `vX.Y.Z` AND `sha-<short>` |
@@ -984,7 +986,10 @@ Ranked by what most moves the needle, given v1 readiness.
   — § 11 (terminal recording chunk redaction).
 - [`docs/production-auth.md`](../production-auth.md) — §8 (lost
   the only password recovery path).
+- [`deploy/docker-compose.production.example.yml`](../../deploy/docker-compose.production.example.yml)
+  — production Compose template the procedures here target;
+  recommended starting point for new deploys.
 - [`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml)
-  — image-mode Compose stack the procedures here target.
+  — equivalent image-mode Compose reference (minimal comments).
 - [`deploy/relayterm.env.example`](../../deploy/relayterm.env.example)
   — env contract the §3 sensitive-material warning rests on.

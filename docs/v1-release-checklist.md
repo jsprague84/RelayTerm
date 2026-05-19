@@ -108,7 +108,15 @@ Before tagging.
 ## 4. Configuration checks
 
 The operator's `.env` and the reverse-proxy config. Every row
-maps to a row in `deploy/relayterm.env.example`.
+maps to a row in `deploy/relayterm.env.example`. The compose file
+on the deploy host should be a copy of
+[`deploy/docker-compose.production.example.yml`](../deploy/docker-compose.production.example.yml)
+(or the equivalent
+[`deploy/docker-compose.images.example.yml`](../deploy/docker-compose.images.example.yml))
+— do NOT use the staging template
+[`deploy/docker-compose.traefik-staging.example.yml`](../deploy/docker-compose.traefik-staging.example.yml)
+on a production host (it carries staging-only hostnames and
+middleware).
 
 > **Boot-time placeholder refusal.** Production mode refuses to
 > start if any of `RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64`,

@@ -313,6 +313,7 @@ DEPLOY_ENV_FILE=deploy/relayterm.env.example
 DEPLOY_BUILD_COMPOSE=deploy/docker-compose.example.yml
 DEPLOY_IMAGES_COMPOSE=deploy/docker-compose.images.example.yml
 DEPLOY_TRAEFIK_COMPOSE=deploy/docker-compose.traefik-staging.example.yml
+DEPLOY_PRODUCTION_COMPOSE=deploy/docker-compose.production.example.yml
 CONFIG_DEV_TOML=docs/config-examples/relayterm.dev.example.toml
 CONFIG_PROD_TOML=docs/config-examples/relayterm.production.example.toml
 
@@ -383,7 +384,8 @@ for var in \
     "$DEPLOY_ENV_FILE" \
     "$DEPLOY_BUILD_COMPOSE" \
     "$DEPLOY_IMAGES_COMPOSE" \
-    "$DEPLOY_TRAEFIK_COMPOSE"
+    "$DEPLOY_TRAEFIK_COMPOSE" \
+    "$DEPLOY_PRODUCTION_COMPOSE"
 done
 
 note_category "deploy config plumbing — postgres credentials"
@@ -396,7 +398,8 @@ for var in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB; do
     "$DEPLOY_ENV_FILE" \
     "$DEPLOY_BUILD_COMPOSE" \
     "$DEPLOY_IMAGES_COMPOSE" \
-    "$DEPLOY_TRAEFIK_COMPOSE"
+    "$DEPLOY_TRAEFIK_COMPOSE" \
+    "$DEPLOY_PRODUCTION_COMPOSE"
 done
 
 note_category "deploy config plumbing — image-mode-only env"
@@ -412,7 +415,8 @@ note_category "deploy config plumbing — image-mode-only env"
 for var in RELAYTERM_IMAGE_TAG; do
   require_substr_in_files "image-mode-env" "$var" \
     "$DEPLOY_IMAGES_COMPOSE" \
-    "$DEPLOY_TRAEFIK_COMPOSE"
+    "$DEPLOY_TRAEFIK_COMPOSE" \
+    "$DEPLOY_PRODUCTION_COMPOSE"
 done
 
 note_category "deploy config plumbing — TOML config-examples"

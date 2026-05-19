@@ -61,8 +61,18 @@ commit. See §3 for tag-policy guidance.
 
 **Compose / env templates** (in this repo):
 
+- [`deploy/docker-compose.production.example.yml`](../../deploy/docker-compose.production.example.yml)
+  — the **production-oriented Compose template** (image-mode, no
+  reverse-proxy hardcoding, ships with a commented Traefik labels
+  block and a Caddy / outer-nginx alternative documented inline).
+  This is the file the v1 release-checklist § 4 / § 5 walk against
+  on the operator's production host; copy it to the deploy host as
+  `docker-compose.yml`.
 - [`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml)
-  — image-mode Compose file. Operators copy this to the deploy host.
+  — the original image-mode reference. Equivalent service shape;
+  kept as the canonical minimal-comment file. Either file works on
+  the production host; new deploys should prefer the production
+  template above.
 - [`deploy/relayterm.env.example`](../../deploy/relayterm.env.example)
   — env template with every required variable annotated. Operators
   copy this to `.env` and fill it in.
@@ -130,12 +140,19 @@ cd /srv/relayterm
 From a clone of this repo (or via a release artifact):
 
 ```sh
-cp /path/to/RelayTerm/deploy/docker-compose.images.example.yml \
+cp /path/to/RelayTerm/deploy/docker-compose.production.example.yml \
    /srv/relayterm/docker-compose.yml
 cp /path/to/RelayTerm/deploy/relayterm.env.example \
    /srv/relayterm/.env
 chmod 600 /srv/relayterm/.env
 ```
+
+The production template (`docker-compose.production.example.yml`) is
+the recommended starting point — it ships with the upgrade /
+rollback / backup comments inline and a commented Traefik labels
+block you can adapt to your reverse proxy. The original
+`docker-compose.images.example.yml` is equivalent in service shape
+and is still valid; pick whichever the operator prefers.
 
 The `chmod 600` is load-bearing: this file ends up holding the session
 signing key, the vault master key, and the database password.

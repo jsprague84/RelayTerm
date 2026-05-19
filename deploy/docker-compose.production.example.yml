@@ -1,0 +1,400 @@
+# RelayTerm — production Compose template (single self-hosted v1 deploy).
+#
+# This file is the production-oriented sibling of the existing examples:
+#   * `docker-compose.example.yml`              — build-mode, local
+#                                                 Dockerfile build, for
+#                                                 contributors iterating
+#                                                 on the stack locally.
+#   * `docker-compose.images.example.yml`       — image-mode reference,
+#                                                 also suitable for
+#                                                 production; kept as
+#                                                 the canonical
+#                                                 minimal-comment file.
+#   * `docker-compose.traefik-staging.example.yml` — VPS STAGING ONLY.
+#                                                 Hardcoded staging
+#                                                 hostname, `secure-chain
+#                                                 @file` middleware, and
+#                                                 the host-side `proxy`
+#                                                 external network — do
+#                                                 NOT copy any of those
+#                                                 into production.
+#
+# What this template is for. A single self-hosted RelayTerm v1 deploy
+# running the published OCI images behind an operator-chosen outer
+# reverse proxy (Traefik / Caddy / outer nginx). It is the file the v1
+# release-checklist § 4-§ 5 walk against on the operator's production
+# host. The companion runbook is
+# [`docs/deployment/production-runbook.md`](../docs/deployment/production-runbook.md);
+# the backup, restore, and rollback procedures live in
+# [`docs/deployment/backup-restore-runbook.md`](../docs/deployment/backup-restore-runbook.md).
+#
+# How to use this file on the production host:
+#
+#   # 0. Place this file and a `.env` (chmod 600) in the operator's
+#   #    chosen compose dir (example: /srv/relayterm/).
+#   cp deploy/docker-compose.production.example.yml \
+#      /srv/relayterm/docker-compose.yml
+#   cp deploy/relayterm.env.example /srv/relayterm/.env
+#   chmod 600 /srv/relayterm/.env
+#
+#   # 1. Fill in every CHANGE_ME_* placeholder in .env. The production
+#   #    boot validator (apps/backend/src/config.rs ::
+#   #    Config::validate_production_secrets) refuses to start if any
+#   #    secret-shaped field still contains the literal `CHANGE_ME`
+#   #    substring. Do NOT work around the refusal.
+#
+#   # 2. Pin an immutable image tag in .env. Production should ALWAYS
+#   #    pin to a release tag (`vX.Y.Z`) or an immutable commit tag
+#   #    (`sha-<short>`); never `:main`, never a floating `:latest`
+#   #    (the CI does not publish `:latest` for exactly this reason —
+#   #    see docs/deployment/production-runbook.md § 3).
+#   #
+#   #    echo 'RELAYTERM_IMAGE_TAG=v0.1.0'      >> .env   # release pin
+#   #    # or
+#   #    echo 'RELAYTERM_IMAGE_TAG=sha-abc1234' >> .env   # commit pin
+#   #    # Digest pinning (most reproducible — runbook § 6.1 fallback):
+#   #    #   echo 'RELAYTERM_IMAGE_TAG=v0.1.0@sha256:<full-digest>' >> .env
+#   #    # (a Compose `image:` reference with `@sha256:<digest>` resolves
+#   #    # via `docker pull` and skips the tag-mutability hazard).
+#
+#   # 3. (Optional but recommended) log in to the registry with a
+#   #    `read:package`-scoped Forgejo token — NEVER the CI publish
+#   #    token. See production-runbook.md § 4.6.
+#   docker login git.js-node.cc
+#
+#   # 4. Render once to confirm env interpolation is clean BEFORE
+#   #    pulling. Compose's `${...:?}` placeholders fail loudly here
+#   #    if a required env var is missing.
+#   cd /srv/relayterm
+#   docker compose -f docker-compose.yml config
+#
+#   # 5. Pull images at the pinned tag.
+#   docker compose -f docker-compose.yml pull
+#
+#   # 6. FIRST DEPLOY (or any upgrade carrying a schema change): take
+#   #    a Postgres backup BEFORE running migrations — see
+#   #    docs/deployment/backup-restore-runbook.md § 4. Then apply
+#   #    migrations once via the profile-gated one-shot service:
+#   docker compose -f docker-compose.yml \
+#       --profile migrate run --rm relayterm-migrate
+#
+#   # 7. Bring the stack up.
+#   docker compose -f docker-compose.yml up -d \
+#       postgres relayterm-backend relayterm-web
+#   docker compose -f docker-compose.yml ps
+#
+#   # 8. Walk the post-deploy smoke — production-runbook.md § 10 and
+#   #    v1-release-checklist.md § 5 / § 11. Then bootstrap the first
+#   #    user per production-runbook.md § 4.10 and unset the bootstrap
+#   #    token per § 4.11.
+#
+# Upgrade (postgres deliberately omitted from `up -d` — keep it
+# running with its existing volume; only the app containers swap to
+# the new image):
+#
+#   # Always back up first; runbook § 5 names the backup step required.
+#   docker compose exec -T postgres \
+#       pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc \
+#       > /off-host/relayterm-pre-vNEXT-$(date -u +%Y%m%dT%H%M%SZ).dump
+#
+#   sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=v0.2.0/' .env
+#   docker compose -f docker-compose.yml pull
+#   docker compose -f docker-compose.yml \
+#       --profile migrate run --rm relayterm-migrate
+#   docker compose -f docker-compose.yml up -d --no-deps \
+#       relayterm-backend relayterm-web
+#
+# Rollback by image tag (the cheap path; only safe when the schema
+# change between the two tags is backward-compatible — see runbook
+# § 6.1 and backup-restore-runbook.md § 6.1). For a backward-
+# incompatible migration, the path is restore-from-backup AND tag
+# rollback (runbook § 6.2 + backup-restore-runbook.md § 6.2):
+#
+#   sed -i 's/^RELAYTERM_IMAGE_TAG=.*/RELAYTERM_IMAGE_TAG=sha-abc1234/' .env
+#   docker compose -f docker-compose.yml pull
+#   docker compose -f docker-compose.yml up -d --no-deps \
+#       relayterm-backend relayterm-web
+#
+# What NOT to commit. The `.gitignore` covers `.env`; do not override
+# it. Never commit secret material (vault master key, session signing
+# key, Postgres password, bootstrap token, registry credentials) into
+# this repo or any other. Postgres dumps and config archives stay
+# off-repo and off-host per backup-restore-runbook.md § 3.
+#
+# Auto-deploy is deliberately NOT shipped. Every step above is
+# operator-triggered (production-runbook.md § 13). Watchtower / GitOps
+# / SSH push are post-v1.
+
+name: relayterm
+
+services:
+  # -------------------------------------------------------------------
+  # Postgres. Internal-only — never expose this container to the
+  # public network or attach it to a reverse-proxy network. The
+  # `relayterm-pgdata` named volume is the single most important
+  # thing to back up; see docs/deployment/backup-restore-runbook.md
+  # § 2 for the protect-list and § 4 for the pre-upgrade backup
+  # procedure.
+  #
+  # Healthcheck — `pg_isready` is the corresponding DB-side liveness
+  # signal for the `relayterm-backend` row. The Compose
+  # `depends_on: postgres: condition: service_healthy` guard below
+  # serialises the boot order against it.
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+    volumes:
+      - relayterm-pgdata:/var/lib/postgresql/data
+    networks:
+      - relayterm-internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------
+  # One-shot migrations. `--profile migrate` keeps this out of
+  # `docker compose up`; the operator runs it explicitly per the
+  # upgrade procedure above. Canonical migration procedure:
+  # production-runbook.md § 7. Pre-upgrade backup procedure (always
+  # take a backup BEFORE running migrations): backup-restore-runbook.md
+  # § 4. Migration backward-compatibility caveat (forward-only
+  # default; how it interacts with rollback): backup-restore-runbook.md
+  # § 7.
+  #
+  # Pin to the SAME `RELAYTERM_IMAGE_TAG` as the backend — the
+  # migrate image is built from the same commit and carries the
+  # same migration set.
+  # -------------------------------------------------------------------
+  relayterm-migrate:
+    profiles: [migrate]
+    image: git.js-node.cc/jsprague/relayterm-backend-migrate:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG to an immutable pin (e.g. v0.1.0 or sha-abc1234); :main and :latest are NEVER the production tag}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    networks:
+      - relayterm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Backend. Internal-only — the web container reverse-proxies
+  # `/api/*` (with WS upgrade) and `/healthz` to it. Do NOT expose a
+  # host port for the backend; the only intended ingress is via
+  # relayterm-web -> outer reverse proxy.
+  #
+  # Every secret-shaped env var below is sourced from `.env` and
+  # MUST be replaced with a real value before first boot. The
+  # production boot validator (`Config::validate_production_secrets`)
+  # refuses to start if any field still contains the literal
+  # `CHANGE_ME` substring from `relayterm.env.example`; the refusal
+  # names the failing field but NEVER echoes the placeholder value.
+  # Wiring:
+  #   * RELAYTERM_AUTH__MODE must be `production` (the example
+  #     defaults to it). `dev` mode is for local development only;
+  #     never ship `dev` to a public host.
+  #   * RELAYTERM_AUTH__ALLOWED_ORIGINS must equal the public origin
+  #     the browser will use, byte-for-byte (scheme://host[:port],
+  #     lowercase, no trailing slash, no path). The CSRF guard does
+  #     byte-equality on this value.
+  #   * RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64: 32 random bytes
+  #     base64 (`openssl rand -base64 32`). MUST differ from the
+  #     vault master key.
+  #   * RELAYTERM_VAULT__MASTER_KEY_B64: 32 random bytes base64.
+  #     AEAD-wraps every stored SSH private key. Treat as
+  #     set-and-protect, not rotate-on-schedule (runbook § 11.2).
+  #   * RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN: ONLY required for
+  #     the first deploy window; unset and restart after bootstrap
+  #     per runbook § 4.11.
+  #   * Recording (`RELAYTERM_TERMINAL_RECORDING__*`) is OFF by
+  #     default at v1 (recommended). If flipped ON, re-read
+  #     docs/terminal-recording.md end-to-end first.
+  # -------------------------------------------------------------------
+  relayterm-backend:
+    image: git.js-node.cc/jsprague/relayterm-backend:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG to an immutable pin (e.g. v0.1.0 or sha-abc1234); :main and :latest are NEVER the production tag}
+    restart: unless-stopped
+    environment:
+      RELAYTERM_SERVER__BIND: 0.0.0.0:8080
+      RELAYTERM_DATABASE__URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RELAYTERM_AUTH__MODE: "${RELAYTERM_AUTH__MODE:-production}"
+      RELAYTERM_AUTH__ALLOWED_ORIGINS: "${RELAYTERM_AUTH__ALLOWED_ORIGINS:?set to your public origin (e.g. https://relay.example.com); byte-equality match against the browser Origin header}"
+      RELAYTERM_AUTH__COOKIE_SECURE: "${RELAYTERM_AUTH__COOKIE_SECURE:-true}"
+      RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64: "${RELAYTERM_AUTH__SESSION_SIGNING_KEY_B64:?generate with openssl rand -base64 32; MUST differ from RELAYTERM_VAULT__MASTER_KEY_B64}"
+      RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN: "${RELAYTERM_AUTH__FIRST_USER_BOOTSTRAP_TOKEN:-}"
+      RELAYTERM_VAULT__ENABLED: "${RELAYTERM_VAULT__ENABLED:-true}"
+      RELAYTERM_VAULT__MASTER_KEY_B64: "${RELAYTERM_VAULT__MASTER_KEY_B64:?generate with openssl rand -base64 32, MUST differ from session signing key, or set RELAYTERM_VAULT__ENABLED=false and remove this line}"
+      RELAYTERM_TERMINAL_RECORDING__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__ENABLED:-false}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__PERIODIC_SWEEP_ENABLED:-true}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__SWEEP_INTERVAL_SECONDS:-3600}"
+      RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE: "${RELAYTERM_TERMINAL_RECORDING__CLEANUP__BATCH_SIZE:-250}"
+      RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS: "${RELAYTERM_TERMINAL_SESSIONS__DETACHED_LIVE_PTY_TTL_SECONDS:-30}"
+      RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_USER:-8}"
+      RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER: "${RELAYTERM_TERMINAL_SESSIONS__MAX_STARTING_SESSIONS_PER_USER:-4}"
+      RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT: "${RELAYTERM_TERMINAL_SESSIONS__MAX_LIVE_PTY_SESSIONS_PER_DEPLOYMENT:-64}"
+      RUST_LOG: "${RUST_LOG:-relayterm=info,axum=info,sqlx=warn,info}"
+    networks:
+      - relayterm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # `/healthz` is a static `200 {"status":"ok"}` served by the
+    # backend process — PROCESS-ALIVE PROBE ONLY. A `(healthy)` row
+    # here does NOT certify DB connectivity, migration state, vault
+    # unwrap, or russh capability; the `postgres` `pg_isready`
+    # healthcheck above is the corresponding DB-side liveness signal.
+    # Both are required after a deploy. See
+    # docs/deployment/production-runbook.md § 10 for the full probe
+    # semantics block.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1:8080/healthz >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # -------------------------------------------------------------------
+  # Web frontend. nginx serves the static SPA and reverse-proxies
+  # `/api/*` (with WS upgrade) and `/healthz` to the backend over
+  # the internal compose network. This is the only service that an
+  # outer reverse proxy should route public traffic to.
+  #
+  # The host port mapping below intentionally binds to loopback
+  # (`127.0.0.1:8081`) so a bare `docker compose up` on a server
+  # does NOT expose plain HTTP to the public internet. The OUTER
+  # reverse proxy (Traefik / Caddy / outer nginx) on the host
+  # terminates TLS for the public origin and forwards requests to
+  # this port.
+  #
+  # WHERE TO SET THE PRODUCTION HOSTNAME. The hostname lives in
+  # TWO places:
+  #   1. RELAYTERM_AUTH__ALLOWED_ORIGINS in `.env` — the backend
+  #      CSRF allow-list. MUST equal the public origin byte-for-byte.
+  #   2. The outer reverse proxy's routing rule (Traefik label,
+  #      Caddyfile site block, or nginx `server_name` directive).
+  # See production-runbook.md § 9 for the reverse-proxy checklist:
+  # `Origin` MUST pass through unmodified, WS upgrade headers MUST
+  # be honoured for `/api/`, and `proxy_read_timeout` / `proxy_
+  # send_timeout` MUST be generous (3600s) on the API location.
+  # -------------------------------------------------------------------
+  relayterm-web:
+    image: git.js-node.cc/jsprague/relayterm-web:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG to an immutable pin (e.g. v0.1.0 or sha-abc1234); :main and :latest are NEVER the production tag}
+    restart: unless-stopped
+    environment:
+      RELAYTERM_BACKEND_URL: http://relayterm-backend:8080
+    ports:
+      - "127.0.0.1:8081:80"
+    networks:
+      - relayterm-internal
+    depends_on:
+      relayterm-backend:
+        condition: service_healthy
+    # `/_web_health` is a static `200 ok\n` served by the inner nginx
+    # (deploy/nginx/web.conf.template) with `access_log off`. It
+    # confirms the web container is up and serving — it does NOT
+    # reach the backend (use `/healthz` for that). The `access_log
+    # off` line keeps the operator-visible nginx log free of probe
+    # noise.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget -qO- --tries=1 --timeout=2 http://127.0.0.1/_web_health >/dev/null
+          || exit 1
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+    # ---------------------------------------------------------------
+    # Reverse-proxy integration. Reverse-proxy-AGNOSTIC by default —
+    # this template ships with NO routing labels; the outer proxy on
+    # the host routes `https://<your-production-origin>/` to
+    # `127.0.0.1:8081` (the loopback port mapping above).
+    #
+    # If you run TRAEFIK on the same host, uncomment and adapt the
+    # block below. The placeholder values are intentionally generic;
+    # do NOT copy the staging template's `secure-chain@file`
+    # middleware or its `cloudflare` certresolver — those are
+    # staging-host conventions and have NO production analogue
+    # shipped in this repo.
+    #
+    # CSP POSTURE. The production CSP MUST stay strict — the
+    # staging-only `'wasm-unsafe-eval'` relaxation (added for
+    # experimental-renderer evaluation against the throwaway staging
+    # slot) MUST NOT migrate to production. xterm is the v1
+    # production default and runs cleanly under the strict
+    # `default-src 'self'` posture. Do NOT add `unsafe-eval`,
+    # `data:`, or `blob:` allowances "to make the experimental
+    # renderers work" — the experimental renderers reach the
+    # production shell ONLY via the gated lazy loader and stay
+    # OFF by default (v1-release-checklist.md § 4 last bullet).
+    #
+    # labels:
+    #   - "traefik.enable=true"
+    #   # Pin the network Traefik uses to reach this service if you
+    #   # attach multiple networks (e.g. you also joined an external
+    #   # `proxy` network managed by Traefik).
+    #   - "traefik.docker.network=relayterm-internal"
+    #   # Replace <YOUR-PRODUCTION-HOSTNAME> with the operator's
+    #   # production origin host (e.g. relay.example.com). Match
+    #   # this against the RELAYTERM_AUTH__ALLOWED_ORIGINS value in
+    #   # .env, byte-for-byte (scheme://host).
+    #   - "traefik.http.routers.relayterm.rule=Host(`<YOUR-PRODUCTION-HOSTNAME>`)"
+    #   - "traefik.http.routers.relayterm.entrypoints=websecure"
+    #   - "traefik.http.routers.relayterm.tls=true"
+    #   # Use whichever certresolver name your Traefik instance has
+    #   # defined; common values: `letsencrypt`, `cloudflare`. The
+    #   # resolver itself is operator-side Traefik config and is
+    #   # intentionally not shipped here.
+    #   - "traefik.http.routers.relayterm.tls.certresolver=<YOUR-CERT-RESOLVER>"
+    #   - "traefik.http.services.relayterm.loadbalancer.server.port=80"
+    #
+    # If you run CADDY or an OUTER NGINX on the host instead, leave
+    # the labels block commented and configure routing in your
+    # proxy's own config file. The runbook (§ 9) and the docker-
+    # compose reference (docs/deployment/docker-compose.md § 3) have
+    # the copy-pastable snippets — in particular, nginx needs
+    # `proxy_set_header Origin $http_origin;` explicitly (it does
+    # NOT forward `Origin` automatically), and both Caddy and nginx
+    # need long `proxy_read_timeout` / `proxy_send_timeout` on the
+    # `/api/` location so long-lived terminal WebSockets do not get
+    # closed at the proxy's default 60s.
+
+volumes:
+  # The single most important thing to back up. Holds users, password
+  # hashes, hosts, identities (with vault-wrapped private keys),
+  # server profiles, known-host entries, terminal session metadata
+  # and history, audit events, and (when enabled) recording chunks
+  # and markers. Pre-upgrade backup procedure:
+  # docs/deployment/backup-restore-runbook.md § 4.
+  relayterm-pgdata:
+
+networks:
+  # Internal, private. Only postgres, the backend, the migrate
+  # one-shot, and the web container live here. The web container is
+  # the only service the outer reverse proxy should reach.
+  #
+  # If you run an OUTER reverse proxy on the SAME docker host and
+  # want it to reach the web container directly (instead of via the
+  # loopback port mapping), you can either:
+  #   a. Join the reverse-proxy container to `relayterm-internal`
+  #      with `docker network connect`, OR
+  #   b. Promote this network to `external: true` and create it
+  #      ahead of time so the outer proxy and this stack share it
+  #      by name.
+  # NEITHER is required — the default loopback mapping is the
+  # simplest production posture.
+  relayterm-internal:
+    driver: bridge

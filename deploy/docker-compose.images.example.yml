@@ -86,7 +86,7 @@ services:
   # -------------------------------------------------------------------
   relayterm-migrate:
     profiles: [migrate]
-    image: git.js-node.cc/jsprague/relayterm-backend-migrate:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0, main, or sha-abc1234)}
+    image: git.js-node.cc/jsprague/relayterm-backend-migrate:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0 or sha-abc1234; :main is mutable and not for production)}
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     networks:
@@ -101,7 +101,7 @@ services:
   # `docs/deployment/docker-compose.md` for the env contract.
   # -------------------------------------------------------------------
   relayterm-backend:
-    image: git.js-node.cc/jsprague/relayterm-backend:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0, main, or sha-abc1234)}
+    image: git.js-node.cc/jsprague/relayterm-backend:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0 or sha-abc1234; :main is mutable and not for production)}
     restart: unless-stopped
     environment:
       RELAYTERM_SERVER__BIND: 0.0.0.0:8080
@@ -151,7 +151,7 @@ services:
   # nginx) terminates TLS in production.
   # -------------------------------------------------------------------
   relayterm-web:
-    image: git.js-node.cc/jsprague/relayterm-web:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0, main, or sha-abc1234)}
+    image: git.js-node.cc/jsprague/relayterm-web:${RELAYTERM_IMAGE_TAG:?set RELAYTERM_IMAGE_TAG (e.g. v0.1.0 or sha-abc1234; :main is mutable and not for production)}
     restart: unless-stopped
     environment:
       RELAYTERM_BACKEND_URL: http://relayterm-backend:8080

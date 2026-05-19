@@ -96,7 +96,15 @@ confirmed" block when starting a real walk.
   runs) and reachable from the operator's workstation (SSH or
   console).
 - [ ] **Compose / project path on the deploy host** known
-  (matches runbook §4.1).
+  (matches runbook §4.1). The compose file on the deploy host
+  is a copy of
+  [`deploy/docker-compose.production.example.yml`](../../deploy/docker-compose.production.example.yml)
+  (the production-oriented template) or the equivalent
+  [`deploy/docker-compose.images.example.yml`](../../deploy/docker-compose.images.example.yml).
+  The staging template
+  [`deploy/docker-compose.traefik-staging.example.yml`](../../deploy/docker-compose.traefik-staging.example.yml)
+  is NOT a production template — do not use it on a production
+  host.
 - [ ] **Image tag/digest** decided (`vX.Y.Z` AND `sha-<short>`
   for both `relayterm-backend` and `relayterm-web`, plus
   `relayterm-backend-migrate`). `:main` and unpinned `:latest`
